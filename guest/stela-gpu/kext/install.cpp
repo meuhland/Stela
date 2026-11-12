@@ -25,6 +25,19 @@
  */
 static const char kPlugins[] = "/System/Volumes/Data/Library/GPUBundles";
 static const char kPlugin[] = "/System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/";
+/*
+ * The plugin's code again, where sandboxes that refuse to map code from
+ * /Library/GPUBundles (WebKit's GPU and web content processes, replayd) find
+ * it: refused there, dyld retries the same path under the OS cryptex's
+ * Incoming copy, and a symlink made once at
+ * Incoming/OS/Library/GPUBundles/StelaGPU.bundle/Contents/MacOS/StelaGPU
+ * resolves to this file, which lies where those sandboxes map frameworks
+ * from. The kext keeps the file current; it cannot make the symlink.
+ */
+static const char kOverlayCode[] =
+    "/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/PrivateFrameworks/StelaGPU.overlay";
+static const char kPluginCode[] = "Contents/MacOS/StelaGPU";
+
 /* How often the installer looks for the Data volume, in milliseconds. */
 static const unsigned kMountPoll = 50;
 
@@ -70,6 +83,47 @@ install(vfs_context_t context, char *buffer)
 	return report;
 }
 
+static bool
+samePath(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+/* Keeps the code's copy for sandboxed processes current. Failing only costs
+ * those processes Metal, so it is reported and otherwise ignored. */
+static void
+installOverlay(vfs_context_t context, char *buffer)
+{
+	for (const stela_bundle_file &file : stela_bundle_files) {
+		if (!samePath(file.path, kPluginCode)) {
+			continue;
+		}
+		bool same = false;
+		int error = stelaMatches(kOverlayCode, file.sha256, file.length, context, buffer, &same);
+		if (same) {
+			return;
+		}
+		if (error && error != ENOENT) {
+			IOLog("StelaGPU: reading %s failed: %d\n", kOverlayCode, error);
+			return;
+		}
+		error = stelaWriteFile(kOverlayCode, file.bytes, file.length, file.mode, context);
+		if (!error) {
+			error = stelaMatches(kOverlayCode, file.sha256, file.length, context, buffer, &same);
+		}
+		if (error || !same) {
+			IOLog("StelaGPU: writing %s failed: %d\n", kOverlayCode, error ? error : EIO);
+			return;
+		}
+		IOLog("StelaGPU: installed %s from stela.efi\n", kOverlayCode);
+		return;
+	}
+}
+
 bool
 StelaGPU::isStopping()
 {
@@ -95,6 +149,9 @@ StelaGPU::installPlugin(void *parameter, wait_result_t)
 		if (!stopping) {
 			vnode_put(plugins);
 			report = install(context, buffer);
+			if (report == STELA_GATE_BUNDLE_CURRENT || report == STELA_GATE_BUNDLE_UPDATED) {
+				installOverlay(context, buffer);
+			}
 		}
 	} else {
 		IOLog("StelaGPU: the plugin's installer cannot allocate\n");
