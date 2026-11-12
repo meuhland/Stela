@@ -51,8 +51,22 @@ const REQUEST_BYTES: usize = 28;
 const COMMAND_MAGIC: &[u8; 4] = b"DRCS";
 /// An ACM command's bytes before its input.
 const COMMAND_BYTES: usize = 8;
-/// The largest served request: a u32 of input.
-const LARGEST_REQUEST: usize = REQUEST_BYTES + COMMAND_BYTES + 4;
+/// The bytes of a request read: the head, the command and 64 bytes of input,
+/// enough for every served command and for the diagnostic dump.
+const LARGEST_REQUEST: usize = REQUEST_BYTES + COMMAND_BYTES + 64;
+/// `kCmdContextCreate`, `kCmdContextDelete`, `kCmdContextCreateWithTracking`
+/// and `kCmdContextCreateNonAutoDisposableWithTracking` (26C kernel command
+/// table, `Cmd_GetNameSafe`). `LibCall_ACMContextCreate` reads a 17-byte
+/// reply for create (a 16-byte handle and a flag byte) and 21 bytes for the
+/// tracking forms (the same and a u32 tracking ID).
+const CONTEXT_CREATE: u8 = 1;
+const CONTEXT_DELETE: u8 = 2;
+const CONTEXT_CREATE_TRACKING: u8 = 36;
+const CONTEXT_CREATE_NON_AUTO_DISPOSABLE: u8 = 52;
+/// Commands whose input can carry a passphrase: add, remove, set available,
+/// replace passphrase. Their input is never dumped.
+const SECRET_COMMANDS: [u8; 4] = [5, 6, 8, 15];
+static CONTEXTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 const INITIALIZE: u8 = 10;
 const GET_ENVIRONMENT_VARIABLE: u8 = 25;
 /// The environment variable `LDMCheckParity` compares with NVRAM.
@@ -104,8 +118,16 @@ pub fn request(frame: Frame, payload: &mut dyn Payload) -> Result<Frame, Refusal
     let Some(served) = output_of(frame, &request) else {
         let command = request[REQUEST_BYTES + COMMAND_MAGIC.len()];
         let input = input_length(frame).unwrap_or(0);
+        let dump = if SECRET_COMMANDS.contains(&command) {
+            alloc::string::String::from("(withheld)")
+        } else {
+            request[REQUEST_BYTES + COMMAND_BYTES..][..input.min(64)]
+                .iter()
+                .map(|b| alloc::format!("{b:02x}"))
+                .collect()
+        };
         let leading = u32::from_le_bytes(
-            request[REQUEST_BYTES + COMMAND_BYTES..]
+            request[REQUEST_BYTES + COMMAND_BYTES..][..4]
                 .try_into()
                 .expect("a u32 of input"),
         );
@@ -114,7 +136,8 @@ pub fn request(frame: Frame, payload: &mut dyn Payload) -> Result<Frame, Refusal
                 "SEP credential manager command is not implemented",
                 command,
                 input,
-                leading = %format_args!("{leading:#x}")
+                leading = %format_args!("{leading:#x}"),
+                bytes = %dump
             ),
             Answer {
                 frame: reply(frame, HEAD_BYTES as u16, UNSUPPORTED),
@@ -122,7 +145,7 @@ pub fn request(frame: Frame, payload: &mut dyn Payload) -> Result<Frame, Refusal
             },
         ));
     };
-    output.extend_from_slice(served);
+    output.extend_from_slice(&served);
     payload
         .output(&output)
         .map_err(|reason| Refusal::answered(reason, Answer::frame(failure(frame))))?;
@@ -136,21 +159,40 @@ fn input_length(frame: Frame) -> Option<usize> {
 }
 
 /// The output of a served command, by the input length `frame` names.
-fn output_of(frame: Frame, request: &[u8; LARGEST_REQUEST]) -> Option<&'static [u8]> {
+fn output_of(frame: Frame, request: &[u8; LARGEST_REQUEST]) -> Option<Vec<u8>> {
     let command = &request[REQUEST_BYTES..];
     if &command[..COMMAND_MAGIC.len()] != COMMAND_MAGIC {
         return None;
     }
     let input = input_length(frame)?;
     match (command[COMMAND_MAGIC.len()], input) {
-        (INITIALIZE, 0) => Some(&[]),
+        (INITIALIZE, 0) => Some(Vec::new()),
         (GET_ENVIRONMENT_VARIABLE, 4)
-            if command[COMMAND_BYTES..] == LOCKDOWN_MODE.to_le_bytes() =>
+            if command[COMMAND_BYTES..][..4] == LOCKDOWN_MODE.to_le_bytes() =>
         {
-            Some(&[LOCKDOWN_OFF])
+            Some(alloc::vec![LOCKDOWN_OFF])
         }
+        (CONTEXT_CREATE, 0) => Some(context(false)),
+        (CONTEXT_CREATE_TRACKING | CONTEXT_CREATE_NON_AUTO_DISPOSABLE, _) => Some(context(true)),
+        (CONTEXT_DELETE, _) => Some(Vec::new()),
         _ => None,
     }
+}
+
+/// A new context's reply: a 16-byte handle, a zero flag byte and, for the
+/// tracking forms, a u32 tracking ID. The handle is unique for this sepOS
+/// start; no context state is kept yet.
+fn context(tracking: bool) -> Vec<u8> {
+    let id = CONTEXTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let mut reply = alloc::vec![0; 16];
+    reply[..4].copy_from_slice(&id.to_le_bytes());
+    reply[4..8].copy_from_slice(b"STLA");
+    reply[8..12].copy_from_slice(&id.wrapping_mul(0x9e37_79b9).to_le_bytes());
+    reply.push(0);
+    if tracking {
+        reply.extend_from_slice(&id.to_le_bytes());
+    }
+    reply
 }
 
 fn head(request: &[u8; LARGEST_REQUEST]) -> Vec<u8> {
