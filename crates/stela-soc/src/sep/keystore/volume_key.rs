@@ -258,6 +258,11 @@ impl VolumeKeys {
                 let secret = fields.blob()?;
                 let uuid = uuid(fields.blob()?)?;
                 fields.end()?;
+                notes(alloc::format!(
+                    "diag fv NEW_KEK secret_len={} uuid={}",
+                    secret.len(),
+                    hex16(&uuid)
+                ));
                 let kek = random(entropy)?;
                 reply.blob(&self.seal_kek(uuid, secret, &kek));
             }
@@ -287,7 +292,17 @@ impl VolumeKeys {
                 let secret = fields.blob()?;
                 let wrapped_kek = fields.blob()?;
                 let wrapped_vek = fields.blob()?;
-                if !fields.blob()?.is_empty() {
+                let acm = fields.blob()?;
+                notes(alloc::format!(
+                    "diag fv UNWRAP variant={variant} kind={kind} secret_len={} printable={} kek_len={} kek_uuid={} vek_len={} acm_len={}",
+                    secret.len(),
+                    secret.iter().all(|b| (0x20..0x7f).contains(b)),
+                    wrapped_kek.len(),
+                    kek_uuid(wrapped_kek).map(|u| hex16(&u)).unwrap_or_else(|_| "not-stela".into()),
+                    wrapped_vek.len(),
+                    acm.len()
+                ));
+                if !acm.is_empty() {
                     return Err(refuse!(
                         "SEP volume-key ACM-authorized unwrap is not modeled"
                     ));
@@ -589,6 +604,10 @@ fn kek_uuid(blob: &[u8]) -> Result<[u8; UUID_BYTES]> {
         return Err(refuse!("SEP volume-key wrapped KEK is not a Stela KEK"));
     }
     Ok(blob[8..KEK_HEADER].try_into().unwrap())
+}
+
+fn hex16(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| alloc::format!("{b:02x}")).collect()
 }
 
 fn uuid(bytes: &[u8]) -> Result<[u8; UUID_BYTES]> {
