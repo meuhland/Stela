@@ -189,6 +189,9 @@ static StelaRegionRecord region_record(NSUInteger slice, NSUInteger level, MTLOr
 
 @end
 
+void stela_diag_upload(const char *what, NSUInteger format, NSUInteger width, NSUInteger height,
+		       NSUInteger regionWidth, NSUInteger regionHeight, NSUInteger bytesPerRow);
+
 @implementation StelaGPUBlitEncoder
 
 - (void)copyFromBuffer:(StelaGPUBuffer *)source
@@ -222,6 +225,8 @@ static StelaRegionRecord region_record(NSUInteger slice, NSUInteger level, MTLOr
 {
 	[_commands use:source];
 	[_commands use:texture];
+	stela_diag_upload("blitFromBuffer", texture->_pixelFormat, texture->_width, texture->_height, size.width, size.height,
+			  bytesPerRow);
 	StelaCopyBufferToTexture command = {
 		.source = {source->_handle, offset, bytesPerRow, bytesPerImage},
 		.texture = texture->_handle,

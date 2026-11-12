@@ -69,6 +69,9 @@ void stela_depth_stencil_record(id descriptor, StelaDepthStencilRecord *record)
 	stencil_record(descriptor ? [descriptor backFaceStencil] : nil, &record->back_face_stencil);
 }
 
+void stela_diag_upload(const char *what, NSUInteger format, NSUInteger width, NSUInteger height,
+		       NSUInteger regionWidth, NSUInteger regionHeight, NSUInteger bytesPerRow);
+
 @implementation StelaGPUObject
 
 - (instancetype)initWithDevice:(StelaGPUDevice *)device handle:(uint64_t)handle
@@ -260,6 +263,10 @@ NSUInteger stela_purgeable_state(NSUInteger *slot, NSUInteger state)
 	     secondBytesPerRow:(NSUInteger)secondBytesPerRow
 		 surfaceFormat:(uint32_t)surfaceFormat
 {
+	if (!surfaceFormat) {
+		stela_diag_upload("bufferTexture", [descriptor pixelFormat], [descriptor width], [descriptor height],
+				  [descriptor width], [descriptor height], bytesPerRow);
+	}
 	StelaNewBufferTextureRequest request = {
 		.buffer = _handle,
 		.offset = offset,
@@ -603,6 +610,8 @@ static StelaGPUTexture *new_view(StelaGPUTexture *texture, NSUInteger format, NS
 						       region:region
 							level:level
 							slice:slice];
+	stela_diag_upload("replaceRegion", _pixelFormat, _width, _height, region.size.width, region.size.height,
+			  bytesPerRow);
 	StelaEmpty nothing;
 	StelaFailure failure;
 	StelaSpans spans = {.reads = &request.bytes, .read_count = 1};
@@ -1162,6 +1171,24 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 }
 
 /* diag: one report per distinct IOSurface shape, to the host's log. */
+/* Diagnostic: each shape of upload of CPU bytes into a texture, by process:
+ * the texture's format and size, the region, and the bytes a row the
+ * caller gave. */
+void stela_diag_upload(const char *what, NSUInteger format, NSUInteger width, NSUInteger height, NSUInteger regionWidth,
+		       NSUInteger regionHeight, NSUInteger bytesPerRow)
+{
+	if (regionWidth < 64 || regionHeight < 16) {
+		return;
+	}
+	NSString *text = [NSString stringWithFormat:@"diag upload %s fmt=%lu tex=%lux%lu region=%lux%lu bpr=%lu bpr/w=%lu.%02lu",
+						    what, (unsigned long)format, (unsigned long)width, (unsigned long)height,
+						    (unsigned long)regionWidth, (unsigned long)regionHeight,
+						    (unsigned long)bytesPerRow, (unsigned long)(bytesPerRow / regionWidth),
+						    (unsigned long)(bytesPerRow * 100 / regionWidth % 100)];
+	StelaFailure note = {.reason = "diag"};
+	stela_report(text.UTF8String, &note);
+}
+
 /* Nonzero 32-bit words, sampled every 256 bytes, in [from, to) of the plane. */
 static unsigned long diag_nonzero(const uint8_t *plane, size_t from, size_t to)
 {
