@@ -300,7 +300,7 @@ unsafe fn with_interrupts<R>(body: impl FnOnce() -> R) -> R {
 
 /// Logs why the service refused a guest's call, once for each reason.
 fn report(reason: &str) {
-    static SEEN: Seen<512> = Seen::new();
+    static SEEN: Seen<4096> = Seen::new();
     if let Some(unheld) = SEEN.first_time(reason) {
         output::arguments(format_args!("GPU REFUSED {reason}{unheld}\n"));
     }

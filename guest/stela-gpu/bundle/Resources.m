@@ -1200,7 +1200,12 @@ static void diag_surface(const char *what, IOSurfaceRef surface, const uint8_t *
 	 * only the plane's first `reported * height` bytes, one at the pitch the
 	 * texture reads fills `used * height`. These lines name each surface, so
 	 * each reports once. */
-	if (base && (fourcc >> 24 == '&' || strncmp(label.UTF8String, "WebKit", 6) == 0)) {
+	/* Core Animation's own surfaces are known good: report each shape of
+	 * them once, and every other surface by its ID. */
+	if (strcmp(label.UTF8String, "QuartzCore") == 0 || strcmp(label.UTF8String, "CA Framebuffer") == 0) {
+		base = NULL;
+	}
+	if (base) {
 		size_t height = IOSurfaceGetHeight(surface);
 		size_t used = bytesPerRow * height;
 		size_t room = IOSurfaceGetAllocSize(surface) - offset;
@@ -1212,8 +1217,8 @@ static void diag_surface(const char *what, IOSurfaceRef surface, const uint8_t *
 			reported = used;
 		}
 		const uint8_t *start = base + offset;
-		text = [NSString stringWithFormat:@"%@ id=%u seed=%u nz_reported=%lu/%zu nz_rest=%lu/%zu", text,
-						     IOSurfaceGetID(surface), IOSurfaceGetSeed(surface),
+		text = [NSString stringWithFormat:@"%@ id=%u nz_reported=%lu/%zu nz_rest=%lu/%zu", text,
+						     IOSurfaceGetID(surface),
 						     diag_nonzero(start, 0, reported), reported / 256,
 						     diag_nonzero(start, reported, used), (used - reported) / 256];
 	}
