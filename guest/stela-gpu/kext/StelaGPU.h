@@ -144,4 +144,5 @@ public:
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
 	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
 	static IOReturn replaceCache(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+	static IOReturn readCache(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
