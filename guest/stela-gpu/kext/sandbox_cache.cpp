@@ -42,6 +42,13 @@ static const IOExternalMethodDispatch kMethods[kStelaSandboxSelectorCount] = {
 		.checkScalarOutputCount = 0,
 		.checkStructureOutputSize = 0,
 	},
+	{
+		.function = &StelaSandboxClient::readCache,
+		.checkScalarInputCount = 0,
+		.checkStructureInputSize = kIOUCVariableStructureSize,
+		.checkScalarOutputCount = 1,
+		.checkStructureOutputSize = kIOUCVariableStructureSize,
+	},
 };
 
 bool
@@ -189,7 +196,14 @@ StelaSandboxClient::replaceCache(OSObject *, void *, IOExternalMethodArguments *
 		goto done;
 	}
 	if (arguments->structureInputDescriptor) {
-		if (arguments->structureInputDescriptor->readBytes(0, input, size) != size) {
+		IOMemoryDescriptor *in = arguments->structureInputDescriptor;
+		if (in->prepare(kIODirectionOut) != kIOReturnSuccess) {
+			result = kIOReturnBadArgument;
+			goto done;
+		}
+		unsigned long got = in->readBytes(0, input, size);
+		in->complete(kIODirectionOut);
+		if (got != size) {
 			result = kIOReturnBadArgument;
 			goto done;
 		}
@@ -256,6 +270,61 @@ done:
 	}
 	if (input) {
 		IOFreeData(input, size);
+	}
+	return result;
+}
+
+/*
+ * A data vault is closed to reads as well as writes. Structure input: the
+ * cache's path, as for replaceCache; scalar output: its length; structure
+ * output: its bytes, when the caller's buffer holds them all.
+ */
+IOReturn
+StelaSandboxClient::readCache(OSObject *, void *, IOExternalMethodArguments *arguments)
+{
+	char path[256];
+	unsigned long pathLength = arguments->structureInputSize;
+	if (arguments->structureInputDescriptor || pathLength == 0 || pathLength >= sizeof path
+	    || !isCachePath(static_cast<const char *>(arguments->structureInput), pathLength)) {
+		return kIOReturnBadArgument;
+	}
+	memcpy(path, arguments->structureInput, pathLength);
+	path[pathLength] = 0;
+	auto existing = static_cast<char *>(IOMallocData(kMaxCache));
+	vfs_context_t context = vfs_context_create(nullptr);
+	IOReturn result = kIOReturnNoMemory;
+	if (existing && context) {
+		int length = 0;
+		int error = stelaReadFile(path, existing, int(kMaxCache), &length, context);
+		if (error) {
+			result = error == ENOENT ? kIOReturnNotFound : kIOReturnIOError;
+		} else {
+			arguments->scalarOutput[0] = uint64_t(length);
+			IOMemoryDescriptor *out = arguments->structureOutputDescriptor;
+			unsigned long room = out ? out->getLength() : arguments->structureOutputSize;
+			if (room < unsigned(length)) {
+				result = kIOReturnNoSpace;
+			} else if (out) {
+				result = out->prepare(kIODirectionIn);
+				if (result == kIOReturnSuccess) {
+					result = out->writeBytes(0, existing, unsigned(length)) == unsigned(length)
+					    ? kIOReturnSuccess
+					    : kIOReturnIOError;
+					out->complete(kIODirectionIn);
+				}
+				arguments->structureOutputDescriptorSize = unsigned(length);
+			} else {
+				memcpy(arguments->structureOutput, existing, unsigned(length));
+				arguments->structureOutputSize = unsigned(length);
+				result = kIOReturnSuccess;
+			}
+		}
+	}
+	if (context) {
+		vfs_context_rele(context);
+	}
+	if (existing) {
+		IOFreeData(existing, kMaxCache);
 	}
 	return result;
 }
