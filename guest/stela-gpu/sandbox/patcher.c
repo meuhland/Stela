@@ -90,17 +90,16 @@ static void (*free_profile)(sandbox_profile_t);
 #define DT_REG 8
 
 #define FOLDERS "/private/var/folders"
-/* The caches the patcher left as WebKit wrote them, by content, so each is
- * looked at once rather than every run. */
-#define REFUSED "/private/var/db/org.stela.SandboxPatch.refused"
+/* Each cache the patcher wrote ("patched") or left as WebKit wrote it
+ * ("refused"), by its content's fingerprint, so each is looked at once:
+ * compiled rules keep no plain copy of the paths they name. */
+#define STATE "/private/var/db/org.stela.SandboxPatch.state"
 #define PLUGIN "/Library/GPUBundles/StelaGPU.bundle/Contents/MacOS/StelaGPU"
-/* What the patched profile adds, and how a patched cache is recognized:
- * compiled rules keep their literals. */
+/* What the patched profile adds. */
 static const char kRule[] = "\n;; Stela: map the StelaGPU Metal plugin, as Apple GPUs' plugins are mapped\n"
 			    "(allow file-map-executable\n"
 			    "    (literal \"" PLUGIN "\")\n"
 			    "    (literal \"/System/Volumes/Data" PLUGIN "\"))\n";
-static const char kMarker[] = "/System/Volumes/Data" PLUGIN;
 
 /* CachedSandboxHeader's fields, from its start. */
 enum {
@@ -195,19 +194,22 @@ static void fingerprint(const unsigned char *bytes, size_t length, char out[18])
 	snprintf(out, 18, "%016llx\n", (unsigned long long)hash);
 }
 
-static int was_refused(const char line[18])
+/* Whether the state names this fingerprint, patched or refused. */
+static int known(const char line[18])
 {
 	size_t length = 0;
-	unsigned char *refused = slurp(REFUSED, &length);
-	int found = refused && memmem(refused, length, line, 17) != NULL;
-	free(refused);
+	unsigned char *state = slurp(STATE, &length);
+	int found = state && memmem(state, length, line, 17) != NULL;
+	free(state);
 	return found;
 }
 
-static void refuse(const char line[18])
+/* Records `line` as `outcome`, a word of 8 characters and a space. */
+static void record(const char *outcome, const char line[18])
 {
-	int fd = open(REFUSED, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	int fd = open(STATE, O_WRONLY | O_CREAT | O_APPEND, 0600);
 	if (fd >= 0) {
+		write(fd, outcome, 9);
 		write(fd, line, 17);
 		close(fd);
 	}
@@ -310,14 +312,13 @@ static void patch(io_object_t connection, const char *path)
 	}
 	size_t fixed = length - text_length - data_length;
 	const unsigned char *text = cache + fixed, *rules = text + text_length;
-	if (fixed < kMinFixed || fixed > kMaxFixed
-	    || memmem(rules, data_length, kMarker, sizeof kMarker - 1)) {
+	if (fixed < kMinFixed || fixed > kMaxFixed) {
 		free(cache);
 		return;
 	}
 	char line[18];
 	fingerprint(cache, length, line);
-	if (was_refused(line)) {
+	if (known(line)) {
 		free(cache);
 		return;
 	}
@@ -360,6 +361,7 @@ static void patch(io_object_t connection, const char *path)
 	unsigned char *profile = NULL, *patched = NULL, *replacement = NULL;
 	sandbox_profile_t original = NULL, extended = NULL;
 	if (!framework) {
+		printf("%s: its header names no WEBKIT2_FRAMEWORK_DIR; leaving it\n", path);
 		goto done;
 	}
 	size_t profile_length = text_length - at;
@@ -377,7 +379,7 @@ static void patch(io_object_t connection, const char *path)
 	memcpy(patched, profile, profile_length);
 	memcpy(patched + profile_length, kRule, sizeof kRule);
 	extended = compile((const char *)patched, params, count, path);
-	if (!extended || !memmem(extended->data, extended->size, kMarker, sizeof kMarker - 1)) {
+	if (!extended) {
 		goto done;
 	}
 	// The request: the path's length, the path, then the cache's new bytes.
@@ -396,12 +398,15 @@ static void patch(io_object_t connection, const char *path)
 	if (result == 0) {
 		printf("%s: patched (%zu bytes of rules, %zu before)\n", path, extended->size, data_length);
 		patched_ok = 1;
+		char written[18];
+		fingerprint(bytes, new_length, written);
+		record("patched  ", written);
 	} else {
 		printf("%s: the kext refused the patch: %#x\n", path, result);
 	}
 done:
 	if (!patched_ok) {
-		refuse(line);
+		record("refused  ", line);
 	}
 	if (extended) {
 		free_profile(extended);
