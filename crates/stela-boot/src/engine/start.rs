@@ -2837,7 +2837,9 @@ fn start_devices(
             }
             host_usb = Some(usb);
             // The guest's controller hangs off the hub of its keyboard.
-            host_bluetooth = host_controller.filter(|_| options.input);
+            // diag: no guest Bluetooth even with --input, to test whether the
+            // modeled no-radio controller stalls Setup Assistant.
+            host_bluetooth = host_controller.filter(|_| false);
             // The guest's adapter is its own: the mount's client keeps the
             // first one. Without one the Mac boots with no network, which
             // is reported once.
