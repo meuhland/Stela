@@ -64,6 +64,9 @@ kern_return_t IOServiceClose(io_object_t connect);
 kern_return_t IOObjectRelease(io_object_t object);
 kern_return_t IOConnectCallStructMethod(io_object_t connect, uint32_t selector, const void *input,
     size_t input_length, void *output, size_t *output_length);
+kern_return_t IOConnectCallMethod(io_object_t connect, uint32_t selector, const uint64_t *input, uint32_t input_count,
+    const void *input_struct, size_t input_struct_length, uint64_t *output, uint32_t *output_count,
+    void *output_struct, size_t *output_struct_length);
 
 /* libsandbox, as WebKit's SandboxSPI.h declares it */
 typedef struct {
@@ -159,6 +162,26 @@ static unsigned char *slurp(const char *path, size_t *length)
 		used += (size_t)got;
 	}
 	close(fd);
+	return buffer;
+}
+
+/* The cache at `path`, which only the kext may read: its data vault is
+ * closed to every process. NULL when absent or unreadable. */
+static unsigned char *read_cache(io_object_t connection, const char *path, size_t *length)
+{
+	size_t room = 2u << 20;
+	unsigned char *buffer = malloc(room);
+	uint64_t size = 0;
+	uint32_t outputs = 1;
+	if (!buffer
+	    || IOConnectCallMethod(connection, kStelaSandboxReadCache, NULL, 0, path, strlen(path), &size, &outputs,
+		   buffer, &room)
+		   != 0
+	    || size > room) {
+		free(buffer);
+		return NULL;
+	}
+	*length = (size_t)size;
 	return buffer;
 }
 
@@ -275,7 +298,7 @@ static unsigned char *find_profile(const char *framework, const unsigned char *t
 static void patch(io_object_t connection, const char *path)
 {
 	size_t length = 0;
-	unsigned char *cache = slurp(path, &length);
+	unsigned char *cache = read_cache(connection, path, &length);
 	if (!cache || length < kMinFixed || le32(cache, kBuiltinSizeAt) != 0xffffffffu) {
 		free(cache);
 		return;
