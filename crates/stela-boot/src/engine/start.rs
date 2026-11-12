@@ -2894,7 +2894,10 @@ fn start_devices(
             }
             host_usb = Some(usb);
             // The guest's controller hangs off the hub of its keyboard.
-            host_bluetooth = host_controller.filter(|_| options.input);
+            // Workaround: cable no guest Bluetooth even with --input. On a host
+            // without a radio, the modeled no-radio controller stalls Setup
+            // Assistant and WindowServer (black screen, beach ball).
+            host_bluetooth = host_controller.filter(|_| false);
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {
