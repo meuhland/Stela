@@ -1162,8 +1162,20 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 }
 
 /* diag: one report per distinct IOSurface shape, to the host's log. */
-static void diag_surface(const char *what, IOSurfaceRef surface, id descriptor, NSUInteger plane, NSUInteger offset,
-			 NSUInteger bytesPerRow)
+/* Nonzero 32-bit words, sampled every 256 bytes, in [from, to) of the plane. */
+static unsigned long diag_nonzero(const uint8_t *plane, size_t from, size_t to)
+{
+	unsigned long count = 0;
+	for (size_t at = (from + 255) & ~(size_t)255; at + 4 <= to; at += 256) {
+		if (*(const uint32_t *)(plane + at) != 0) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static void diag_surface(const char *what, IOSurfaceRef surface, const uint8_t *base, id descriptor, NSUInteger plane,
+			 NSUInteger offset, NSUInteger bytesPerRow)
 {
 	uint32_t fourcc = IOSurfaceGetPixelFormat(surface);
 	char cc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc, 0};
@@ -1172,16 +1184,39 @@ static void diag_surface(const char *what, IOSurfaceRef surface, id descriptor, 
 			cc[i] = '?';
 		}
 	}
+	id name = (__bridge_transfer id)IOSurfaceCopyValue(surface, (__bridge CFStringRef)@"IOSurfaceName");
+	NSString *label = [name isKindOfClass:[NSString class]] ? name : @"-";
 	NSString *text = [NSString
-		stringWithFormat:@"diag iosurface %s fourcc=%s(0x%08x) %zux%zu bpe=%zu bpr=%zu planes=%zu alloc=%zu "
+		stringWithFormat:@"diag iosurface %s name=\"%@\" fourcc=%s(0x%08x) %zux%zu bpe=%zu bpr=%zu planes=%zu alloc=%zu "
 				 @"plane=%lu plane_bpr=%zu elem_h=%zu plane_w=%zu offset=%lu used_bpr=%lu mtl_format=%lu usage=0x%lx",
-				 what, cc, fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+				 what, label, cc, fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
 				 IOSurfaceGetBytesPerElement(surface), IOSurfaceGetBytesPerRow(surface),
 				 IOSurfaceGetPlaneCount(surface), IOSurfaceGetAllocSize(surface), (unsigned long)plane,
 				 IOSurfaceGetBytesPerRowOfPlane(surface, plane), IOSurfaceGetElementHeightOfPlane(surface, plane),
 				 IOSurfaceGetWidthOfPlane(surface, plane), (unsigned long)offset, (unsigned long)bytesPerRow,
 				 descriptor ? (unsigned long)[descriptor pixelFormat] : 0ul,
 				 descriptor ? (unsigned long)[descriptor usage] : 0ul];
+	/* Which rows a CPU wrote: a writer at the surface's reported pitch fills
+	 * only the plane's first `reported * height` bytes, one at the pitch the
+	 * texture reads fills `used * height`. These lines name each surface, so
+	 * each reports once. */
+	if (base && (fourcc >> 24 == '&' || strncmp(label.UTF8String, "WebKit", 6) == 0)) {
+		size_t height = IOSurfaceGetHeight(surface);
+		size_t used = bytesPerRow * height;
+		size_t room = IOSurfaceGetAllocSize(surface) - offset;
+		if (used > room) {
+			used = room;
+		}
+		size_t reported = IOSurfaceGetBytesPerRow(surface) * height;
+		if (reported > used) {
+			reported = used;
+		}
+		const uint8_t *start = base + offset;
+		text = [NSString stringWithFormat:@"%@ id=%u seed=%u nz_reported=%lu/%zu nz_rest=%lu/%zu", text,
+						     IOSurfaceGetID(surface), IOSurfaceGetSeed(surface),
+						     diag_nonzero(start, 0, reported), reported / 256,
+						     diag_nonzero(start, reported, used), (used - reported) / 256];
+	}
 	StelaFailure note = {.reason = "diag"};
 	stela_report(text.UTF8String, &note);
 }
@@ -1199,7 +1234,7 @@ static void diag_surface(const char *what, IOSurfaceRef surface, id descriptor, 
 		stela_report("newBufferWithIOSurface:", &failure);
 		return nil;
 	}
-	diag_surface("buffer", surface, nil, 0, 0, IOSurfaceGetBytesPerRow(surface));
+	diag_surface("buffer", surface, IOSurfaceGetBaseAddress(surface), nil, 0, 0, IOSurfaceGetBytesPerRow(surface));
 	CFRetain(surface);
 	StelaGPUBuffer *buffer = [self newBufferWithBytesNoCopy:IOSurfaceGetBaseAddress(surface)
 							 length:IOSurfaceGetAllocSize(surface)
@@ -1237,7 +1272,7 @@ static void diag_surface(const char *what, IOSurfaceRef surface, id descriptor, 
 	if (IOSurfaceGetPixelFormat(surface) >> 24 == '&' && bytesPerRow < row) {
 		bytesPerRow = row;
 	}
-	diag_surface("texture", surface, descriptor, plane, offset, bytesPerRow);
+	diag_surface("texture", surface, base, descriptor, plane, offset, bytesPerRow);
 	CFRetain(surface);
 	StelaGPUBuffer *buffer = [self newBufferWithBytesNoCopy:base
 							 length:IOSurfaceGetAllocSize(surface)
