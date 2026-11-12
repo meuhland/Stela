@@ -1229,7 +1229,9 @@ static void diag_surface(const char *what, IOSurfaceRef surface, const uint8_t *
 	 * each reports once. */
 	/* Core Animation's own surfaces are known good: report each shape of
 	 * them once, and every other surface by its ID. */
-	if (strcmp(label.UTF8String, "QuartzCore") == 0 || strcmp(label.UTF8String, "CA Framebuffer") == 0) {
+	bool reads = descriptor && [descriptor usage] == 0x1;
+	if (strcmp(label.UTF8String, "CA Framebuffer") == 0 ||
+	    (strcmp(label.UTF8String, "QuartzCore") == 0 && !reads)) {
 		base = NULL;
 	}
 	if (base) {
@@ -1244,10 +1246,16 @@ static void diag_surface(const char *what, IOSurfaceRef surface, const uint8_t *
 			reported = used;
 		}
 		const uint8_t *start = base + offset;
-		text = [NSString stringWithFormat:@"%@ id=%u nz_reported=%lu/%zu nz_rest=%lu/%zu", text,
-						     IOSurfaceGetID(surface),
+		/* And by quarter of the rows the texture reads: a writer at a
+		 * quarter of its pitch fills only the first. */
+		size_t quarter = used / 4;
+		text = [NSString stringWithFormat:@"%@ id=%u nz_reported=%lu/%zu nz_rest=%lu/%zu quarters=%lu,%lu,%lu,%lu/%zu",
+						     text, IOSurfaceGetID(surface),
 						     diag_nonzero(start, 0, reported), reported / 256,
-						     diag_nonzero(start, reported, used), (used - reported) / 256];
+						     diag_nonzero(start, reported, used), (used - reported) / 256,
+						     diag_nonzero(start, 0, quarter), diag_nonzero(start, quarter, 2 * quarter),
+						     diag_nonzero(start, 2 * quarter, 3 * quarter),
+						     diag_nonzero(start, 3 * quarter, 4 * quarter), quarter / 256];
 	}
 	StelaFailure note = {.reason = "diag"};
 	stela_report(text.UTF8String, &note);
