@@ -7,5 +7,5 @@ exports:
   - targets:         [ arm64-macos ]
     symbols:         [ _IOServiceMatching, _IOServiceGetMatchingService,
                        _IOServiceOpen, _IOServiceClose, _IOObjectRelease,
-                       _IOConnectCallStructMethod ]
+                       _IOConnectCallStructMethod, _IOConnectCallMethod ]
 ...
