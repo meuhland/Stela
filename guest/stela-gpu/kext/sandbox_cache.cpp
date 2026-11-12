@@ -22,6 +22,9 @@
 #include <stela/sandbox_patch.h>
 #include <sys/errno.h>
 
+/* Exported to kexts, but declared only for the kernel's own builds. */
+extern "C" vfs_context_t vfs_context_kernel(void);
+
 OSDefineMetaClassAndStructors(StelaSandboxClient, IOUserClient);
 
 /* Larger than any compiled WebKit sandbox (about 100 KiB in macOS 27). */
@@ -189,7 +192,9 @@ StelaSandboxClient::replaceCache(OSObject *, void *, IOExternalMethodArguments *
 	auto input = static_cast<unsigned char *>(IOMallocData(size));
 	auto existing = static_cast<char *>(IOMallocData(kMaxCache));
 	auto chunk = static_cast<char *>(IOMallocData(kStelaChunk));
-	vfs_context_t context = vfs_context_create(nullptr);
+	// The kernel's own context: one made from this thread would carry the
+	// caller's credentials, which the data vault refuses.
+	vfs_context_t context = vfs_context_kernel();
 	IOReturn result = kIOReturnNoMemory;
 	char path[256];
 	if (!input || !existing || !chunk || !context) {
@@ -259,9 +264,6 @@ StelaSandboxClient::replaceCache(OSObject *, void *, IOExternalMethodArguments *
 		result = kIOReturnSuccess;
 	}
 done:
-	if (context) {
-		vfs_context_rele(context);
-	}
 	if (chunk) {
 		IOFreeData(chunk, kStelaChunk);
 	}
@@ -291,12 +293,19 @@ StelaSandboxClient::readCache(OSObject *, void *, IOExternalMethodArguments *arg
 	memcpy(path, arguments->structureInput, pathLength);
 	path[pathLength] = 0;
 	auto existing = static_cast<char *>(IOMallocData(kMaxCache));
-	vfs_context_t context = vfs_context_create(nullptr);
+	// The kernel's own context: one made from this thread would carry the
+	// caller's credentials, which the data vault refuses.
+	vfs_context_t context = vfs_context_kernel();
 	IOReturn result = kIOReturnNoMemory;
 	if (existing && context) {
 		int length = 0;
 		int error = stelaReadFile(path, existing, int(kMaxCache), &length, context);
 		if (error) {
+			static bool reported = false;
+			if (error != ENOENT && !reported) {
+				reported = true;
+				IOLog("StelaGPU: sandbox cache %s does not read: %d\n", path, error);
+			}
 			result = error == ENOENT ? kIOReturnNotFound : kIOReturnIOError;
 		} else {
 			arguments->scalarOutput[0] = uint64_t(length);
@@ -319,9 +328,6 @@ StelaSandboxClient::readCache(OSObject *, void *, IOExternalMethodArguments *arg
 				result = kIOReturnSuccess;
 			}
 		}
-	}
-	if (context) {
-		vfs_context_rele(context);
 	}
 	if (existing) {
 		IOFreeData(existing, kMaxCache);
