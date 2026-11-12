@@ -1161,6 +1161,31 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 	return buffer;
 }
 
+/* diag: one report per distinct IOSurface shape, to the host's log. */
+static void diag_surface(const char *what, IOSurfaceRef surface, id descriptor, NSUInteger plane, NSUInteger offset,
+			 NSUInteger bytesPerRow)
+{
+	uint32_t fourcc = IOSurfaceGetPixelFormat(surface);
+	char cc[5] = {(char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc, 0};
+	for (int i = 0; i < 4; i++) {
+		if (cc[i] < 0x20 || cc[i] > 0x7e) {
+			cc[i] = '?';
+		}
+	}
+	NSString *text = [NSString
+		stringWithFormat:@"diag iosurface %s fourcc=%s(0x%08x) %zux%zu bpe=%zu bpr=%zu planes=%zu alloc=%zu "
+				 @"plane=%lu plane_bpr=%zu elem_h=%zu plane_w=%zu offset=%lu used_bpr=%lu mtl_format=%lu usage=0x%lx",
+				 what, cc, fourcc, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+				 IOSurfaceGetBytesPerElement(surface), IOSurfaceGetBytesPerRow(surface),
+				 IOSurfaceGetPlaneCount(surface), IOSurfaceGetAllocSize(surface), (unsigned long)plane,
+				 IOSurfaceGetBytesPerRowOfPlane(surface, plane), IOSurfaceGetElementHeightOfPlane(surface, plane),
+				 IOSurfaceGetWidthOfPlane(surface, plane), (unsigned long)offset, (unsigned long)bytesPerRow,
+				 descriptor ? (unsigned long)[descriptor pixelFormat] : 0ul,
+				 descriptor ? (unsigned long)[descriptor usage] : 0ul];
+	StelaFailure note = {.reason = "diag"};
+	stela_report(text.UTF8String, &note);
+}
+
 /* A buffer over the surface's own pages, all of its allocation, shared with
  * the CPU as any imported buffer is. It keeps the surface; wiring the pages
  * outlasts the lock that maps them. */
@@ -1174,6 +1199,7 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 		stela_report("newBufferWithIOSurface:", &failure);
 		return nil;
 	}
+	diag_surface("buffer", surface, nil, 0, 0, IOSurfaceGetBytesPerRow(surface));
 	CFRetain(surface);
 	StelaGPUBuffer *buffer = [self newBufferWithBytesNoCopy:IOSurfaceGetBaseAddress(surface)
 							 length:IOSurfaceGetAllocSize(surface)
@@ -1211,6 +1237,7 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 	if (IOSurfaceGetPixelFormat(surface) >> 24 == '&' && bytesPerRow < row) {
 		bytesPerRow = row;
 	}
+	diag_surface("texture", surface, descriptor, plane, offset, bytesPerRow);
 	CFRetain(surface);
 	StelaGPUBuffer *buffer = [self newBufferWithBytesNoCopy:base
 							 length:IOSurfaceGetAllocSize(surface)
