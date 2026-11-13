@@ -1875,6 +1875,15 @@ impl Heartbeat {
             self.clock_count = count;
             output::arguments(format_args!("CLOCK count={count:#x}\n"));
             report_stalls(machine);
+            // A PE that never runs again holds the count for good, and with
+            // it every PE's time: name it while it does.
+            if let Some((pe, stopped, count)) = machine.devices.hub().clock_holder() {
+                output::arguments(format_args!(
+                    "CLOCK HELD pe={pe} by={} published={count:#x} count={:#x}\n",
+                    if stopped { "host-work" } else { "no-progress" },
+                    self.clock_count,
+                ));
+            }
         }
         let per_pe = parallel::counts(machine);
         let retired = per_pe

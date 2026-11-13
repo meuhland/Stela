@@ -1274,6 +1274,9 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
     crate::engine::stop_gpus_for_fatal();
+    // Each step after the GPUs' says it ended: a fatal stop that hangs
+    // names the step it hangs in.
+    arguments(format_args!("STELA FATAL GPUs done; keeping the log\n"));
     // Inside the host drivers no store goes through them, or only the USB's
     // log the GPU's start drives. The lines go to the stick where they can
     // and to the PC's firmware in any case, before the screen is drawn: the
@@ -1292,6 +1295,7 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     // A stop with no screen of Stela's own leaves its record too.
     flush_log();
     stop_advice(Some(&message));
+    arguments(format_args!("STELA FATAL turning the PC off\n"));
     terminate(0x11)
 }
 
