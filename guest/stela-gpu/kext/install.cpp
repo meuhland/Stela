@@ -13,6 +13,7 @@
 #include "compression.h"
 #include "files.h"
 #include "sandbox_cache.h"
+#include "video_encoder.h"
 
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
@@ -97,6 +98,7 @@ StelaGPU::installPlugin(void *parameter, wait_result_t)
 		if (!stopping) {
 			vnode_put(plugins);
 			report = install(context, buffer);
+			stelaDeliverVideoEncoder(context, buffer);
 		}
 	} else {
 		IOLog("StelaGPU: the plugin's installer cannot allocate\n");
