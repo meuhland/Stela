@@ -572,6 +572,25 @@ impl SharedClock {
         self.stall.load(Ordering::Relaxed) / STALL_MILLIS
     }
 
+    /// While a ceiling holds the count: the PE whose limit set it, whether
+    /// it stopped in the kernel for host work (else it published nothing
+    /// for a part of the limit), and the count it last published. Read
+    /// outside the sequence, for reports.
+    pub fn holder(&self) -> Option<(usize, bool, u64)> {
+        let ceiling = self.state.ceiling.load(Ordering::Relaxed);
+        if ceiling == UNBOUNDED {
+            return None;
+        }
+        (0..self.slots.len()).find_map(|pe| {
+            let count = self.slot(pe);
+            (self.limit_of(count, ceiling) == Some(ceiling)).then_some((
+                pe,
+                count & STOPPED != 0,
+                count & !STOPPED,
+            ))
+        })
+    }
+
     /// Host counts the count lags the host's by, owed to the slew.
     pub fn lag(&self) -> u64 {
         self.snapshot().lag
