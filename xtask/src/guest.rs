@@ -52,6 +52,7 @@ pub fn run() -> Result<()> {
         include.join("stela/sandbox_patch.h"),
         sandbox_patch_header(&patcher, &component.join("sandbox").join(SANDBOX_PATCH_JOB))?,
     )?;
+    fs::write(include.join("stela/stelavt.h"), stelavt_header(&component.join("stelavt"))?)?;
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
     fs::write(include.join("stela/compression.h"), compression::header()?)?;
     let kext = build_kext(&component, &output, &xnu, &include)?;
@@ -253,6 +254,31 @@ fn build_sandbox_patch(component: &Path, output: &Path) -> Result<PathBuf> {
     )
     .with_context(|| format!("linking the sandbox patcher with {}", linker.display()))?;
     Ok(executable)
+}
+
+/// Where the kext installs StelaVT, the prebuilt H.264 encoder whose code
+/// the trust cache lists (`kext/video_encoder.cpp`).
+const STELAVT_DIRECTORY: &str = "/System/Volumes/Data/Library/Video/Plug-Ins/StelaVT.bundle/Contents/";
+
+/// `stela/stelavt.h`: StelaVT's executable and Info.plist as the kext
+/// installs them, or `STELAVT_PRESENT 0` when the tree has no prebuilt one.
+fn stelavt_header(source: &Path) -> Result<String> {
+    use std::fmt::Write as _;
+    let executable = source.join("StelaVT");
+    let mut header = String::from("#pragma once\n");
+    if !executable.exists() {
+        header.push_str("#define STELAVT_PRESENT 0\n");
+        return Ok(header);
+    }
+    header.push_str("#define STELAVT_PRESENT 1\n");
+    writeln!(header, "#define STELAVT_EXECUTABLE_PATH {:?}", format!("{STELAVT_DIRECTORY}MacOS/StelaVT"))?;
+    writeln!(header, "#define STELAVT_INFO_PATH {:?}", format!("{STELAVT_DIRECTORY}Info.plist"))?;
+    for (name, path) in [("stelavt_executable", executable), ("stelavt_info", source.join("Info.plist"))] {
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        c_bytes(&mut header, name, &bytes)?;
+        writeln!(header, "static const unsigned char {name}_sha256[32] = {{{}}};", c_digest(&bytes))?;
+    }
+    Ok(header)
 }
 
 /// `stela/sandbox_patch.h`: the patcher and its launchd job as the kext
