@@ -671,12 +671,18 @@ static COSTS: Costs = Costs {
 /// entries added during the boot, decoded records, and the fetch pages the
 /// machines keep (a page and its bookkeeping
 /// take about 4.5 KiB).
+///
+/// A sixteenth of the heap for added entries: at a thirty-second, a boot
+/// that builds software (an 8.8 GiB heap, 275 MiB) left more blocks unkept
+/// than it kept (13.5M against 8.4M), and the next boot compiled them again;
+/// that load's heap peak left over 3 GiB free. Decoded records likewise, as
+/// a larger pack gives more of them.
 fn bounds(heap: usize) -> (pack::Bounds, usize) {
     const MIB: usize = 1 << 20;
     let defaults = pack::Bounds::default();
     let bounds = pack::Bounds {
-        added: (heap / 32).clamp(defaults.added, 512 * MIB),
-        decoded: (heap / 64).clamp(defaults.decoded, 128 * MIB),
+        added: (heap / 16).clamp(defaults.added, 1024 * MIB),
+        decoded: (heap / 32).clamp(defaults.decoded, 256 * MIB),
     };
     (bounds, (heap / 64 / (4608)).max(4096))
 }
