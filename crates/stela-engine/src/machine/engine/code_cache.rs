@@ -1254,7 +1254,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.note_gone(cache, slot as usize, cause);
             }
         }
-        let (_, listed) = cache.index.page_part(frame, 0, 0);
+        // Only the runs of the retired blocks' guest pages hold them.
+        let tags =
+            super::block_index::page_tags(slots.iter().map(|&slot| blocks[slot as usize].pc));
+        let (_, listed) = cache.index.page_tags_part(frame, &tags, 0, 0);
         let events = &code.events;
         events.walk(board::Walk::UnindexCalls, 1);
         events.walk(board::Walk::UnindexListed, listed as u64);
@@ -1273,7 +1276,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let marked = mark(&mut cache.marked, blocks.len(), &slots);
         cache
             .index
-            .forget_marked(frame, |slot| bit_set(&marked, slot));
+            .forget_marked_in(frame, Some(&tags), |slot| bit_set(&marked, slot));
         unmark(&mut cache.marked, marked, &slots);
         let mut visits = (slots.len() + listed / 16) as u64;
         let mut unlinks = Vec::new();
@@ -1327,7 +1330,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) -> (Option<usize>, u64) {
         let code = Arc::clone(&self.code);
         let blocks = &code.blocks;
-        let (sources, listed) = cache.index.page_part(frame, from, most);
+        // A chained link stays in its guest page ([`board::Record::chained`]):
+        // only the runs of the retired PCs' pages can hold one into them.
+        let tags = super::block_index::page_tags(pcs.iter().copied());
+        let (sources, listed) = cache.index.page_tags_part(frame, &tags, from, most);
         let mut visited = 0;
         let mut relevant = 0u64;
         let mut unlinks = Vec::new();
@@ -1537,7 +1543,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let mut unlinks = Vec::new();
         let (mut visited, mut relevant) = (0u64, 0u64);
         for page in gone.chunk_by(|a, b| a.0 == b.0) {
-            sources.extend(cache.index.page(page[0].0));
+            // Links stay in their guest page: only its runs can hold one.
+            let tags = super::block_index::page_tags(page.iter().map(|&(_, pc)| pc));
+            sources.extend(
+                cache
+                    .index
+                    .page_tags_part(page[0].0, &tags, 0, usize::MAX)
+                    .0,
+            );
             let mut guest: Vec<u64> = page.iter().map(|&(_, pc)| pc >> 12).collect();
             guest.sort_unstable();
             guest.dedup();
