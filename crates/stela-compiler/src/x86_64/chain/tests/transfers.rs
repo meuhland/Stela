@@ -667,13 +667,18 @@ fn transfers_cost_what_their_path_runs() {
         ("b forward", Cost::new(7, 1, 1, 2)),
         ("b back", Cost::new(10, 3, 1, 2)),
         ("cbz back, fallthrough", Cost::new(9, 1, 1, 2)),
-        ("cbz back, taken", Cost::new(13, 3, 1, 2)),
+        // Its polled link's patch point is padded to alignment: with the
+        // direct exits' base slot (`chain::BASE_BYTES`) one NOP here, where
+        // the layout before it took two.
+        ("cbz back, taken", Cost::new(12, 3, 1, 2)),
         ("cbz forward, side exit", Cost::new(9, 1, 1, 2)),
     ];
     assert_eq!(costs, expected);
     // An iteration inside a self-loop, and one through its polled link.
     assert_eq!(loop_iteration(true), Cost::new(6, 1, 0, 1));
-    assert_eq!(loop_iteration(false), Cost::new(13, 3, 1, 2));
+    // Its polled link's patch point is padded to alignment: with the
+    // direct exits' base slot, six bytes, a 1-byte and a 5-byte NOP.
+    assert_eq!(loop_iteration(false), Cost::new(14, 3, 1, 2));
 }
 
 /// The scanner's linked blocks count what they ran: its counts, the

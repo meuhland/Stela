@@ -1364,6 +1364,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         traces: options.traces.clone(),
         watches: options.watches.clone(),
         step_timing: options.profile,
+        page_relative: options.page_relative,
     };
     // The loader handle's last RAM copy preceded canonical registration; its
     // borrow has ended. It never executes a guest instruction.

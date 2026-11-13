@@ -1974,9 +1974,10 @@ fn conditional_exits_branch_over_the_fallthrough_exit() {
     );
     let fallthrough = super::super::chain::direct_exit(GuestAddress(0x1004), ExitKind::Fallthrough);
     let taken = super::super::chain::direct_exit(GuestAddress(0x2000), ExitKind::Direct);
-    assert_eq!(code[..6], [0x0f, 0x85, 24, 0, 0, 0]);
-    assert_eq!(code[6..30], fallthrough);
-    assert_eq!(code[30..], taken);
+    let over = super::super::chain::DIRECT_EXIT_BYTES;
+    assert_eq!(code[..6], [0x0f, 0x85, over as u8, 0, 0, 0]);
+    assert_eq!(code[6..6 + over], fallthrough);
+    assert_eq!(code[6 + over..], taken);
     assert_eq!(code.instructions(), 23);
 }
 
@@ -2995,6 +2996,7 @@ fn clock_exit_requests_runtime_service_without_counter_or_guest_writes() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
+        expected.extend(super::super::chain::BASE_NOP);
         expected.extend([
             0xba, 7, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
         ]);
@@ -3039,6 +3041,7 @@ fn pac_helper_exit_has_no_guest_writes_or_embedded_service_address() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
+        expected.extend(super::super::chain::BASE_NOP);
         expected.extend([
             0xba, 6, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
         ]);
@@ -3105,6 +3108,7 @@ fn trap_exit_uses_instruction_pc_and_only_native_return_scratch_registers() {
         );
         let mut expected = vec![0x48, 0xb8]; // movabs rax,instruction_pc
         expected.extend(pc.0.to_le_bytes());
+        expected.extend(super::super::chain::BASE_NOP);
         expected.extend([
             0xba, 5, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
         ]); // mov edx,Trap; ret

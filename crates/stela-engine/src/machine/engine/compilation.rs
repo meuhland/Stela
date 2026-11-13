@@ -1344,7 +1344,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) -> Option<(Option<Successor>, Option<u64>)> {
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
         let exit = ExitKind::PointerAuthentication;
-        if !chain::is_direct_exit(&native[site..], GuestAddress(pc), exit) {
+        if !super::exits_to(&native[site..], pc, exit) {
             return None;
         }
         let instruction = block::decode_pointer_authentication(GuestAddress(pc), word).ok()??;
@@ -1400,7 +1400,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         before: u32,
     ) -> Option<Successor> {
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
-        if !chain::is_direct_exit(&native[site..], GuestAddress(pc), ExitKind::System) {
+        if !super::exits_to(&native[site..], pc, ExitKind::System) {
             return None;
         }
         let masks = register_read::MaskWrite::of(word).filter(|_| self.native_system().exclusive);

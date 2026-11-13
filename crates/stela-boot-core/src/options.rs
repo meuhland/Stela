@@ -291,6 +291,10 @@ pub struct System {
     /// Time the engine's phases and report them with each heartbeat
     /// (`--profile`).
     pub profile: bool,
+    /// Compile guest code page-relative (`--page-relative`): a block's code
+    /// serves every page that maps the same bytes, each entry setting the
+    /// page it runs at.
+    pub page_relative: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -396,6 +400,7 @@ impl Default for System {
             native_rounds: false,
             parallel: true,
             profile: false,
+            page_relative: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -847,6 +852,7 @@ impl fmt::Display for System {
             self.native_rounds || self.native_shared_check || self.native_bootstrap_check;
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile)?;
+        line.flag("--page-relative", self.page_relative)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
