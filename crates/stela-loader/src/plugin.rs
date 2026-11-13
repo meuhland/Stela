@@ -1262,6 +1262,94 @@ fn code_hash(signed: &[u8], blob: &[u8]) -> Result<CodeHash> {
     Ok(hash)
 }
 
+/// The code hash of each slice of a bundle Apple's `codesign` signed, as
+/// the boot trust cache lists it: SHA-256 of the slice's code directory,
+/// found through the superblob's index among the requirement, entitlement
+/// and resource blobs `codesign` adds, after checking each signed page
+/// against the directory. For prebuilt components, not this linker's output.
+pub fn prebuilt_code_hashes(file: &[u8]) -> Result<Vec<CodeHash>> {
+    use object::read::macho::{FatArch, MachHeader, MachOFatFile32};
+
+    fn word(bytes: &[u8], at: usize) -> Result<usize> {
+        let value = bytes
+            .get(at..)
+            .and_then(|tail| tail.get(..4))
+            .ok_or(refuse!("a prebuilt signature is truncated"))?;
+        Ok(u32::from_be_bytes(value.try_into().unwrap()) as usize)
+    }
+    let fat = MachOFatFile32::parse(file).within(|| refuse!("the prebuilt bundle is not a fat file"))?;
+    require!(!fat.arches().is_empty(), "the prebuilt bundle has no slices");
+    fat.arches()
+        .iter()
+        .map(|arch| {
+            let slice = arch.data(file)?;
+            let header = macho::MachHeader64::<LE>::parse(slice, 0)?;
+            require!(
+                header.filetype(LE) == macho::MH_BUNDLE,
+                "a prebuilt slice is not a bundle"
+            );
+            let mut commands = header.load_commands(LE, slice, 0)?;
+            let mut signature = None;
+            while let Some(command) = commands.next()? {
+                if command.cmd() == macho::LC_CODE_SIGNATURE {
+                    let data: &macho::LinkeditDataCommand<LE> = command.data()?;
+                    signature = Some(data.dataoff.get(LE) as usize);
+                }
+            }
+            let offset = signature.ok_or(refuse!("a prebuilt slice is unsigned"))?;
+            let blob = slice
+                .get(offset..)
+                .ok_or(refuse!("a prebuilt signature offset exceeds its slice"))?;
+            require!(
+                word(blob, 0)? == CSMAGIC_EMBEDDED_SIGNATURE as usize,
+                "a prebuilt slice's signature is malformed"
+            );
+            let count = word(blob, 8)?;
+            let mut directory = None;
+            for index in 0..count {
+                if word(blob, 12 + 8 * index)? == 0 {
+                    directory = Some(word(blob, 16 + 8 * index)?);
+                }
+            }
+            let at = directory.ok_or(refuse!("a prebuilt signature has no code directory"))?;
+            let length = word(blob, at + 4)?;
+            let directory = blob
+                .get(at..)
+                .and_then(|tail| tail.get(..length))
+                .ok_or(refuse!("a prebuilt code directory exceeds its signature"))?;
+            require!(
+                word(directory, 0)? == CSMAGIC_CODEDIRECTORY as usize
+                    && directory.get(36..38) == Some(&[HASH_BYTES as u8, CS_HASHTYPE_SHA256][..]),
+                "a prebuilt code directory is not SHA-256"
+            );
+            let hashes_at = word(directory, 16)?;
+            let slots = word(directory, 28)?;
+            let limit = word(directory, 32)?;
+            let page = 1usize << directory[39];
+            let signed = slice
+                .get(..limit)
+                .ok_or(refuse!("a prebuilt code limit exceeds its slice"))?;
+            let hashes = directory
+                .get(hashes_at..)
+                .and_then(|tail| tail.get(..slots * HASH_BYTES))
+                .ok_or(refuse!("a prebuilt code hash table exceeds its directory"))?;
+            require!(
+                slots == signed.len().div_ceil(page),
+                "a prebuilt code hash table does not cover its code"
+            );
+            for (chunk, hash) in signed.chunks(page).zip(hashes.chunks(HASH_BYTES)) {
+                require!(
+                    Sha256::digest(chunk).as_slice() == hash,
+                    "a prebuilt signed page has changed"
+                );
+            }
+            let mut hash = CodeHash::default();
+            hash.copy_from_slice(&Sha256::digest(directory)[..size_of::<CodeHash>()]);
+            Ok(hash)
+        })
+        .collect()
+}
+
 /// Links each slice's objects and joins the slices into one fat file, whose
 /// bytes go in the bundle as its executable. Each slice's signature names
 /// `identifier`.
