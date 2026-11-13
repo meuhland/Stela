@@ -24,7 +24,7 @@ pub const HEAP_FLOOR: u64 = 2816 * MIB;
 /// runs more and larger pipelines, apps and translation packs.
 pub const HEAP_CEILING: u64 = 16 * GIB;
 /// Free host RAM bytes per byte of the engine heap's base share, which
-/// passes the floor only on hosts with more than about 50 GiB free. The
+/// passes the floor on hosts with more than about 8.5 GiB free. The
 /// heap's peak past its window's block records does not grow with the
 /// guest: 2111 MiB with 6.7 GiB of guest DRAM and 1987 MiB with 10.4 GiB
 /// (`BEAT peak=2815M` with a 704 MiB window, `peak=2963M` with 976 MiB),
@@ -174,7 +174,7 @@ impl Shortfall {
 /// running PEs; the others add only their parked reserves.
 ///
 /// Each part takes a share of `free`, between its bounds:
-/// - the heap a twenty-fourth, [`HEAP_PER_WINDOW`] byte per byte of the board's
+/// - the heap a quarter, [`HEAP_PER_WINDOW`] byte per byte of the board's
 ///   code window and [`PE_HEAP`] per runner, within
 ///   [`HEAP_FLOOR`]..=[`HEAP_CEILING`], the floor moved by the window's
 ///   difference from [`FLOOR_WINDOW`];
