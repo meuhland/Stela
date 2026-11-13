@@ -55,7 +55,17 @@ pub fn run() -> Result<()> {
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
     fs::write(include.join("stela/compression.h"), compression::header()?)?;
     let kext = build_kext(&component, &output, &xnu, &include)?;
-    let code = stela_loader::plugin::code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?)?;
+    let mut code = stela_loader::plugin::code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?)?;
+    // StelaVT, the H.264 encoder the Metal plugin registers in processes with
+    // VideoToolbox (bundle/VideoEncoder.m), is prebuilt on macOS against x264
+    // and installed as /Library/Video/Plug-Ins/StelaVT.bundle. Platform
+    // processes such as the video encoder service map only platform code, so
+    // its code goes in the same trust cache; the installed copy must be this one.
+    let encoder = component.join("stelavt").join("StelaVT");
+    if encoder.exists() {
+        code.extend(stela_loader::plugin::code_hashes(&fs::read(&encoder)?)?);
+        println!("StelaVT code: {}", encoder.display());
+    }
     fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
     embed_kext(&kext, &code, &output.join("StelaGPU.kext.rs"))?;
     stela_cli::gpu::Payload::write(&output)?;
