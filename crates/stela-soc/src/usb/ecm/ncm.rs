@@ -48,7 +48,7 @@ const CAPABILITIES: u8 = 0x01;
 pub(super) const FUNCTIONAL: [u8; 6] = [6, 0x24, 0x1a, 0x00, 0x01, CAPABILITIES];
 
 /// dwNtbInMaxSize and dwNtbOutMaxSize: room for ten full frames.
-pub const BLOCK_BYTES: usize = 16 * 1024;
+pub const BLOCK_BYTES: usize = 60 * 1024;
 /// The smallest input size a host may set for NTB16 (6.2.7).
 const MIN_BLOCK: usize = 2048;
 /// wNdp*Divisor, wNdp*PayloadRemainder, wNdp*Alignment.
@@ -575,10 +575,10 @@ mod tests {
         let mut expected = [0u8; 28];
         expected[0] = 0x1c;
         expected[2] = 1;
-        expected[4..8].copy_from_slice(&16384u32.to_le_bytes());
+        expected[4..8].copy_from_slice(&61440u32.to_le_bytes());
         expected[8] = 4;
         expected[12] = 4;
-        expected[16..20].copy_from_slice(&16384u32.to_le_bytes());
+        expected[16..20].copy_from_slice(&61440u32.to_le_bytes());
         expected[20] = 4;
         expected[24] = 4;
         assert_eq!(bytes, expected);
@@ -586,7 +586,7 @@ mod tests {
         let p = ntb::Parameters::parse(&bytes).unwrap();
         assert_eq!(
             (p.in_max, p.out_max, p.supports_ntb32),
-            (16384, 16384, false)
+            (61440, 61440, false)
         );
         // NTB16 is the format; NTB32 is refused.
         assert_eq!(
@@ -597,11 +597,11 @@ mod tests {
         assert!(transfer(&mut e, setup(0x21, 0x84, 1, 0, 0), &[]).is_err());
         // The input size: honoured, clamped to ours, refused below 2048.
         let size = |e: &mut Ecm| transfer(e, setup(0xa1, 0x85, 0, 0, 4), &[]).unwrap();
-        assert_eq!(size(&mut e), 16384u32.to_le_bytes());
+        assert_eq!(size(&mut e), 61440u32.to_le_bytes());
         transfer(&mut e, setup(0x21, 0x86, 0, 0, 4), &4096u32.to_le_bytes()).unwrap();
         assert_eq!(size(&mut e), 4096u32.to_le_bytes());
         transfer(&mut e, setup(0x21, 0x86, 0, 0, 4), &65536u32.to_le_bytes()).unwrap();
-        assert_eq!(size(&mut e), 16384u32.to_le_bytes());
+        assert_eq!(size(&mut e), 61440u32.to_le_bytes());
         assert!(transfer(&mut e, setup(0x21, 0x86, 0, 0, 4), &1024u32.to_le_bytes()).is_err());
         let eight = [0x00, 0x20, 0, 0, 3, 0, 0, 0];
         transfer(&mut e, setup(0x21, 0x86, 0, 0, 8), &eight).unwrap();
@@ -613,7 +613,7 @@ mod tests {
         transfer(&mut e, setup(0x01, SET_INTERFACE, 0, 1, 0), &[]).unwrap();
         assert_eq!(size(&mut e), 0x2000u32.to_le_bytes());
         transfer(&mut e, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
-        assert_eq!(size(&mut e), 16384u32.to_le_bytes());
+        assert_eq!(size(&mut e), 61440u32.to_le_bytes());
         // ECM's requests still answer.
         transfer(&mut e, setup(0x21, 0x43, 0x0e, 0, 0), &[]).unwrap();
         assert_eq!(
