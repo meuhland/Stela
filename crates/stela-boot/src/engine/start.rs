@@ -79,6 +79,10 @@ fn from_disk(
     // the Lockdown Mode variable. Without it every password prompt fails at
     // kCmdContextCreateWithTracking with ODErrorCredentialsOperationFailed.
     defaults.boot_args.push_str(" acm_fastsim=1");
+    // Workaround: let third-party arm64e code load. macOS runs its video
+    // encoder service as arm64e only, and Stela has no Apple video encoder,
+    // so a VideoToolbox encoder plugin (StelaVT) must be arm64e to load there.
+    defaults.boot_args.push_str(" -arm64e_preview_abi");
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
     let maintenance_write = options.maintenance_write || options.bundle_repair;
