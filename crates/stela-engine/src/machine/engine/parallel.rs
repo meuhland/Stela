@@ -637,6 +637,12 @@ impl Hub {
         (self.clock.lag(), self.clock.take_repaid())
     }
 
+    /// The PE holding the count below a ceiling, if any
+    /// ([`SharedClock::holder`]).
+    pub fn clock_holder(&self) -> Option<(usize, bool, u64)> {
+        self.clock.holder()
+    }
+
     /// Each PE's longest gap with guest work and no instruction retired
     /// since the last call, in counts, and the phase that took most of it
     /// ([`SharedClock::take_stalls`]): a step loop phase's name, `host` for

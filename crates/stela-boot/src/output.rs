@@ -978,12 +978,16 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
     crate::engine::stop_gpus_for_fatal();
+    // Each step after the GPUs' says it ended: a fatal stop that hangs
+    // names the step it hangs in.
+    arguments(format_args!("STELA FATAL GPUs done; keeping the log\n"));
     // The reason is on the screen before the last store, which may be what
     // fails, and the advice after it says whether the log was kept.
     stopped(&message, &|| {
         flush_log();
         stopped_text()
     });
+    arguments(format_args!("STELA FATAL turning the PC off\n"));
     terminate(0x11)
 }
 
