@@ -831,7 +831,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let record = code.blocks.record(index);
         // Another PE may serve it meanwhile: checked again under the lock.
-        let mut cache = code.cache_at(board::LockSite::Dynamic);
+        // With the lock held elsewhere the exit keeps its lookup until it
+        // is taken again ([`Self::link`]); its record stays open.
+        let Some(mut cache) = code.try_cache_at(board::LockSite::Dynamic) else {
+            self.statistics.dynamic_skips += 1;
+            return;
+        };
         if !record.dynamic_open() || !record.live() {
             return;
         }
