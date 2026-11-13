@@ -527,6 +527,8 @@ pub struct CodeReport {
     pub generations: [u32; 2],
     pub promoted: u64,
     pub outs: [u64; 4],
+    /// [`Events::walks`] since the last report, by [`Walk`].
+    pub walks: [u64; Walk::COUNT],
     /// Installs relocated from an entry proven during the boot, entries
     /// proven and refused, and the bytes kept ([`super::rebase`]).
     pub rebases: super::RebaseCounts,
@@ -571,11 +573,47 @@ pub(super) struct Events {
     pub(super) targets_deferred: AtomicU64,
     /// Installs that went to the tenured generation.
     pub(super) promoted: AtomicU64,
+    /// The frame-list walks under the lock, since the last report
+    /// ([`Walk`]): how much of each walk visited blocks of the guest pages
+    /// it was for, against all the frame's aliases.
+    pub(super) walks: [AtomicU64; Walk::COUNT],
 }
+
+/// What [`Events::walks`] counts.
+#[derive(Clone, Copy)]
+pub(super) enum Walk {
+    /// `cut_links_into`: blocks visited, and of those on a guest page a
+    /// retired block was on.
+    CutVisited,
+    CutRelevant,
+    /// `detach` on an install: blocks visited, and of those on the guest
+    /// page of a detached block.
+    DetachVisited,
+    DetachRelevant,
+    /// `unindex` calls and the frame-list entries they forgot from.
+    UnindexCalls,
+    UnindexListed,
+    /// One unindex in [`WALK_SAMPLE`]: the frame-list entries and the
+    /// distinct guest pages among them (the frame's aliases).
+    SampledListed,
+    SampledPages,
+    Samples,
+}
+
+impl Walk {
+    pub(super) const COUNT: usize = Self::Samples as usize + 1;
+}
+
+/// One unindex in this many counts its frame's distinct guest pages.
+pub(super) const WALK_SAMPLE: u64 = 64;
 
 impl Events {
     pub(super) fn count(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn walk(&self, walk: Walk, amount: u64) {
+        self.walks[walk as usize].fetch_add(amount, Ordering::Relaxed);
     }
 
     /// A retirement ended.
@@ -798,6 +836,7 @@ impl Code {
                 .map_or([0; 4], |arena| arena.ring.outs()),
             rebases: self.rebases.counts(),
             flushes: self.epoch.load(Ordering::Relaxed),
+            walks: core::array::from_fn(|walk| self.events.walks[walk].swap(0, Ordering::Relaxed)),
         }
     }
 
