@@ -14,6 +14,9 @@
 
 #define STELAVT "/Library/Video/Plug-Ins/StelaVT.bundle/Contents/MacOS/StelaVT"
 #define RTLD_DEFAULT ((void *)-2)
+/* libsandbox's sandbox_check() filter and flag. */
+#define SANDBOX_FILTER_PATH 1
+#define SANDBOX_CHECK_NO_REPORT 0x40000000
 
 typedef int32_t (*Factory)(uint32_t, const void *, const void **);
 typedef int32_t (*Register)(uint32_t, const void *, Factory);
@@ -23,6 +26,14 @@ __attribute__((constructor)) static void register_stela_video_encoder(void)
 	Register registerEncoder = (Register)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
 	const void *const *hardwareKey = dlsym(RTLD_DEFAULT, "kVTVideoEncoder_IsHardwareAccelerated");
 	if (!registerEncoder || !hardwareKey) {
+		return;
+	}
+	/* A sandbox that may not map StelaVT (WindowServer's) would only log a
+	 * violation for each attempt; such a process encodes nothing anyway. */
+	int (*sandboxCheck)(int, const char *, int, ...) = dlsym(RTLD_DEFAULT, "sandbox_check");
+	int (*processID)(void) = dlsym(RTLD_DEFAULT, "getpid");
+	if (sandboxCheck && processID &&
+	    sandboxCheck(processID(), "file-map-executable", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, STELAVT) > 0) {
 		return;
 	}
 	void *library = dlopen(STELAVT, RTLD_NOW | RTLD_LOCAL);
