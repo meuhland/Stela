@@ -55,7 +55,9 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 let (record, data) = payload.split::<BeginRender>()?;
                 let request = self.render_pass(connection, &record, data.bytes())?;
                 if let Err(error) = self.device.begin_render(commands, &request) {
-                    self.noted = Some(self.describe_pass(&request));
+                    // The refusal's reason with the pass, so that a refused
+                    // pass says what this device lacks for it.
+                    self.noted = Some(format!("{} because {error:?}", self.describe_pass(&request)));
                     return Err(error.into());
                 }
             }
