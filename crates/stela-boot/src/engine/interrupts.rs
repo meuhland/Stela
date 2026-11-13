@@ -344,7 +344,7 @@ vectors!(
     64 none,
     80 none, 81 none, 82 none, 83 none, 84 none, 85 none, 86 none, 87 none,
     88 none, 89 none, 90 none, 91 none, 92 none, 93 none, 94 none, 95 none,
-    96 none, 97 none, 255 none,
+    96 none, 97 none, 98 none, 255 none,
 );
 
 unsafe extern "C" {
