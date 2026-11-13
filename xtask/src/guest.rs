@@ -60,7 +60,7 @@ pub fn run() -> Result<()> {
     // its code goes in the same trust cache; the installed copy must be this one.
     let encoder = component.join("stelavt").join("StelaVT");
     if encoder.exists() {
-        code.extend(stela_loader::plugin::code_hashes(&fs::read(&encoder)?)?);
+        code.extend(stela_loader::plugin::prebuilt_code_hashes(&fs::read(&encoder)?)?);
         println!("StelaVT code: {}", encoder.display());
     }
     fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
