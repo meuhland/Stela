@@ -690,8 +690,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let record = code.blocks.record(index);
         let find = || unlinked(&code);
         // Another PE may link or detach it meanwhile: found again under the
-        // lock, for a block still installed.
-        let mut cache = code.cache_at(board::LockSite::Link);
+        // lock, for a block still installed. With the lock held elsewhere
+        // the link waits for the exit's next turn instead of this PE: an
+        // unlinked exit costs one exit, a wait for the lock costs more.
+        let Some(mut cache) = code.try_cache_at(board::LockSite::Link) else {
+            self.statistics.link_skips += 1;
+            return false;
+        };
         // Only an indexed block links out: a detach finds the sources of
         // its links among the indexed blocks of the target's page, so a
         // link from a block an IC IVAU forgot would outlive its target.
@@ -1115,7 +1120,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// while every stamped cell is held.
     pub(super) fn promote_hot_exits(&mut self) {
         let code = Arc::clone(&self.code);
-        let mut cache = code.cache_at(board::LockSite::Link);
+        // A later sweep takes these samples with the next ones: with the
+        // lock held elsewhere this one waits for it ([`Self::link`]).
+        let Some(mut cache) = code.try_cache_at(board::LockSite::Link) else {
+            self.statistics.link_skips += 1;
+            return;
+        };
         let mut samples = core::mem::take(&mut self.cell_samples);
         self.statistics.cell_samples += samples.len() as u64;
         for &address in &samples {
