@@ -12,6 +12,9 @@ pub(crate) struct Code {
     /// ([`super::Asm::guest_imm64`]), ascending: what a stored block adds its
     /// page's displacement to when it is installed at another address.
     pub(super) relocations: Vec<u32>,
+    /// [`super::super::NativeSystem::page_relative`]: guest addresses
+    /// add [`crate::GuestState::page_base`] ([`Asm::guest_imm64`]).
+    pub(super) page_relative: bool,
     /// Whether guest registers live in host registers ([`super::super::pinned`]).
     pub(super) pinned: bool,
     locals: Option<super::super::pinned::LocalRegisters>,
@@ -105,6 +108,7 @@ impl Code {
             instructions: 0,
             sites: Vec::new(),
             relocations: Vec::new(),
+            page_relative: false,
             pinned: false,
             locals: None,
             dirty: Default::default(),
@@ -196,6 +200,11 @@ impl Code {
     pub(crate) fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
     }
+    /// Emit guest addresses page-relative from here on
+    /// ([`super::super::NativeSystem::page_relative`]).
+    pub(crate) fn set_page_relative(&mut self, page_relative: bool) {
+        self.page_relative = page_relative;
+    }
     /// Map temporary guest registers only while emitting a pure pinned span.
     pub(in crate::x86_64) fn set_local_registers(
         &mut self,
@@ -222,6 +231,7 @@ impl Code {
             shared: Some(&mut self.instructions),
             sites: Some(&mut self.sites),
             relocations: Some(&mut self.relocations),
+            page_relative: self.page_relative,
             pinned: self.pinned,
             locals: self.locals,
             dirty: self.dirty,
@@ -419,6 +429,7 @@ impl Code {
             instructions: self.instructions - at.instructions,
             sites,
             relocations,
+            page_relative: self.page_relative,
             pinned: self.pinned,
             locals: None,
             dirty: Default::default(),

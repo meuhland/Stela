@@ -114,7 +114,26 @@ pub struct GuestState {
     /// has retired in the iterations before the one it runs, which its exits
     /// move to the chain's count and a fault's settlement adds: 0 outside one.
     pub loop_retired: u64,
+    /// The guest page a page-relative block runs at
+    /// ([`crate::x86_64::NativeSystem::page_relative`]): its guest addresses
+    /// are this plus their offset from the page it was compiled at. Set by
+    /// whatever enters such a block; other code never reads it.
+    pub page_base: PageBase,
 }
+
+/// [`GuestState::page_base`]: the host's, no part of the guest's state, so
+/// any two compare equal.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageBase(pub u64);
+
+impl PartialEq for PageBase {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PageBase {}
 
 /// [`GuestState::lower_limit`]: the host's, no part of the guest's state, so
 /// any two compare equal.
@@ -155,6 +174,7 @@ impl Default for GuestState {
             anchors: Anchors::default(),
             lower_limit: Limit(0),
             loop_retired: 0,
+            page_base: PageBase(0),
         }
     }
 }
@@ -170,7 +190,7 @@ mod tests {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
             assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v13-"));
         }
-        assert_eq!(size_of::<GuestState>(), 904);
+        assert_eq!(size_of::<GuestState>(), 912);
         assert_eq!(align_of::<GuestState>(), 8);
         assert_eq!(offset_of!(GuestState, x), 0);
         assert_eq!(offset_of!(GuestState, sp), 248);
@@ -184,6 +204,7 @@ mod tests {
         assert_eq!(offset_of!(GuestState, pan), 816);
         assert_eq!(offset_of!(GuestState, lower_limit), 888);
         assert_eq!(offset_of!(GuestState, loop_retired), 896);
+        assert_eq!(offset_of!(GuestState, page_base), 904);
     }
 
     #[test]
