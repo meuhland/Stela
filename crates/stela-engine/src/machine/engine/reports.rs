@@ -543,6 +543,9 @@ pub struct Statistics {
     pub chained: u64,
     /// Direct exits redirected into their successors.
     pub links: u64,
+    /// Links left for a later exit because another PE held the code lock
+    /// ([`super::board::Code::try_cache_at`]).
+    pub link_skips: u64,
     /// Exits out of their page given a stamped tail
     /// ([`stela_compiler::x86_64::chain::stamped_tail`]).
     pub stamped_tails: u64,
@@ -785,6 +788,7 @@ impl core::ops::AddAssign for Statistics {
             replaced_retired,
             chained,
             links,
+            link_skips,
             stamped_tails,
             predicted_tails,
             stamped_in_use,
@@ -967,6 +971,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.blocks, blocks),
             (&mut self.chained, chained),
             (&mut self.links, links),
+            (&mut self.link_skips, link_skips),
             (&mut self.stamped_tails, stamped_tails),
             (&mut self.predicted_tails, predicted_tails),
             (&mut self.cell_probes, cell_probes),
