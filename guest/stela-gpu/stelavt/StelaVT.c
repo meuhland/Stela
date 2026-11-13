@@ -199,7 +199,7 @@ static OSStatus setProperty(CMBaseObjectRef object, CFStringRef key, CFTypeRef v
 		status = kVTPropertyNotSupportedErr;
 	}
 	pthread_mutex_unlock(&e->lock);
-	os_log(logger(), "StelaVT: setProperty %{public}@ -> %d", key, (int)status);
+	os_log_debug(logger(), "StelaVT: setProperty %{public}@ -> %d", key, (int)status);
 	return status;
 }
 
@@ -224,7 +224,7 @@ static OSStatus copyProperty(CMBaseObjectRef object, CFStringRef key, CFAllocato
 		*value = CFRetain(kCFBooleanFalse);
 		return noErr;
 	}
-	os_log(logger(), "StelaVT: copyProperty %{public}@ unsupported", key);
+	os_log_debug(logger(), "StelaVT: copyProperty %{public}@ unsupported", key);
 	return kVTPropertyNotSupportedErr;
 }
 
@@ -256,7 +256,7 @@ static OSStatus copySupportedPropertyDictionary(VTVideoEncoderRef encoder, CFDic
 	addProperty(d, kVTCompressionPropertyKey_TransferFunction, kVTPropertyType_Enumeration);
 	addProperty(d, kVTCompressionPropertyKey_YCbCrMatrix, kVTPropertyType_Enumeration);
 	addProperty(d, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kVTPropertyType_Boolean);
-	os_log(logger(), "StelaVT: copySupportedPropertyDictionary");
+	os_log_debug(logger(), "StelaVT: copySupportedPropertyDictionary");
 	*out = d;
 	return noErr;
 }
@@ -520,7 +520,7 @@ __attribute__((visibility("default"))) OSStatus StelaVT_CreateInstance(FourCharC
 	Encoder *e = vt.derivedStorage(object);
 	memset(e, 0, sizeof *e);
 	pthread_mutex_init(&e->lock, NULL);
-	os_log(logger(), "StelaVT: CreateInstance");
+	os_log_debug(logger(), "StelaVT: CreateInstance");
 	*out = object;
 	return noErr;
 }
