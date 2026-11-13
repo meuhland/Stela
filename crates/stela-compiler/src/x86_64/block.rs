@@ -71,7 +71,7 @@ pub(super) fn direct_exit_with(asm: &mut Asm, target: GuestAddress, word: impl I
     let word = word.into();
     let slot = super::chain::link_slot(asm.linked_block(), target, word.kind);
     super::chain::empty_link(asm, slot);
-    asm.guest_imm64(Gpr::Rax, target);
+    asm.guest_exit_imm64(Gpr::Rax, target);
     exit_kind_with(asm, word);
 }
 
@@ -504,6 +504,7 @@ fn emit_selected(
     };
     let code = &mut block.x86_64_code;
     code.set_pinned(pinned);
+    code.set_page_relative(native.page_relative);
     if pinned
         && let Some(first) = instructions
             .first()
