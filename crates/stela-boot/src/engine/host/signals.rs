@@ -99,6 +99,31 @@ pub(crate) fn completion_signal(id: u64) -> Option<stela_drivers::bus::irq::MsiM
     })
 }
 
+/// [`completion_signal`] for a network adapter's arriving frames, on its
+/// own vector so that [`network_interrupt`] knows them from a disk's.
+pub(crate) fn network_signal(id: u64) -> Option<stela_drivers::bus::irq::MsiMessage> {
+    (id < 255).then(|| stela_drivers::bus::irq::MsiMessage {
+        address: 0xfee0_0000 | id << 12,
+        data: u32::from(super::super::interrupts::NETWORK_VECTOR),
+    })
+}
+
+/// Frames reached a host network adapter since [`take_network_signal`].
+static NETWORK_SIGNALLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A wake ([`wake_interrupt`]) that also notes arriving frames, for the
+/// core it woke to ask for the host's service outside the handler.
+pub(crate) fn network_interrupt() {
+    NETWORK_SIGNALLED.store(true, core::sync::atomic::Ordering::Release);
+    wake_interrupt();
+}
+
+/// Whether frames arrived since the last call.
+pub(crate) fn take_network_signal() -> bool {
+    NETWORK_SIGNALLED.load(core::sync::atomic::Ordering::Relaxed)
+        && NETWORK_SIGNALLED.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// Doorbells a local APIC did not deliver since the last report: each may
 /// leave its processor asleep until its next wake.
 pub(super) static UNDELIVERED: core::sync::atomic::AtomicU64 =

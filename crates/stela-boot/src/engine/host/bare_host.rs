@@ -745,6 +745,7 @@ impl Host for BareHost<'_> {
         // SAFETY: interrupts are disabled and the host IDT takes the wake;
         // the ring is this processor's.
         unsafe { crate::native_idle::wait_with(budget, ring) };
+        super::super::network::signalled();
     }
 
     fn relax(&mut self) {
@@ -765,6 +766,7 @@ impl Host for BareHost<'_> {
         let interrupted = local::interrupted();
         if interrupted {
             local::clear_interrupt();
+            super::super::network::signalled();
         }
         interrupted
     }

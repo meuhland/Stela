@@ -50,6 +50,11 @@ pub struct Handoff {
     /// engine takes one: it wakes the core that looks for completions
     /// ([`block::BlockDevice::signals`]). `None` leaves every disk polled.
     pub completion: Option<bus::irq::MsiMessage>,
+    /// The message a network adapter sends as frames arrive, where the
+    /// engine tells it from a disk's: it asks for the host's service, which
+    /// moves the frames, at once. `None` sends the adapter's on
+    /// [`Self::completion`].
+    pub network: Option<bus::irq::MsiMessage>,
 }
 
 impl Handoff {
@@ -372,6 +377,7 @@ mod tests {
         let handoff = Handoff {
             firmware: None,
             completion: None,
+            network: None,
             ecam: Vec::new(),
             mapped: vec![0x1000..0x3000, 0x8000..0x9000],
             dma: 0..0,
@@ -397,6 +403,7 @@ mod tests {
             },
             firmware: Some(catalog.clone()),
             completion: None,
+            network: None,
         };
         let cloned = handoff.clone();
         assert!(Arc::ptr_eq(cloned.firmware.as_ref().unwrap(), &catalog));

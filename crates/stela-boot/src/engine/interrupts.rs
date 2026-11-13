@@ -17,6 +17,9 @@ pub const TIMER_VECTOR: u8 = 0x40;
 pub(crate) const NATIVE_WAKE_VECTOR: u8 = 0x60;
 /// The MMIO aperture's TLB shootdown (`native_mmio::shootdown`).
 pub(crate) const SHOOTDOWN_VECTOR: u8 = 0x61;
+/// A host network adapter's frames arrived (`host::network_signal`): a
+/// wake that also asks for the host's service.
+pub(crate) const NETWORK_VECTOR: u8 = 0x62;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 const CODE_SELECTOR: u16 = 0x08;
 const DATA_SELECTOR: u16 = 0x10;
@@ -529,6 +532,7 @@ pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_
         TIMER_VECTOR => host::timer_interrupt(),
         NATIVE_WAKE_VECTOR => host::wake_interrupt(),
         SHOOTDOWN_VECTOR => host::shootdown_interrupt(),
+        NETWORK_VECTOR => host::network_interrupt(),
         SPURIOUS_VECTOR => host::spurious_interrupt(),
         vector @ 32.. => host::stray_interrupt(vector),
         _ => fatal(frame),

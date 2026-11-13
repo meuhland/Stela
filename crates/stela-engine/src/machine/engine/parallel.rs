@@ -792,6 +792,12 @@ impl Hub {
         }
     }
 
+    /// [`Self::request_service`] for the host's own sources: a host network
+    /// adapter's frames arrived. Safe from any core outside an interrupt.
+    pub fn request_host_service(&self) {
+        self.request_service();
+    }
+
     /// Whether the host's service is due with no PE asleep to wake for it:
     /// every PE runs, and only one that waits would take it.
     pub fn service_unclaimed(&self) -> bool {

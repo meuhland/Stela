@@ -1229,6 +1229,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
     // they are stale diagnostics, not coherent source-state receipts.
     hub.set_source_observations(options.profile);
     gpu::set_hub(hub.clone(), boot_processor);
+    network::set_hub(hub.clone());
     let devices = parallel::Board::new(devices, hub.clone());
     let settings = parallel::Settings {
         traces: options.traces.clone(),
@@ -2730,6 +2731,8 @@ fn start_devices(
             let bsp = native_processors.expect("validated native roster");
             storage_handoff.completion =
                 host::completion_signal(bsp.processors[bsp.selected[0] as usize].apic_id);
+            storage_handoff.network =
+                host::network_signal(bsp.processors[bsp.selected[0] as usize].apic_id);
             #[cfg(feature = "diagnostics")]
             if options.audio_check.is_some() {
                 // The audio check keeps the final slice even after shutdown.

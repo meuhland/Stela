@@ -544,6 +544,36 @@ impl stela_runtime::restore::tss::Transport for Offline {
     }
 }
 
+/// The hub [`signalled`] asks for the host's service, once the parallel
+/// run has one ([`set_hub`]).
+static HUB: core::sync::atomic::AtomicPtr<stela_engine::machine::engine::Hub> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub(super) fn set_hub(hub: alloc::sync::Arc<stela_engine::machine::engine::Hub>) {
+    let hub = alloc::sync::Arc::into_raw(hub).cast_mut();
+    let ordering = core::sync::atomic::Ordering::AcqRel;
+    if HUB.compare_exchange(core::ptr::null_mut(), hub, ordering, core::sync::atomic::Ordering::Acquire).is_err() {
+        // One run, one hub: a second is not kept.
+        // SAFETY: made above by `Arc::into_raw` and never stored.
+        drop(unsafe { alloc::sync::Arc::from_raw(hub) });
+    }
+}
+
+/// Frames reached the host adapter (`host::network_interrupt`): the host's
+/// service is due, as it is when the guest's adapter leaves frames for the
+/// host. The service reads the adapter about every 4 ms otherwise, which
+/// every frame to the guest waited for. Called by the woken core after its
+/// wait, outside the handler.
+pub(super) fn signalled() {
+    if super::host::take_network_signal() {
+        // SAFETY: set once from `Arc::into_raw` and never freed while the
+        // engine runs.
+        if let Some(hub) = unsafe { HUB.load(core::sync::atomic::Ordering::Acquire).as_ref() } {
+            hub.request_host_service();
+        }
+    }
+}
+
 /// The guest's USB Ethernet adapter bridged to a host adapter of its own
 /// (`--guest-network`). The adapter keeps the host adapter's station
 /// address, so the guest is that adapter on the host's network and the

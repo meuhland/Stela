@@ -1769,7 +1769,13 @@ pub unsafe fn probe_observed(
                 continue;
             } else if net::virtio::matches(&function) {
                 let minimum = minimum_for_function!().clone();
-                let attached = VirtioNet::new(&mut function, handoff, dma, minimum.as_ref());
+                // Arriving frames ask for the host's service at once
+                // (`Handoff::network`), not only wake the core a disk's would.
+                let signalled = Handoff {
+                    completion: handoff.network.or(handoff.completion),
+                    ..handoff.clone()
+                };
+                let attached = VirtioNet::new(&mut function, &signalled, dma, minimum.as_ref());
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -2947,6 +2953,7 @@ mod tests {
                 },
                 firmware: None,
                 completion: None,
+                network: None,
             };
             let services = services::tests::Refusing::minimum_only();
             // SAFETY: the empty region can allocate no DMA pages. Only the
@@ -3106,6 +3113,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = |device| Address {
             segment: 0,
@@ -3209,6 +3217,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let services = services::tests::Refusing::minimum_only();
         // SAFETY: as in the EHCI fixture above: no DMA pages, only the
@@ -3371,6 +3380,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let firmware = handoff_provider(&handoff);
         let network = Network {
@@ -3446,6 +3456,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = Address {
             segment: 0,

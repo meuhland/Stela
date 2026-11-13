@@ -57,7 +57,11 @@ const TRANSMIT_WAIT_US: u64 = 100_000;
 /// 1.2 section 2.7). Up to 16 entries this is [`Modern::queue`]'s layout.
 const fn layout(entries: u16) -> (usize, usize, usize) {
     let entries = entries as usize;
-    let driver = if 16 * entries > AVAIL { 16 * entries } else { AVAIL };
+    let driver = if 16 * entries > AVAIL {
+        16 * entries
+    } else {
+        AVAIL
+    };
     let device = (driver + 6 + 2 * entries + 3) & !3;
     let device = if device > USED { device } else { USED };
     let bytes = (device + 6 + 8 * entries + 4095) & !4095;
@@ -100,7 +104,8 @@ impl Queue {
         // A device that takes fewer entries leaves the rings room to spare.
         let (driver, device, bytes) = layout(entries);
         let ring = dma.allocate(bytes, 4096)?;
-        let (entries, notify) = transport.queue_at(handoff, index, entries, &ring, driver, device)?;
+        let (entries, notify) =
+            transport.queue_at(handoff, index, entries, &ring, driver, device)?;
         let buffers = dma.allocate(usize::from(entries) * BUFFER, 4096)?;
         Ok(Self {
             ring,

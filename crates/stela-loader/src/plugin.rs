@@ -1277,8 +1277,12 @@ pub fn prebuilt_code_hashes(file: &[u8]) -> Result<Vec<CodeHash>> {
             .ok_or(refuse!("a prebuilt signature is truncated"))?;
         Ok(u32::from_be_bytes(value.try_into().unwrap()) as usize)
     }
-    let fat = MachOFatFile32::parse(file).within(|| refuse!("the prebuilt bundle is not a fat file"))?;
-    require!(!fat.arches().is_empty(), "the prebuilt bundle has no slices");
+    let fat =
+        MachOFatFile32::parse(file).within(|| refuse!("the prebuilt bundle is not a fat file"))?;
+    require!(
+        !fat.arches().is_empty(),
+        "the prebuilt bundle has no slices"
+    );
     fat.arches()
         .iter()
         .map(|arch| {
