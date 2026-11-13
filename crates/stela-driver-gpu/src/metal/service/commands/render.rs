@@ -56,8 +56,15 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 let request = self.render_pass(connection, &record, data.bytes())?;
                 if let Err(error) = self.device.begin_render(commands, &request) {
                     // The refusal's reason with the pass, so that a refused
-                    // pass says what this device lacks for it.
-                    self.noted = Some(format!("{} because {error:?}", self.describe_pass(&request)));
+                    // pass says what this device lacks for it. A pass whose
+                    // compilation deferred is not refused: the call is made
+                    // again once the compilation is done.
+                    if error != crate::metal::compiler::DEFERRED {
+                        self.noted = Some(format!(
+                            "{} because {error:?}",
+                            self.describe_pass(&request)
+                        ));
+                    }
                     return Err(error.into());
                 }
             }
