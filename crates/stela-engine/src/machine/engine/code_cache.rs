@@ -1244,6 +1244,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         let (_, listed) = cache.index.page_part(frame, 0, 0);
+        let events = &code.events;
+        events.walk(board::Walk::UnindexCalls, 1);
+        events.walk(board::Walk::UnindexListed, listed as u64);
+        if events.walks[board::Walk::UnindexCalls as usize]
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(board::WALK_SAMPLE)
+        {
+            let (entries, _) = cache.index.page_part(frame, 0, usize::MAX);
+            let mut pages: Vec<u64> = entries.map(|slot| blocks[slot].pc >> 12).collect();
+            events.walk(board::Walk::SampledListed, pages.len() as u64);
+            pages.sort_unstable();
+            pages.dedup();
+            events.walk(board::Walk::SampledPages, pages.len() as u64);
+            events.walk(board::Walk::Samples, 1);
+        }
         let marked = mark(&mut cache.marked, blocks.len(), &slots);
         cache
             .index
@@ -1303,9 +1318,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let blocks = &code.blocks;
         let (sources, listed) = cache.index.page_part(frame, from, most);
         let mut visited = 0;
+        let mut relevant = 0u64;
         let mut unlinks = Vec::new();
+        // The guest pages of the retired PCs, sorted as `pcs` is.
+        let mut pages: Vec<u64> = pcs.iter().map(|pc| pc >> 12).collect();
+        pages.dedup();
         for source in sources {
             visited += 1;
+            relevant += u64::from(pages.binary_search(&(blocks[source].pc >> 12)).is_ok());
             let record = blocks.record(source);
             for (position, exit) in blocks[source].successors.iter().enumerate() {
                 if record.chained(position) && pcs.binary_search(&exit.target.0).is_ok() {
@@ -1320,6 +1340,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         // One store each, which a core running the exit may meet.
         self.unlink_points(unlinks);
+        code.events.walk(board::Walk::CutVisited, visited as u64);
+        code.events.walk(board::Walk::CutRelevant, relevant);
         let next = from + visited;
         ((next < listed).then_some(next), visited as u64)
     }
@@ -1502,12 +1524,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         gone.dedup();
         let mut sources = core::mem::take(&mut cache.page_blocks);
         let mut unlinks = Vec::new();
+        let (mut visited, mut relevant) = (0u64, 0u64);
         for page in gone.chunk_by(|a, b| a.0 == b.0) {
             sources.extend(cache.index.page(page[0].0));
+            let mut guest: Vec<u64> = page.iter().map(|&(_, pc)| pc >> 12).collect();
+            guest.sort_unstable();
+            guest.dedup();
             for &source in &sources {
                 if detached(source) {
                     continue;
                 }
+                visited += 1;
+                relevant += u64::from(guest.binary_search(&(blocks[source].pc >> 12)).is_ok());
                 let record = blocks.record(source);
                 for (position, exit) in blocks[source].successors.iter().enumerate() {
                     if record.chained(position)
@@ -1524,6 +1552,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             sources.clear();
         }
         cache.page_blocks = sources;
+        self.code.events.walk(board::Walk::DetachVisited, visited);
+        self.code.events.walk(board::Walk::DetachRelevant, relevant);
         // One store each, which a core running the exit may meet.
         self.unlink_points(unlinks);
         // Lookup entries go by the frames their keys name, in runs.
