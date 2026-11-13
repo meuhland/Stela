@@ -626,7 +626,7 @@ pub struct GuestNetwork {
 
 /// Frames read from the host adapter in one service turn at most, outside
 /// the devices' lock: the rest wait in the adapter's ring.
-const RECEIVE_BURST: usize = 64;
+const RECEIVE_BURST: usize = 256;
 
 impl GuestNetwork {
     /// The second adapter when the mount's own client (`wants_client`)
