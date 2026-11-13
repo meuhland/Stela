@@ -2152,7 +2152,9 @@ fn board_code(
         " board={}M/{}/{} retired={} forced={} lost={} redone/refused={}/{} \
          grace_waits={}/{}{churn} \
          retire_longest=us/steps:{}/{}{targets} \
-         lock=acquired/contended/waited_us/longest_us:{}/{}/{}/{}{sites}",
+         lock=acquired/contended/waited_us/longest_us:{}/{}/{}/{}{sites} \
+         walks=cut/relevant:{}/{} detach/relevant:{}/{} unindex/listed:{}/{} \
+         sampled/listed/pages:{}/{}/{}",
         now.window >> 20,
         now.parts,
         now.generation,
@@ -2169,6 +2171,15 @@ fn board_code(
         now.lock.contended.saturating_sub(was.lock.contended),
         micros(now.lock.waited.saturating_sub(was.lock.waited)),
         micros(now.lock.longest),
+        now.walks[0],
+        now.walks[1],
+        now.walks[2],
+        now.walks[3],
+        now.walks[4],
+        now.walks[5],
+        now.walks[8],
+        now.walks[6],
+        now.walks[7],
     )
 }
 
