@@ -47,7 +47,8 @@ const CAPABILITIES: u8 = 0x01;
 /// The NCM functional descriptor (5.2.1): bcdNcmVersion 1.00.
 pub(super) const FUNCTIONAL: [u8; 6] = [6, 0x24, 0x1a, 0x00, 0x01, CAPABILITIES];
 
-/// dwNtbInMaxSize and dwNtbOutMaxSize: room for ten full frames.
+/// dwNtbInMaxSize and dwNtbOutMaxSize: room for forty full frames, under
+/// NTB16's 64 KiB.
 pub const BLOCK_BYTES: usize = 60 * 1024;
 /// The smallest input size a host may set for NTB16 (6.2.7).
 const MIN_BLOCK: usize = 2048;
@@ -708,8 +709,8 @@ mod tests {
             blocks += 1;
         }
         assert_eq!(received, NCM_QUEUE_FRAMES);
-        // Ten full frames fit in 16 KiB.
-        assert_eq!(blocks, NCM_QUEUE_FRAMES.div_ceil(10));
+        // Forty full frames fit in 60 KiB.
+        assert_eq!(blocks, NCM_QUEUE_FRAMES.div_ceil(40));
         // A smaller input size bounds the block.
         transfer(&mut e, setup(0x01, SET_INTERFACE, 0, 1, 0), &[]).unwrap();
         transfer(&mut e, setup(0x21, 0x86, 0, 0, 4), &2048u32.to_le_bytes()).unwrap();
