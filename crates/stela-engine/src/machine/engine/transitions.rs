@@ -655,7 +655,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     ) -> Option<u64> {
         let (kind, immediate) = transition_word(word)?;
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
-        if !chain::is_direct_exit(&native[site..], GuestAddress(pc), ExitKind::System) {
+        if !super::exits_to(&native[site..], pc, ExitKind::System) {
             return None;
         }
         // GEXIT and ERET read the count (`Places::lines_until`), and every

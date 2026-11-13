@@ -98,6 +98,8 @@ pub(crate) struct Settings {
     pub watches: Vec<(u64, u64)>,
     /// `--profile`: time each engine phase, as the home machine does.
     pub step_timing: bool,
+    /// `--page-relative`, as the home machine compiles.
+    pub page_relative: bool,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -129,6 +131,7 @@ pub(crate) fn spawn<H: Host>(
             traces: settings.traces.clone(),
             watches: settings.watches.clone(),
             step_timing: settings.step_timing,
+            page_relative: settings.page_relative,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -151,6 +154,7 @@ struct Pe {
     traces: Vec<u64>,
     watches: Vec<(u64, u64)>,
     step_timing: bool,
+    page_relative: bool,
 }
 
 impl Pe {
@@ -163,6 +167,7 @@ impl Pe {
             traces,
             watches,
             step_timing,
+            page_relative,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -185,6 +190,7 @@ impl Pe {
             .start(cpu, owner.host(), devices, pe)
             .unwrap_or_else(|error| output::fatal(error));
         machine.set_step_timing(step_timing);
+        machine.set_page_relative(page_relative);
         if step_timing {
             host::pmu::start(pe);
         }

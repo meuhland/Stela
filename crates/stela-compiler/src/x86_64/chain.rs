@@ -66,7 +66,7 @@
 //! block's first instruction would.
 use crate::x86_64::asm::{
     Alu, BitTest, Code, Cond,
-    Gpr::{self, R8, R9, R10, R11, Rax, Rcx, Rdx},
+    Gpr::{self, R8, R9, R10, R11, Rax, Rcx, Rdi, Rdx},
     Mem, ShiftOp,
     Size::{self, Dword, Qword},
 };
@@ -80,9 +80,25 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
-/// Bytes in a direct exit: `movabs rax, target` and a [`DYNAMIC_EXIT_BYTES`]
-/// exit.
-pub const DIRECT_EXIT_BYTES: usize = 10 + DYNAMIC_EXIT_BYTES;
+/// Bytes in a direct exit: `movabs rax, target`, its [`BASE_BYTES`] base
+/// slot and a [`DYNAMIC_EXIT_BYTES`] exit.
+pub const DIRECT_EXIT_BYTES: usize = ADDRESS_BYTES + DYNAMIC_EXIT_BYTES;
+/// Bytes of a direct exit's target: the MOVABS and its base slot.
+pub const ADDRESS_BYTES: usize = 10 + BASE_BYTES;
+/// Bytes of a direct exit's base slot, after its MOVABS: [`BASE_ADD`] in a
+/// page-relative block (`NativeSystem::page_relative`), whose MOVABS holds
+/// the target's offset from the block's page, else [`BASE_NOP`]. One size
+/// for every exit, so that the patch point lies where every exit's does:
+/// whatever follows (a link, a cell, a tail, the engine) finds the target
+/// whole in RAX.
+pub const BASE_BYTES: usize = 7;
+/// `add rax,[rdi+page_base]` (`GuestState::page_base`).
+pub const BASE_ADD: [u8; BASE_BYTES] = {
+    let at = (core::mem::offset_of!(crate::GuestState, page_base) as u32).to_le_bytes();
+    [0x48, 0x03, 0x87, at[0], at[1], at[2], at[3]]
+};
+/// A 7-byte NOP (Intel SDM vol. 2, NOP).
+pub const BASE_NOP: [u8; BASE_BYTES] = [0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00];
 /// Bytes of a `jmp rel32`: what an install writes over the start of a
 /// direct exit before the code is reachable.
 pub const JUMP_BYTES: usize = 5;
@@ -1887,7 +1903,7 @@ const ENTRY_TARGETS: i32 = core::mem::offset_of!(LookupEntry, targets) as i32;
 /// an address its patch point does not suit is aligned before it runs
 /// ([`align_direct_exit`]); [`is_direct_exit`] accepts every padding.
 pub fn direct_exit(target: GuestAddress, kind: impl Into<ExitWord>) -> [u8; DIRECT_EXIT_BYTES] {
-    direct_exit_padded(target, kind.into().encoded(), 0)
+    direct_exit_padded(target, kind.into().encoded(), 0, BASE_NOP)
 }
 
 /// [`direct_exit`] for host address `at`, its patch point
@@ -1897,15 +1913,26 @@ pub fn direct_exit_at(
     target: GuestAddress,
     kind: impl Into<ExitWord>,
 ) -> [u8; DIRECT_EXIT_BYTES] {
-    direct_exit_padded(target, kind.into().encoded(), patch_pad(at + 15))
+    direct_exit_padded(
+        target,
+        kind.into().encoded(),
+        patch_pad(at + ADDRESS_BYTES as u64 + 5),
+        BASE_NOP,
+    )
 }
 
-fn direct_exit_padded(target: GuestAddress, word: u32, pad: usize) -> [u8; DIRECT_EXIT_BYTES] {
+fn direct_exit_padded(
+    target: GuestAddress,
+    word: u32,
+    pad: usize,
+    base: [u8; BASE_BYTES],
+) -> [u8; DIRECT_EXIT_BYTES] {
     const MOVABS_RAX: [u8; 2] = [0x48, 0xb8];
     let mut bytes = [0; DIRECT_EXIT_BYTES];
     bytes[..2].copy_from_slice(&MOVABS_RAX);
     bytes[2..10].copy_from_slice(&target.0.to_le_bytes());
-    bytes[10..].copy_from_slice(&exit_word_bytes(word, pad));
+    bytes[10..ADDRESS_BYTES].copy_from_slice(&base);
+    bytes[ADDRESS_BYTES..].copy_from_slice(&exit_word_bytes(word, pad));
     bytes
 }
 
@@ -1965,7 +1992,7 @@ pub const fn dynamic_patch(at: u64) -> u64 {
 
 /// The patch point of the direct exit at host address `at`, aligned for it.
 pub const fn direct_patch(at: u64) -> u64 {
-    dynamic_patch(at + 10)
+    dynamic_patch(at + ADDRESS_BYTES as u64)
 }
 
 /// The link slot of `bytes` at host address `at`'s patch point: the jump
@@ -2013,10 +2040,16 @@ fn exit_word_of(bytes: &[u8]) -> Option<u32> {
 }
 
 /// Whether `bytes` are the direct exit to `target` of `kind`, of any
-/// padding.
+/// padding and either base slot ([`BASE_BYTES`]): a page-relative block's
+/// holds the target's offset from its page, which a caller passes as
+/// `target` for it.
 pub fn is_direct_exit(bytes: &[u8], target: GuestAddress, kind: impl Into<ExitWord>) -> bool {
     let word = kind.into().encoded();
-    (0..=MAX_PAD).any(|pad| bytes == direct_exit_padded(target, word, pad))
+    (0..=MAX_PAD).any(|pad| {
+        [BASE_NOP, BASE_ADD]
+            .into_iter()
+            .any(|base| bytes == direct_exit_padded(target, word, pad, base))
+    })
 }
 
 /// Whether `bytes` are the dynamic exit of `kind`, of any padding.
@@ -2030,14 +2063,16 @@ pub fn align_direct_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
     let Some(bytes) = code.get_mut(offset..offset + DIRECT_EXIT_BYTES) else {
         return false;
     };
-    let Some(word) = exit_word_of(&bytes[10..]) else {
+    let Some(word) = exit_word_of(&bytes[ADDRESS_BYTES..]) else {
         return false;
     };
-    if bytes[..2] != [0x48, 0xb8] {
+    if bytes[..2] != [0x48, 0xb8]
+        || (bytes[10..ADDRESS_BYTES] != BASE_NOP && bytes[10..ADDRESS_BYTES] != BASE_ADD)
+    {
         return false;
     }
-    let pad = patch_pad(at + offset as u64 + 15);
-    bytes[10..].copy_from_slice(&exit_word_bytes(word, pad));
+    let pad = patch_pad(at + offset as u64 + ADDRESS_BYTES as u64 + 5);
+    bytes[ADDRESS_BYTES..].copy_from_slice(&exit_word_bytes(word, pad));
     true
 }
 
@@ -2536,9 +2571,10 @@ fn stamp(asm: &mut crate::x86_64::asm::Asm) {
     asm.bind(kept);
 }
 
-/// Bytes in a [`stamped_tail`]: 130 at most, with a 32-bit displacement
+/// Bytes in a [`stamped_tail`]: 143 at most (13 of them its page store,
+/// [`enter_page`]), with a 32-bit displacement
 /// for the stamp of a cell numbered 8 or above.
-pub const STAMPED_TAIL_BYTES: usize = 144;
+pub const STAMPED_TAIL_BYTES: usize = 160;
 
 /// The tail at host address `at` of a hot direct exit to `target` out of
 /// its page, whose stamped cell `number` at `cell` held `block`, entered at
@@ -2675,6 +2711,8 @@ fn stamped_with_policy(
         asm.mov_imm64(R9, named);
         asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R9);
     }
+    // The exit loaded the target in RAX.
+    enter_page(&mut asm);
     let transfer = asm.jmp();
     let distance = relative(at + transfer.end() as u64, entry)?;
     code.patch(transfer.offset(), distance.to_le_bytes());
@@ -2767,7 +2805,17 @@ fn translate(asm: &mut crate::x86_64::asm::Asm, misses: &mut Vec<crate::x86_64::
 
 /// A probe's transfer, counted: into the block at R9.
 fn found(asm: &mut crate::x86_64::asm::Asm) {
+    enter_page(asm);
     asm.jmp_rm(R9);
+}
+
+/// Before a transfer into another page's block, the target in RAX, which
+/// the block does not read: its page, which a page-relative block adds to
+/// its addresses (`GuestState::page_base`). A link in its page leaves it.
+fn enter_page(asm: &mut crate::x86_64::asm::Asm) {
+    const PAGE_BASE: i32 = core::mem::offset_of!(crate::GuestState, page_base) as i32;
+    asm.alu_imm32(Alu::And, Qword, Rax, -(LINK_PAGE as i32));
+    asm.mov_store(Qword, Mem::base(Rdi, PAGE_BASE), Rax);
 }
 
 /// A probe's exit to the engine, with RAX and EDX as the tail left them: the
@@ -2778,7 +2826,7 @@ fn missed(asm: &mut crate::x86_64::asm::Asm) {
 
 /// Bytes in a [`lookup_tail`]: the jump cache's hit, its exhausted
 /// budget's return, and the plain tail ([`TAIL_BYTES`]) of a miss.
-pub const LOOKUP_TAIL_BYTES: usize = 144;
+pub const LOOKUP_TAIL_BYTES: usize = 160;
 // The engine installs a lookup tail where a stamped tail may go.
 const _: () = assert!(LOOKUP_TAIL_BYTES <= STAMPED_TAIL_BYTES);
 
@@ -2848,6 +2896,7 @@ fn lookup_tail_with_policy(
     asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    enter_page(&mut asm);
     asm.jmp_rm(entry(JUMP_CODE));
     // A spent budget returns as the probe's would, its word in EDX whole.
     asm.bind(exhausted);
