@@ -451,9 +451,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 };
             }
         }
-        Err(self.unsupported(RequirementKind::Native(
-            "a native address check failed where no access faults",
-        )))
+        // The native check and this one disagree: seen once, in an EL0 app
+        // on 26B123, where stopping the PE froze the whole machine. Report
+        // the instruction, and run its page in the translated variant, whose
+        // every access the host's helper checks in software; a page already
+        // translated stops as before, naming the instruction.
+        let requirement = |machine: &Self| {
+            let mut requirement = machine.requirement(RequirementKind::Instruction {
+                word,
+                detail: alloc::format!(
+                    "a native address check failed where no access faults ({:?}, trap {}, \
+                     at native offset {:#x} of the block at {:#x}, address {:#x})",
+                    fault.cause,
+                    fault.trap,
+                    fault.offset,
+                    machine.code.blocks[index].pc,
+                    fault.address,
+                ),
+            });
+            requirement.address = Some(fault.address);
+            requirement
+        };
+        self.degrade(requirement(self));
+        match self.run_translated(index, pc, fault.address) {
+            Ok(()) => {
+                self.timed_check(step_timing::Check::Translated);
+                Ok(())
+            }
+            Err(_) => Err(super::Stop::Unsupported(requirement(self))),
+        }
     }
 
     /// Run the instruction at `pc`, whose access to the tagged `address`
