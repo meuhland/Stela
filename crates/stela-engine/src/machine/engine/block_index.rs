@@ -1,10 +1,15 @@
-//! The installed blocks by physical page: a page's slots sorted by page
-//! offset and a tag of the PC, whose blocks hold the rest of each key. The
-//! tag keeps a lookup among many copies of one frame mapped at other PCs
-//! (each process's own slide of the same binary) from loading each copy. A block costs a few
-//! bytes here, and forgetting a page forgets its blocks at once. Each fetch
-//! a lookup misses comes here, so a direct-mapped cache of pages answers
-//! most without walking the ordered map, which sweeps keep their place in.
+//! The installed blocks by physical page: a page's slots sorted by a tag of
+//! the guest page they run at, then page offset, whose blocks hold the rest
+//! of each key. A frame mapped at other PCs (each process's own slide of
+//! the same binary; a build's compiler has some twenty at once) keeps each
+//! copy's blocks in a run of its own: a lookup loads only its own copy's
+//! blocks, and the walks of a retirement or detach, which a link from
+//! another guest page can never concern ([`super::board::Record::chained`]
+//! links stay in their page), visit only the runs of the pages they are
+//! for ([`BlockIndex::page_tags_part`]). A block costs a few bytes here,
+//! and forgetting a page forgets its blocks at once. Each fetch a lookup
+//! misses comes here, so a direct-mapped cache of pages answers most
+//! without walking the ordered map, which sweeps keep their place in.
 //!
 //! The index changes under the board's code lock; a [`Finder`] beside it
 //! answers a fetch without that lock.
@@ -25,8 +30,9 @@ const NO_FRAME: u64 = 1;
 /// The entries a forgotten page's list keeps room for.
 const KEPT_ENTRIES: usize = 16;
 
-/// One block of a page: its offset, a tag of its PC ([`pc_tag`]) and its
-/// slot. The tag takes the room alignment left, so an entry is 8 bytes.
+/// One block of a page: its offset, a tag of its guest page
+/// ([`page_tag`]) and its slot. The tag takes the room alignment left, so
+/// an entry is 8 bytes.
 #[derive(Clone, Copy)]
 struct Entry {
     offset: u16,
@@ -35,15 +41,41 @@ struct Entry {
 }
 
 impl Entry {
+    /// Runs by guest page, then by offset: a page's offset and its guest
+    /// page give the PC, so a run's blocks of one offset differ only in
+    /// variant (or in a tag both pages share).
     fn order(&self) -> (u16, u16) {
-        (self.offset, self.tag)
+        (self.tag, self.offset)
     }
 }
 
-/// A PC's 16-bit tag: blocks of one offset at different PCs mostly differ
-/// in it.
-fn pc_tag(pc: u64) -> u16 {
-    ((pc >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as u16
+/// A 16-bit tag of the guest page of `pc`: copies of one frame at other
+/// PCs mostly differ in it. Two pages of one tag only make a walk visit
+/// more than it needs.
+pub(super) fn page_tag(pc: u64) -> u16 {
+    ((pc / FETCH_PAGE).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as u16
+}
+
+/// The sorted, distinct tags of the guest pages of `pcs`.
+pub(super) fn page_tags(pcs: impl IntoIterator<Item = u64>) -> Vec<u16> {
+    let mut tags: Vec<u16> = pcs.into_iter().map(page_tag).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    tags
+}
+
+/// The runs of `entries` whose tags `tags` (sorted) names, as position
+/// ranges in ascending order.
+fn tag_runs(entries: &[Entry], tags: &[u16]) -> Vec<core::ops::Range<usize>> {
+    let mut runs = Vec::with_capacity(tags.len());
+    for &tag in tags {
+        let start = entries.partition_point(|entry| entry.tag < tag);
+        let end = start + entries[start..].partition_point(|entry| entry.tag == tag);
+        if start < end {
+            runs.push(start..end);
+        }
+    }
+    runs
 }
 
 /// The finder's hash of a block's physical address and PC.
@@ -104,20 +136,15 @@ impl BlockIndex {
         self.pages.get(&frame).map(|&entries| entries as usize)
     }
 
-    /// The entries of `physical`'s page at its offset, which blocks of
-    /// other PCs or variants may share.
-    fn at(&mut self, physical: u64) -> Option<&[Entry]> {
-        let (frame, offset) = split(physical);
+    /// The entries of the page at `frame`, noted in the front cache.
+    fn list(&mut self, frame: u64) -> Option<&[Entry]> {
         let page = self.page_of(frame)?;
         self.front[Self::front_slot(frame)] = (frame, page as u32);
-        let entries = &self.entries[page];
-        let start = entries.partition_point(|entry| entry.offset < offset);
-        let count = entries[start..].partition_point(|entry| entry.offset == offset);
-        Some(&entries[start..start + count])
+        Some(&self.entries[page])
     }
 
     /// The block at `pc`, `physical` and `variant`: only the entries of
-    /// its offset with its PC's tag load their blocks.
+    /// its guest page's run at its offset load their blocks.
     pub(super) fn get(
         &mut self,
         blocks: &impl Index<usize, Output = Block>,
@@ -125,12 +152,13 @@ impl BlockIndex {
         physical: u64,
         variant: VariantId,
     ) -> Option<usize> {
-        let tag = pc_tag(pc);
-        let entries = self.at(physical)?;
-        let start = entries.partition_point(|entry| entry.tag < tag);
+        let (frame, offset) = split(physical);
+        let key = (page_tag(pc), offset);
+        let entries = self.list(frame)?;
+        let start = entries.partition_point(|entry| entry.order() < key);
         entries[start..]
             .iter()
-            .take_while(|entry| entry.tag == tag)
+            .take_while(|entry| entry.order() == key)
             .map(|entry| entry.slot as usize)
             .find(|&slot| blocks[slot].pc == pc && blocks[slot].variant == variant)
     }
@@ -147,19 +175,34 @@ impl BlockIndex {
         variant: VariantId,
     ) -> Option<bool> {
         let mut shared = None;
-        let tag = pc_tag(pc);
-        for entry in self.at(physical)? {
-            // Another tag is another PC, without loading its block.
-            if entry.tag != tag {
-                return Some(true);
+        let (frame, offset) = split(physical);
+        let tag = page_tag(pc);
+        let entries = self.list(frame)?;
+        // Each guest page's run at the offset.
+        let mut run = 0;
+        while run < entries.len() {
+            let run_tag = entries[run].tag;
+            let end = run + entries[run..].partition_point(|entry| entry.tag == run_tag);
+            let part = &entries[run..end];
+            let start = part.partition_point(|entry| entry.offset < offset);
+            for entry in part[start..]
+                .iter()
+                .take_while(|entry| entry.offset == offset)
+            {
+                // Another tag is another guest page, so another PC, without
+                // loading its block.
+                if entry.tag != tag {
+                    return Some(true);
+                }
+                let other = &blocks[entry.slot as usize];
+                if other.pc != pc {
+                    return Some(true);
+                }
+                if other.variant != variant {
+                    shared = Some(false);
+                }
             }
-            let other = &blocks[entry.slot as usize];
-            if other.pc != pc {
-                return Some(true);
-            }
-            if other.variant != variant {
-                shared = Some(false);
-            }
+            run = end;
         }
         shared
     }
@@ -190,6 +233,34 @@ impl BlockIndex {
         (part.iter().map(|entry| entry.slot as usize), entries.len())
     }
 
+    /// The blocks of the page holding `physical` that run at guest pages of
+    /// the sorted `tags` ([`page_tags`]), at positions `from..` of their
+    /// runs taken in turn, at most `most`, and the runs' length: what a
+    /// walk for blocks of those pages visits, the frame's other copies
+    /// left out.
+    pub(super) fn page_tags_part(
+        &self,
+        physical: u64,
+        tags: &[u16],
+        from: usize,
+        most: usize,
+    ) -> (Vec<usize>, usize) {
+        let (frame, _) = split(physical);
+        let entries: &[Entry] = self
+            .page_of(frame)
+            .map_or(&[], |page| self.entries[page].as_slice());
+        let runs = tag_runs(entries, tags);
+        let listed = runs.iter().map(|run| run.len()).sum();
+        let slots = runs
+            .into_iter()
+            .flat_map(|run| entries[run].iter())
+            .skip(from)
+            .take(most)
+            .map(|entry| entry.slot as usize)
+            .collect();
+        (slots, listed)
+    }
+
     /// Find the block in `slot` by its key, in place of any block of the
     /// key: the slot of the block it replaces.
     pub(super) fn insert(
@@ -212,11 +283,11 @@ impl BlockIndex {
             }
         };
         let entries = &mut self.entries[page];
-        let tag = pc_tag(block.pc);
-        let start = entries.partition_point(|entry| entry.order() < (offset, tag));
+        let tag = page_tag(block.pc);
+        let start = entries.partition_point(|entry| entry.order() < (tag, offset));
         let same = entries[start..]
             .iter()
-            .take_while(|entry| entry.order() == (offset, tag))
+            .take_while(|entry| entry.order() == (tag, offset))
             .position(|entry| {
                 let other = &blocks[entry.slot as usize];
                 other.pc == block.pc && other.variant == block.variant
@@ -270,19 +341,48 @@ impl BlockIndex {
 
     /// Stop finding the blocks of the page at `frame` whose slots `marked`
     /// names, in one pass over the page.
+    #[cfg(test)]
     pub(super) fn forget_marked(&mut self, frame: u64, marked: impl Fn(u32) -> bool) {
+        self.forget_marked_in(frame, None, marked)
+    }
+
+    /// [`Self::forget_marked`] for blocks only in the runs of the sorted
+    /// `tags`, or in all of them with none: the rest of the page moves up,
+    /// unvisited.
+    pub(super) fn forget_marked_in(
+        &mut self,
+        frame: u64,
+        tags: Option<&[u16]>,
+        marked: impl Fn(u32) -> bool,
+    ) {
         let Some(page) = self.page_of(frame) else {
             return;
         };
         let entries = &mut self.entries[page];
+        let runs = match tags {
+            Some(tags) => tag_runs(entries, tags),
+            None => core::iter::once(0..entries.len()).collect(),
+        };
+        let Some(first) = runs.first().map(|run| run.start) else {
+            return;
+        };
         let finder = &self.finder;
-        entries.retain(|entry| {
-            let gone = marked(entry.slot);
-            if gone {
-                finder.unlink(entry.slot);
+        let mut write = first;
+        let mut runs = runs.into_iter().peekable();
+        for read in first..entries.len() {
+            while runs.peek().is_some_and(|run| run.end <= read) {
+                runs.next();
             }
-            !gone
-        });
+            let entry = entries[read];
+            let visited = runs.peek().is_some_and(|run| run.contains(&read));
+            if visited && marked(entry.slot) {
+                finder.unlink(entry.slot);
+                continue;
+            }
+            entries[write] = entry;
+            write += 1;
+        }
+        entries.truncate(write);
         if entries.is_empty() {
             self.forget_page(frame);
         }
@@ -540,6 +640,87 @@ mod tests {
         let slot = push(blocks, block);
         assert_eq!(index.insert(blocks, slot), None);
         slot
+    }
+
+    /// A frame mapped at many guest pages keeps each page's blocks in a run:
+    /// a walk for some pages visits only theirs, and forgetting marked
+    /// blocks there keeps the others' and every unmarked block findable.
+    #[test]
+    fn a_frames_copies_at_other_pages_keep_runs_of_their_own() {
+        const FRAME: u64 = 0x8000_0000;
+        let mut blocks = Vec::new();
+        let mut index = BlockIndex::new();
+        let id = VariantId;
+        let copies: Vec<u64> = (0..20u64)
+            .map(|copy| 0x1_0000_0000 + copy * 0x10_0000)
+            .collect();
+        let mut slots = Vec::new();
+        for &base in &copies {
+            for offset in [0x10, 0x40, 0x80] {
+                slots.push(add(
+                    &mut blocks,
+                    &mut index,
+                    block(base + offset, FRAME + offset, 0),
+                ));
+            }
+        }
+        for (copy, &base) in copies.iter().enumerate() {
+            for (n, offset) in [0x10, 0x40, 0x80].into_iter().enumerate() {
+                assert_eq!(
+                    index.get(&blocks, base + offset, FRAME + offset, id(0)),
+                    Some(slots[copy * 3 + n])
+                );
+            }
+        }
+        assert_eq!(
+            index.sharing(&blocks, copies[3] + 0x40, FRAME + 0x40, id(0)),
+            Some(true)
+        );
+
+        // Two copies' pages: their six blocks, from any position on.
+        let tags = page_tags([copies[2] + 0x10, copies[7] + 0x80]);
+        let (walked, listed) = index.page_tags_part(FRAME, &tags, 0, usize::MAX);
+        assert_eq!(listed, 6);
+        let mut expected: Vec<usize> = [2, 7]
+            .iter()
+            .flat_map(|&copy| slots[copy * 3..copy * 3 + 3].to_vec())
+            .collect();
+        let mut sorted = walked.clone();
+        sorted.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(sorted, expected);
+        let (rest, _) = index.page_tags_part(FRAME, &tags, 4, usize::MAX);
+        assert_eq!(rest, walked[4..]);
+        let (part, _) = index.page_tags_part(FRAME, &tags, 1, 2);
+        assert_eq!(part, walked[1..3]);
+
+        // Forget one block of copy 2 and all of copy 7, visiting their runs.
+        let gone = [
+            slots[2 * 3 + 1],
+            slots[7 * 3],
+            slots[7 * 3 + 1],
+            slots[7 * 3 + 2],
+        ];
+        index.forget_marked_in(FRAME, Some(&tags), |slot| gone.contains(&(slot as usize)));
+        for (copy, &base) in copies.iter().enumerate() {
+            for (n, offset) in [0x10, 0x40, 0x80].into_iter().enumerate() {
+                let slot = slots[copy * 3 + n];
+                let found = index.get(&blocks, base + offset, FRAME + offset, id(0));
+                assert_eq!(
+                    found,
+                    (!gone.contains(&slot)).then_some(slot),
+                    "copy {copy} offset {offset:#x}"
+                );
+            }
+        }
+        assert_eq!(index.page(FRAME).count(), 60 - gone.len());
+        // A mark outside the runs is not visited.
+        let other = slots[0];
+        index.forget_marked_in(FRAME, Some(&tags), |slot| slot as usize == other);
+        assert_eq!(
+            index.get(&blocks, copies[0] + 0x10, FRAME + 0x10, id(0)),
+            Some(other)
+        );
     }
 
     #[test]
