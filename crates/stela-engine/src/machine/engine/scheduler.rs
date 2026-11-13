@@ -299,6 +299,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.enter_events();
         self.cpu.state.anchors = self.anchors();
         self.cpu.state.lower_limit = self.lower_limit();
+        // A page-relative block's addresses add the page it runs at
+        // (`NativeSystem::page_relative`); a native transfer into another
+        // page's block sets it again.
+        self.cpu.state.page_base = page_base(self.code.blocks[index].pc);
         let entered = self.timing_start();
         // SAFETY: installed by this machine since the last discard, for the system-mode block ABI;
         // chained blocks and thunks too.
@@ -1124,4 +1128,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);
         Some(installed.0 as u64)
     }
+}
+
+/// [`stela_compiler::GuestState::page_base`] for a block at `pc`: its fetch
+/// page.
+pub(super) fn page_base(pc: u64) -> stela_compiler::PageBase {
+    stela_compiler::PageBase(pc & !(super::FETCH_PAGE - 1))
 }

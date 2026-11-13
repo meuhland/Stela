@@ -1022,6 +1022,10 @@ fn run_machine<H: Host>(
         ));
     }
     machine.set_step_timing(options.profile);
+    machine.set_page_relative(options.page_relative);
+    if options.page_relative {
+        output::arguments(format_args!("ENGINE page-relative code\n"));
+    }
     if options.profile {
         host::pmu::start(machine.processor());
     }
