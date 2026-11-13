@@ -612,13 +612,14 @@ impl GuestNetwork {
     }
 
     /// The beat report's line: the frames the guest adapter moved each way
-    /// and dropped (oversized, filtered and overflowed), so a run shows
-    /// whether traffic moves.
+    /// and dropped (oversized, filtered and overflowed), and the NCM blocks
+    /// from the guest that did not decode, so a run shows whether traffic
+    /// moves.
     pub fn report(&self) {
         let counters = self.counters;
         output::arguments(format_args!(
             "GUEST NETWORK frames link={} to_host={} to_guest={} drops={} oversized={} \
-             filtered={} overflowed={}\n",
+             filtered={} overflowed={} malformed={}\n",
             match self.up {
                 Some(true) => "up",
                 Some(false) => "down",
@@ -629,7 +630,8 @@ impl GuestNetwork {
             counters.oversized + counters.filtered + counters.overflowed,
             counters.oversized,
             counters.filtered,
-            counters.overflowed
+            counters.overflowed,
+            counters.malformed
         ));
     }
 
