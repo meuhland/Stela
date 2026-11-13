@@ -537,6 +537,9 @@ pub struct Statistics {
     /// Block table entries left for a later fetch because another PE held
     /// the code lock.
     pub target_skips: u64,
+    /// Dynamic exits left on their lookup for a later exit because another
+    /// PE held the code lock.
+    pub dynamic_skips: u64,
     /// Exits out of their page given a stamped tail
     /// ([`stela_compiler::x86_64::chain::stamped_tail`]).
     pub stamped_tails: u64,
@@ -753,6 +756,7 @@ impl core::ops::AddAssign for Statistics {
             links,
             link_skips,
             target_skips,
+            dynamic_skips,
             stamped_tails,
             predicted_tails,
             stamped_in_use,
@@ -920,6 +924,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.links, links),
             (&mut self.link_skips, link_skips),
             (&mut self.target_skips, target_skips),
+            (&mut self.dynamic_skips, dynamic_skips),
             (&mut self.stamped_tails, stamped_tails),
             (&mut self.predicted_tails, predicted_tails),
             (&mut self.unlinks, unlinks),
