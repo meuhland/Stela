@@ -31,7 +31,12 @@ pub const HEAP_CEILING: u64 = 16 * GIB;
 /// both under the 2304 MiB the floor keeps past its 512 MiB window. (A
 /// sixteenth, 1816 MiB, was once too little for a 16 GiB guest, under
 /// today's floor.)
-const HEAP_SHARE: u64 = 24;
+///
+/// A sixth: a 32 GiB host with a 784 MiB code window peaked at 2909 MiB
+/// carved of the 3072 MiB floor heap, fragmented to 30-50 MiB extents, and
+/// stopped on an allocation (26B123, a desktop with Safari and Parsec),
+/// while its 26.7 GiB guest kept 95% of its RAM free.
+const HEAP_SHARE: u64 = 6;
 /// Heap bytes per byte of the board's code window: the shared block records,
 /// successors, recovery rows, index and lookup of the blocks it holds,
 /// once for the board since the block store is shared. An 8-PE 26A434
