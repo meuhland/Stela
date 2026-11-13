@@ -2733,6 +2733,19 @@ fn start_devices(
                 host::completion_signal(bsp.processors[bsp.selected[0] as usize].apic_id);
             storage_handoff.network =
                 host::network_signal(bsp.processors[bsp.selected[0] as usize].apic_id);
+            // The guest network's receive signal moves, once the guest runs,
+            // to the last PE's core: macOS runs the lower PEs first, and the
+            // last one mostly waits, so takes an interrupt at once.
+            let idle_network_signal = options
+                .native_cores
+                .or(options.guest_pes)
+                .map(|pes| pes.min(bsp.core_count as usize))
+                .and_then(|pes| pes.checked_sub(1))
+                .filter(|&slot| slot > 0)
+                .and_then(|slot| {
+                    let apic = bsp.processors[bsp.selected[slot] as usize].apic_id;
+                    host::network_signal(apic).map(|message| (message, apic))
+                });
             #[cfg(feature = "diagnostics")]
             if options.audio_check.is_some() {
                 // The audio check keeps the final slice even after shutdown.
@@ -2930,7 +2943,7 @@ fn start_devices(
             let guest_network = options
                 .guest_network
                 .then(|| {
-                    network::GuestNetwork::open(&mut links, wants_network)
+                    network::GuestNetwork::open(&mut links, wants_network, idle_network_signal)
                         .inspect_err(|error| {
                             output::arguments(format_args!("guest network refusal: {error}\n"));
                             // Optional: macOS boots without it.

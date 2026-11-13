@@ -395,6 +395,12 @@ impl Link for Adapter {
             Self::RealtekWifi(device) => device.signals(),
         }
     }
+    fn retarget(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
+        match self {
+            Self::Virtio(device) => device.retarget(message),
+            _ => false,
+        }
+    }
     fn due_us(&self) -> Option<u64> {
         match self {
             #[cfg(feature = "native-acpi")]

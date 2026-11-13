@@ -123,6 +123,11 @@ impl Link for RootLink {
     fn signals(&self) -> bool {
         self.device.signals()
     }
+    fn retarget(&mut self, message: stela_drivers::bus::irq::MsiMessage) -> bool {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::enter(self.root) };
+        self.device.retarget(message)
+    }
     fn carrier_wait_us(&self) -> u64 {
         self.device.carrier_wait_us()
     }
@@ -588,6 +593,11 @@ pub struct GuestNetwork {
     /// Frames read from the host adapter that the guest's receive queue
     /// had no room for yet, delivered first at the next turn.
     received: alloc::collections::VecDeque<Vec<u8>>,
+    /// Where the adapter's receive signal goes once the guest's link is
+    /// up: a core whose PE mostly waits, rather than the boot PE's, which
+    /// takes interrupts only between its slices (`host::network_signal`).
+    /// Taken at the first link up, when every PE runs.
+    retarget: Option<(stela_drivers::bus::irq::MsiMessage, u64)>,
 }
 
 /// Frames read from the host adapter in one service turn at most, outside
@@ -597,7 +607,11 @@ const RECEIVE_BURST: usize = 256;
 impl GuestNetwork {
     /// The second adapter when the mount's own client (`wants_client`)
     /// keeps the first, otherwise the first.
-    pub fn open(links: &mut Links, wants_client: bool) -> Result<Self> {
+    pub fn open(
+        links: &mut Links,
+        wants_client: bool,
+        retarget: Option<(stela_drivers::bus::irq::MsiMessage, u64)>,
+    ) -> Result<Self> {
         let index = usize::from(wants_client);
         if links.devices.len() <= index {
             return Err(refuse!(
@@ -618,6 +632,7 @@ impl GuestNetwork {
             counters: Default::default(),
             refused: false,
             received: alloc::collections::VecDeque::new(),
+            retarget,
         })
     }
 
@@ -630,6 +645,13 @@ impl GuestNetwork {
         let up = status.is_some_and(|(up, _)| up);
         if let Some((_, counters)) = status {
             self.counters = counters;
+        }
+        if up && let Some((message, apic)) = self.retarget.take() {
+            let moved = self.link.retarget(message);
+            output::arguments(format_args!(
+                "GUEST NETWORK receive signal {} processor apic={apic}\n",
+                if moved { "moved to" } else { "stays: no MSI-X entry for" }
+            ));
         }
         if self.up != Some(up) {
             self.up = Some(up);
