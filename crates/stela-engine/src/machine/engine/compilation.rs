@@ -377,7 +377,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             board::Events::count(&code.events.targets_deferred);
             return false;
         }
-        let mut cache = code.cache_at(board::LockSite::Target);
+        // An entry is an optimization the next fetch of the block can add as
+        // well: with the lock held elsewhere this fetch does not wait for it
+        // and gives its attempt back ([`board::Record::unremember`]).
+        let Some(mut cache) = code.try_cache_at(board::LockSite::Target) else {
+            code.blocks.record(index).unremember();
+            self.statistics.target_skips += 1;
+            return false;
+        };
         insert_target(code, &mut cache, pc, index, slot, target)
     }
 

@@ -1016,6 +1016,13 @@ impl Record {
         let tries = self.remembers.fetch_add(1, Ordering::Relaxed);
         tries < REMEMBERS_FREE || tries.is_multiple_of(REMEMBER_EVERY)
     }
+
+    /// Give back the attempt [`Self::remember`] allowed and that did not
+    /// take place (the lock was held elsewhere): the next fetch tries again
+    /// as this one would have.
+    pub(super) fn unremember(&self) {
+        self.remembers.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The board's blocks: slot numbers from [`Slots`] and a [`Record`] per
