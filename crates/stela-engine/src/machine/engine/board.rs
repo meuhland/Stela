@@ -666,6 +666,22 @@ impl Code {
         self.cache_at(LockSite::Other)
     }
 
+    /// [`Self::cache_at`] only while no other PE holds the lock: `None`
+    /// otherwise. For work a later turn can do as well (a link), which
+    /// should not wait: under a launch's compile load the lock is taken by
+    /// some PE most of the time, and each wait stops a PE.
+    pub(super) fn try_cache_at(&self, site: LockSite) -> Option<CacheGuard<'_>> {
+        let site = site as usize;
+        let mut cache = self.cache.try_lock().ok()?;
+        cache.lock.acquired += 1;
+        cache.lock.sites[site].acquired += 1;
+        Some(CacheGuard {
+            guard: cache,
+            site,
+            since: timestamp(),
+        })
+    }
+
     /// The board's code lock, counted ([`LockCounts`]) for `site`.
     pub(super) fn cache_at(&self, site: LockSite) -> CacheGuard<'_> {
         let site = site as usize;
