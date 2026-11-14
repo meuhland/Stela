@@ -2730,11 +2730,15 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
     line.push_str(&format!(" classes={}", classes.join(",")));
     // The size-class slabs, and the bytes of free blocks they keep.
     line.push_str(&format!(" slabs={}/{}M", heap.slabs, heap.slab_free >> 20));
-    // Allocations that found no memory, which fallible callers survive, and
-    // whether the heap is low enough that the engine gives memory back.
+    // Allocations that found no memory, which fallible callers survive,
+    // those served once the store let its caches go and the bytes it let
+    // go, and whether the heap is low enough that the engine gives memory
+    // back.
     line.push_str(&format!(
-        " failures={} low={}",
+        " failures={} reclaims={}/{}M low={}",
         crate::ALLOCATOR.failures(),
+        crate::ALLOCATOR.reclaims(),
+        super::translations::reclaimed() >> 20,
         crate::ALLOCATOR.low()
     ));
     output::arguments(format_args!("{line}\n"));
