@@ -328,7 +328,9 @@ bool stela_metal_sampler_states(const void *air, size_t size,
 
 /* Compiles entry against the specialization: NIR whose entry point is
  * main, which stela_metal_release frees, or NULL after reporting why. A
- * visible function compiles only into the functions that link it. */
+ * visible function compiles only into the functions that link it. A
+ * compilation that gave a threadgroup buffer more bytes than its dispatch
+ * set says so in the error's detail, of kind STELA_AIR_OK. */
 nir_shader *stela_metal_compile(const void *air, size_t size, const char *entry,
                                 const struct stela_metal_target *target,
                                 const struct stela_metal_specialization *specialization,
