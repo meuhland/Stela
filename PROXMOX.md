@@ -39,17 +39,21 @@ qm set 117 --memory 32768 --balloon 0 --vga none
 ```
 
 ```bash
-qm set 117 --hostpci0 0000:01:00.0,pcie=1 --usb0 host=413c:301c,usb3=1 --serial0 socket
+qm set 117 --hostpci0 0000:01:00.0,pcie=1,x-vga=1 --usb0 host=413c:301c,usb3=1 --serial0 socket
 ```
 
-The `--usb0` ID above is our Dell keyboard and mouse receiver. Find yours with `lsusb`.
+```bash
+qm set 117 --sata0 local-lvm:vm-117-disk-2,cache=writeback,discard=on,ssd=1,serial=123456DRIVE
+```
 
-The EFI disk must have Secure Boot off. Either create the disk with `pre-enrolled-keys=0`, or turn Secure Boot off in the OVMF setup menu.
+- **USB ID:** the `--usb0` ID above is our Dell keyboard and mouse receiver. Find yours with `lsusb`.
+- **macOS disk:** it goes on SATA, which Stela drives as AHCI. The `serial=` is required. virtio-blk does not work, because the firmware reports no serial for it. We run `cache=unsafe` for speed, but that loses recent writes if the Proxmox host crashes, so `writeback` is the safe choice.
+- **Secure Boot:** it must be off. Either create the EFI disk with `pre-enrolled-keys=0`, or turn Secure Boot off in the OVMF setup menu. Our VM has `pre-enrolled-keys=1` with Secure Boot turned off in the menu.
 
-The stick and the macOS disk go in `args`, because the web UI cannot set either way of attaching them. In `/etc/pve/qemu-server/117.conf`, everything on one line:
+The stick goes in `args`, because the web UI cannot put a USB disk on its own controller. In `/etc/pve/qemu-server/117.conf`, everything on one line:
 
 ```
-args: -cpu host,+invtsc -machine i8042=off -drive file=/dev/pve/vm-117-disk-5,if=none,id=stela-stick,format=raw,cache=none -device qemu-xhci,id=stelaxhci -device usb-storage,bus=stelaxhci.0,drive=stela-stick,removable=on,bootindex=0 -drive file=/dev/pve/vm-117-disk-2,if=none,id=macos,format=raw,cache=writeback,discard=unmap -device nvme,drive=macos,serial=123456DRIVE
+args: -cpu host,+invtsc -machine i8042=off -drive file=/dev/pve/vm-117-disk-5,if=none,id=stela-stick,format=raw,cache=none -device qemu-xhci,id=stelaxhci -device usb-storage,bus=stelaxhci.0,drive=stela-stick,removable=on,bootindex=0
 ```
 
 | Part | Why |
@@ -57,9 +61,10 @@ args: -cpu host,+invtsc -machine i8042=off -drive file=/dev/pve/vm-117-disk-5,if
 | `-cpu host,+invtsc` | Stela's code needs the host's instruction set: SSSE3 and POPCNT failed under QEMU's default `kvm64` CPU. Stela also expects an invariant TSC. |
 | `-machine i8042=off` | Removes QEMU's emulated PS/2 controller. Input comes from the USB devices passed through instead. |
 | `qemu-xhci,id=stelaxhci` and `bootindex=0` | Puts the stick on its own xHCI controller, so Stela can take that controller without disturbing the passed-through input devices, and OVMF boots from it first. |
-| `-device nvme ... serial=...` | Puts the macOS disk on an emulated NVMe drive. The serial is required. virtio-blk does not work, because the firmware reports no serial for it. Do not attach the same disk a second time as `sata0` or `scsi0`. |
 
 You need no vIOMMU (`viommu=`) or `intel-iommu` options.
+
+An emulated NVMe drive also works for the macOS disk: add `-drive file=/dev/pve/vm-117-disk-2,if=none,id=macos,format=raw,cache=writeback,discard=unmap -device nvme,drive=macos,serial=123456DRIVE` to `args`, in place of `sata0`. Never attach the same disk both ways.
 
 **Network:** use a `virtio` NIC, for example `--net0 virtio,bridge=vmbr0`. Stela passes it to macOS as a USB Ethernet adapter.
 
