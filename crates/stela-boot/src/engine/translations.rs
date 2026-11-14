@@ -604,6 +604,47 @@ impl<T> Lock<T> {
         self.held.store(false, Ordering::Release);
         result
     }
+
+    /// [`Self::with`] when the lock is free now; `None` without waiting
+    /// when anyone, this processor included, holds it.
+    fn try_with<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        self.acquired.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `held` excludes every other access until it is released.
+        let result = f(unsafe { &mut *self.value.get() });
+        self.held.store(false, Ordering::Release);
+        Some(result)
+    }
+}
+
+/// The heap's reclaim hook (`Heap::set_reclaim_hook`): a request found no
+/// extent, so the store's parts let go of their decoded records and shared
+/// blocks, which only save work. It runs inside an allocation, perhaps one
+/// a part's own holder makes, so it takes only the parts that are free now.
+/// The bytes the parts had charged for what they let go of.
+pub(super) fn reclaim(_bytes: usize) -> usize {
+    let mut charged = 0;
+    for lock in &STORES {
+        if let Some(Some((records, bytes))) =
+            lock.try_with(|store| store.as_mut().map(Store::release_caches))
+        {
+            // Outside the lock, as every eviction's.
+            drop(records);
+            charged += bytes;
+        }
+    }
+    RECLAIMED.fetch_add(charged as u64, Ordering::Relaxed);
+    charged
+}
+
+/// The bytes [`reclaim`] let go of so far.
+static RECLAIMED: AtomicU64 = AtomicU64::new(0);
+
+/// [`RECLAIMED`], for the heap's lines.
+pub(super) fn reclaimed() -> u64 {
+    RECLAIMED.load(Ordering::Relaxed)
 }
 
 static BOOT: Lock<Option<Boot>> = Lock::new(None);
