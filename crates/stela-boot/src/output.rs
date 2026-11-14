@@ -973,6 +973,9 @@ pub fn stopped_text() -> &'static str {
 }
 
 pub fn fatal(message: impl core::fmt::Display) -> ! {
+    // A remote PE's processor halts at the end, and may wait on the way: its
+    // clock slot must not hold the other PEs' time meanwhile.
+    crate::engine::release_clock_for_fatal();
     let message = alloc::string::ToString::to_string(&message);
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.

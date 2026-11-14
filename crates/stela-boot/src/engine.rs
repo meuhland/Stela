@@ -1383,6 +1383,12 @@ pub(crate) fn starting_host_devices() -> bool {
     storage::starting_devices_here()
 }
 
+/// Before anything a fatal stop may wait for: a remote PE's processor gives
+/// up its clock slot (`parallel::release_clock_for_fatal`).
+pub(crate) fn release_clock_for_fatal() {
+    parallel::release_clock_for_fatal();
+}
+
 /// Unload the GPUs' firmware before a fatal stop, where one can
 /// (`gpu::gate::stop_for_fatal`).
 pub(crate) fn stop_gpus_for_fatal() {
