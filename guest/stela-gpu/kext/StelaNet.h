@@ -3,10 +3,14 @@
  * /arm-io/stela-net0 (stela_contracts::net, generated into stela/net.h).
  *
  * Prototype: a plain ifnet (the BSD network KPI, no IONetworkingFamily
- * vtables) named stn0, which the user configures with ifconfig. Frames move
+ * vtables) named stn0. It reports its link (KEV_DL_LINK_ON/OFF, SIOCGIFMEDIA)
+ * as an Ethernet driver does, so IPConfiguration configures it once asked
+ * (`ipconfig set stn0 DHCP`, which the sandbox patcher's job does); not being
+ * an IONetworkInterface, it is no hardware port in System Settings. Frames move
  * through two virtio split virtqueues the kext allocates: receive buffers of
  * 2 KiB each posted once and reposted as they are harvested, and transmit
- * slots of 2 KiB each that every packet is copied into. When the device
+ * slots of 2 KiB each that every packet is copied into, with a backlog of
+ * packets waiting for slots while the ring is full. When the device
  * offers them, TCP and UDP checksums are offloaded both ways; the guest
  * still segments every frame itself.
  *
@@ -56,10 +60,18 @@ private:
 	/* With txLock held: takes back the transmit slots the device completed. */
 	void reclaimTransmit();
 	errno_t transmit(mbuf_t packet);
+	/* Moves `packet`, if any, and the backlog into free transmit slots. */
+	errno_t pump(mbuf_t packet);
+	/* With txLock held: copies a packet into the next slot, which is free. */
+	bool fillSlot(mbuf_t packet);
+	/* Posts the link's state to the stack. */
+	void reportLink(bool up);
+	/* SIOCGIFMEDIA. */
+	errno_t mediaStatus(void *data);
 	/* Marks the slot's header NEEDS_CSUM when the stack left a checksum partial. */
 	void markPartialChecksum(mbuf_t packet, uint8_t *data, size_t length);
-	/* Writes KICK if the device asked to hear of `queue` moving from `old`. */
-	void kick(Queue *queue, uint16_t old, uint64_t which);
+	/* Writes KICK if the device asked to hear of `queue` moving from `old` to `now`. */
+	void kick(Queue *queue, uint16_t old, uint16_t now, uint64_t which);
 
 	static errno_t ifOutput(ifnet_t interface, mbuf_t packet);
 	static errno_t ifIoctl(ifnet_t interface, unsigned long command, void *data);
@@ -78,6 +90,12 @@ private:
 	Queue tx = {};
 	/* Transmit slots the device has not completed. */
 	uint16_t txInFlight = 0;
+	/* With txLock held: packets waiting for a transmit slot, oldest first. */
+	mbuf_t backlogHead = nullptr;
+	mbuf_t backlogTail = nullptr;
+	uint32_t backlogCount = 0;
+	/* LINK bit 0, as last read. */
+	bool linkUp = false;
 	uint64_t accepted = 0;
 	uint8_t mac[6] = {};
 	ifnet_t ifp = nullptr;
