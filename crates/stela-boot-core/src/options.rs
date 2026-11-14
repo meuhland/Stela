@@ -322,6 +322,10 @@ pub struct System {
     /// each register window backed by a logging stub (`--probe-apcie`), to
     /// record how far macOS's own root-complex driver brings its ports up.
     pub probe_apcie: bool,
+    /// Make one PCIe port real (`--apcie`, with the probe): its link trains
+    /// and a minimal endpoint answers behind it
+    /// (`board::apcie_probe::MODELED_PORT`).
+    pub apcie: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -435,6 +439,7 @@ impl Default for System {
             shared_aliases: false,
             shared_limits: 0,
             probe_apcie: false,
+            apcie: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -863,6 +868,7 @@ impl fmt::Display for System {
             line.flag(name, self.shared_limits & 1 << bit != 0)?;
         }
         line.flag("--probe-apcie", self.probe_apcie)?;
+        line.flag("--apcie", self.apcie)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

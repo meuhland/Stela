@@ -111,6 +111,10 @@ fn the_apcie_probe_is_off_unless_asked_for_and_round_trips() {
     let probe = round_trip(&format!("--system --preboot {DISK} --probe-apcie"));
     assert!(probe.probe_apcie);
     assert!(probe.to_string().contains("--probe-apcie"));
+    assert!(!probe.apcie);
+    let model = round_trip(&format!("--system --preboot {DISK} --apcie"));
+    assert!(model.apcie && !model.probe_apcie);
+    assert!(model.to_string().contains("--apcie"));
 }
 
 #[test]

@@ -15,7 +15,7 @@
 use super::apertures;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use stela_contracts::adt::Node;
 
 static APCIE: AtomicBool = AtomicBool::new(false);
@@ -71,6 +71,28 @@ pub fn apcie() -> bool {
     APCIE.load(Ordering::Acquire)
 }
 
+/// The port the root-complex model (`--apcie`) makes real: J473AP's
+/// `apcie[2:lan-1gb]`, the built-in 1 GbE port. Its endpoint is a plain
+/// network function with nothing of the platform's own around it (the
+/// `wlan` port's endpoint is driven through the AMFM and Bluetooth, the
+/// `pcie-xhci` port's carries the USB-A ports' wiring), so a dummy function,
+/// then an emulated NIC or NVMe controller, or a passed-through device can
+/// stand in for it with macOS's own PCI drivers.
+pub const MODELED_PORT: u32 = 2;
+const NO_PORT: u32 = u32::MAX;
+static MODEL: AtomicU32 = AtomicU32::new(NO_PORT);
+
+/// Model `port` (`--apcie`), or no port. The probe must be on as well.
+pub fn set_model_port(port: Option<u32>) {
+    MODEL.store(port.unwrap_or(NO_PORT), Ordering::Release);
+}
+
+/// The port the root-complex model makes real, while the probe is on.
+pub fn model_port() -> Option<u32> {
+    let port = MODEL.load(Ordering::Acquire);
+    (apcie() && port != NO_PORT).then_some(port)
+}
+
 /// Whether `name` is a PCIe root complex's `compatible` (`apcie,t8112`).
 /// The `apcie-phy` style names of other blocks do not match.
 pub fn is_root_complex(name: &str) -> bool {
@@ -121,6 +143,58 @@ pub struct Apcie {
     pub ports: Vec<ApciePort>,
     /// `bus-range`'s first bus, where the root ports' own headers are.
     pub first_bus: u8,
+    /// The PCI memory windows of `ranges`.
+    pub memory: Vec<ApcieMemory>,
+    /// The port the root-complex model makes real (`--apcie`), when the
+    /// complex has it.
+    pub model: Option<u32>,
+}
+
+/// One PCI memory window of a root complex's `ranges`: its PCI address,
+/// its guest PA (`None` when `/arm-io`'s ranges do not cover it) and size,
+/// and whether it is prefetchable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApcieMemory {
+    pub pci: u64,
+    pub physical: Option<u64>,
+    pub bytes: u64,
+    pub prefetchable: bool,
+}
+
+/// `ranges` entries: the PCI address (`phys.hi`, then the 64-bit address
+/// as two cells, low first, as XNU reads multi-cell values), the parent
+/// address (two cells) and the size (two cells), seven cells in all, the
+/// layout `AppleEmbeddedPCIE::configure` (0xfffffe000944286c) copies.
+/// Memory spaces only (`phys.hi` bits 25:24 of 2 or 3); I/O is skipped.
+pub fn memory_ranges(io: &Node<'_>, raw: &[u8]) -> Vec<ApcieMemory> {
+    if !raw.len().is_multiple_of(28) {
+        return Vec::new();
+    }
+    let word = |entry: &[u8; 28], cell: usize| {
+        u64::from(u32::from_le_bytes(
+            entry[4 * cell..4 * cell + 4].try_into().unwrap_or_default(),
+        ))
+    };
+    raw.as_chunks::<28>()
+        .0
+        .iter()
+        .filter_map(|entry| {
+            let hi = word(entry, 0);
+            let space = hi >> 24 & 3;
+            if space < 2 {
+                return None;
+            }
+            let pci = word(entry, 1) | word(entry, 2) << 32;
+            let parent = word(entry, 3) | word(entry, 4) << 32;
+            let bytes = word(entry, 5) | word(entry, 6) << 32;
+            (bytes != 0).then(|| ApcieMemory {
+                pci,
+                physical: io.translate_range(parent, bytes),
+                bytes,
+                prefetchable: hi & 1 << 30 != 0,
+            })
+        })
+        .collect()
 }
 
 /// The visible root complexes under `/arm-io`, when the probe is on.
@@ -172,7 +246,8 @@ fn root_complex(io: &Node<'_>, node: &Node<'_>) -> Apcie {
                 index: child.first_u32("apcie-port")?,
             })
         })
-        .collect();
+        .collect::<Vec<ApciePort>>();
+    let model = model_port().filter(|&port| ports.iter().any(|child| child.index == port));
     Apcie {
         name: text(node.property("name").unwrap_or(b"?")),
         windows,
@@ -182,6 +257,11 @@ fn root_complex(io: &Node<'_>, node: &Node<'_>) -> Apcie {
             .property("bus-range")
             .and_then(|range| range.first().copied())
             .unwrap_or(0),
+        memory: node
+            .property("ranges")
+            .map(|raw| memory_ranges(io, raw))
+            .unwrap_or_default(),
+        model,
     }
 }
 
@@ -207,5 +287,76 @@ mod tests {
         // Nothing in this crate's tests turns it on.
         assert!(!apcie());
         assert!(!claims("apcie,t8112", |_| None));
+        // A model port means nothing without the probe.
+        set_model_port(Some(MODELED_PORT));
+        assert_eq!(model_port(), None);
+        set_model_port(None);
+    }
+
+    #[test]
+    fn memory_windows_come_from_ranges_through_arm_io() {
+        use stela_contracts::adt::encode;
+        let words = |values: &[u64]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        // `/arm-io` maps 0x4_0000_0000 to 0x6_0000_0000.
+        let io = encode(
+            &[
+                ("name", b"arm-io\0"),
+                (
+                    "ranges",
+                    &words(&[0x4_0000_0000, 0x6_0000_0000, 0x1_0000_0000]),
+                ),
+            ],
+            &[],
+        );
+        let io = Node::root(&io).unwrap();
+        let entry = |hi: u32, pci: u64, parent: u64, bytes: u64| -> Vec<u8> {
+            [
+                hi,
+                pci as u32,
+                (pci >> 32) as u32,
+                parent as u32,
+                (parent >> 32) as u32,
+            ]
+            .into_iter()
+            .chain([bytes as u32, (bytes >> 32) as u32])
+            .flat_map(u32::to_le_bytes)
+            .collect()
+        };
+        // J473AP-like: a 64-bit prefetchable window, a 32-bit window whose
+        // PCI address differs from its CPU address, and an I/O window.
+        let raw = [
+            entry(0x4300_0000, 0x6_a000_0000, 0x4_a000_0000, 0x2000_0000),
+            entry(0x0200_0000, 0xc000_0000, 0x4_c000_0000, 0x4000_0000),
+            entry(0x0100_0000, 0, 0x4_f000_0000, 0x1_0000),
+        ]
+        .concat();
+        let memory = memory_ranges(&io, &raw);
+        assert_eq!(
+            memory,
+            [
+                ApcieMemory {
+                    pci: 0x6_a000_0000,
+                    physical: Some(0x6_a000_0000),
+                    bytes: 0x2000_0000,
+                    prefetchable: true,
+                },
+                ApcieMemory {
+                    pci: 0xc000_0000,
+                    physical: Some(0x6_c000_0000),
+                    bytes: 0x4000_0000,
+                    prefetchable: false,
+                },
+            ]
+        );
+        // A window outside `/arm-io`'s ranges has no PA; a malformed
+        // property gives no window.
+        let outside = entry(0x0200_0000, 0, 0x9_0000_0000, 0x1000);
+        assert_eq!(memory_ranges(&io, &outside)[0].physical, None);
+        assert!(memory_ranges(&io, &raw[..27]).is_empty());
     }
 }
