@@ -22,6 +22,13 @@ pub trait CallerMemory {
     fn read(&mut self, address: u64, buffer: &mut [u8]) -> Result<(), CallerFault>;
     /// Writes nothing unless every byte is writable RAM.
     fn write(&mut self, address: u64, data: &[u8]) -> Result<(), CallerFault>;
+    /// Lets go of memory held around the call only to save work, as the
+    /// service's room for `bytes` of a span ran out; answers the bytes let
+    /// go. The span tries again while this lets something go.
+    fn reclaim(&mut self, bytes: usize) -> usize {
+        let _ = bytes;
+        0
+    }
 }
 
 /// Wired guest RAM: contiguous guest physical memory, in whole pages.
