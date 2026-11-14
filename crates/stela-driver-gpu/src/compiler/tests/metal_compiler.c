@@ -83,6 +83,35 @@ static const char *idle =
    "!42 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
    " !\"air.arg_name\", !\"tid\"}\n";
 
+/* Stores each thread's index to a threadgroup buffer whose metadata, as
+ * MPS's reduce_multiple_passes_axes_add's buffer 7, declares no type size
+ * (and here no alignment but what `declared` adds): its dispatch's length
+ * sizes it. */
+#define UNTYPED(declared)                                                                         \
+   "define void @untyped(ptr addrspace(1) %data, ptr addrspace(3) %shared, i32 %tid) {\n"          \
+   "%i = zext i32 %tid to i64\n"                                                                  \
+   "%p = getelementptr i32, ptr addrspace(3) %shared, i64 %i\n"                                   \
+   "store i32 %tid, ptr addrspace(3) %p, align 4\n"                                               \
+   "call void @air.wg.barrier(i32 2, i32 1) convergent\n"                                         \
+   "%v = load i32, ptr addrspace(3) %p, align 4\n"                                                \
+   "%q = getelementptr i32, ptr addrspace(1) %data, i64 %i\n"                                     \
+   "store i32 %v, ptr addrspace(1) %q, align 4\n"                                                 \
+   "ret void\n}\n"                                                                                \
+   "declare void @air.wg.barrier(i32, i32) convergent\n"                                          \
+   "!air.kernel = !{!2}\n"                                                                        \
+   "!2 = !{ptr @untyped, !3, !4, !5}\n!3 = !{}\n!5 = !{!\"air.max_work_group_size\", i32 64}\n"   \
+   "!4 = !{!40, !41, !42}\n"                                                                      \
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 2, i32 1, !\"air.read_write\","  \
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\","  \
+   " i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"data\"}\n"                    \
+   "!41 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 7, i32 1, !\"air.read_write\","  \
+   " !\"air.address_space\", i32 3," declared " !\"air.arg_type_name\", !\"void\","                \
+   " !\"air.arg_name\", !\"scratch\"}\n"                                                          \
+   "!42 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","          \
+   " !\"air.arg_name\", !\"tid\"}\n"
+static const char *untyped = UNTYPED("");
+static const char *misaligned = UNTYPED(" !\"air.arg_type_align_size\", i32 3,");
+
 /* Reads buffer 1 on every thread and buffer 4 on thread 0 alone. */
 static const char *guarded =
    "define void @guarded(ptr addrspace(1) %out, ptr addrspace(1) %extra, i32 %tid) {\n"
@@ -1251,6 +1280,27 @@ kernels_reflect_and_compile_their_threadgroup_memory(void)
    assert(shader && error.kind == STELA_AIR_OK && !error.detail[0]);
    assert(shader->info.shared_size == 0);
    stela_metal_release(shader);
+
+   /* A buffer whose type declares no size or alignment takes its
+    * dispatch's length, else one 16-byte granule. */
+   assert(reflect(untyped, "untyped", &reflection, &error));
+   assert(reflection.threadgroup_count == 1 && reflection.threadgroup[0].index == 7 &&
+          reflection.threadgroup[0].bytes == 0);
+   const struct stela_metal_threadgroup_length untyped_lengths[] = {{7, 256}};
+   specialization.threadgroup_length_count = 1;
+   specialization.threadgroup_lengths = untyped_lengths;
+   shader = compile(untyped, "untyped", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "untyped: %u %s\n", error.kind, error.detail);
+   assert(shader && error.kind == STELA_AIR_OK && !error.detail[0]);
+   assert(shader->info.shared_size >= 256);
+   stela_metal_release(shader);
+   specialization.threadgroup_length_count = 0;
+   shader = compile(untyped, "untyped", &specialization, &error);
+   assert(shader && !strcmp(error.detail, "threadgroup arg 7 unset: using 16"));
+   stela_metal_release(shader);
+   /* What it does declare is still checked. */
+   assert(!reflect(misaligned, "untyped", &reflection, &error) && error.kind == STELA_AIR_METADATA);
 }
 
 static nir_variable *

@@ -2300,8 +2300,15 @@ metadata_arguments(struct stela_air_metadata *t, LLVMValueRef fn, LLVMValueRef a
          if (indirect && !argument_fields(t, kernel, struct_info, desc.type_size, index, 0,
                                           &argument_buffer))
             return false;
-         if (shared && (!has_size || !has_align || !desc.type_size || !desc.type_alignment))
-            return fail(t, STELA_AIR_ARGUMENT, "invalid/unbound threadgroup buffer %u", index);
+         /* A threadgroup buffer is the bytes its dispatch sets
+          * (setThreadgroupMemoryLength:atIndex:), not its type's: one of a
+          * type without a size, as MPS's kernels have, declares none and is
+          * placed at Metal's 16-byte threadgroup alignment. A size or
+          * alignment it does declare was checked above. */
+         if (shared && !has_size)
+            desc.type_size = 0;
+         if (shared && !has_align)
+            desc.type_alignment = 16;
       } else if (payload) {
          /* An object function writes its payload; its mesh functions read it. */
          LLVMTypeRef type = LLVMTypeOf(param);
