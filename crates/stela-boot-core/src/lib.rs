@@ -37,6 +37,7 @@ pub mod exit_port;
 pub mod fiber;
 pub mod firmware_connect;
 pub mod firmware_pages;
+pub mod firmware_retry;
 pub mod firmware_screen;
 pub mod firmware_state;
 pub mod firmware_time;
