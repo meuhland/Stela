@@ -1916,6 +1916,23 @@ impl<'a> Store<'a> {
         self.decoded.shrink(bounds.decoded)
     }
 
+    /// Let go of what the store keeps only to save work, for a heap that
+    /// has no room left: every decoded record, and every block shared with
+    /// the other machines. Both fill again under their bounds, which stay;
+    /// the added entries, which the next boot needs, stay too. The decoded
+    /// records come back, to drop outside a lock, with the bytes the store
+    /// charged for both.
+    pub fn release_caches(&mut self) -> (Vec<Arc<StoredRecord>>, usize) {
+        let charged = self.decoded.bytes + self.shared_usage();
+        let decoded_bound = self.decoded.bound;
+        let evicted = self.decoded.shrink(0);
+        self.decoded.bound = decoded_bound;
+        let shared_bound = self.shared_bound;
+        self.share(0);
+        self.shared_bound = shared_bound;
+        (evicted, charged)
+    }
+
     /// Take `other`'s run (another part of one store over the same pack):
     /// what it looked up, its added entries and its counts. Its shared
     /// blocks are dropped.
@@ -2325,6 +2342,44 @@ mod tests {
         drop(held);
         assert_eq!(store.record(&keys[1]).unwrap().key, keys[1]);
         assert_eq!(store.counters.decoded, 10);
+    }
+
+    #[test]
+    fn released_caches_give_their_records_back_and_keep_their_bounds() {
+        let translator = translator_id();
+        let keys: Vec<Digest> = (0u8..4)
+            .map(|index| {
+                let mut key = Digest([3; 32]);
+                key.0[31] = index;
+                key
+            })
+            .collect();
+        let bytes = Layout::new(
+            &translator,
+            keys.iter()
+                .map(|&key| (key, Piece::New(Record::new(translator, key).encode())))
+                .collect(),
+        )
+        .to_vec();
+        let mut store = Store::new(translator, Some(&bytes)).0;
+        let one = Record::new(translator, keys[0]).retained_bytes();
+        drop(store.set_bounds(Bounds {
+            decoded: 8 * one,
+            ..Bounds::default()
+        }));
+        for key in &keys {
+            drop(store.record(key).unwrap());
+        }
+        let (released, charged) = store.release_caches();
+        assert_eq!(released.len(), keys.len());
+        assert_eq!(charged, keys.len() * one);
+        assert_eq!(store.decoded.bytes, 0);
+        drop(released);
+        // Nothing to let go of now; the cache fills again under its bound.
+        assert_eq!(store.release_caches().0.len(), 0);
+        drop(store.record(&keys[0]).unwrap());
+        assert_eq!(store.counters.decoded, 5);
+        assert_eq!((store.decoded.bytes, store.decoded.bound), (one, 8 * one));
     }
 
     #[test]
