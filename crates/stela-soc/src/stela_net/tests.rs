@@ -608,7 +608,7 @@ fn chains_refuse_bad_shapes() {
     assert!(matches!(queue.pop(&mut ram), Err(RingError::Malformed(_))));
     assert!(Queue::new(0, 4).is_err());
     assert!(Queue::new(RX, 0).is_err());
-    assert!(Queue::new(u64::MAX & !15, 4).is_err());
+    assert!(Queue::new(0xffff_ffff_ffff_fff0, 4).is_err());
 }
 
 /// A header marking a partial checksum from `start`, its field at `offset`.
