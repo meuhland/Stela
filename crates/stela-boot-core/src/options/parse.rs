@@ -150,6 +150,10 @@ impl ParseState<'_> {
                 options.guest_network = true;
                 options.guest_network_ecm = true;
             }
+            "--guest-network-stelanet" => {
+                options.guest_network = true;
+                options.guest_network_stelanet = true;
+            }
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {

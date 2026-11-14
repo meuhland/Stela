@@ -132,6 +132,15 @@ fn setup_lines_parse_and_serialize_identically() {
     let ecm = round_trip(&format!("{preboot}-ecm"));
     assert!(ecm.guest_network && ecm.guest_network_ecm);
     assert_eq!(ecm.to_string(), format!("{preboot} --guest-network-ecm"));
+    assert!(!options.guest_network_stelanet && !ecm.guest_network_stelanet);
+    // StelaNet instead of a USB adapter: the flag alone gives the network.
+    let stelanet = round_trip(&format!("{preboot}-stelanet"));
+    assert!(stelanet.guest_network && stelanet.guest_network_stelanet);
+    assert!(!stelanet.guest_network_ecm);
+    assert_eq!(
+        stelanet.to_string(),
+        format!("{preboot} --guest-network-stelanet")
+    );
     let bundle = format!("--system --storage {DISK} --nor {DISK} --bundle \\EFI\\stela\\r");
     assert_eq!(round_trip(&bundle).to_string(), bundle);
 }
