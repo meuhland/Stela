@@ -145,6 +145,7 @@ pub mod features {
     pub const CHECKSUMS: u64 = CSUM | GUEST_CSUM;
     /// What a driver must accept.
     pub const REQUIRED: u64 = VERSION_1;
+    const _: () = assert!(OFFERED & REQUIRED == REQUIRED);
 }
 
 /// A split virtqueue's layout in its one physically contiguous block.
@@ -208,6 +209,5 @@ mod tests {
         assert_eq!(ring::used(256), 4672);
         assert_eq!(ring::bytes(256), 4672 + 4 + 2048 + 2);
         assert!(ring::bytes(window::QUEUE_MAX) <= 0x8000);
-        assert!(features::OFFERED & features::REQUIRED == features::REQUIRED);
     }
 }
