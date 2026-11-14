@@ -324,6 +324,11 @@ pub struct System {
     /// USB transfer, instead of the default Network Control Model
     /// (`--guest-network-ecm`, which also gives the guest the adapter).
     pub guest_network_ecm: bool,
+    /// The guest's network is the StelaNet paravirtual adapter at
+    /// `/arm-io/stela-net0` instead of a USB Ethernet adapter
+    /// (`--guest-network-stelanet`, which also gives the guest the network).
+    /// A prototype: the StelaGPU kext's StelaNet front end drives it.
+    pub guest_network_stelanet: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -416,6 +421,7 @@ impl Default for System {
             external_disks: false,
             guest_network: false,
             guest_network_ecm: false,
+            guest_network_stelanet: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -802,6 +808,10 @@ impl fmt::Display for System {
         line.flag(
             "--guest-network-ecm",
             self.guest_network && self.guest_network_ecm,
+        )?;
+        line.flag(
+            "--guest-network-stelanet",
+            self.guest_network && self.guest_network_stelanet,
         )?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(

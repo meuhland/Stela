@@ -331,11 +331,17 @@ impl Service {
         if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, next)) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
-            let (frames, status, room) = devices.with(|devices| {
+            let (frames, status, room, fault) = devices.with(|devices| {
                 let frames = network::GuestNetwork::queued(devices);
-                (frames, devices.network_status(), devices.network_room())
+                (
+                    frames,
+                    devices.network_status(),
+                    devices.network_room(),
+                    devices.stela_net_error(),
+                )
             });
             network.status(status);
+            network.fault(fault);
             let reusable = network.transmit(frames);
             network.receive(room);
             devices.serve(|devices| {

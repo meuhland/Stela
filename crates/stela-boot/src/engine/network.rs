@@ -566,6 +566,8 @@ pub struct GuestNetwork {
     /// Whether the adapter's receive signal was pointed at
     /// [`set_receive_core`]'s core, which the first link up does.
     retargeted: bool,
+    /// Why the StelaNet adapter last stopped itself, as last reported.
+    fault: Option<&'static str>,
 }
 
 /// The APIC ID of the core the guest network's receive signal goes to once
@@ -609,6 +611,7 @@ impl GuestNetwork {
             refused: false,
             received: alloc::collections::VecDeque::new(),
             retargeted: false,
+            fault: None,
         })
     }
 
@@ -646,6 +649,17 @@ impl GuestNetwork {
                 if up { "up" } else { "down" }
             ));
         }
+    }
+
+    /// Report why the StelaNet adapter stopped itself, once per new reason.
+    pub fn fault(&mut self, fault: Option<&'static str>) {
+        if fault.is_some() && self.fault != fault {
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet stopped: {}\n",
+                fault.unwrap_or_default()
+            ));
+        }
+        self.fault = fault;
     }
 
     /// The beat report's line: the frames the guest adapter moved each way
