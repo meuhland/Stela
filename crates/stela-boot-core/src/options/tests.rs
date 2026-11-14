@@ -160,6 +160,14 @@ fn setup_lines_parse_and_serialize_identically() {
     assert!(options.bundle && options.external_disks);
     assert_eq!(options.ecid, Some(0x1234));
     assert_eq!(options.to_string(), preboot);
+    assert!(!options.guest_network_stelanet);
+    // StelaNet instead of a USB adapter: the flag alone gives the network.
+    let stelanet = round_trip(&format!("{preboot}-stelanet"));
+    assert!(stelanet.guest_network && stelanet.guest_network_stelanet);
+    assert_eq!(
+        stelanet.to_string(),
+        format!("{preboot} --guest-network-stelanet")
+    );
     let bundle = format!("--system --storage {DISK} --nor {DISK} --bundle \\EFI\\stela\\r");
     assert_eq!(round_trip(&bundle).to_string(), bundle);
 }
