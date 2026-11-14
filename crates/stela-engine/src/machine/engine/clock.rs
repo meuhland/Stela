@@ -88,7 +88,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use stela_compiler::x86_64::register_read::{Count, CountState};
 
 /// The most counts one block may account for: one count at 24 MHz is
@@ -255,6 +255,9 @@ struct Slot {
     /// [`SharedClock::take_stalls`], in host counts, with the phase that
     /// took most of it in the low [`PHASE_BITS`].
     longest: AtomicU64,
+    /// Its PE stopped for good ([`SharedClock::release`]): `count` stays
+    /// [`IDLE`], whatever it publishes after.
+    released: AtomicBool,
 }
 
 impl SharedClock {
@@ -268,6 +271,7 @@ impl SharedClock {
                 .map(|_| Slot {
                     count: AtomicU64::new(IDLE),
                     longest: AtomicU64::new(0),
+                    released: AtomicBool::new(false),
                 })
                 .collect(),
             stall: AtomicU64::new(0),
@@ -454,7 +458,29 @@ impl SharedClock {
 
     /// PE `pe` publishes `count`, the count now or a mark.
     fn publish(&self, pe: usize, count: u64) {
-        self.slots[pe].count.store(count, Ordering::Relaxed);
+        let slot = &self.slots[pe];
+        if !slot.released.load(Ordering::Relaxed) {
+            slot.count.store(count, Ordering::Relaxed);
+        }
+    }
+
+    /// PE `pe` stops for good: its machine stopped, and its core goes to a
+    /// fatal stop that may wait (for the GPUs, the log's disk) and then
+    /// halts. From now on it holds the count no more, whatever it
+    /// published, and a ceiling its slot set is lifted now: left to the
+    /// others' looks, a stalled slot that never runs again would hold every
+    /// PE's time at its limit for good (the freeze of 2026-11-12 21:58,
+    /// PE 5 at EL0). Call it before anything that can wait.
+    pub fn release(&self, pe: usize, mut counter: impl Counter) {
+        let slot = &self.slots[pe];
+        slot.released.store(true, Ordering::SeqCst);
+        slot.count.store(IDLE, Ordering::SeqCst);
+        // A look that read the slot before the store and settles after this
+        // load sets a ceiling the next look lifts: every running PE looks
+        // at each mark while one is set.
+        if self.state.ceiling.load(Ordering::SeqCst) != UNBOUNDED {
+            self.settle(&mut counter);
+        }
     }
 
     /// Guest work waits for PE `pe` from `count` on while it is out of its

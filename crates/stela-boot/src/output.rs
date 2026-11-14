@@ -1225,6 +1225,10 @@ fn stop_advice(reason: Option<&str>) -> &'static str {
 }
 
 pub fn fatal(message: impl core::fmt::Display) -> ! {
+    // A remote PE's processor halts at the end, and may wait on the way: its
+    // clock slot must not hold the other PEs' time meanwhile, whether this
+    // stop is the first or a later one.
+    crate::engine::release_clock_for_fatal();
     if let Claim::Later { first_here } = FIRST_STOP.claim(stopping_processor()) {
         later_stop(&message, first_here)
     }

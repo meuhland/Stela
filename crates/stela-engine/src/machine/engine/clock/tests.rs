@@ -603,3 +603,52 @@ fn a_look_reads_no_slot_until_one_could_look_stalled() {
     assert_eq!(shared.count(|| 1000 + span), 1000 + span);
     assert_eq!(shared.take_stalled(), 0);
 }
+
+#[test]
+fn a_pe_released_for_good_holds_the_count_no_more() {
+    let (shared, mut first, mut second) = pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    second.busy(|| 1000, 0, None);
+    let limit = 1000 + FREQUENCY * STALL_MILLIS / 1000;
+    // The first PE's machine stopped after it published 1000, and its core
+    // went to a fatal stop; the second runs and looks.
+    let mut retired = 0;
+    for host in (1010..1000 + LONG_STALL).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+    }
+    assert_eq!(second.read(|| 1000 + LONG_STALL), limit);
+    assert_eq!(shared.holder(), Some((0, false, 1000)));
+    // Released, it holds the count no more: it goes on from the limit at
+    // once, before any other PE looks.
+    shared.release(0, || 1000 + LONG_STALL);
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
+    assert_eq!(shared.holder(), None);
+    assert_eq!(second.read(|| 1100 + LONG_STALL), limit + 100);
+    // Whatever its clock publishes after, a stop in the kernel included.
+    first.mark(|| 1200 + LONG_STALL, 1, None);
+    assert!(first.leave(|| 1300 + LONG_STALL, 0, false));
+    for host in (1300 + LONG_STALL..1300 + 3 * LONG_STALL).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+    }
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
+    assert!(second.read(|| 1300 + 3 * LONG_STALL) >= limit + 300 + 2 * LONG_STALL);
+}
+
+#[test]
+fn a_pe_stopped_in_the_kernel_and_released_lifts_its_ceiling_at_once() {
+    let (shared, mut first, mut second) = pair();
+    assert!(first.leave(|| 2000, 0, false));
+    // Held at the stop's limit, 1200 counts past it.
+    assert_eq!(second.read(|| 6000), 3200);
+    assert_eq!(shared.holder(), Some((0, true, 2000)));
+    shared.release(0, || 6000);
+    assert_eq!(second.read(|| 6100), 3300);
+    assert_eq!(shared.holder(), None);
+    // A resume after the release publishes nothing either.
+    first.resume(|| 6200, 0);
+    assert_eq!(shared.slot(0), IDLE);
+}

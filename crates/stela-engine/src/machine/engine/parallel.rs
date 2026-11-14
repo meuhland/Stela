@@ -833,6 +833,12 @@ impl Hub {
         self.clock.holder()
     }
 
+    /// PE `pe` stopped for good: it holds the count no more, at the host's
+    /// counter `counter` ([`SharedClock::release`]).
+    pub fn release_clock(&self, pe: usize, counter: impl FnMut() -> u64) {
+        self.clock.release(pe, counter);
+    }
+
     /// Each PE's longest gap with guest work and no instruction retired
     /// since the last call, in counts, and the phase that took most of it
     /// ([`SharedClock::take_stalls`]): a step loop phase's name, `host` for

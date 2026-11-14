@@ -1609,6 +1609,12 @@ pub(crate) unsafe fn in_loader_root_at_stop<T>(root: u64, call: impl FnOnce() ->
     unsafe { storage::at_stop_in_loader_root(root, call) }
 }
 
+/// Before anything a fatal stop may wait for: a remote PE's processor gives
+/// up its clock slot (`parallel::release_clock_for_fatal`).
+pub(crate) fn release_clock_for_fatal() {
+    parallel::release_clock_for_fatal();
+}
+
 /// Unload the GPUs' firmware before a fatal stop, where one can
 /// (`gpu::gate::stop_for_fatal`).
 pub(crate) fn stop_gpus_for_fatal() {
