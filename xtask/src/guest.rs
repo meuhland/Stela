@@ -52,7 +52,10 @@ pub fn run() -> Result<()> {
         include.join("stela/sandbox_patch.h"),
         sandbox_patch_header(&patcher, &component.join("sandbox").join(SANDBOX_PATCH_JOB))?,
     )?;
-    fs::write(include.join("stela/stelavt.h"), stelavt_header(&component.join("stelavt"))?)?;
+    fs::write(
+        include.join("stela/stelavt.h"),
+        stelavt_header(&component.join("stelavt"))?,
+    )?;
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
     fs::write(include.join("stela/compression.h"), compression::header()?)?;
     let kext = build_kext(&component, &output, &xnu, &include)?;
@@ -64,7 +67,9 @@ pub fn run() -> Result<()> {
     // its code goes in the same trust cache; the installed copy must be this one.
     let encoder = component.join("stelavt").join("StelaVT");
     if encoder.exists() {
-        code.extend(stela_loader::plugin::prebuilt_code_hashes(&fs::read(&encoder)?)?);
+        code.extend(stela_loader::plugin::prebuilt_code_hashes(&fs::read(
+            &encoder,
+        )?)?);
         println!("StelaVT code: {}", encoder.display());
     }
     fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
@@ -221,7 +226,8 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
 /// Where the kext installs the sandbox patcher and its launchd job
 /// (`kext/sandbox_cache.cpp`), on the Data volume.
 const SANDBOX_PATCH_PATH: &str = "/System/Volumes/Data/private/var/db/org.stela.SandboxPatch";
-const SANDBOX_PATCH_JOB_PATH: &str = "/System/Volumes/Data/Library/LaunchDaemons/org.stela.SandboxPatch.plist";
+const SANDBOX_PATCH_JOB_PATH: &str =
+    "/System/Volumes/Data/Library/LaunchDaemons/org.stela.SandboxPatch.plist";
 const SANDBOX_PATCH_JOB: &str = "org.stela.SandboxPatch.plist";
 
 /// The sandbox patcher (`guest/stela-gpu/sandbox`): a plain arm64 macOS
@@ -234,7 +240,13 @@ fn build_sandbox_patch(component: &Path, output: &Path) -> Result<PathBuf> {
     let executable = output.join("org.stela.SandboxPatch");
     exec(
         Command::new(&toolset.clang)
-            .args(["--no-default-config", "-ffreestanding", "-O2", "-Wall", "-Werror"])
+            .args([
+                "--no-default-config",
+                "-ffreestanding",
+                "-O2",
+                "-Wall",
+                "-Werror",
+            ])
             .arg("--target=arm64-apple-macos27.0")
             .arg("-I")
             .arg(component.join("include"))
@@ -246,7 +258,15 @@ fn build_sandbox_patch(component: &Path, output: &Path) -> Result<PathBuf> {
     let linker = toolset.linker.with_file_name("ld64.lld");
     exec(
         Command::new(&linker)
-            .args(["-arch", "arm64", "-platform_version", "macos", "27.0", "27.0", "-o"])
+            .args([
+                "-arch",
+                "arm64",
+                "-platform_version",
+                "macos",
+                "27.0",
+                "27.0",
+                "-o",
+            ])
             .arg(&executable)
             .arg(&object)
             .arg(source.join("libSystem.tbd"))
@@ -258,7 +278,8 @@ fn build_sandbox_patch(component: &Path, output: &Path) -> Result<PathBuf> {
 
 /// Where the kext installs StelaVT, the prebuilt H.264 encoder whose code
 /// the trust cache lists (`kext/video_encoder.cpp`).
-const STELAVT_DIRECTORY: &str = "/System/Volumes/Data/Library/Video/Plug-Ins/StelaVT.bundle/Contents/";
+const STELAVT_DIRECTORY: &str =
+    "/System/Volumes/Data/Library/Video/Plug-Ins/StelaVT.bundle/Contents/";
 
 /// `stela/stelavt.h`: StelaVT's executable and Info.plist as the kext
 /// installs them, or `STELAVT_PRESENT 0` when the tree has no prebuilt one.
@@ -271,12 +292,27 @@ fn stelavt_header(source: &Path) -> Result<String> {
         return Ok(header);
     }
     header.push_str("#define STELAVT_PRESENT 1\n");
-    writeln!(header, "#define STELAVT_EXECUTABLE_PATH {:?}", format!("{STELAVT_DIRECTORY}MacOS/StelaVT"))?;
-    writeln!(header, "#define STELAVT_INFO_PATH {:?}", format!("{STELAVT_DIRECTORY}Info.plist"))?;
-    for (name, path) in [("stelavt_executable", executable), ("stelavt_info", source.join("Info.plist"))] {
+    writeln!(
+        header,
+        "#define STELAVT_EXECUTABLE_PATH {:?}",
+        format!("{STELAVT_DIRECTORY}MacOS/StelaVT")
+    )?;
+    writeln!(
+        header,
+        "#define STELAVT_INFO_PATH {:?}",
+        format!("{STELAVT_DIRECTORY}Info.plist")
+    )?;
+    for (name, path) in [
+        ("stelavt_executable", executable),
+        ("stelavt_info", source.join("Info.plist")),
+    ] {
         let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         c_bytes(&mut header, name, &bytes)?;
-        writeln!(header, "static const unsigned char {name}_sha256[32] = {{{}}};", c_digest(&bytes))?;
+        writeln!(
+            header,
+            "static const unsigned char {name}_sha256[32] = {{{}}};",
+            c_digest(&bytes)
+        )?;
     }
     Ok(header)
 }
@@ -286,12 +322,25 @@ fn stelavt_header(source: &Path) -> Result<String> {
 fn sandbox_patch_header(executable: &Path, job: &Path) -> Result<String> {
     use std::fmt::Write as _;
     let mut header = String::from("#pragma once\n");
-    writeln!(header, "#define STELA_SANDBOX_PATCH_PATH {SANDBOX_PATCH_PATH:?}")?;
-    writeln!(header, "#define STELA_SANDBOX_PATCH_JOB_PATH {SANDBOX_PATCH_JOB_PATH:?}")?;
-    for (name, path) in [("stela_sandbox_patch", executable), ("stela_sandbox_patch_job", job)] {
+    writeln!(
+        header,
+        "#define STELA_SANDBOX_PATCH_PATH {SANDBOX_PATCH_PATH:?}"
+    )?;
+    writeln!(
+        header,
+        "#define STELA_SANDBOX_PATCH_JOB_PATH {SANDBOX_PATCH_JOB_PATH:?}"
+    )?;
+    for (name, path) in [
+        ("stela_sandbox_patch", executable),
+        ("stela_sandbox_patch_job", job),
+    ] {
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         c_bytes(&mut header, name, &bytes)?;
-        writeln!(header, "static const unsigned char {name}_sha256[32] = {{{}}};", c_digest(&bytes))?;
+        writeln!(
+            header,
+            "static const unsigned char {name}_sha256[32] = {{{}}};",
+            c_digest(&bytes)
+        )?;
     }
     Ok(header)
 }
