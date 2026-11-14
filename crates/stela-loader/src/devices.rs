@@ -330,6 +330,106 @@ fn apcie_providers(root: &Node, parents: &mut Vec<u32>) {
     parents.extend(providers);
 }
 
+/// Probe-only (`--probe-apcie`): retreat from the DARTs the probe showed
+/// that the board model would refuse, rather than stop the boot on them.
+/// The DART admission above checks a t8110 DART by its `compatible` alone;
+/// the board model (`dart_topology`) also takes each visible mapper as one
+/// `AAPL,phandle` word and one `reg` SID word below `sid-count`, and checks
+/// the DART's own windows, instances and streams. First each visible mapper
+/// of another shape is hidden (26B123 J473AP's `dart-apcie1` has one: run
+/// 1 stopped on "mapper requires one native phandle and SID word"). The
+/// root complex's bring-up does not use them: the driver resolves its DART
+/// through `function-dart_*` and maps requester IDs only for an endpoint.
+/// Then each DART the board model still refuses is hidden with its
+/// mappers. Every step is an `APCIE PREPARE` line saying what the node
+/// held, so the next boot shows the real layout.
+fn conform_apcie_darts(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
+    fn word(node: &Node, name: &str) -> Option<u32> {
+        node.property(name)
+            .and_then(|p| <[u8; 4]>::try_from(p.value.as_slice()).ok())
+            .map(u32::from_le_bytes)
+    }
+    fn hex(node: &Node, name: &str) -> String {
+        node.property(name).map_or_else(
+            || String::from("none"),
+            |p| p.value.iter().map(|byte| format!("{byte:02x}")).collect(),
+        )
+    }
+    /// Visible mappers under visible DARTs that the board model refuses.
+    fn odd_mappers(node: &Node, path: &str, streams: Option<u32>, odd: &mut Vec<(String, String)>) {
+        let dart = is_dart(node) && node.property(COMPATIBLE).is_some();
+        let streams = if dart {
+            Some(
+                node.property("sid-count")
+                    .and_then(|p| p.as_u32())
+                    .unwrap_or(16),
+            )
+        } else {
+            streams
+        };
+        if let Some(streams) = streams
+            && !dart
+            && named(node, board::IOMMU_MAPPER)
+            && !(word(node, PHANDLE).is_some()
+                && word(node, "reg").is_some_and(|sid| sid < streams))
+        {
+            odd.push((
+                path.into(),
+                format!(
+                    "AAPL,phandle={} reg={} sid-count={streams}",
+                    hex(node, PHANDLE),
+                    hex(node, "reg")
+                ),
+            ));
+        }
+        for child in &node.children {
+            let name = child.name().unwrap_or("?");
+            odd_mappers(child, &format!("{path}/{name}"), streams, odd);
+        }
+    }
+    let mut odd = Vec::new();
+    odd_mappers(&tree.root, "", None, &mut odd);
+    for (path, held) in odd {
+        if let Some(node) = tree.node_mut(&path) {
+            node.remove_property(COMPATIBLE);
+            hidden.push(path.clone());
+            board::apcie_probe::note(format_args!(
+                "APCIE PREPARE {path} hidden: the board model takes one phandle and one SID \
+                 word below sid-count; it holds {held}\n"
+            ));
+        }
+    }
+    // Each round hides at least one DART, so this ends.
+    loop {
+        let refused = board::apcie_probe::dart_refusals(&tree.serialize());
+        let mut darts = Vec::new();
+        for (name, reason) in &refused {
+            let mut paths = Vec::new();
+            visible_paths(
+                &tree.root,
+                "",
+                &|node| is_dart(node) && node.name() == Some(name.as_str()),
+                &mut paths,
+            );
+            for path in paths {
+                board::apcie_probe::note(format_args!(
+                    "APCIE PREPARE {path} hidden with its mappers: the board model refuses \
+                     it: {reason}\n"
+                ));
+                darts.push(path);
+            }
+        }
+        if darts.is_empty() {
+            break;
+        }
+        for path in darts {
+            if let Some(node) = tree.node_mut(&path) {
+                retire(node, &path, hidden);
+            }
+        }
+    }
+}
+
 fn kept_mapper(node: &Node, parents: &[u32]) -> bool {
     named(node, board::IOMMU_MAPPER)
         && node
@@ -418,6 +518,9 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
         apcie_providers(&tree.root, &mut parents);
     }
     visit(&mut tree.root, "", &parents, &[], &mut hidden);
+    if board::apcie_probe::apcie() {
+        conform_apcie_darts(tree, &mut hidden);
+    }
     hide_unprovided_buttons(tree, &mut hidden);
     hide_unprovided_clients(tree, &mut hidden);
     hide_unused_spmi(tree, &mut hidden);

@@ -13,11 +13,53 @@
 //! admission and the board's power-resource ownership ask [`super::models`],
 //! and the boot sets it once, before either runs.
 use super::apertures;
-use alloc::{string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{format, string::String, vec::Vec};
+use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use stela_contracts::adt::Node;
 
 static APCIE: AtomicBool = AtomicBool::new(false);
+static SINK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Where the probe's preparation notes go ([`note`]); nothing is printed
+/// until it is set.
+pub fn set_sink(sink: fn(fmt::Arguments<'_>)) {
+    SINK.store(sink as *mut (), Ordering::Release);
+}
+
+/// One `APCIE PREPARE` line: what the probe's admission changed and why.
+pub fn note(args: fmt::Arguments<'_>) {
+    let sink = SINK.load(Ordering::Acquire);
+    if !sink.is_null() {
+        // SAFETY: SINK only ever holds a `fn(fmt::Arguments<'_>)` stored by
+        // `set_sink`; function and data pointers have the same size here.
+        let sink: fn(fmt::Arguments<'_>) = unsafe { core::mem::transmute(sink) };
+        sink(args);
+    }
+}
+
+/// The visible DARTs under `/arm-io` the board model refuses, by `name`,
+/// with the refusal: the same per-DART check [`super::board`] makes
+/// (`dart_topology::iommu`), run on each DART alone so the probe's
+/// admission can retreat from the ones it showed rather than stop the boot.
+/// An image without an `/arm-io` gives none.
+pub fn dart_refusals(tree: &[u8]) -> Vec<(String, String)> {
+    let Some(io) = Node::root(tree).and_then(|root| root.child("arm-io")) else {
+        return Vec::new();
+    };
+    let extent = |offset: u64, bytes: u64| io.translate_range(offset, bytes);
+    let mut refused = Vec::new();
+    apertures::visit(&io, &extent, &mut |node, translate| {
+        let dart = node.property("compatible").is_some_and(|list| {
+            list.split(|byte| *byte == 0)
+                .any(|name| name.starts_with(b"dart,"))
+        });
+        if dart && let Err(error) = super::dart_topology::iommu(node, translate) {
+            refused.push((super::name_of(node), format!("{error}")));
+        }
+    });
+    refused
+}
 
 /// Turn the probe on or off for every later admission and board.
 pub fn set_apcie(on: bool) {
