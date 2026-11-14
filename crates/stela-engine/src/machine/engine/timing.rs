@@ -69,6 +69,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.native_system = None;
     }
 
+    /// Leave self-loop counts out of timed code (`--profile-keep-pack`):
+    /// its translation context stays an untimed boot's, so the pack serves
+    /// it. Self-loop entries and iterations are then not reported.
+    pub fn set_loop_counts_off(&mut self, off: bool) {
+        self.loop_counts_off = off;
+        self.native_system = None;
+    }
+
     /// The step loop's timing so far, while it is on.
     pub fn step_timing(&self) -> Option<&step_timing::StepTiming> {
         self.step_timing.as_ref()
