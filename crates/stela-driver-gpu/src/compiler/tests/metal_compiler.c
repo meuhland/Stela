@@ -63,6 +63,26 @@ static const char *kernel =
    "!42 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
    " !\"air.arg_name\", !\"tid\"}\n";
 
+/* Writes its index out and never touches its threadgroup buffer, which Apple's
+ * compiler marks unused. */
+static const char *idle =
+   "define void @idle(ptr addrspace(1) %data, ptr addrspace(3) %unused, i32 %tid) {\n"
+   "%i = zext i32 %tid to i64\n"
+   "%q = getelementptr i32, ptr addrspace(1) %data, i64 %i\n"
+   "store i32 %tid, ptr addrspace(1) %q, align 4\n"
+   "ret void\n}\n"
+   "!air.kernel = !{!2}\n"
+   "!2 = !{ptr @idle, !3, !4, !5}\n!3 = !{}\n!5 = !{!\"air.max_work_group_size\", i32 64}\n"
+   "!4 = !{!40, !41, !42}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 2, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"
+   " !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"data\"}\n"
+   "!41 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 3, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 3, !\"air.arg_type_size\", i32 1024, !\"air.arg_type_align_size\", i32 16,"
+   " !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"unused\", !\"air.arg_unused\"}\n"
+   "!42 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","
+   " !\"air.arg_name\", !\"tid\"}\n";
+
 /* Reads buffer 1 on every thread and buffer 4 on thread 0 alone. */
 static const char *guarded =
    "define void @guarded(ptr addrspace(1) %out, ptr addrspace(1) %extra, i32 %tid) {\n"
@@ -1244,9 +1264,34 @@ kernels_reflect_and_compile_their_threadgroup_memory(void)
    assert(shader->info.shared_size >= 256 + 64);
    stela_metal_release(shader);
 
-   /* Each threadgroup buffer needs its dispatch's length. */
+   /* A buffer its dispatch never sized runs on Apple GPUs, as one sized
+    * short of its type: each gets the type's bytes in 16-byte granules,
+    * and the compilation says so. */
    specialization.threadgroup_length_count = 0;
-   assert(!compile(kernel, "kernel", &specialization, &error) && error.kind != STELA_AIR_OK);
+   shader = compile(kernel, "kernel", &specialization, &error);
+   assert(shader && error.kind == STELA_AIR_OK && shader->info.shared_size >= 16 + 64);
+   assert(!strcmp(error.detail, "threadgroup arg 0 unset: using 16"));
+   stela_metal_release(shader);
+   const struct stela_metal_threadgroup_length short_lengths[] = {{0, 8}};
+   specialization.threadgroup_length_count = 1;
+   specialization.threadgroup_lengths = short_lengths;
+   shader = compile(kernel, "kernel", &specialization, &error);
+   assert(shader && error.kind == STELA_AIR_OK && shader->info.shared_size >= 16 + 64);
+   assert(!strcmp(error.detail, "threadgroup arg 0 short: 8 bytes, using 16"));
+   stela_metal_release(shader);
+
+   /* A buffer the function never touches binds no memory, sized or not,
+    * as Apple's compiler drops it. */
+   assert(reflect(idle, "idle", &reflection, &error));
+   assert(reflection.threadgroup_count == 1 && reflection.threadgroup[0].index == 3 &&
+          reflection.threadgroup[0].bytes == 1024);
+   specialization.threadgroup_length_count = 0;
+   shader = compile(idle, "idle", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "idle: %u %s\n", error.kind, error.detail);
+   assert(shader && error.kind == STELA_AIR_OK && !error.detail[0]);
+   assert(shader->info.shared_size == 0);
+   stela_metal_release(shader);
 }
 
 static nir_variable *
@@ -3741,9 +3786,12 @@ stitched_threadgroup_memory_is_its_kernels(void)
    assert(shader && shader->info.shared_size >= 128);
    stela_metal_release(shader);
 
-   /* Its dispatch sizes it, as a kernel's threadgroup buffer. */
-   assert(!compile_stitched(stitched, "bound", source, kept, NULL, 0, &error) &&
-          strstr(error.detail, "threadgroup buffer 2"));
+   /* Its dispatch sizes it, as a kernel's threadgroup buffer; unsized, it
+    * declares no type and gets one 16-byte granule. */
+   shader = compile_stitched(stitched, "bound", source, kept, NULL, 0, &error);
+   assert(shader && shader->info.shared_size >= 16 &&
+          !strcmp(error.detail, "threadgroup arg 2 unset: using 16"));
+   stela_metal_release(shader);
    LLVMDisposeMemoryBuffer(stitched);
 
    /* Threadgroup memory feeds only a threadgroup pointer. */

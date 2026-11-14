@@ -64,6 +64,7 @@ use alloc::{
     boxed::Box,
     collections::BTreeMap,
     ffi::CString,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
@@ -310,6 +311,9 @@ pub struct AirCompiler {
     libraries: Libraries,
     next_library: u64,
     refusal: Option<Refusal>,
+    /// What compilations gave in place of what their calls asked, such
+    /// as a threadgroup buffer's bytes, until the device takes them.
+    notices: Vec<String>,
     /// Reflections and compiled NIR, once the platform keeps them
     /// ([`AirCompiler::keep_compilations`]).
     reflections: Option<ReflectionCache>,
@@ -446,6 +450,7 @@ impl AirCompiler {
             libraries: BTreeMap::new(),
             next_library: 0,
             refusal: None,
+            notices: Vec::new(),
             reflections: None,
             nir: None,
             deferring: false,
@@ -589,12 +594,14 @@ impl AirCompiler {
             result,
             serialized,
             restored,
+            notice,
         } = finished;
         match restored {
             Some(false) => self.restored += 1,
             Some(true) => self.recalled += 1,
             None => self.note_compiled(Some(key)),
         }
+        self.notices.extend(notice);
         self.keep_serialized(&key, serialized.as_deref());
         let Some(nir) = self.nir.as_mut() else {
             if let Ok((shader, _)) = result {
@@ -813,6 +820,10 @@ impl AirCompiler {
 }
 
 impl Compiler for AirCompiler {
+    fn take_notice(&mut self) -> Option<String> {
+        (!self.notices.is_empty()).then(|| self.notices.remove(0))
+    }
+
     fn take_refusal(&mut self) -> Option<Refusal> {
         self.refusal.take()
     }
@@ -1353,7 +1364,8 @@ impl AirCompiler {
         };
         self.note_compiled(job.key);
         match result {
-            Ok((shader, bytes)) => {
+            Ok((shader, bytes, notice)) => {
+                self.notices.extend(notice);
                 if let Some(key) = job.key
                     && self.persist.is_some()
                 {
@@ -1717,6 +1729,8 @@ pub struct Finished {
     /// Deserialized rather than compiled: `true` from this boot's NIR,
     /// `false` from an earlier boot's.
     restored: Option<bool>,
+    /// What it gave in place of what the call asked ([`CompileJob::run`]).
+    notice: Option<String>,
 }
 
 impl CompileJob {
@@ -1736,19 +1750,24 @@ impl CompileJob {
                 result: Ok(shader),
                 serialized: None,
                 restored: Some(recalled),
+                notice: None,
             };
         }
         let serializing = self.serializing;
-        let result = self.run();
+        let (result, notice) = match self.run() {
+            Ok((shader, bytes, notice)) => (Ok((shader, bytes)), notice),
+            Err(_) => (Err(()), None),
+        };
         let serialized = match &result {
             Ok((shader, _)) if serializing => serialize(shader.code),
             _ => None,
         };
         Finished {
             key: self.key.expect("a deferred compilation has its key"),
-            result: result.map_err(|_| ()),
+            result,
             serialized,
             restored: None,
+            notice,
         }
     }
 
@@ -1770,8 +1789,13 @@ impl CompileJob {
         &self.name
     }
 
-    /// Runs the service: the shader and its NIR's bytes, or the refusal.
-    fn run(&self) -> core::result::Result<(CompiledShader, usize), Box<ffi::AirError>> {
+    /// Runs the service: the shader, its NIR's bytes and what the compiler
+    /// gave in place of what the call asked (a threadgroup buffer's bytes,
+    /// say), or the refusal.
+    #[allow(clippy::type_complexity, reason = "one private result")]
+    fn run(
+        &self,
+    ) -> core::result::Result<(CompiledShader, usize, Option<String>), Box<ffi::AirError>> {
         let specialization = &self.specialization;
         let constants = constant_values(&specialization.constants);
         let values: Vec<_> = self
@@ -1903,7 +1927,13 @@ impl CompileJob {
         if shader.is_null() {
             return Err(Box::new(error));
         }
-        Ok(self.finish(shader))
+        // A compilation that succeeded leaves a detail only to say what it
+        // gave in place of the specialization.
+        let detail = error.detail();
+        let notice = (error.kind == ffi::kind::OK && !detail.is_empty())
+            .then(|| format!("{detail} in {}", self.name));
+        let (shader, bytes) = self.finish(shader);
+        Ok((shader, bytes, notice))
     }
 
     /// The compiled shader of `shader`, this job's NIR, with its NIR's bytes.
