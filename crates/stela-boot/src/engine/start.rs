@@ -289,6 +289,15 @@ fn start(handoff: u64) -> Started {
         Ok(options) => options,
         Err(error) => output::fatal(error),
     };
+    // Before any boot bundle is prepared or board placed: both ask it.
+    stela_soc_data::board::apcie_probe::set_apcie(options.probe_apcie);
+    if options.probe_apcie {
+        stela_soc::apcie::set_sink(apcie_line);
+        output::arguments(format_args!(
+            "APCIE PROBE on: the guest is shown its PCIe root complexes and their              DARTs over a logging register stub; no endpoint is modeled
+"
+        ));
+    }
     // SAFETY: the loader handoff and all reservations stay pinned in the physmap.
     let native_processors = unsafe { crate::native_smp::validate(handoff, options.native_cores) }
         .unwrap_or_else(|error| output::fatal(error));
@@ -325,6 +334,11 @@ struct OpenedHost {
     state_in_storage: bool,
     /// Whether an install streams its remote image.
     remote_image: bool,
+}
+
+/// The PCIe probe's lines (`--probe-apcie`), on the console and the boot log.
+fn apcie_line(arguments: core::fmt::Arguments<'_>) {
+    output::arguments(arguments);
 }
 
 /// Install the host, start its platform and devices, and place the guest's

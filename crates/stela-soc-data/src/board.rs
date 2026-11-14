@@ -133,6 +133,7 @@ use soc::{WakeLayout, chip_row};
 use stela_contracts::caches::Cache;
 #[cfg(test)]
 use stela_contracts::{Chip, caches::Caches};
+pub mod apcie_probe;
 mod models;
 #[cfg(test)]
 use models::ROLE_MODELS;
@@ -425,6 +426,9 @@ pub const USB_DRD: &str = "usb-drd,t8112";
 /// Everything the engine models of a board, from its DeviceTree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
+    /// The PCIe root complexes the probe backs (`--probe-apcie`); empty
+    /// without it.
+    pub apcie: Vec<apcie_probe::Apcie>,
     /// The AP GPIO bank, when visible.
     pub gpio: Option<GpioBank>,
     /// The other visible GPIO banks, in DeviceTree order.
@@ -936,6 +940,7 @@ pub fn board(tree: &[u8]) -> Result<Board> {
     let spmis = spmi_controllers(&io, &extent, phandle)?;
     let dcp = dcp_device(&io, &translate, &darts)?;
     Ok(Board {
+        apcie: apcie_probe::root_complexes(&io),
         spmis,
         dcp,
         gpio,

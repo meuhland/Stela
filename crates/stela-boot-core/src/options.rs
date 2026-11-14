@@ -295,6 +295,10 @@ pub struct System {
     /// serves every page that maps the same bytes, each entry setting the
     /// page it runs at.
     pub page_relative: bool,
+    /// Show the guest its PCIe root complexes (`apcie`) and their DARTs,
+    /// each register window backed by a logging stub (`--probe-apcie`), to
+    /// record how far macOS's own root-complex driver brings its ports up.
+    pub probe_apcie: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -405,6 +409,7 @@ impl Default for System {
             parallel: true,
             profile: false,
             page_relative: false,
+            probe_apcie: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -828,6 +833,7 @@ impl fmt::Display for System {
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile)?;
         line.flag("--page-relative", self.page_relative)?;
+        line.flag("--probe-apcie", self.probe_apcie)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
