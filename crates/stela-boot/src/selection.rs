@@ -16,8 +16,10 @@
 //! restore leaves it, boots nothing ([`Refusal::RecoveryMode`]).
 //!
 //! Each partition is found as the engine finds it: exactly one whole disk
-//! reports the serial, and exactly one of its GPT partitions has the GUID;
-//! an EFI system partition is refused. A blank NOR partition holds no
+//! reports the serial (or, when none does, exactly one that reports no
+//! serial holds the GUID: OVMF's virtio-blk, `chosen_disk::choose`), and
+//! exactly one of its GPT partitions has the GUID; an EFI system partition
+//! is refused. A blank NOR partition holds no
 //! variables yet: the engine initializes it. When `--nor` names the
 //! `--storage` partition, the NOR is the start of that partition's tail
 //! (`pc::machine_state`), and the Preboot disk is the rest, as the engine
@@ -311,6 +313,10 @@ fn planned<'a>(io: ScopedProtocol<BlockIO>, plan: &Plan) -> Result<Partition<'a>
     })
 }
 
+/// A whole disk the firmware lists for the chosen disk's search: the serial
+/// it reports, and its chosen partition and GPT when it is one to read.
+type ReadDisk<'a> = (Option<String>, Option<(Partition<'a>, gpt::Table)>);
+
 /// The partition `target` names, as the engine finds it, or what was found
 /// instead (`chosen_disk::Search`); the partition the `pending` plan is
 /// for, as the engine finds it once the plan is applied ([`planned`]).
@@ -328,35 +334,72 @@ fn search<'a>(
         });
         partition
     };
-    let mut disks: Vec<_> = whole_disks()?
-        .into_iter()
-        .filter(|(serial, _)| serial.as_deref() == Some(target.serial.as_str()))
-        .collect();
-    let io = match disks.len() {
-        0 => return Ok(Err(Search::NoDisk)),
-        1 => disks.remove(0).1,
-        _ => return Ok(Err(Search::SeveralDisks)),
-    };
+    // A pending plan is for the disk the picker found by its serial.
     if let Some(plan) = pending.plan.as_ref().filter(|plan| plan.is_for(target)) {
+        let mut disks: Vec<_> = whole_disks()?
+            .into_iter()
+            .filter(|(serial, _)| serial.as_deref() == Some(target.serial.as_str()))
+            .collect();
+        let io = match disks.len() {
+            0 => return Ok(Err(Search::NoDisk)),
+            1 => disks.remove(0).1,
+            _ => return Ok(Err(Search::SeveralDisks)),
+        };
         return planned(io, plan).map(named).map(Ok);
     }
-    // A table that cannot be read is a blank or wiped disk to a boot.
-    let Ok((mut whole, table)) = table(io) else {
-        return Ok(Err(Search::NoTable));
+    // Only the disks that report the serial, or none, are read: one of
+    // another serial is never the chosen disk.
+    let mut disks: Vec<ReadDisk<'a>> = Vec::new();
+    for (serial, io) in whole_disks()? {
+        let candidate = serial
+            .as_deref()
+            .is_none_or(|serial| serial == target.serial);
+        // A table that cannot be read is a blank or wiped disk to a boot.
+        let read = if candidate { table(io).ok() } else { None };
+        disks.push((serial, read));
+    }
+    let guid = target.partition.0;
+    let listed: Vec<chosen_disk::Listed<'_>> = disks
+        .iter()
+        .map(|(serial, read)| {
+            let matching = read.as_ref().map(|(_, table)| {
+                table
+                    .partitions
+                    .iter()
+                    .filter(|p| p.unique_guid.0 == guid)
+                    .collect::<Vec<_>>()
+            });
+            chosen_disk::Listed {
+                serial: serial.as_deref(),
+                matching: matching.as_ref().map(Vec::len),
+                esp: matching.is_some_and(|matching| {
+                    matching
+                        .first()
+                        .is_some_and(|partition| partition.role() == Some(Role::Esp))
+                }),
+            }
+        })
+        .collect();
+    let index = match chosen_disk::choose(&listed, &target.serial) {
+        Ok(index) => index,
+        Err(search) => return Ok(Err(search)),
     };
-    let matching: Vec<_> = table
+    if disks[index].0.is_none() {
+        output::arguments(format_args!(
+            "CHOSEN DISK {} found by its partition GUID on the one disk the firmware gives no              serial; Stela's own driver reads its serial
+",
+            target.serial
+        ));
+    }
+    let (mut whole, table) = disks
+        .swap_remove(index)
+        .1
+        .expect("a chosen disk has a table");
+    let partition = table
         .partitions
         .iter()
-        .filter(|p| p.unique_guid.0 == target.partition.0)
-        .collect();
-    let partition = match matching[..] {
-        [partition] => partition,
-        [] => return Ok(Err(Search::NoPartition)),
-        _ => return Ok(Err(Search::SeveralPartitions)),
-    };
-    if partition.role() == Some(Role::Esp) {
-        return Ok(Err(Search::EspPartition));
-    }
+        .find(|p| p.unique_guid.0 == guid)
+        .expect("a chosen disk has the partition");
     whole.first_lba = partition.first_lba;
     whole.bytes = partition.blocks() * whole.block_bytes;
     Ok(Ok(named(whole)))
@@ -364,7 +407,9 @@ fn search<'a>(
 
 fn find<'a>(target: &Target, pending: &'a Pending) -> Result<Partition<'a>> {
     search(target, pending)?.map_err(|found| match found {
-        Search::NoDisk | Search::SeveralDisks => refuse!("not exactly one disk has the serial"),
+        Search::NoDisk | Search::SeveralDisks | Search::SeveralUnnamed => {
+            refuse!("not exactly one disk has the serial")
+        }
         Search::NoTable => refuse!("the disk has no valid GPT"),
         Search::NoPartition | Search::SeveralPartitions => {
             refuse!("not exactly one partition has the GUID")
