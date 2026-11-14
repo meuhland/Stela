@@ -1415,6 +1415,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         traces: options.traces.clone(),
         watches: options.watches.clone(),
         step_timing: options.profile,
+        table_insert_throttled: options.table_insert_throttled,
         loop_counts_off: options.profile_keep_pack,
     };
     // The loader handle's last RAM copy preceded canonical registration; its

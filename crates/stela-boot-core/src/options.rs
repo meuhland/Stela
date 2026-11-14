@@ -335,6 +335,10 @@ pub struct System {
     /// (`--profile-keep-pack`), so the boot still reads its pack and the
     /// shares are those of a normal boot.
     pub profile_keep_pack: bool,
+    /// Throttle every block table insert by its block's count
+    /// (`--table-insert-throttled`), as before an entry's first insert on a
+    /// PE went in regardless: for A/B runs.
+    pub table_insert_throttled: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -450,6 +454,7 @@ impl Default for System {
             parallel: true,
             profile: false,
             profile_keep_pack: false,
+            table_insert_throttled: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -921,6 +926,7 @@ impl fmt::Display for System {
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile && !self.profile_keep_pack)?;
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
+        line.flag("--table-insert-throttled", self.table_insert_throttled)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

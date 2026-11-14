@@ -1192,6 +1192,12 @@ fn run_machine<H: Host>(
             "ENGINE profile without self-loop counts: the pack serves this boot\n"
         ));
     }
+    machine.set_table_insert_throttled(options.table_insert_throttled);
+    if options.table_insert_throttled {
+        output::arguments(format_args!(
+            "ENGINE block table inserts all throttled by their block\n"
+        ));
+    }
     if options.profile {
         host::pmu::start(machine.processor());
     }
