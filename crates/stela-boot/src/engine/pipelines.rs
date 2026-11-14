@@ -20,7 +20,7 @@
 use super::store_file::{Direct, Held, Queued, Staged};
 use super::translations;
 use crate::{firmware, handoff::Region, output, paging::PAGE};
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
 use stela_drivers::gpu::metal::native::pipeline_store::{self, Key, MAX_BYTES};
 use stela_formats::journal::{self, Blob, Change, Commit, DATA_START, Execution, SLOT_BYTES};
 use stela_formats::payload::pieces::Extent;
@@ -219,12 +219,39 @@ pub fn prepare() {
     });
 }
 
-/// The journal change that writes `update` after `committed`.
+/// A cache snapshot the device's store keeps, written from its own bytes.
+struct Snapshot(Arc<Vec<u8>>);
+
+impl journal::Source for Snapshot {
+    fn length(&self) -> u64 {
+        self.0.len() as u64
+    }
+    fn read_at(&self, offset: u64, into: &mut [u8]) {
+        journal::Source::read_at(self.0.as_slice(), offset, into);
+    }
+}
+
+/// NIR the device's store keeps, written an entry piece at a time.
+struct Nir(pipeline_store::NirPieces);
+
+impl journal::Source for Nir {
+    fn length(&self) -> u64 {
+        self.0.len()
+    }
+    fn read_at(&self, offset: u64, into: &mut [u8]) {
+        self.0.read_at(offset, into);
+    }
+}
+
+/// The journal change that writes `update` after `committed`. Its blobs
+/// read the store's own bytes as the journal writes them: a copy of a
+/// cache of tens of MiB, and of the NIR gathered into one buffer, ran the
+/// engine heap out of memory as the guest stopped.
 fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change<'static> {
     let mut change = Change::default();
     if let Some(cache) = &update.cache {
         change.replace.push(CACHE);
-        change.blobs.push(Blob::new(CACHE, cache.to_vec()));
+        change.blobs.push(Blob::new(CACHE, Snapshot(cache.clone())));
     }
     if !update.nir.is_empty() {
         let pieces = committed
@@ -240,9 +267,9 @@ fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change
             change.replace.push(NIR);
             change
                 .blobs
-                .push(Blob::new(NIR, pipeline_store::all_nir(&update.key)));
+                .push(Blob::new(NIR, Nir(pipeline_store::all_nir(&update.key))));
         } else {
-            change.blobs.push(Blob::new(NIR, update.nir.clone()));
+            change.blobs.push(Blob::new(NIR, Nir(update.nir.clone())));
         }
     }
     change
