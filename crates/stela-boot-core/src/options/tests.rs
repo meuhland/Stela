@@ -303,7 +303,17 @@ fn shared_aliases_are_off_by_default_and_round_trip() {
     let line = "--system --page-relative --shared-aliases";
     let options = round_trip(line);
     assert!(options.page_relative && options.shared_aliases);
+    assert_eq!(options.shared_limits, 0);
     assert_eq!(options.to_string(), line);
+    let limited = "--system --page-relative --shared-aliases --shared-el0 --shared-no-links \
+                   --shared-verify --shared-log";
+    let options = round_trip(limited);
+    assert_eq!(options.shared_limits, 0b1100_0101);
+    let all = format!(
+        "--system --page-relative --shared-aliases {}",
+        SHARED_LIMITS.join(" ")
+    );
+    assert_eq!(round_trip(&all).shared_limits, 0x1ff);
 }
 
 #[test]

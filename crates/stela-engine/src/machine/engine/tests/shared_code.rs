@@ -262,3 +262,140 @@ fn an_excluded_block_stays_one_pcs() {
         fetched(&mut machine, moved + 12)
     );
 }
+
+/// [`aliased`], with sharing narrowed by `limits`.
+fn limited(words: &[u32], limits: SharedLimits) -> (Machine<FakeHost, NoDevices>, u64) {
+    let (mut machine, moved) = aliased(words, true);
+    machine.set_shared_limits(limits);
+    (machine, moved)
+}
+
+/// The shared diagnostics `machine` reported.
+fn shared_events(machine: &Machine<FakeHost, NoDevices>) -> Vec<SharedEvent> {
+    machine
+        .host
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Shared(shared) => Some(*shared),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `--shared-verify` checks an alias PC once before the shared block runs
+/// there: the same bytes and code there let it run.
+#[test]
+fn a_verified_alias_runs_the_shared_block() {
+    let limits = SharedLimits {
+        verify: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[0x1000_0200, RET], limits); // ADR X0,#0x40
+    let first = fetched(&mut machine, BASE);
+    assert_eq!(fetched(&mut machine, moved), first);
+    assert_eq!(machine.statistics.aliases[Alias::Verified as usize], 1);
+    assert_eq!(machine.statistics.aliases[Alias::Mismatched as usize], 0);
+    assert_eq!(machine.statistics.aliases[Alias::Hits as usize], 1);
+    assert!(shared_events(&machine).is_empty());
+}
+
+/// An alias whose frame no longer holds the block's bytes (written with no
+/// IC IVAU) is refused: reported once, and the PC compiles a block of its
+/// own, which serves it from then on.
+#[test]
+fn a_mismatched_alias_is_reported_and_gets_its_own_block() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    let limits = SharedLimits {
+        verify: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[ADD, RET], limits);
+    let first = fetched(&mut machine, BASE);
+    assert!(machine.code.blocks[first].shared);
+    // The frame's first word changes behind the block's back.
+    let at = (machine.code.blocks[first].physical - BASE) as usize;
+    machine.host.ram[at..at + 4].copy_from_slice(&0x9100_0800u32.to_le_bytes());
+    let second = fetched(&mut machine, moved);
+    assert_ne!(second, first);
+    assert!(!machine.code.blocks[second].shared);
+    let events = shared_events(&machine);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        (events[0].pc, events[0].installed_pc, events[0].mismatch),
+        (moved, BASE, Some("bytes"))
+    );
+    assert_eq!(machine.statistics.aliases[Alias::Mismatched as usize], 1);
+    assert_eq!(fetched(&mut machine, moved), second);
+    assert_eq!(shared_events(&machine).len(), 1, "reported once");
+}
+
+/// `--shared-own-pc` installs shared blocks that serve their own PC alone;
+/// `--shared-el0` shares nothing fetched above EL0; `--shared-log` reports
+/// alias hits at EL0 only.
+#[test]
+fn bisection_limits_narrow_sharing() {
+    let own = SharedLimits {
+        own_pc: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[], own);
+    let first = fetched(&mut machine, BASE + 8);
+    let second = fetched(&mut machine, moved + 8);
+    assert_ne!(first, second);
+    assert!(machine.code.blocks[first].shared && machine.code.blocks[second].shared);
+    assert_eq!(fetched(&mut machine, BASE + 8), first);
+    assert_eq!(machine.statistics.aliases[Alias::Hits as usize], 0);
+
+    let el0 = SharedLimits {
+        el0_only: true,
+        log: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[], el0);
+    assert_ne!(machine.cpu.pstate.el, 0);
+    let first = fetched(&mut machine, BASE + 8);
+    assert!(!machine.code.blocks[first].shared);
+    assert_ne!(fetched(&mut machine, moved + 8), first);
+
+    let log = SharedLimits {
+        log: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[], log);
+    let first = fetched(&mut machine, BASE + 8);
+    assert_eq!(fetched(&mut machine, moved + 8), first);
+    assert!(shared_events(&machine).is_empty(), "above EL0");
+}
+
+/// `--shared-no-table` leaves an alias PC no block table entry, and
+/// `--shared-no-links` links no shared block in its page.
+#[test]
+fn table_and_link_limits_keep_aliases_in_the_engine() {
+    let limits = SharedLimits {
+        no_table: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[], limits);
+    let first = fetched(&mut machine, BASE + 8);
+    assert_eq!(fetched(&mut machine, moved + 8), first);
+    assert_eq!(fetched(&mut machine, moved + 8), first);
+    assert_eq!(table_entry(&machine, BASE + 8), (BASE + 8, first as u32));
+    assert_ne!(table_entry(&machine, moved + 8), (moved + 8, first as u32));
+
+    const B_8: u32 = 0x1400_0002; // b .+8
+    let limits = SharedLimits {
+        no_links: true,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&[B_8, 0, RET], limits);
+    let ret = fetched(&mut machine, BASE + 8);
+    machine.cpu.pc = moved;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: moved + 8,
+        kind: ExitKind::Direct as u64,
+    }];
+    machine.step().unwrap();
+    assert_eq!(fetched(&mut machine, moved + 8), ret);
+    assert_eq!(machine.statistics.links, 0);
+}

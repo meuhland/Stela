@@ -739,6 +739,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
         if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0 {
+            if block.shared && self.shared_limits.no_cells {
+                return false;
+            }
             let point = chain::direct_patch(block.successors[position].site);
             let stamped = !block.shared;
             if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, stamped) {
@@ -767,6 +770,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             return false;
         };
+        // `--shared-no-links`; and with `--shared-verify`, only into a
+        // shared block a fetch here checked.
+        if (block.shared || code.blocks[target].shared)
+            && (self.shared_limits.no_links || !self.alias_checked(target, next_pc))
+        {
+            return false;
+        }
         let exit = block.successors[position];
         let site = exit.site;
         let entry = code.blocks[target].code.0 as u64;
