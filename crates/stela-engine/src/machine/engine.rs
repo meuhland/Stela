@@ -1021,6 +1021,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// Whether blocks compile page-relative (`NativeSystem::page_relative`),
     /// every entry setting the page they run at: off unless asked for.
     page_relative: bool,
+    /// Self-loops leave their entry and iteration counts out while timing
+    /// is on (`--profile-keep-pack`), so the translation context, and with
+    /// it the pack, stays that of an untimed boot.
+    loop_counts_off: bool,
     /// Whether a page-relative block serves every guest page that maps its
     /// frame (`--shared-aliases`, [`Block::shared`]): off unless asked for,
     /// and only with [`Self::page_relative`].
@@ -1494,6 +1498,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             native_system: None,
             self_loops: true,
             page_relative: false,
+            loop_counts_off: false,
             shared_aliases: false,
             shared_limits: SharedLimits::default(),
             shared_verified: BTreeMap::new(),
