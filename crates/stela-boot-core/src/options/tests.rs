@@ -168,6 +168,13 @@ fn setup_lines_parse_and_serialize_identically() {
         stelanet.to_string(),
         format!("{preboot} --guest-network-stelanet")
     );
+    assert!(!stelanet.guest_network_stelanet_csum);
+    let csum = round_trip(&format!("{preboot}-stelanet-csum"));
+    assert!(csum.guest_network && csum.guest_network_stelanet && csum.guest_network_stelanet_csum);
+    assert_eq!(
+        csum.to_string(),
+        format!("{preboot} --guest-network-stelanet-csum")
+    );
     let bundle = format!("--system --storage {DISK} --nor {DISK} --bundle \\EFI\\stela\\r");
     assert_eq!(round_trip(&bundle).to_string(), bundle);
 }
