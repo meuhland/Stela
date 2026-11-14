@@ -899,7 +899,7 @@ fn a_method_in_a_slot_the_kernel_reserves_is_refused() {
 /// `STELA_BOOT_KC=<kernelcache> STELA_KEXT=<target/guest/StelaGPU.kext>
 /// cargo test -p stela-loader --lib -- --ignored a_built_kext`.
 #[test]
-#[ignore = "needs a boot kernel collection and a built kext"]
+#[ignore = "oracle: STELA_BOOT_KC, STELA_KEXT"]
 fn a_built_kext_links_against_a_real_boot_collection() {
     extern crate std;
     let (Ok(collection), Ok(kext)) = (std::env::var("STELA_BOOT_KC"), std::env::var("STELA_KEXT"))
