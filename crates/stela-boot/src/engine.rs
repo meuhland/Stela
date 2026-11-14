@@ -1026,6 +1026,17 @@ fn run_machine<H: Host>(
     if options.page_relative {
         output::arguments(format_args!("ENGINE page-relative code\n"));
     }
+    machine.set_shared_aliases(options.shared_aliases);
+    if options.shared_aliases {
+        output::arguments(format_args!(
+            "ENGINE shared aliases {}\n",
+            if machine.shared_aliases() {
+                "on"
+            } else {
+                "off: they need --page-relative"
+            }
+        ));
+    }
     if options.profile {
         host::pmu::start(machine.processor());
     }

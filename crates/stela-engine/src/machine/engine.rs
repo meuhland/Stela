@@ -14,8 +14,8 @@ use compilation::{PENDING_EXITS, PendingExits};
 use mirrors::*;
 use reports::*;
 pub use reports::{
-    DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS, MailWait,
-    Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
+    Alias, DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS,
+    MailWait, Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
     Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit,
 };
 mod amx;
@@ -470,6 +470,13 @@ struct Block {
     /// exit is the site's access, on whichever PE runs it, whether or not
     /// that PE learnt the site.
     device_stub: bool,
+    /// One body for every guest page that maps its frame
+    /// (`--shared-aliases`): page-relative code without per-PC thunks, its
+    /// `pc` the one it was installed for. It runs at
+    /// `GuestState::page_base` plus its page offset ([`Self::start_at`]),
+    /// and is found for any PC of that offset in its variant and half
+    /// ([`Self::serves`]).
+    shared: bool,
 }
 
 // The board keeps one per block, millions in all.
@@ -481,10 +488,46 @@ impl Block {
         usize::from(self.instructions) * INSTRUCTION as usize
     }
 
-    /// The PC of its last instruction.
+    /// The PC of its last instruction, where it was installed.
+    #[cfg(test)]
     fn terminal_pc(&self) -> u64 {
         self.pc + self.source_bytes() as u64 - INSTRUCTION
     }
+
+    /// Its first instruction's PC in the guest page of `pc`, a PC inside
+    /// it as it runs: a shared block's runs at any page that maps its
+    /// frame ([`Self::shared`]), any other block's at its own PC. A block
+    /// never crosses its page ([`prepare::window`]).
+    fn start_at(&self, pc: u64) -> u64 {
+        if self.shared {
+            (pc & !(FETCH_PAGE - 1)) | (self.pc & (FETCH_PAGE - 1))
+        } else {
+            self.pc
+        }
+    }
+
+    /// The PC of its last instruction as it runs in the page of `pc`
+    /// ([`Self::start_at`]).
+    fn terminal_at(&self, pc: u64) -> u64 {
+        self.start_at(pc) + self.source_bytes() as u64 - INSTRUCTION
+    }
+
+    /// Whether a fetch at `pc` of its frame and variant may run it: its own
+    /// PC, or for a shared block when `aliases` allows, any PC of its page
+    /// offset in the same half of the address space.
+    fn serves(&self, pc: u64, aliases: bool) -> bool {
+        if self.shared {
+            aliases && same_offset_and_half(self.pc, pc)
+        } else {
+            self.pc == pc
+        }
+    }
+}
+
+/// Whether `a` and `b` have the same fetch page offset and lie in the same
+/// half of the address space: PCs one shared block serves.
+fn same_offset_and_half(a: u64, b: u64) -> bool {
+    (a ^ b) & (FETCH_PAGE - 1) == 0 && chain::half(a) == chain::half(b)
 }
 
 /// The bytes a block of `variant` at `pc` may be compiled from: one
@@ -956,6 +999,15 @@ pub struct Machine<H: Host, D: Devices> {
     /// Whether blocks compile page-relative (`NativeSystem::page_relative`),
     /// every entry setting the page they run at: off unless asked for.
     page_relative: bool,
+    /// Whether a page-relative block serves every guest page that maps its
+    /// frame (`--shared-aliases`, [`Block::shared`]): off unless asked for,
+    /// and only with [`Self::page_relative`].
+    shared_aliases: bool,
+    /// The guest page the last native run ended in
+    /// (`GuestState::page_base` at its exit), or of the block fetched
+    /// since, which runs there: where its block runs, for a shared block,
+    /// which serves several ([`Self::running_pc`]).
+    ran_page: u64,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1028,6 +1080,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// of the block, forgets it.
     /// The block's slot incarnation is kept with it.
     direct_exit: Option<(usize, u32, u64, ExitWord)>,
+    /// The guest page the block of [`Self::direct_exit`] ran in when it
+    /// left by it: a shared block's exits are its page's.
+    direct_exit_page: u64,
     /// The PC whose fetch compiles its block now and takes its block table
     /// entry in the install's hold of the board's lock, not in a hold of
     /// its own after ([`Self::remember_target`]); none outside such a
@@ -1395,6 +1450,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             native_system: None,
             self_loops: true,
             page_relative: false,
+            shared_aliases: false,
+            ran_page: 0,
             event_sample: None,
             debug: None,
             device_lines: None,
@@ -1419,6 +1476,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             posted: Vec::new(),
             mail_spare: Vec::new(),
             direct_exit: None,
+            direct_exit_page: 0,
             publishing_target: None,
             outgoing: Vec::new(),
             lines_epoch: 0,

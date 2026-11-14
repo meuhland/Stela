@@ -224,7 +224,7 @@ fn exit_transition_costs() {
             kind: ExitKind::Direct as u64,
         });
         let budget = machine.chain_budget();
-        machine.execute(index, budget).unwrap();
+        machine.execute(index, BASE, budget).unwrap();
     });
     std::println!("EXITS direct part=execute ns={ns}");
 }

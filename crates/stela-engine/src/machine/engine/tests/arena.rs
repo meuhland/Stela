@@ -656,7 +656,9 @@ fn a_part_of_interleaved_pages_retires_in_steps_that_visit_each_page_once() {
         for (position, exit) in block.successors.iter().enumerate() {
             if record.chained(position) {
                 let physical = block.physical + (exit.target.0 - block.pc);
-                let target = machine.code.find(exit.target.0, physical, block.variant);
+                let target = machine
+                    .code
+                    .find(exit.target.0, physical, block.variant, true);
                 assert!(target.is_some_and(|target| !evicted.contains(&target)));
             }
         }
@@ -831,7 +833,7 @@ fn a_page_with_a_long_index_list_retires_in_steps_of_bounded_work() {
     let quarter = FETCH_PAGE / 4 + 4;
     let middle = machine
         .code
-        .find(base + quarter, physical + quarter, variant)
+        .find(base + quarter, physical + quarter, variant, true)
         .expect("indexed");
     let range = part_of(&machine, middle);
     let evicted: Vec<usize> = (0..machine.code.blocks.len())
@@ -850,7 +852,7 @@ fn a_page_with_a_long_index_list_retires_in_steps_of_bounded_work() {
             let block = &machine.code.blocks[slot];
             let target = machine
                 .code
-                .find(block.pc + 4, block.physical + 4, block.variant);
+                .find(block.pc + 4, block.physical + 4, block.variant, true);
             target.is_some_and(|target| evicted.contains(&target))
         })
         .count();
@@ -882,7 +884,9 @@ fn a_page_with_a_long_index_list_retires_in_steps_of_bounded_work() {
         for (position, exit) in block.successors.iter().enumerate() {
             if record.chained(position) {
                 let physical = block.physical + (exit.target.0 - block.pc);
-                let target = machine.code.find(exit.target.0, physical, block.variant);
+                let target = machine
+                    .code
+                    .find(exit.target.0, physical, block.variant, true);
                 assert!(target.is_some_and(|target| !evicted.contains(&target)));
             }
         }
@@ -1325,6 +1329,7 @@ fn pes_that_look_up_and_link_never_meet_a_block_a_concurrent_retirement_took() {
                                 base + 16 * group,
                                 page + 16 * group,
                                 variant,
+                                true,
                             )
                         });
                         let mut sources: Vec<usize> = hot.collect();
@@ -1374,7 +1379,7 @@ fn pes_that_look_up_and_link_never_meet_a_block_a_concurrent_retirement_took() {
         let Some(block) = code.blocks.installed(slot) else {
             continue;
         };
-        if code.find(block.pc, block.physical, block.variant) == Some(slot) {
+        if code.find(block.pc, block.physical, block.variant, true) == Some(slot) {
             let part = arena.part_of(block.code.0).expect("code in the window");
             let held = board::Place {
                 generation: arena.ring.holds(part),
@@ -1393,7 +1398,10 @@ fn pes_that_look_up_and_link_never_meet_a_block_a_concurrent_retirement_took() {
                     panic!("after the retirements: {error}");
                 }
                 let physical = block.physical + (exit.target.0 - block.pc);
-                assert!(code.find(exit.target.0, physical, block.variant).is_some());
+                assert!(
+                    code.find(exit.target.0, physical, block.variant, true)
+                        .is_some()
+                );
             }
         }
     }
@@ -1750,7 +1758,7 @@ fn a_block_whose_thunk_fills_its_part_is_published_in_a_part_that_stays() {
     assert_eq!(ring.retired_through(part), 0, "the block's part went");
     assert!(ring.live(held), "the block's part was chosen to go");
     assert_eq!(code.report().redone, 0);
-    assert_eq!(machine.code.find(pc, physical, id), Some(slot));
+    assert_eq!(machine.code.find(pc, physical, id, true), Some(slot));
 }
 
 /// Another PE's advance chooses a block's part between the block's take
@@ -1801,7 +1809,7 @@ fn a_block_whose_part_is_chosen_before_it_publishes_is_installed_again() {
     assert_eq!(code.report().redone, 1);
     let block = &code.blocks[slot];
     assert_eq!(
-        code.find(pc, block.physical, block.variant),
+        code.find(pc, block.physical, block.variant, true),
         Some(slot),
         "the block installed again is the one indexed"
     );

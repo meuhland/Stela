@@ -750,16 +750,29 @@ impl Code {
         }
     }
 
-    /// The indexed block at `pc`, `physical` and `variant`: from the
+    /// The indexed block at `pc`, `physical` and `variant` (with `aliases`,
+    /// a shared one of another page, [`BlockIndex::get`]): from the
     /// [`Finder`] without the lock, which a caller inside its section may
     /// read, or under it when the finder cannot say.
-    pub(super) fn find(&self, pc: u64, physical: u64, variant: VariantId) -> Option<usize> {
-        match self.finder.find(&self.blocks, pc, physical, variant) {
+    pub(super) fn find(
+        &self,
+        pc: u64,
+        physical: u64,
+        variant: VariantId,
+        aliases: bool,
+    ) -> Option<usize> {
+        match self
+            .finder
+            .find(&self.blocks, pc, physical, variant, aliases)
+        {
             Some(found) => found,
-            None => self
-                .cache_at(LockSite::Fetch)
-                .index
-                .get(&self.blocks, pc, physical, variant),
+            None => self.cache_at(LockSite::Fetch).index.get(
+                &self.blocks,
+                pc,
+                physical,
+                variant,
+                aliases,
+            ),
         }
     }
 

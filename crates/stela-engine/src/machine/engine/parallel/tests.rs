@@ -753,7 +753,7 @@ fn a_pe_times_its_tlb_mail_from_the_first_post_to_the_read() {
         kind: stela_compiler::block::ExitKind::Fallthrough as u64,
     }];
     let budget = machine.chain_budget();
-    machine.execute(index, budget).unwrap();
+    machine.execute(index, pc, budget).unwrap();
     machine.read_mail().unwrap();
     let after = waits(&machine);
     assert_eq!(after[MailWait::Count as usize], 2);

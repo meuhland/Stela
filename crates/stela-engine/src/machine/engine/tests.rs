@@ -2520,7 +2520,7 @@ fn eviction_undoes_the_links_into_evicted_blocks_and_keeps_their_pages() {
             .code
             .cache()
             .index
-            .get(&machine.code.blocks, base + 12, physical, variant),
+            .get(&machine.code.blocks, base + 12, physical, variant, true),
         Some(1)
     );
     assert_eq!(
@@ -2528,7 +2528,7 @@ fn eviction_undoes_the_links_into_evicted_blocks_and_keeps_their_pages() {
             .code
             .cache()
             .index
-            .get(&machine.code.blocks, base, first_physical, variant),
+            .get(&machine.code.blocks, base, first_physical, variant, true),
         None
     );
     // The second block took no lookup entry: the first's exit linked into
