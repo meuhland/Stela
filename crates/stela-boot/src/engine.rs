@@ -1398,7 +1398,12 @@ fn finish<H: Host>(
             pipelines::write();
             let pipelines = output::millis_since(started);
             let started = output::now();
-            translations::write();
+            // A short boot or one that crashed shows nothing of what its
+            // user runs: its used keys refresh records but age none.
+            translations::write(stela_engine::translations::pack::ages_records(
+                orderly(&reset),
+                seconds as u64,
+            ));
             let translations = output::millis_since(started);
             let hold = match reset.transition {
                 Transition::Restart | Transition::PowerOff => {
