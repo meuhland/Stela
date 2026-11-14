@@ -369,11 +369,17 @@ impl Service {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
             let carrier = network.carrier();
-            let (frames, status, room) = devices.with(|devices| {
+            let (frames, status, room, fault) = devices.with(|devices| {
                 let frames = network.queued(devices);
-                (frames, devices.network_status(), devices.network_room())
+                (
+                    frames,
+                    devices.network_status(),
+                    devices.network_room(),
+                    devices.stela_net_error(),
+                )
             });
             network.status(status);
+            network.fault(fault);
             let reusable = network.transmit(frames);
             network.receive(room);
             // Served, as a received frame is: a carrier change is a

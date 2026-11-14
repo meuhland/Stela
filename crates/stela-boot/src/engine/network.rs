@@ -741,6 +741,8 @@ pub struct GuestNetwork {
     facts: stela_runtime::net::facts::Facts,
     /// Reports since the facts line was last looked at.
     facts_reports: u32,
+    /// Why the StelaNet adapter last stopped itself, as last reported.
+    fault: Option<&'static str>,
 }
 
 /// Reports between two host adapter state lines while the guest receives
@@ -851,6 +853,7 @@ impl GuestNetwork {
             carrier_checked: 0,
             facts: Default::default(),
             facts_reports: 0,
+            fault: None,
         })
     }
 
@@ -911,6 +914,17 @@ impl GuestNetwork {
                 if up { "up" } else { "down" }
             ));
         }
+    }
+
+    /// Report why the StelaNet adapter stopped itself, once per new reason.
+    pub fn fault(&mut self, fault: Option<&'static str>) {
+        if fault.is_some() && self.fault != fault {
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet stopped: {}\n",
+                fault.unwrap_or_default()
+            ));
+        }
+        self.fault = fault;
     }
 
     /// The beat report's line: the frames the guest adapter moved each way
