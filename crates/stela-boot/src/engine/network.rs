@@ -726,6 +726,8 @@ pub struct GuestNetwork {
     carrier_checked: u64,
     /// Why the StelaNet adapter last stopped itself, as last reported.
     fault: Option<&'static str>,
+    /// The guest's IPv4 address as StelaNet last reported it.
+    address: Option<[u8; 4]>,
 }
 
 /// Reports between two host adapter state lines while the guest receives
@@ -785,6 +787,7 @@ impl GuestNetwork {
             carrier: None,
             carrier_checked: 0,
             fault: None,
+            address: None,
         })
     }
 
@@ -857,6 +860,19 @@ impl GuestNetwork {
             ));
         }
         self.fault = fault;
+    }
+
+    /// Report the IPv4 address the guest claimed through StelaNet, once per
+    /// new address: how a run finds a guest whose address DHCP chose.
+    pub fn address(&mut self, address: Option<[u8; 4]>) {
+        if let Some([a, b, c, d]) = address
+            && self.address != address
+        {
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet guest address {a}.{b}.{c}.{d}\n"
+            ));
+            self.address = address;
+        }
     }
 
     /// The beat report's line: the frames the guest adapter moved each way

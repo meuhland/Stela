@@ -57,6 +57,24 @@ impl AppleDevices {
         self.stela_net_ref()?.error()
     }
 
+    /// Whether the board has a StelaNet adapter.
+    pub fn has_stela_net(&self) -> bool {
+        self.stela_net.is_some()
+    }
+
+    /// The IPv4 address the guest last claimed through StelaNet (ARP), for
+    /// the boot log.
+    pub fn stela_net_address(&self) -> Option<[u8; 4]> {
+        self.stela_net_ref()?.guest_address()
+    }
+
+    /// The host adapter's carrier, for StelaNet's `LINK` and its link cause.
+    pub fn stela_net_set_link(&mut self, up: bool) {
+        if let Some(net) = self.stela_net() {
+            net.set_link(up);
+        }
+    }
+
     pub(super) fn stela_net_due(&self) -> bool {
         self.stela_net_ref().is_some_and(Net::due)
     }
