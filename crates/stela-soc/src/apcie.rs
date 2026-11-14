@@ -8,7 +8,11 @@
 //! 1 the common (root-complex) registers, 2 the PHY, 3 the PHY IP, 4 AXI2AF,
 //! 5 the PMGR eFuses, then per port N five windows from 6 + 5N: the port's
 //! registers, its LTSSM debug block, PHY glue, PHY IP lane and INTR2AXI.
-//! Each window is placed at its own device offset (`index << WINDOW_SHIFT`).
+//! The windows overlap: on 26B123 J473AP the PHY window (`reg[2]`) spans
+//! the PHY IP and each port's PHY glue (probe2's trace logged the port-0
+//! refclk handshake at `phy+0x4000` and the fuse copies at `phy+0x4xxxx`).
+//! So the stub sees guest physical addresses and names each access by the
+//! smallest window that holds it.
 //!
 //! Every register stores what software writes and reads it back, except the
 //! acknowledgements the driver polls without a timeout (from the
@@ -49,8 +53,9 @@ use stela_contracts::bus::{Access, Lifecycle, LifecycleState, MmioDevice, MmioEr
 
 const NAME: &str = "apcie-probe";
 
-/// Each window's device offset is its `reg` index shifted by this.
-pub const WINDOW_SHIFT: u32 = 40;
+/// A stored register's key is its window's `reg` index shifted by this,
+/// then its offset in the window.
+const WINDOW_SHIFT: u32 = 40;
 /// The most `APCIE` access lines a boot prints.
 pub const LINE_CAP: u32 = 20_000;
 /// Seconds between summaries while the registers change.
@@ -93,6 +98,8 @@ pub enum Window {
     PhyGlue(usize),
     PhyIpLane(usize),
     Intr2Axi(usize),
+    /// A placed address no window holds, by its physical address.
+    Outside,
 }
 
 impl Window {
@@ -130,6 +137,7 @@ impl Window {
             Self::PhyGlue(n) => 8 + 5 * n,
             Self::PhyIpLane(n) => 9 + 5 * n,
             Self::Intr2Axi(n) => 10 + 5 * n,
+            Self::Outside => 0xf_ffff,
         }
     }
 }
@@ -148,6 +156,7 @@ impl fmt::Display for Window {
             Self::PhyGlue(n) => write!(f, "phy-glue{n}"),
             Self::PhyIpLane(n) => write!(f, "phy-ip-lane{n}"),
             Self::Intr2Axi(n) => write!(f, "intr2axi{n}"),
+            Self::Outside => f.write_str("pa"),
         }
     }
 }
@@ -274,6 +283,8 @@ pub struct ApcieProbe {
     name: String,
     first_bus: u8,
     ports: Vec<RootPort>,
+    /// Each window, its guest PA and size, smallest first.
+    windows: Vec<(Window, u64, u64)>,
     /// Stored 32-bit words by device offset (window and offset).
     words: BTreeMap<u64, u32>,
     lines: u32,
@@ -291,12 +302,21 @@ pub struct ApcieProbe {
 
 impl ApcieProbe {
     /// A stub for root complex `name` whose root ports' headers are on
-    /// `first_bus` at the device numbers `ports`.
-    pub fn new(name: &str, first_bus: u8, ports: &[u8]) -> Self {
+    /// `first_bus` at the device numbers `ports`, with `windows` as
+    /// (`reg` index, guest PA, bytes). It is placed at device offsets equal
+    /// to guest PAs.
+    pub fn new(name: &str, first_bus: u8, ports: &[u8], windows: &[(usize, u64, u64)]) -> Self {
+        let mut windows: Vec<_> = windows
+            .iter()
+            .map(|&(index, physical, bytes)| (Window::of(index), physical, bytes))
+            .collect();
+        // Smallest first; of two alike, the later `reg` entry (a port's).
+        windows.sort_by_key(|&(window, _, bytes)| (bytes, core::cmp::Reverse(window.index())));
         Self {
             name: name.into(),
             first_bus,
             ports: ports.iter().map(|&device| RootPort::new(device)).collect(),
+            windows,
             words: BTreeMap::new(),
             lines: 0,
             capped: false,
@@ -523,11 +543,15 @@ impl ApcieProbe {
         emit(format_args!("APCIE SUMMARY {} end\n", self.name));
     }
 
-    fn place(offset: u64) -> Place {
-        Place(
-            Window::of((offset >> WINDOW_SHIFT) as usize),
-            offset & ((1 << WINDOW_SHIFT) - 1),
-        )
+    /// The smallest window holding guest PA `physical`, and the offset in it.
+    fn place(&self, physical: u64) -> Place {
+        self.windows
+            .iter()
+            .find(|&&(_, at, bytes)| at <= physical && physical - at < bytes)
+            .map_or(
+                Place(Window::Outside, physical & ((1 << WINDOW_SHIFT) - 1)),
+                |&(window, at, _)| Place(window, physical - at),
+            )
     }
 }
 
@@ -553,7 +577,7 @@ impl MmioDevice for ApcieProbe {
         width: Width,
         access: &mut Access<'_>,
     ) -> Result<u64, MmioError> {
-        let place = Self::place(offset);
+        let place = self.place(offset);
         let bytes = width.bytes();
         let value = match place.0 {
             Window::Config => self.read_config(place.1, bytes),
@@ -570,7 +594,7 @@ impl MmioDevice for ApcieProbe {
         value: u64,
         access: &mut Access<'_>,
     ) -> Result<(), MmioError> {
-        let place = Self::place(offset);
+        let place = self.place(offset);
         let bytes = width.bytes();
         let value = value & width.mask();
         self.record(Direction::Write, place, bytes, value, access);

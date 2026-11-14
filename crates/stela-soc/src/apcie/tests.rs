@@ -1,12 +1,27 @@
 use super::*;
 use stela_contracts::interrupt::InterruptLatch;
 
+/// Each window's guest PA in these tests: apart, and ECAM above the rest.
+fn base(index: usize) -> u64 {
+    if index == 0 {
+        0x10_0000_0000
+    } else {
+        (index as u64) << 24
+    }
+}
+
 fn at(window: Window, offset: u64) -> u64 {
-    ((window.index() as u64) << WINDOW_SHIFT) | offset
+    base(window.index()) + offset
 }
 
 fn probe() -> ApcieProbe {
-    ApcieProbe::new("apcie", 0, &[0, 1])
+    let windows: Vec<_> = (0..50)
+        .map(|index| {
+            let bytes = if index == 0 { 0x1000_0000 } else { 0x10_0000 };
+            (index, base(index), bytes)
+        })
+        .collect();
+    ApcieProbe::new("apcie", 0, &[0, 1], &windows)
 }
 
 #[test]
@@ -85,7 +100,7 @@ fn registers_store_writes_and_interrupt_status_clears_by_writing_ones() {
     );
     stub.write(at(Window::Port(0), 0x100), Width::Word, 0, &mut access)
         .unwrap();
-    stub.words.insert(at(Window::Port(0), 0x100), 0x1000 | 0x4);
+    stub.store(Window::Port(0), 0x100, 0x1000 | 0x4);
     stub.write(at(Window::Port(0), 0x100), Width::Word, 0x4, &mut access)
         .unwrap();
     assert_eq!(
@@ -227,4 +242,33 @@ fn every_lifecycle_state_is_accepted() {
         };
         assert!(stub.check_lifecycle(state).is_ok());
     }
+}
+
+#[test]
+fn an_access_belongs_to_the_smallest_window_holding_it() {
+    // J473AP: the PHY window holds the PHY IP and each port's PHY glue.
+    let phy = 0x6_8008_4000;
+    let windows = [
+        (2, phy, 0x6_0000),
+        (3, phy + 0x4_0000, 0x1_0000),
+        (8, phy + 0x4000, 0x4000),
+        (13, phy + 0x8000, 0x4000),
+    ];
+    let mut stub = ApcieProbe::new("apcie", 0, &[0, 1], &windows);
+    assert_eq!(stub.place(phy), Place(Window::Phy, 0));
+    assert_eq!(stub.place(phy + 0x4004), Place(Window::PhyGlue(0), 4));
+    assert_eq!(stub.place(phy + 0x8000), Place(Window::PhyGlue(1), 0));
+    assert_eq!(stub.place(phy + 0x4_6238), Place(Window::PhyIp, 0x6238));
+    assert_eq!(stub.place(phy + 0xc000), Place(Window::Phy, 0xc000));
+    assert_eq!(stub.place(0x1000), Place(Window::Outside, 0x1000));
+    // Probe2's hang: port 0's refclk request at phy+0x4000 is acknowledged.
+    let mut latch = InterruptLatch::new();
+    let access = &mut Access::new(0, 0, &mut latch);
+    stub.write(phy + 0x4004, Width::Word, 0x8000, access)
+        .unwrap();
+    stub.write(phy + 0x4000, Width::Word, 1, access).unwrap();
+    assert_eq!(stub.read(phy + 0x4000, Width::Word, access), Ok(0x5));
+    stub.write(phy + 0x4000, Width::Word, 3, access).unwrap();
+    assert_eq!(stub.read(phy + 0x4000, Width::Word, access), Ok(0xf));
+    assert_eq!(stub.read(phy + 0x4004, Width::Word, access), Ok(0x8000));
 }
