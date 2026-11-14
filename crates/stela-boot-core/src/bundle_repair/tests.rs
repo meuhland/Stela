@@ -43,10 +43,59 @@ fn a_normal_boot_repairs_once_and_then_stops_with_the_manual_remedy() {
         decide(Report::Missing, Boot::Normal, Record::None, false),
         Decision::StopMissing { attempted: false }
     );
+}
+
+#[test]
+fn a_plugin_the_kext_cannot_write_is_repaired_once_and_then_stops() {
+    let failed = |record, persistent| decide(Report::Failed, Boot::Normal, record, persistent);
+    assert_eq!(failed(Record::None, true), Decision::Repair);
+    assert_eq!(failed(Record::Other, true), Decision::Repair);
+    assert_eq!(failed(Record::Outdated, true), Decision::Repair);
+    assert_eq!(failed(Record::Retried, true), Decision::StopFailed);
+    assert_eq!(failed(Record::Attempted, true), Decision::StopFailed);
+    assert_eq!(failed(Record::Pending, true), Decision::StopFailed);
+    assert_eq!(failed(Record::None, false), Decision::StopFailed);
+    // The repair removes the bundle's files right after the step that
+    // makes the directories the kext writes them into, so the bundle is
+    // there to search.
+    let steps = steps();
+    let remove = steps
+        .iter()
+        .position(|step| step.command == remove_files())
+        .unwrap();
+    assert!(!steps[remove].required);
     assert_eq!(
-        decide(Report::Failed, Boot::Normal, Record::None, true),
-        Decision::StopFailed
+        remove_files(),
+        "/usr/bin/find /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle -type f -delete"
     );
+    let mkdir = steps
+        .iter()
+        .position(|step| step.command.starts_with("/bin/mkdir"))
+        .unwrap();
+    assert_eq!(remove, mkdir + 1);
+}
+
+#[test]
+fn the_repair_removes_a_plugin_file_the_kext_cannot_write() {
+    let mut guest = Guest::new(Some(true));
+    let bundle = format!("{PLUGINS}/{}", DIRECTORIES[0]);
+    let file = format!("{PLUGINS}/{}/StelaGPU", DIRECTORIES[2]);
+    for directory in DIRECTORIES {
+        guest.directories.push(format!("{PLUGINS}/{directory}"));
+    }
+    guest.files.push(file.clone());
+    let guest = RefCell::new(guest);
+    let (mut driver, _console) = repair_in(&guest);
+    assert_eq!(driver.outcome(), Some(&Outcome::Done));
+    assert!(
+        !driver
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, Event::Skipped { .. } | Event::Failed(_)))
+    );
+    let guest = guest.into_inner();
+    assert!(guest.files.is_empty(), "{file}");
+    assert!(guest.directories.contains(&bundle));
 }
 
 #[test]
@@ -126,13 +175,13 @@ fn the_steps_create_the_directories_the_manual_remedy_does() {
     assert!(!commands.iter().any(|command| command.contains("xattr")));
     let chflags = format!("/usr/bin/chflags restricted {all}");
     assert!(commands.contains(&chflags.as_str()));
-    // Only the restricted flag and the read-only remount after the sync are
-    // optional.
+    // Only removing the plugin's files, the restricted flag and the
+    // read-only remount after the sync are optional.
     let remount = "/sbin/mount -u -r /System/Volumes/Data";
     for step in &steps {
         assert_eq!(
             step.required,
-            step.command != chflags && step.command != remount,
+            step.command != chflags && step.command != remount && step.command != remove_files(),
             "{}",
             step.command
         );
@@ -352,6 +401,15 @@ impl Guest {
             "/usr/sbin/chown" | "/usr/bin/chflags" => {
                 u32::from(!paths.iter().all(|path| exists(self, path)))
             }
+            // `find DIR -type f -delete`: DIR's files go, its directories stay.
+            "/usr/bin/find" => {
+                if !self.directories.iter().any(|d| d == paths[0]) {
+                    return 1;
+                }
+                let inside = format!("{}/", paths[0]);
+                self.files.retain(|file| !file.starts_with(&inside));
+                0
+            }
             _ => 127,
         }
     }
@@ -430,7 +488,10 @@ fn a_failing_optional_step_is_logged_and_the_repair_goes_on() {
     let status = |command: &str| Some(u32::from(command.starts_with("/usr/bin/chflags")));
     pump(&mut driver, &mut console, &mut now, &status);
     assert!(!driver.failed());
-    let chflags = steps().iter().position(|step| !step.required).unwrap();
+    let chflags = steps()
+        .iter()
+        .position(|step| step.command.starts_with("/usr/bin/chflags"))
+        .unwrap();
     let events = driver.take_events();
     assert!(events.contains(&Event::Skipped {
         index: chflags,
