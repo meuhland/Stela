@@ -289,6 +289,34 @@ impl<H: Host, D: Devices> Machine<H, D> {
         anchors
     }
 
+    /// Start the native jump cache over at every native entry
+    /// (`--jump-serial-always`), as before it could keep it across entries
+    /// while nothing its entries rest on changed ([`Self::jump_basis`]).
+    pub fn set_jump_serial_always(&mut self, always: bool) {
+        self.jump_serial_always = always;
+    }
+
+    /// What this PE's native jump cache entries rest on besides its
+    /// control ([`chain_control::JumpBasis`]), now: the board's count of
+    /// unpublished blocks and this PE's ITLB's drops and capacity
+    /// evictions.
+    pub(super) fn jump_basis(&self) -> chain_control::JumpBasis {
+        let drops = (self.itlb.address() as i64 + i64::from(chain::ITLB_DROPS))
+            as *const core::sync::atomic::AtomicU64;
+        // SAFETY: an ITLB's drop epochs, one atomic word per half in the
+        // header in front of its table (`chain::ITLB_DROPS`), live with it.
+        let dropped = unsafe {
+            (*drops)
+                .load(Ordering::Relaxed)
+                .wrapping_add((*drops.add(1)).load(Ordering::Relaxed))
+        };
+        let [put_out, moved_out] = self.itlb.evicted();
+        chain_control::JumpBasis {
+            board: self.code.unpublished(),
+            itlb: dropped.wrapping_add(put_out).wrapping_add(moved_out),
+        }
+    }
+
     /// Run compiled block `index`, fetched at `pc`, and the blocks it
     /// chains into, up to `budget` of them, and complete the last one's
     /// exit or fault.
@@ -300,7 +328,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Whether a transition may continue in this run, logged where
         // counters tell the levels apart (`transitions`).
         self.mirrors.transitions.chain = self.transition_chain();
-        self.chain.begin(index, budget);
+        let basis = (!self.jump_serial_always).then(|| self.jump_basis());
+        let moved = self.chain.begin(index, budget, basis);
+        self.statistics.jump_serials[usize::from(!moved)] += 1;
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
         self.mirrors.monitor = u64::from(self.cpu.monitor.is_some());

@@ -638,6 +638,10 @@ pub struct Statistics {
     /// direct exits out of their page), and the transfers those made.
     pub lookups: u64,
     pub lookup_hits: u64,
+    /// Native entries whose jump cache serial moved, every entry its
+    /// lookup tails filled going, then those that kept it
+    /// (`chain_control::JumpBasis`, `--jump-serial-always`).
+    pub jump_serials: [u64; 2],
     /// Native runs that ended in an exit to the engine, by `ExitKind`
     /// (Fallthrough, Direct, Indirect, Call, Return, Trap, PAC, Clock,
     /// ThreadRegister, FloatingPoint, ScalableNumerical, System, AMX).
@@ -861,6 +865,7 @@ impl core::ops::AddAssign for Statistics {
             unlinks,
             lookups,
             lookup_hits,
+            jump_serials,
             exit_kinds,
             lookup_misses,
             lookup_forgets,
@@ -938,6 +943,9 @@ impl core::ops::AddAssign for Statistics {
         }
         self.replaced_retired = self.replaced_retired.saturating_add(replaced_retired);
         for (total, count) in self.exit_kinds.iter_mut().zip(exit_kinds) {
+            *total += count;
+        }
+        for (total, count) in self.jump_serials.iter_mut().zip(jump_serials) {
             *total += count;
         }
         for (total, count) in self.amx_moves.iter_mut().zip(amx_moves) {

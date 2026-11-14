@@ -1643,10 +1643,12 @@ impl Heartbeat {
                 String::from("PES ALIAS hits/shared_installs/lost/verified/mismatched");
             // Per PE: stamped tail hits and misses by cause, stamps written,
             // changed cells, table probe transfers (jump cache misses), stamped
-            // tails made, then every probe transfer (jump cache and table).
+            // tails made, every probe transfer (jump cache and table), then
+            // native entries that moved the jump cache's serial (starting
+            // the cache over) and those that kept it.
             let mut stamped = String::from(concat!(
                 "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed",
-                "/filled/promoted/probe_hits",
+                "/filled/promoted/probe_hits/serial_moved/serial_kept",
             ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
@@ -1806,10 +1808,12 @@ impl Heartbeat {
                     &now.stamped[..promoted],
                     &before.stamped[..promoted],
                 );
-                stamped.push_str(&format!(
-                    "/{}",
-                    now.stamped[promoted + 2].saturating_sub(before.stamped[promoted + 2])
-                ));
+                for count in [promoted + 2, promoted + 3, promoted + 4] {
+                    stamped.push_str(&format!(
+                        "/{}",
+                        now.stamped[count].saturating_sub(before.stamped[count])
+                    ));
+                }
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
                 pac_fills += now.pac_fills.saturating_sub(before.pac_fills);

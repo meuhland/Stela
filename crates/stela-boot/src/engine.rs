@@ -1063,6 +1063,12 @@ fn run_machine<H: Host>(
 "
         ));
     }
+    machine.set_jump_serial_always(options.jump_serial_always);
+    if options.jump_serial_always {
+        output::arguments(format_args!(
+            "ENGINE jump cache serial moves at every native entry\n"
+        ));
+    }
     machine.set_page_relative(options.page_relative);
     if options.page_relative {
         output::arguments(format_args!("ENGINE page-relative code\n"));

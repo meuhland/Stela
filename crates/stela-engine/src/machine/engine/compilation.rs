@@ -41,8 +41,16 @@ fn insert_target(
         cache.targets_raced += 1;
         return false;
     }
+    // An entry of the same PC and key that names another block (or other
+    // BTYPEs) changes what a probe of them finds: a native jump cache
+    // filled from the old one goes too.
+    let held = cache.targets.find(slot, pc, target.key);
+    let replaced = held.pc == pc && held.key == target.key && held != target;
     cache.targets.insert(slot, target);
     cache.targets_inserted += 1;
+    if replaced {
+        code.note_unpublished();
+    }
     true
 }
 
