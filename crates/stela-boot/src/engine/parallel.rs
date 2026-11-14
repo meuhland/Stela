@@ -114,6 +114,9 @@ pub(crate) struct Settings {
     /// `--jump-serial-always`, as the home machine starts its jump cache
     /// over at every native entry.
     pub jump_serial_always: bool,
+    /// `--table-insert-throttled`, as the home machine throttles block
+    /// table inserts.
+    pub table_insert_throttled: bool,
     /// `--profile-keep-pack`, as the home machine leaves self-loop counts
     /// out of timed code so its pack serves it.
     pub loop_counts_off: bool,
@@ -152,6 +155,7 @@ pub(crate) fn spawn<H: Host>(
             shared_aliases: settings.shared_aliases,
             shared_limits: settings.shared_limits,
             jump_serial_always: settings.jump_serial_always,
+            table_insert_throttled: settings.table_insert_throttled,
             loop_counts_off: settings.loop_counts_off,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
@@ -179,6 +183,7 @@ struct Pe {
     shared_aliases: bool,
     shared_limits: u16,
     jump_serial_always: bool,
+    table_insert_throttled: bool,
     loop_counts_off: bool,
 }
 
@@ -196,6 +201,7 @@ impl Pe {
             shared_aliases,
             shared_limits,
             jump_serial_always,
+            table_insert_throttled,
             loop_counts_off,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
@@ -225,6 +231,7 @@ impl Pe {
         machine.set_shared_aliases(shared_aliases);
         machine.set_shared_limits(super::shared_limits(shared_limits));
         machine.set_jump_serial_always(jump_serial_always);
+        machine.set_table_insert_throttled(table_insert_throttled);
         if step_timing {
             host::pmu::start(pe);
         }

@@ -462,3 +462,16 @@ fn numbers_take_decimal_and_separated_hex() {
 
 mod constraints;
 mod grammar;
+
+/// An entry's first block table insert on a PE goes in regardless of its
+/// block's throttle unless `--table-insert-throttled` asks for the old
+/// throttle of every insert, which round-trips.
+#[test]
+fn table_insert_throttled_is_off_by_default_and_round_trips() {
+    assert!(!System::default().table_insert_throttled);
+    let line = "--system --jump-serial-always --table-insert-throttled";
+    let options = round_trip(line);
+    assert!(options.table_insert_throttled && options.jump_serial_always);
+    assert_eq!(options.to_string(), line);
+    assert!(!round_trip("--system").table_insert_throttled);
+}
