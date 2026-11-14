@@ -27,6 +27,7 @@
 use super::bundle::Bytes;
 use super::store_file::{Direct, Held, Queued, Staged};
 use crate::{firmware, handoff::Region, output, paging::PAGE};
+use alloc::string::ToString;
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, vec, vec::Vec};
 use core::{
     cell::UnsafeCell,
@@ -230,9 +231,7 @@ pub fn read(budget: u64) -> Option<Opened> {
         };
         let limit = bound.min(budget);
         let path = pack_path(&translator, "\\");
-        if open(&mut root, &path, FileMode::Read).is_none() {
-            claim_spare(&mut root, &translator);
-        }
+        provide_pack(&mut root, &translator, bound);
         // A read-only volume's pack is read and never written; a missing
         // one leaves the boot's translations in memory.
         let opened = open(&mut root, &path, FileMode::ReadWrite)
@@ -292,18 +291,134 @@ pub fn read(budget: u64) -> Option<Opened> {
     None
 }
 
-/// Give `translator` the spare pack file by renaming it, when the store
-/// has one: the file keeps its preallocated clusters.
-fn claim_spare(root: &mut Directory, translator: &Digest) {
-    let Some(mut file) = open(root, &format!("{DIRECTORY}\\{SPARE}"), FileMode::ReadWrite) else {
+/// Give `translator` a pack file when it has none, by renaming one: the
+/// spare when the store has one, else the least recently modified pack of
+/// another translator (`stela_boot_core::store_packs`), which the journal
+/// reads as empty for this one. Then, without a spare, an older pack of
+/// another translator becomes the next one. The firmware grows a file only
+/// by writing every byte, so no pack file is made from free space.
+fn provide_pack(root: &mut Directory, translator: &Digest, bound: u64) {
+    let own = pack_name(translator);
+    let spare = format!("{DIRECTORY}\\{SPARE}");
+    if open(root, &pack_path(translator, "\\"), FileMode::Read).is_none() {
+        if open(root, &spare, FileMode::Read).is_some() {
+            let taken = rename(root, &spare, &own, true);
+            output::arguments(format_args!(
+                "TRANSLATIONS spare {} as {own}\n",
+                if taken { "taken" } else { "refused" }
+            ));
+        } else {
+            let packs = pack_files(root);
+            let listed = listed(&packs);
+            match stela_boot_core::store_packs::recycled(&listed, &own, bound) {
+                Some(index) => {
+                    let old = &packs[index].0;
+                    let taken = rename(root, &format!("{DIRECTORY}\\{old}"), &own, true);
+                    output::arguments(format_args!(
+                        "TRANSLATIONS {} {old} for {own}\n",
+                        if taken {
+                            "recycled"
+                        } else {
+                            "could not recycle"
+                        }
+                    ));
+                }
+                None => output::arguments(format_args!(
+                    "TRANSLATIONS no spare and no other pack of {bound} bytes for {own}: \
+                     this boot keeps its translations in memory; `stela setup repair` \
+                     prepares a spare\n"
+                )),
+            }
+        }
+    }
+    if open(root, &pack_path(translator, "\\"), FileMode::Read).is_none()
+        || open(root, &spare, FileMode::Read).is_some()
+    {
         return;
+    }
+    let packs = pack_files(root);
+    let listed = listed(&packs);
+    if let Some(index) = stela_boot_core::store_packs::spare(&listed, &own, bound) {
+        let old = &packs[index].0;
+        if rename(root, &format!("{DIRECTORY}\\{old}"), SPARE, true) {
+            output::arguments(format_args!(
+                "TRANSLATIONS spare made of {old} for the next translator\n"
+            ));
+        }
+    }
+}
+
+/// The `.pak` files in the store's directory: name, bytes and the stamp of
+/// their modification time.
+fn pack_files(root: &mut Directory) -> Vec<(String, u64, u64)> {
+    #[repr(align(8))]
+    struct InfoBuffer([u8; 1024]);
+    let mut packs = Vec::new();
+    let Some(path) = CString16::try_from(DIRECTORY).ok() else {
+        return packs;
+    };
+    let Some(mut directory) = root
+        .open(&path, FileMode::Read, FileAttribute::empty())
+        .ok()
+        .and_then(|handle| handle.into_directory())
+    else {
+        return packs;
+    };
+    let mut buffer = InfoBuffer([0; 1024]);
+    // The store holds a few files; a bound keeps a damaged directory short.
+    for _ in 0..256 {
+        let Ok(Some(info)) = directory.read_entry(&mut buffer.0) else {
+            break;
+        };
+        let name = info.file_name().to_string();
+        if info.attribute().contains(FileAttribute::DIRECTORY)
+            || !name
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{PACK_EXTENSION}"))
+        {
+            continue;
+        }
+        let time = info.modification_time();
+        let stamp = stela_boot_core::store_packs::stamp(
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second(),
+        );
+        packs.push((name, info.file_size(), stamp));
+    }
+    packs
+}
+
+fn listed(packs: &[(String, u64, u64)]) -> Vec<stela_boot_core::store_packs::PackFile<'_>> {
+    packs
+        .iter()
+        .map(
+            |(name, bytes, modified)| stela_boot_core::store_packs::PackFile {
+                name,
+                bytes: *bytes,
+                modified: *modified,
+            },
+        )
+        .collect()
+}
+
+/// Rename the file at `path` to `name` in its directory, keeping its
+/// clusters; `touch` gives it the firmware's time now as its modification
+/// time, so that the translator that took it uses it most recently.
+fn rename(root: &mut Directory, path: &str, name: &str, touch: bool) -> bool {
+    let Some(mut file) = open(root, path, FileMode::ReadWrite) else {
+        return false;
     };
     let Ok(info) = file.get_boxed_info::<FileInfo>() else {
-        return;
+        return false;
     };
-    let Ok(name) = CString16::try_from(pack_name(translator).as_str()) else {
-        return;
+    let Ok(name) = CString16::try_from(name) else {
+        return false;
     };
+    let now = touch.then(|| uefi::runtime::get_time().ok()).flatten();
     let mut storage = vec![0u64; FILE_INFO_WORDS];
     // SAFETY: the words' bytes, 8-byte aligned as FileInfo requires.
     let bytes = unsafe {
@@ -314,18 +429,14 @@ fn claim_spare(root: &mut Directory, translator: &Digest) {
         info.file_size(),
         info.physical_size(),
         *info.create_time(),
-        *info.last_access_time(),
-        *info.modification_time(),
+        now.unwrap_or(*info.last_access_time()),
+        now.unwrap_or(*info.modification_time()),
         info.attribute(),
         &name,
     ) else {
-        return;
+        return false;
     };
-    let claimed = file.set_info(renamed).is_ok() && file.flush().is_ok();
-    output::arguments(format_args!(
-        "TRANSLATIONS spare {} as {name}\n",
-        if claimed { "taken" } else { "refused" }
-    ));
+    file.set_info(renamed).is_ok() && file.flush().is_ok()
 }
 
 /// What [`read_journal`] read: the handoff region (its placement left
