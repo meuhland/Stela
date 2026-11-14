@@ -26,7 +26,62 @@ pub enum Event {
         guarded: bool,
         pc: u64,
     },
+    /// A shared alias block's diagnostic (`--shared-log`,
+    /// `--shared-verify`), reported at once, unthrottled.
+    Shared(SharedEvent),
 }
+
+/// What a shared alias block did at a PC other than the one it was
+/// installed for ([`Event::Shared`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedEvent {
+    pub pe: usize,
+    pub el: u8,
+    /// The PC the fetch was for, and the PC the block was installed for.
+    pub pc: u64,
+    pub installed_pc: u64,
+    /// The page the block runs at for `pc`.
+    pub page_base: u64,
+    /// `None` for a hit; for a refused alias, why
+    /// ([`SharedLimits::verify`]): its bytes, or its code compiled there.
+    pub mismatch: Option<&'static str>,
+}
+
+/// Limits on shared alias blocks (`--shared-aliases`) that narrow a fault
+/// down without another build, each from a boot option.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedLimits {
+    /// Share blocks fetched at EL0 only (`--shared-el0`), or above EL0
+    /// only (`--shared-el1`).
+    pub el0_only: bool,
+    pub el1_only: bool,
+    /// No link in its page from or into a shared block
+    /// (`--shared-no-links`).
+    pub no_links: bool,
+    /// No cell link out of a shared block's page (`--shared-no-cells`).
+    pub no_cells: bool,
+    /// No block table entry at a PC a shared block was not installed
+    /// for: every alias entry goes through the engine
+    /// (`--shared-no-table`).
+    pub no_table: bool,
+    /// Install shared blocks but run each at its own PC alone
+    /// (`--shared-own-pc`): the bookkeeping without the aliasing.
+    pub own_pc: bool,
+    /// Check each alias PC before a shared block runs there
+    /// (`--shared-verify`): the frame's bytes are the block's, and the
+    /// block compiled at that PC is the same code. A mismatch is reported
+    /// once and the PC gets a block of its own.
+    pub verify: bool,
+    /// Report the first [`SHARED_LOGGED`] alias hits of each PE at EL0
+    /// (`--shared-log`).
+    pub log: bool,
+    /// Share only blocks compiled in this boot, none relocated from the
+    /// pack or rebased (`--shared-fresh`).
+    pub fresh_only: bool,
+}
+
+/// The alias hits a PE reports with [`SharedLimits::log`].
+pub const SHARED_LOGGED: u32 = 512;
 
 /// Where a PE is, for a report of a wait on it
 /// ([`RequirementKind::MaintenanceOverrun`]).
@@ -470,13 +525,16 @@ pub enum Alias {
     /// Installs dropped for a shared block another PE installed for
     /// another page meanwhile.
     Lost,
+    /// Alias PCs checked ([`SharedLimits::verify`]), and those refused.
+    Verified,
+    Mismatched,
 }
 
 impl Alias {
-    pub const COUNT: usize = 3;
+    pub const COUNT: usize = 5;
 }
 
-const _: () = assert!(Alias::Lost as usize + 1 == Alias::COUNT);
+const _: () = assert!(Alias::Mismatched as usize + 1 == Alias::COUNT);
 
 /// Why the ITLB lacked a page it then took ([`Statistics::itlb_misses`]): a
 /// fill of another page took its entry's place, a TLBI by VA dropped it,

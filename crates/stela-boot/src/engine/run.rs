@@ -1383,7 +1383,8 @@ impl Heartbeat {
             // installed for another guest page served (installs avoided),
             // its shared installs, and its installs lost to a shared block
             // another PE installed meanwhile.
-            let mut aliases = String::from("PES ALIAS hits/shared_installs/lost");
+            let mut aliases =
+                String::from("PES ALIAS hits/shared_installs/lost/verified/mismatched");
             let mut stamped = String::from(
                 "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
             );
