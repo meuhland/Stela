@@ -4798,6 +4798,14 @@
   },
   {
     "package": "stela-engine",
+    "test": "page_relative_corpus",
+    "source": "crates/stela-engine/src/machine/engine/density.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "page-relative code comparison over a guest code sample at two pages; run on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "compression_costs",
     "source": "crates/stela-engine/src/machine/engine/compression.rs",
     "kind": "manual",
