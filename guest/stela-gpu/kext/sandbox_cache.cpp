@@ -370,12 +370,9 @@ stelaDeliverSandboxPatch(vfs_context_t context, char *buffer)
 }
 
 IOReturn
-StelaGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+StelaGPU::newSandboxClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
     IOUserClient **handler)
 {
-	if (type != kStelaGPUSandboxClientType) {
-		return IOAccelerator::newUserClient(owningTask, securityID, type, properties, handler);
-	}
 	StelaSandboxClient *client = OSTypeAlloc(StelaSandboxClient);
 	if (!client) {
 		return kIOReturnNoMemory;
