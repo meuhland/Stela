@@ -4971,5 +4971,16 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of one native entry into a device site's stub and the return; run on request"
+  },
+  {
+    "package": "stela-loader",
+    "test": "a_built_kext_links_against_a_real_boot_collection",
+    "source": "crates/stela-loader/src/aux_kc/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_BOOT_KC",
+      "STELA_KEXT"
+    ],
+    "reason": "requires a boot kernel collection (STELA_BOOT_KC) and a kext built by cargo xtask guest (STELA_KEXT); links it as a boot would"
   }
 ]
