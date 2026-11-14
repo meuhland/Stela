@@ -250,6 +250,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.shared_aliases = on;
     }
 
+    /// Narrow shared alias blocks down ([`SharedLimits`]), from the next
+    /// fetch on. A boot's options; every PE of a board takes the same.
+    pub fn set_shared_limits(&mut self, limits: SharedLimits) {
+        self.shared_limits = limits;
+        self.code
+            .cache_at(board::LockSite::Other)
+            .index
+            .set_exact(limits.own_pc);
+    }
+
+    /// The limits on shared alias blocks ([`Self::set_shared_limits`]).
+    pub fn shared_limits(&self) -> SharedLimits {
+        self.shared_limits
+    }
+
     /// Whether blocks are shared across the guest pages that map their
     /// frame ([`Self::set_shared_aliases`]).
     pub fn shared_aliases(&self) -> bool {
@@ -264,6 +279,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !self.shared_aliases() {
             return false;
         }
+        let limits = self.shared_limits;
+        let el0 = self.cpu.pstate.el == 0;
+        if (limits.el0_only && !el0) || (limits.el1_only && el0) {
+            return false;
+        }
+        if !self.shared_refused.is_empty() && self.shared_refused.contains(&pc) {
+            return false;
+        }
         let page = pc & !(FETCH_PAGE - 1);
         let in_page = |points: &[u64]| {
             let first = points.partition_point(|&point| point < page);
@@ -272,6 +295,116 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .is_some_and(|&point| point < page + FETCH_PAGE)
         };
         !in_page(&self.breakpoints) && !in_page(&self.traces)
+    }
+
+    /// Whether shared block `index`, which a fetch at `pc` and `physical`
+    /// found installed for another PC, may run there: always, but with
+    /// [`SharedLimits::verify`], where the frame's bytes are the block's and
+    /// the block compiled at `pc` is the same code as compiled at its own
+    /// PC. Each alias PC is checked once per block; one refused is
+    /// reported and gets a block of its own from then on.
+    pub(super) fn alias_allowed(&mut self, index: usize, pc: u64, physical: u64) -> bool {
+        let installed = self.code.blocks[index].pc;
+        let limits = self.shared_limits;
+        if limits.log && self.cpu.pstate.el == 0 && self.shared_logged < SHARED_LOGGED {
+            self.shared_logged += 1;
+            self.report_shared(pc, installed, None);
+        }
+        if !limits.verify {
+            return true;
+        }
+        if let Some(&allowed) = self.shared_verified.get(&(pc, installed)) {
+            return allowed;
+        }
+        let mismatch = self.alias_mismatch(index, pc, physical);
+        self.statistics.aliases[Alias::Verified as usize] += 1;
+        if self.shared_verified.len() >= 1 << 16 {
+            self.shared_verified.clear();
+        }
+        self.shared_verified
+            .insert((pc, installed), mismatch.is_none());
+        if let Some(why) = mismatch {
+            self.statistics.aliases[Alias::Mismatched as usize] += 1;
+            self.shared_refused.insert(pc);
+            self.report_shared(pc, installed, Some(why));
+            return false;
+        }
+        true
+    }
+
+    /// Whether this PE checked shared block `index` at `pc` and found it
+    /// may run there, or need not check ([`Self::alias_allowed`]): a link
+    /// in its page enters a block at no fetch.
+    pub(super) fn alias_checked(&self, index: usize, pc: u64) -> bool {
+        let installed = self.code.blocks[index].pc;
+        installed == pc
+            || !self.shared_limits.verify
+            || self.shared_verified.get(&(pc, installed)) == Some(&true)
+    }
+
+    /// Why shared block `index` may not run at `pc` and `physical`
+    /// ([`SharedLimits::verify`]), if it may not.
+    fn alias_mismatch(&mut self, index: usize, pc: u64, physical: u64) -> Option<&'static str> {
+        let (installed, installed_physical, variant_id, source_bytes, hash) = {
+            let block = &self.code.blocks[index];
+            (
+                block.pc,
+                block.physical,
+                block.variant,
+                block.source_bytes(),
+                block.source_hash,
+            )
+        };
+        if physical != installed_physical || !super::same_offset_and_half(pc, installed) {
+            return Some("frame");
+        }
+        let variant = self.variants[variant_id.0 as usize];
+        let preparation = self.preparation(variant);
+        let window = super::source_window(pc, variant);
+        let mut source = alloc::vec![0; window];
+        if !self.host.read_ram(physical, &mut source) {
+            return Some("unreadable");
+        }
+        preparation.admit(&mut source);
+        if source_bytes > source.len() || super::source_hash(&source[..source_bytes]) != hash {
+            return Some("bytes");
+        }
+        let compiled = |at: u64| match preparation.prepare_window(&source, at, source.len(), true) {
+            Some(Ok(Prepared::Block { compiled, .. })) => Some(compiled),
+            _ => None,
+        };
+        let (Some(own), Some(here)) = (compiled(installed), compiled(pc)) else {
+            return Some("refused");
+        };
+        if own.source_bytes != source_bytes || here.source_bytes != source_bytes {
+            return Some("length");
+        }
+        if own.native.x86_64_code != here.native.x86_64_code {
+            return Some("code");
+        }
+        if here
+            .native
+            .relocations
+            .as_ref()
+            .is_none_or(|fields| !fields.is_empty())
+        {
+            return Some("relocations");
+        }
+        None
+    }
+
+    /// Report a shared block installed at `installed` at `pc`
+    /// ([`Event::Shared`]).
+    fn report_shared(&mut self, pc: u64, installed: u64, mismatch: Option<&'static str>) {
+        let event = Event::Shared(SharedEvent {
+            pe: self.current,
+            el: self.cpu.pstate.el,
+            pc,
+            installed_pc: installed,
+            page_base: pc & !(FETCH_PAGE - 1),
+            mismatch,
+        });
+        self.host.report(&event);
     }
 
     /// The PC block `index` ran at in the last native run, which ended in

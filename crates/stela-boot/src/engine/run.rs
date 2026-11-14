@@ -1639,7 +1639,8 @@ impl Heartbeat {
             // installed for another guest page served (installs avoided),
             // its shared installs, and its installs lost to a shared block
             // another PE installed meanwhile.
-            let mut aliases = String::from("PES ALIAS hits/shared_installs/lost");
+            let mut aliases =
+                String::from("PES ALIAS hits/shared_installs/lost/verified/mismatched");
             // Per PE: stamped tail hits and misses by cause, stamps written,
             // changed cells, table probe transfers (jump cache misses), stamped
             // tails made, then every probe transfer (jump cache and table).
