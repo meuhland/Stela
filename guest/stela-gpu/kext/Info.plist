@@ -37,6 +37,17 @@
 			<key>MetalPluginName</key>
 			<string>StelaGPU</string>
 		</dict>
+		<key>StelaNet</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.stela.StelaGPU</string>
+			<key>IOClass</key>
+			<string>StelaNet</string>
+			<key>IONameMatch</key>
+			<string>net,stela</string>
+			<key>IOProviderClass</key>
+			<string>AppleARMIODevice</string>
+		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
