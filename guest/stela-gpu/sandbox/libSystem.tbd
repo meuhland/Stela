@@ -9,5 +9,6 @@ exports:
                        _malloc, _realloc, _free, _memcpy, _memcmp, _memmem,
                        _strlen, _strcmp, _strncmp, _snprintf, _printf,
                        _dlopen, _dlsym, _dlerror, _mach_task_self_, _write,
-                       ___stack_chk_fail, ___stack_chk_guard ]
+                       ___stack_chk_fail, ___stack_chk_guard,
+                       _posix_spawn, _waitpid, _if_nametoindex ]
 ...
