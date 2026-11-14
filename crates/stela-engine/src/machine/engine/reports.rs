@@ -642,6 +642,11 @@ pub struct Statistics {
     /// lookup tails filled going, then those that kept it
     /// (`chain_control::JumpBasis`, `--jump-serial-always`).
     pub jump_serials: [u64; 2],
+    /// Fetches that found their block, by what they did about its block
+    /// table entry, in `compilation::Remember`'s order: linked a waiting
+    /// exit instead, found it held, took none, found the block unindexed,
+    /// throttled, found the lock busy, raced, put it in first, again.
+    pub remembers: [u64; super::compilation::REMEMBERS],
     /// Native runs that ended in an exit to the engine, by `ExitKind`
     /// (Fallthrough, Direct, Indirect, Call, Return, Trap, PAC, Clock,
     /// ThreadRegister, FloatingPoint, ScalableNumerical, System, AMX).
@@ -866,6 +871,7 @@ impl core::ops::AddAssign for Statistics {
             lookups,
             lookup_hits,
             jump_serials,
+            remembers,
             exit_kinds,
             lookup_misses,
             lookup_forgets,
@@ -946,6 +952,9 @@ impl core::ops::AddAssign for Statistics {
             *total += count;
         }
         for (total, count) in self.jump_serials.iter_mut().zip(jump_serials) {
+            *total += count;
+        }
+        for (total, count) in self.remembers.iter_mut().zip(remembers) {
             *total += count;
         }
         for (total, count) in self.amx_moves.iter_mut().zip(amx_moves) {

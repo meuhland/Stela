@@ -763,6 +763,88 @@ fn a_block_whose_entry_keeps_going_takes_the_code_lock_a_bounded_share_of_its_hi
     let report = machine.code.report();
     assert_eq!(report.targets.inserted, taken + 1);
     assert_eq!(report.targets.deferred, HITS - taken);
+    // The PE put the entry in at the install, so each insert after was
+    // one again, and each refusal the throttle's (`PES REMEMBER`).
+    let remembers = machine.statistics.remembers;
+    assert_eq!(remembers[Remember::Again as usize], taken);
+    assert_eq!(remembers[Remember::Throttled as usize], HITS - taken);
+    assert_eq!(remembers[Remember::First as usize], 0);
+}
+
+use super::super::compilation::Remember;
+
+/// A block whose throttle its other entries spent (a shared block at
+/// many alias PCs, a program's code at each process's slide): on `second`,
+/// whose first insert of the entry this is, the fetch puts it in anyway,
+/// unless `throttled` (`--table-insert-throttled`), when the throttle
+/// refuses it. What the block table then holds of `pc`, and the fetch's
+/// [`Remember`].
+fn first_insert_past_a_spent_throttle(throttled: bool) -> (bool, Remember) {
+    let mut memory = vec![0u8; WINDOW];
+    let (mut first, mut second, _hub) = shared_pair(&mut memory);
+    second.set_table_insert_throttled(throttled);
+    let pc = first.cpu.pc;
+    let Ok(Fetched::Block(slot)) = first.fetch_block(pc, false) else {
+        panic!("a block")
+    };
+    // Its free inserts spent, and the next try not one in REMEMBER_EVERY.
+    let record = first.code.blocks.record(slot);
+    while record.remember() {}
+    let key = target_key(&first, pc);
+    let frame = chain::key_frame(key);
+    first
+        .code
+        .cache()
+        .targets
+        .forget_frames(frame..=frame, |_| true);
+    assert!(matches!(second.fetch_block(pc, false), Ok(Fetched::Block(found)) if found == slot));
+    let held = second.code.table.find(target_slot(&second, pc), pc, key);
+    let remembers = second.statistics.remembers;
+    let outcome = [Remember::First, Remember::Throttled]
+        .into_iter()
+        .find(|outcome| remembers[*outcome as usize] == 1)
+        .expect("a counted outcome");
+    assert_eq!(remembers.iter().sum::<u64>(), 1, "{remembers:?}");
+    (held.pc == pc && held.block == slot as u32, outcome)
+}
+
+/// An entry a PE never put in goes in at its first fetch there, whatever
+/// the block's other entries spent of its throttle: each new PC of a
+/// block otherwise came to the engine about [`board::REMEMBER_EVERY`]
+/// times before the native table held it.
+#[test]
+fn an_entrys_first_insert_on_a_pe_passes_its_blocks_spent_throttle() {
+    assert_eq!(
+        first_insert_past_a_spent_throttle(false),
+        (true, Remember::First)
+    );
+}
+
+/// `--table-insert-throttled` keeps the old throttle of every insert.
+#[test]
+fn table_insert_throttled_refuses_a_first_insert_past_a_spent_throttle() {
+    assert_eq!(
+        first_insert_past_a_spent_throttle(true),
+        (false, Remember::Throttled)
+    );
+}
+
+/// A fetch of a block whose entry the table holds already counts it held.
+#[test]
+fn a_fetch_whose_entry_the_table_holds_counts_it_held() {
+    let mut memory = vec![0u8; WINDOW];
+    let mut machine = arena_machine(&mut memory);
+    let pc = machine.cpu.pc;
+    let Ok(Fetched::Block(slot)) = machine.fetch_block(pc, false) else {
+        panic!("a block")
+    };
+    let before = machine.statistics.remembers;
+    assert!(!machine.remember_target(pc, slot));
+    let after = machine.statistics.remembers;
+    assert_eq!(
+        after[Remember::Held as usize],
+        before[Remember::Held as usize] + 1
+    );
 }
 
 /// Pages of two-block groups, each group's first block ending in a direct

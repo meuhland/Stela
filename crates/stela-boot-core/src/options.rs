@@ -317,6 +317,10 @@ pub struct System {
     /// (`--jump-serial-always`), as before entries could keep it while no
     /// block went and the PE's ITLB and contexts stayed: for A/B runs.
     pub jump_serial_always: bool,
+    /// Throttle every block table insert by its block's count
+    /// (`--table-insert-throttled`), as before an entry's first insert on a
+    /// PE went in regardless: for A/B runs.
+    pub table_insert_throttled: bool,
     /// Compile guest code page-relative (`--page-relative`): a block's code
     /// serves every page that maps the same bytes, each entry setting the
     /// page it runs at.
@@ -438,6 +442,7 @@ impl Default for System {
             profile: false,
             profile_keep_pack: false,
             jump_serial_always: false,
+            table_insert_throttled: false,
             page_relative: false,
             shared_aliases: false,
             shared_limits: 0,
@@ -865,6 +870,7 @@ impl fmt::Display for System {
         line.flag("--profile", self.profile && !self.profile_keep_pack)?;
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
         line.flag("--jump-serial-always", self.jump_serial_always)?;
+        line.flag("--table-insert-throttled", self.table_insert_throttled)?;
         line.flag("--page-relative", self.page_relative)?;
         line.flag("--shared-aliases", self.shared_aliases)?;
         for (bit, name) in SHARED_LIMITS.iter().enumerate() {
