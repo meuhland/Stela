@@ -7,13 +7,18 @@
 #include <stela/net.h>
 
 extern "C" {
+#include <libkern/copyio.h>
 #include <net/bpf.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <net/if_ether.h>
+#include <net/if_media.h>
 #include <net/if_types.h>
+#include <net/if_var.h>
+#include <net/net_kev.h>
 #include <sys/errno.h>
+#include <sys/kern_event.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
 }
@@ -31,6 +36,40 @@ static const uint16_t kNever = 0x8000;
 /* virtio_net_hdr_v1 flags. */
 static const uint8_t kNeedsCsum = 1;
 static const uint8_t kDataValid = 2;
+/* Packets output keeps while every transmit slot is in flight. */
+static const uint32_t kBacklogMax = 512;
+/* The media the interface reports: the device's 1 Gb/s full duplex. */
+static const int kMediaAuto = IFM_ETHER | IFM_AUTO;
+static const int kMediaActive = IFM_ETHER | IFM_1000_T | IFM_FDX;
+
+/*
+ * SIOCGIFMEDIA as the stack hands it to an interface for a 64-bit process:
+ * xnu's ifmediareq64 (net/if_private.h, KERNEL_PRIVATE).
+ */
+#pragma pack(push, 4)
+struct MediaRequest {
+	char ifm_name[IFNAMSIZ];
+	int ifm_current;
+	int ifm_mask;
+	int ifm_status;
+	int ifm_active;
+	int ifm_count;
+	user64_addr_t ifmu_ulist __attribute__((aligned(8)));
+};
+#pragma pack(pop)
+static const unsigned long kGetMedia = _IOWR('i', 56, struct MediaRequest);
+
+/* A KEV_DL_SUBCLASS event as IONetworkingFamily posts link changes. */
+struct LinkEvent {
+	uint32_t total_size;
+	uint32_t vendor_code;
+	uint32_t kev_class;
+	uint32_t kev_subclass;
+	uint32_t id;
+	uint32_t event_code;
+	struct net_event_data data;
+};
+static_assert(offsetof(LinkEvent, data) == KEV_MSG_HEADER_SIZE, "the event's data follows its header");
 
 static_assert(STELA_NET_HEADER_BYTES + STELA_NET_FRAME_MAX <= kBufferBytes, "a frame fits a buffer");
 static_assert(kPage % kBufferBytes == 0, "no buffer crosses a page");
@@ -140,6 +179,7 @@ StelaNet::start(IOService *provider)
 	for (int index = 0; index < ETHER_ADDR_LEN; index++) {
 		mac[index] = uint8_t(station >> (8 * index));
 	}
+	linkUp = read(STELA_NET_LINK) & 1;
 	txLock = IOLockAlloc();
 	rx.size = kQueueEntries;
 	tx.size = kQueueEntries;
@@ -198,8 +238,9 @@ StelaNet::start(IOService *provider)
 		stop(provider);
 		return false;
 	}
-	IOLog("StelaNet: stn0 %02x:%02x:%02x:%02x:%02x:%02x, features %llx, %u-entry queues\n", mac[0], mac[1],
-	    mac[2], mac[3], mac[4], mac[5], accepted, unsigned(kQueueEntries));
+	IOLog("StelaNet: stn0 %02x:%02x:%02x:%02x:%02x:%02x, features %llx, %u-entry queues, link %s\n", mac[0],
+	    mac[1], mac[2], mac[3], mac[4], mac[5], accepted, unsigned(kQueueEntries),
+	    __atomic_load_n(&linkUp, __ATOMIC_RELAXED) ? "up" : "down");
 	registerService();
 	return true;
 }
@@ -325,7 +366,48 @@ StelaNet::attachInterface()
 		}
 	}
 	__atomic_store_n(&attached, true, __ATOMIC_RELEASE);
+	// The link as the device started: what IPConfiguration and the IPv6
+	// stack wait for before they configure the interface.
+	reportLink(__atomic_load_n(&linkUp, __ATOMIC_RELAXED));
 	return true;
+}
+
+/* Posts KEV_DL_LINK_ON or KEV_DL_LINK_OFF for stn0, as an Ethernet driver does. */
+void
+StelaNet::reportLink(bool up)
+{
+	LinkEvent event = {};
+	event.total_size = sizeof event;
+	event.vendor_code = KEV_VENDOR_APPLE;
+	event.kev_class = KEV_NETWORK_CLASS;
+	event.kev_subclass = KEV_DL_SUBCLASS;
+	event.event_code = up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF;
+	event.data.if_family = ifnet_family(ifp);
+	event.data.if_unit = ifnet_unit(ifp);
+	snprintf(event.data.if_name, sizeof event.data.if_name, "%s", ifnet_name(ifp));
+	errno_t error = ifnet_event(ifp, reinterpret_cast<struct kern_event_msg *>(&event));
+	if (error != 0) {
+		IOLog("StelaNet: posting the link %s: %d\n", up ? "up" : "down", error);
+	}
+}
+
+/* SIOCGIFMEDIA: 1000baseT full duplex, active while the link is up. */
+errno_t
+StelaNet::mediaStatus(void *data)
+{
+	auto request = static_cast<MediaRequest *>(data);
+	bool up = __atomic_load_n(&linkUp, __ATOMIC_RELAXED);
+	request->ifm_current = kMediaAuto;
+	request->ifm_mask = 0;
+	request->ifm_status = IFM_AVALID | (up ? IFM_ACTIVE : 0);
+	request->ifm_active = up ? kMediaActive : (IFM_ETHER | IFM_NONE);
+	errno_t error = 0;
+	if (request->ifm_count > 0 && request->ifmu_ulist != 0) {
+		int media = kMediaAuto;
+		error = copyout(&media, request->ifmu_ulist, sizeof media);
+	}
+	request->ifm_count = 1;
+	return error;
 }
 
 void
@@ -334,7 +416,13 @@ StelaNet::stop(IOService *provider)
 	if (txLock) {
 		IOLockLock(txLock);
 		running = false;
+		mbuf_t backlog = backlogHead;
+		backlogHead = backlogTail = nullptr;
+		backlogCount = 0;
 		IOLockUnlock(txLock);
+		if (backlog) {
+			mbuf_freem_list(backlog);
+		}
 	}
 	if (registers) {
 		// Once this store retires the device reaches no guest memory.
@@ -391,49 +479,139 @@ StelaNet::reclaimTransmit()
 	*usedEvent(&tx) = static_cast<uint16_t>(tx.used + kNever);
 }
 
-/*
- * Copies the packet after a zeroed header into the next transmit slot,
- * publishes it and kicks when the device asked to hear of it. A full ring
- * drops the packet: the prototype has no output queue of its own.
- */
 errno_t
 StelaNet::transmit(mbuf_t packet)
 {
 	size_t length = mbuf_pkthdr_len(packet);
-	bool sent = false;
+	if (length < ETHER_HDR_LEN || length > STELA_NET_FRAME_MAX) {
+		ifnet_stat_increment_out(ifp, 0, 0, 1);
+		mbuf_freem(packet);
+		return EMSGSIZE;
+	}
+	return pump(packet);
+}
+
+/*
+ * With txLock held: copies the packet after a zeroed header into the next
+ * transmit slot, which must be free, and makes it available unpublished.
+ */
+bool
+StelaNet::fillSlot(mbuf_t packet)
+{
+	size_t length = mbuf_pkthdr_len(packet);
+	uint16_t slot = tx.avail % tx.size;
+	uint8_t *data = buffer(&tx, slot);
+	bzero(data, STELA_NET_HEADER_BYTES);
+	if (mbuf_copydata(packet, 0, length, data + STELA_NET_HEADER_BYTES) != 0) {
+		return false;
+	}
+	markPartialChecksum(packet, data, length);
+	uint64_t physical = bufferPhysical(&tx, slot);
+	descriptors(&tx)[slot] = {physical, uint32_t(STELA_NET_HEADER_BYTES + length), 0, 0};
+	*availSlot(&tx, tx.avail) = slot;
+	tx.avail++;
+	txInFlight++;
+	return true;
+}
+
+/*
+ * Output's queue: `packet` (if any) joins the backlog, and the backlog goes
+ * into free transmit slots in order. While packets wait for slots the device
+ * is asked for an interrupt at the next completion, whose handler pumps
+ * again, so a full ring delays packets instead of dropping them; only a full
+ * backlog drops. Publishes once and kicks when the device asked to hear of
+ * it; the packets copied go to bpf and are freed outside the lock.
+ */
+errno_t
+StelaNet::pump(mbuf_t packet)
+{
+	mbuf_t sentHead = nullptr, sentTail = nullptr, failed = nullptr;
+	uint32_t sentPackets = 0, sentBytes = 0, errors = 0;
+	bool dropped = false;
 	IOLockLock(txLock);
 	uint16_t old = tx.avail;
-	if (running) {
-		reclaimTransmit();
-		if (txInFlight < tx.size && length >= ETHER_HDR_LEN && length <= STELA_NET_FRAME_MAX) {
-			uint16_t slot = tx.avail % tx.size;
-			uint8_t *data = buffer(&tx, slot);
-			bzero(data, STELA_NET_HEADER_BYTES);
-			if (mbuf_copydata(packet, 0, length, data + STELA_NET_HEADER_BYTES) == 0) {
-				markPartialChecksum(packet, data, length);
-				uint64_t physical = bufferPhysical(&tx, slot);
-				descriptors(&tx)[slot] = {physical, uint32_t(STELA_NET_HEADER_BYTES + length), 0, 0};
-				*availSlot(&tx, tx.avail) = slot;
-				tx.avail++;
-				txInFlight++;
-				__atomic_store_n(availIndex(&tx), tx.avail, __ATOMIC_RELEASE);
-				sent = true;
+	if (!running) {
+		dropped = packet != nullptr;
+	} else {
+		if (packet) {
+			if (backlogCount < kBacklogMax) {
+				if (backlogTail) {
+					mbuf_setnextpkt(backlogTail, packet);
+				} else {
+					backlogHead = packet;
+				}
+				backlogTail = packet;
+				backlogCount++;
+			} else {
+				dropped = true;
 			}
 		}
+		for (;;) {
+			reclaimTransmit();
+			while (backlogHead && txInFlight < tx.size) {
+				mbuf_t next = backlogHead;
+				backlogHead = mbuf_nextpkt(next);
+				if (!backlogHead) {
+					backlogTail = nullptr;
+				}
+				backlogCount--;
+				mbuf_setnextpkt(next, nullptr);
+				if (fillSlot(next)) {
+					if (sentTail) {
+						mbuf_setnextpkt(sentTail, next);
+					} else {
+						sentHead = next;
+					}
+					sentTail = next;
+					sentPackets++;
+					sentBytes += uint32_t(mbuf_pkthdr_len(next));
+				} else {
+					mbuf_setnextpkt(next, failed);
+					failed = next;
+					errors++;
+				}
+			}
+			if (!backlogHead) {
+				break;
+			}
+			// Every slot is in flight: hear of the next completion, and look
+			// again in case it came before the device could see the event.
+			*usedEvent(&tx) = tx.used;
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			if (__atomic_load_n(usedIndex(&tx), __ATOMIC_ACQUIRE) == tx.used) {
+				break;
+			}
+		}
+		if (tx.avail != old) {
+			__atomic_store_n(availIndex(&tx), tx.avail, __ATOMIC_RELEASE);
+		}
 	}
-	if (!sent) {
+	uint16_t now = tx.avail;
+	if (dropped) {
 		txDropped++;
+		errors++;
 	}
 	IOLockUnlock(txLock);
-	if (sent) {
-		kick(&tx, old, STELA_NET_KICK_TX);
-		bpf_tap_out(ifp, DLT_EN10MB, packet, nullptr, 0);
-		ifnet_stat_increment_out(ifp, 1, uint32_t(length), 0);
-	} else {
-		ifnet_stat_increment_out(ifp, 0, 0, 1);
+	if (now != old) {
+		kick(&tx, old, now, STELA_NET_KICK_TX);
 	}
-	mbuf_freem(packet);
-	return sent ? 0 : ENOBUFS;
+	for (mbuf_t sent = sentHead; sent;) {
+		mbuf_t next = mbuf_nextpkt(sent);
+		mbuf_setnextpkt(sent, nullptr);
+		bpf_tap_out(ifp, DLT_EN10MB, sent, nullptr, 0);
+		mbuf_freem(sent);
+		sent = next;
+	}
+	if (failed) {
+		mbuf_freem_list(failed);
+	}
+	if (dropped) {
+		mbuf_freem(packet);
+	}
+	if (sentPackets || errors) {
+		ifnet_stat_increment_out(ifp, sentPackets, sentBytes, errors);
+	}
+	return dropped ? ENOBUFS : 0;
 }
 
 /*
@@ -475,11 +653,11 @@ StelaNet::markPartialChecksum(mbuf_t packet, uint8_t *data, size_t length)
 }
 
 void
-StelaNet::kick(Queue *queue, uint16_t old, uint64_t which)
+StelaNet::kick(Queue *queue, uint16_t old, uint16_t now, uint64_t which)
 {
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	bool wanted = (accepted & STELA_NET_F_EVENT_IDX)
-	    ? needEvent(__atomic_load_n(availEvent(queue), __ATOMIC_ACQUIRE), queue->avail, old)
+	    ? needEvent(__atomic_load_n(availEvent(queue), __ATOMIC_ACQUIRE), now, old)
 	    : !(__atomic_load_n(usedFlags(queue), __ATOMIC_ACQUIRE) & STELA_NET_USED_F_NO_NOTIFY);
 	if (wanted) {
 		write(STELA_NET_KICK, which);
@@ -552,7 +730,7 @@ StelaNet::harvestReceive()
 		}
 		__atomic_store_n(availIndex(&rx), rx.avail, __ATOMIC_RELEASE);
 		*usedEvent(&rx) = rx.used;
-		kick(&rx, old, STELA_NET_KICK_RX);
+		kick(&rx, old, rx.avail, STELA_NET_KICK_RX);
 		if (first) {
 			struct ifnet_stat_increment_param stats = {};
 			stats.packets_in = packets;
@@ -580,13 +758,21 @@ StelaNet::interruptOccurred(OSObject *owner, IOInterruptEventSource *, int)
 		IOLockUnlock(net->txLock);
 		return;
 	}
+	if (cause & STELA_NET_CAUSE_LINK) {
+		bool up = net->read(STELA_NET_LINK) & 1;
+		bool was = __atomic_exchange_n(&net->linkUp, up, __ATOMIC_RELAXED);
+		// Before the interface attaches, attachInterface reports the link.
+		if (up != was && __atomic_load_n(&net->attached, __ATOMIC_ACQUIRE)) {
+			IOLog("StelaNet: link %s\n", up ? "up" : "down");
+			net->reportLink(up);
+		}
+	}
 	if (cause & STELA_NET_CAUSE_RX) {
 		net->harvestReceive();
 	}
 	if (cause & STELA_NET_CAUSE_TX) {
-		IOLockLock(net->txLock);
-		net->reclaimTransmit();
-		IOLockUnlock(net->txLock);
+		// Slots completed while packets waited for them.
+		net->pump(nullptr);
 	}
 }
 
@@ -605,8 +791,11 @@ StelaNet::ifIoctl(ifnet_t interface, unsigned long command, void *data)
 	}
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
-		// Every multicast group passes the device's filter.
+		// Every multicast group passes the device's filter
+		// (FILTER_ALL_MULTICAST): mDNS, IPv6 neighbor discovery.
 		return 0;
+	case kGetMedia:
+		return net->mediaStatus(data);
 	case SIOCSIFMTU: {
 		auto request = static_cast<struct ifreq *>(data);
 		if (request->ifr_mtu < 68 || request->ifr_mtu > ETHERMTU) {
