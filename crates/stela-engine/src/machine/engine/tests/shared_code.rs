@@ -369,7 +369,8 @@ fn bisection_limits_narrow_sharing() {
 }
 
 /// `--shared-no-table` leaves an alias PC no block table entry, and
-/// `--shared-no-links` links no shared block in its page.
+/// `--shared-no-links` links no shared block in its page but through a
+/// cell.
 #[test]
 fn table_and_link_limits_keep_aliases_in_the_engine() {
     let limits = SharedLimits {
@@ -397,5 +398,53 @@ fn table_and_link_limits_keep_aliases_in_the_engine() {
     }];
     machine.step().unwrap();
     assert_eq!(fetched(&mut machine, moved + 8), ret);
-    assert_eq!(machine.statistics.links, 0);
+    // Its exit goes through a cell instead of a direct link.
+    let branch = fetched(&mut machine, moved);
+    let record = machine.code.blocks.record(branch);
+    assert!(record.linked(0) && !record.chained(0));
+}
+
+/// A shared block's exit in its page into a block of one PC (here one
+/// ending in SVC) cannot be a direct link, which would enter that PC's
+/// body at every page: it goes through a cell, once, and is settled, so
+/// its later exits take no lock to try again (shared1 stalled so). With
+/// `--shared-own-pc`, which runs no block at another page, it links
+/// directly, as a block of one PC does.
+#[test]
+fn a_shared_exit_into_a_block_of_one_pc_goes_through_a_cell_once() {
+    const B_8: u32 = 0x1400_0002; // b .+8
+    const SVC: u32 = 0xd400_0001;
+    for own_pc in [false, true] {
+        let limits = SharedLimits {
+            own_pc,
+            ..SharedLimits::default()
+        };
+        let (mut machine, _) = limited(&[B_8, 0, SVC], limits);
+        let target = fetched(&mut machine, BASE + 8);
+        assert!(!machine.code.blocks[target].shared);
+        machine.cpu.pc = BASE;
+        machine.host.exits = vec![NativeExit::Exit {
+            next_pc: BASE + 8,
+            kind: ExitKind::Direct as u64,
+        }];
+        machine.step().unwrap();
+        let branch = fetched(&mut machine, BASE);
+        assert!(machine.code.blocks[branch].shared);
+        let record = machine.code.blocks.record(branch);
+        assert_eq!(machine.statistics.links, 1, "own_pc={own_pc}");
+        assert!(record.linked(0), "settled or chained: no retry");
+        assert_eq!(record.chained(0), own_pc, "a direct link only own-pc");
+        assert_eq!(
+            machine
+                .code
+                .cache()
+                .targets
+                .site_cell(chain::direct_patch(
+                    machine.code.blocks[branch].successors[0].site
+                ))
+                .is_some(),
+            !own_pc,
+            "a cell otherwise"
+        );
+    }
 }

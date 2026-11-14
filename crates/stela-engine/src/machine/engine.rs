@@ -507,6 +507,17 @@ impl Block {
         }
     }
 
+    /// Its first PC in the run that ended in page `page`: with `aliasing`
+    /// ([`Machine::aliasing`]) its offset there for a shared block, else
+    /// its own PC, whatever the page base says.
+    fn ran_at(&self, page: u64, aliasing: bool) -> u64 {
+        if aliasing {
+            self.start_at(page)
+        } else {
+            self.pc
+        }
+    }
+
     /// The PC of its last instruction as it runs in the page of `pc`
     /// ([`Self::start_at`]).
     fn terminal_at(&self, pc: u64) -> u64 {

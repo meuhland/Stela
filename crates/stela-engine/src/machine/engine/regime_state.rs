@@ -260,6 +260,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .set_exact(limits.own_pc);
     }
 
+    /// Whether shared blocks run at pages other than their own: shared
+    /// aliases on, and not `--shared-own-pc`.
+    pub(super) fn aliasing(&self) -> bool {
+        self.shared_aliases() && !self.shared_limits.own_pc
+    }
+
     /// The limits on shared alias blocks ([`Self::set_shared_limits`]).
     pub fn shared_limits(&self) -> SharedLimits {
         self.shared_limits
@@ -411,7 +417,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// it: its own, or for a shared block, its offset in the page the run
     /// ended in ([`Machine::ran_page`]).
     pub(super) fn running_pc(&self, index: usize) -> u64 {
-        self.code.blocks[index].start_at(self.ran_page)
+        self.code.blocks[index].ran_at(self.ran_page, self.aliasing())
     }
 
     /// Run self-loops inside their blocks ([`NativeSystem::self_loops`]),
