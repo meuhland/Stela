@@ -86,9 +86,10 @@ pub(crate) use local::activated_base;
 #[cfg(feature = "nvk")]
 pub(crate) use local::context::close_moves;
 pub(crate) use local::context::{RootIdentity, moved_here, moves_closed};
-use local::state;
+pub(crate) use local::processor;
 #[cfg(feature = "nvk")]
-pub(crate) use local::{processor, processors};
+pub(crate) use local::processors;
+use local::state;
 
 /// Calls `action` with each host run behind `bytes` of guest RAM at `guest`, as
 /// (host physical, bytes). False, partway, if part of it is not RAM.
