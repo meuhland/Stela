@@ -788,6 +788,12 @@ pub trait Compiler {
         None
     }
 
+    /// What a compilation gave in place of what its call asked, such as a
+    /// threadgroup buffer's bytes its dispatch never set, once each.
+    fn take_notice(&mut self) -> Option<String> {
+        None
+    }
+
     /// Compiles in the call from here on, rather than deferring a
     /// compilation to run the call again: the call has changed what a
     /// second run would change again.
