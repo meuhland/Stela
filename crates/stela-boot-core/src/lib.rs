@@ -77,6 +77,7 @@ pub mod source_health;
 pub mod staged_disk;
 pub mod staged_frame;
 pub mod storage;
+pub mod store_packs;
 pub mod topology;
 pub mod tsc;
 #[cfg(target_arch = "x86_64")]
