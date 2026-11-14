@@ -1251,14 +1251,22 @@ pub fn step() {
 }
 
 /// At a quiescent point (the guest restarts or powers off): the writer's
-/// stop ([`Writer::stop`]), carried out on the partition directly.
-pub fn write() {
+/// stop ([`Writer::stop`]), carried out on the partition directly. A boot
+/// that does not `age` records (short, or not stopped in order:
+/// `pack::ages_records`) only refreshes the records it used.
+pub fn write(ages: bool) {
     AVAILABLE.capabilities.store(0, Ordering::SeqCst);
     AVAILABLE.shared_bound.store(0, Ordering::Release);
     let started = output::now();
     let held = WRITER.holding(true, Option::take).flatten();
     let writable = BOOT.with(|boot| boot.as_ref().is_some_and(|boot| boot.partition.is_some()));
     if let Some(mut held) = held.filter(|_| writable) {
+        held.writer.set_ages(ages);
+        if !ages {
+            output::arguments(format_args!(
+                "TRANSLATIONS this boot's list refreshes the records it used and ages none\n"
+            ));
+        }
         let stats = held.writer.stats();
         output::arguments(format_args!(
             "TRANSLATIONS writer steps={} longest_us={} segments={} records={} bytes={} \
