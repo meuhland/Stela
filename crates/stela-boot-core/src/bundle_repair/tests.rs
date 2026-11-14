@@ -30,10 +30,35 @@ fn a_normal_boot_repairs_once_and_then_stops_with_the_manual_remedy() {
         decide(Report::Missing, Boot::Normal, Record::None, false),
         Decision::StopMissing { attempted: false }
     );
+}
+
+#[test]
+fn a_plugin_the_kext_cannot_write_is_repaired_once_and_then_stops() {
+    let failed = |record, persistent| decide(Report::Failed, Boot::Normal, record, persistent);
+    assert_eq!(failed(Record::None, true), Decision::Repair);
+    assert_eq!(failed(Record::Other, true), Decision::Repair);
+    assert_eq!(failed(Record::Attempted, true), Decision::StopFailed);
+    assert_eq!(failed(Record::Pending, true), Decision::StopFailed);
+    assert_eq!(failed(Record::None, false), Decision::StopFailed);
+    // The repair removes the bundle's files, and only when it exists,
+    // before it makes the directories the kext writes them into.
+    let steps = steps();
+    let remove = steps
+        .iter()
+        .position(|step| step.command == remove_files())
+        .unwrap();
+    assert!(!steps[remove].required);
     assert_eq!(
-        decide(Report::Failed, Boot::Normal, Record::None, true),
-        Decision::StopFailed
+        remove_files(),
+        "/bin/test ! -d /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle || \
+         /usr/bin/find /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle -type f -delete"
     );
+    let mkdir = steps
+        .iter()
+        .position(|step| step.command.starts_with("/bin/mkdir"))
+        .unwrap();
+    assert!(remove < mkdir);
+    assert!(steps[remove - 1].command.starts_with("/bin/test -d "));
 }
 
 #[test]
@@ -101,13 +126,13 @@ fn the_steps_create_the_directories_the_manual_remedy_does() {
     assert!(!commands.iter().any(|command| command.contains("xattr")));
     let chflags = format!("/usr/bin/chflags restricted {all}");
     assert!(commands.contains(&chflags.as_str()));
-    // Only the restricted flag and the read-only remount after the sync are
-    // optional.
+    // Only removing the plugin's files, the restricted flag and the
+    // read-only remount after the sync are optional.
     let remount = "/sbin/mount -u -r /System/Volumes/Data";
     for step in &steps {
         assert_eq!(
             step.required,
-            step.command != chflags && step.command != remount,
+            step.command != chflags && step.command != remount && step.command != remove_files(),
             "{}",
             step.command
         );
@@ -264,7 +289,10 @@ fn a_failing_optional_step_is_logged_and_the_repair_goes_on() {
     let status = |command: &str| Some(u32::from(command.starts_with("/usr/bin/chflags")));
     pump(&mut driver, &mut console, &mut now, &status);
     assert!(!driver.failed());
-    let chflags = steps().iter().position(|step| !step.required).unwrap();
+    let chflags = steps()
+        .iter()
+        .position(|step| step.command.starts_with("/usr/bin/chflags"))
+        .unwrap();
     let events = driver.take_events();
     assert!(events.contains(&Event::Skipped {
         index: chflags,

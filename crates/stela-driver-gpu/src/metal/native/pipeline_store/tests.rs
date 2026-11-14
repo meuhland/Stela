@@ -210,7 +210,8 @@ fn nir_compiled_this_boot_is_offered_once_and_read_back_after_the_cache() {
     store.add_nir([2; 32], b"second");
     store.keep(&claim, vec![5; 20]);
     let update = store.update().unwrap();
-    let entries: Vec<_> = NirEntries(&update.nir).collect();
+    let nir = update.nir.to_vec();
+    let entries: Vec<_> = NirEntries(&nir).collect();
     assert_eq!(
         entries,
         [([1; 32], &b"first nir"[..]), ([2; 32], &b"second"[..])]
@@ -220,13 +221,13 @@ fn nir_compiled_this_boot_is_offered_once_and_read_back_after_the_cache() {
     let later = store.update().unwrap();
     assert!(later.cache.is_none(), "the snapshot is written");
     assert_eq!(
-        NirEntries(&later.nir)
+        NirEntries(&later.nir.to_vec())
             .map(|(key, _)| key)
             .collect::<Vec<_>>(),
         [[4; 32]]
     );
 
-    let bytes = sealed(&key, &[5; 20], &update.nir);
+    let bytes = sealed(&key, &[5; 20], &update.nir.to_vec());
     assert_eq!(stored_bytes(bytes), Ok(bytes.len() as u64));
     assert_eq!(payload(bytes, &key, MAX_BYTES), Ok(&[5; 20][..]));
 
@@ -241,12 +242,12 @@ fn nir_compiled_this_boot_is_offered_once_and_read_back_after_the_cache() {
     let update = next.update().unwrap();
     assert!(update.cache.is_none());
     assert_eq!(
-        NirEntries(&update.nir)
+        NirEntries(&update.nir.to_vec())
             .map(|(key, _)| key)
             .collect::<Vec<_>>(),
         [[3; 32]]
     );
-    let keys: Vec<_> = NirEntries(&next.all_nir(&key))
+    let keys: Vec<_> = NirEntries(&next.all_nir(&key).to_vec())
         .map(|(key, _)| key)
         .collect();
     assert_eq!(keys, [[1; 32], [2; 32], [3; 32]]);
@@ -285,4 +286,58 @@ fn lookups_count_hits_and_compiles_apart_and_clear_when_taken() {
         }
     );
     assert_eq!(lookups.take(), LookupCounts::default());
+}
+
+#[test]
+fn an_update_reads_its_nir_a_piece_at_a_time_from_the_entries_the_store_keeps() {
+    let gpu = gpu();
+    let key = Key::new(COMPILER, &gpu);
+    let mut stored_nir = Vec::new();
+    push_entry(&mut stored_nir, &[1; 32], b"stored nir");
+    let bytes = sealed(&key, &[5; 20], &stored_nir);
+    let mut store = Store::new(bytes, COMPILER, MAX_BYTES);
+    store.claim(&gpu).unwrap();
+    let large: Vec<u8> = (0..5000u32).map(|byte| byte as u8).collect();
+    store.add_nir([2; 32], &large);
+    store.add_nir([3; 32], b"");
+    store.add_nir([4; 32], b"small");
+
+    let update = store.update().unwrap();
+    // The update shares the store's entries: none is copied for it.
+    assert_eq!(update.nir.entries(), 3);
+    for (key, blob) in &update.nir.entries {
+        assert!(Arc::ptr_eq(blob, &store.nir[key]));
+    }
+    let mut expected = Vec::new();
+    push_entry(&mut expected, &[2; 32], &large);
+    push_entry(&mut expected, &[3; 32], b"");
+    push_entry(&mut expected, &[4; 32], b"small");
+    assert_eq!(update.nir.len(), expected.len() as u64);
+    assert_eq!(update.nir.to_vec(), expected);
+
+    // A rewrite's section starts with the stored entries, read in place.
+    let all = store.all_nir(&key);
+    let whole = [stored_nir.as_slice(), &expected].concat();
+    assert_eq!(all.len(), whole.len() as u64);
+    for piece in [1, 7, 36, 37, 4096, whole.len()] {
+        let mut read = vec![0; whole.len()];
+        for (index, into) in read.chunks_mut(piece).enumerate() {
+            all.read_at((index * piece) as u64, into);
+        }
+        assert_eq!(read, whole, "pieces of {piece} bytes");
+    }
+    let mut empty = [0u8; 0];
+    all.read_at(all.len(), &mut empty);
+    assert!(NirPieces::default().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "a read past the NIR section")]
+fn a_read_past_the_nir_section_is_refused() {
+    let mut store = Store::new(&[], COMPILER, MAX_BYTES);
+    store.claim(&gpu()).unwrap();
+    store.add_nir([1; 32], b"nir");
+    let nir = store.update().unwrap().nir;
+    let mut into = [0; 2];
+    nir.read_at(nir.len() - 1, &mut into);
 }
