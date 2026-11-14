@@ -708,7 +708,7 @@ fn load(
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
     let (native_processors, available_cores) = crate::native_smp::firmware::capture_inventory()
-        .map_err(crate::native_smp::firmware::Error::message)?;
+        .map_err(crate::native_smp::firmware::Error::refusal)?;
     let cores = system.assigned_native_cores(available_cores, bundle_pes)?;
     // The translation cache takes only what the parts and the guest leave,
     // so it is read last before they are reserved: only the engine image's
