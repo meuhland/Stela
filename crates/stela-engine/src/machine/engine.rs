@@ -985,6 +985,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
     self_loops: bool,
+    /// Self-loops leave their entry and iteration counts out while timing
+    /// is on (`--profile-keep-pack`), so the translation context, and with
+    /// it the pack, stays that of an untimed boot.
+    loop_counts_off: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1438,6 +1442,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             memory_checks: None,
             native_system: None,
             self_loops: true,
+            loop_counts_off: false,
             event_sample: None,
             debug: None,
             device_lines: None,

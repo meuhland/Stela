@@ -330,6 +330,11 @@ pub struct System {
     /// Time the engine's phases and report them with each heartbeat
     /// (`--profile`).
     pub profile: bool,
+    /// Time the engine's phases as `--profile` does, without the self-loop
+    /// counts that change the translation context
+    /// (`--profile-keep-pack`), so the boot still reads its pack and the
+    /// shares are those of a normal boot.
+    pub profile_keep_pack: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -444,6 +449,7 @@ impl Default for System {
             native_rounds: false,
             parallel: true,
             profile: false,
+            profile_keep_pack: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -913,7 +919,8 @@ impl fmt::Display for System {
         let implied_serial =
             self.native_rounds || self.native_shared_check || self.native_bootstrap_check;
         line.flag("--serialized", !self.parallel && !implied_serial)?;
-        line.flag("--profile", self.profile)?;
+        line.flag("--profile", self.profile && !self.profile_keep_pack)?;
+        line.flag("--profile-keep-pack", self.profile_keep_pack)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
