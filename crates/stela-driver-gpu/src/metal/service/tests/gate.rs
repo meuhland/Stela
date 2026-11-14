@@ -1347,3 +1347,105 @@ fn a_texture_read_waits_for_its_gpu_copy_and_copies_out_holding_no_turn() {
         .count();
     assert_eq!(freed, 2, "both bands' host memory");
 }
+
+/// The heap a span's room comes from, as its largest free extent: a span
+/// longer finds no room until the caller lets go of enough.
+struct Extents {
+    largest: usize,
+    reclaims: usize,
+}
+
+impl Extents {
+    fn reserve(&mut self, length: usize) -> bool {
+        length <= self.largest
+    }
+}
+
+#[test]
+fn a_span_past_the_largest_free_extent_asks_the_caller_to_let_go_and_tries_again() {
+    use crate::metal::service::gate::{RECLAIMING_SPAN_BYTES, room_for};
+    use core::cell::RefCell;
+    let span = 4 * RECLAIMING_SPAN_BYTES;
+    // Each reclaim joins another extent: the third reserve fits.
+    let heap = RefCell::new(Extents {
+        largest: RECLAIMING_SPAN_BYTES,
+        reclaims: 0,
+    });
+    let room = room_for(
+        span,
+        |_| {
+            let mut heap = heap.borrow_mut();
+            heap.reclaims += 1;
+            heap.largest += 2 * RECLAIMING_SPAN_BYTES;
+            2 * RECLAIMING_SPAN_BYTES
+        },
+        |vec, length| heap.borrow_mut().reserve(length) && vec.try_reserve_exact(length).is_ok(),
+    );
+    assert!(room.is_some_and(|room| room.capacity() >= span));
+    assert_eq!(heap.borrow().reclaims, 2);
+
+    // A caller with nothing to let go of is asked once.
+    let heap = RefCell::new(Extents {
+        largest: RECLAIMING_SPAN_BYTES,
+        reclaims: 0,
+    });
+    let room = room_for(
+        span,
+        |_| {
+            heap.borrow_mut().reclaims += 1;
+            0
+        },
+        |_, length| heap.borrow_mut().reserve(length),
+    );
+    assert!(room.is_none());
+    assert_eq!(heap.borrow().reclaims, 1);
+
+    // Nor is it asked more than three times, whatever it lets go of.
+    let heap = RefCell::new(Extents {
+        largest: 0,
+        reclaims: 0,
+    });
+    let room = room_for(
+        span,
+        |_| {
+            heap.borrow_mut().reclaims += 1;
+            1
+        },
+        |_, length| heap.borrow_mut().reserve(length),
+    );
+    assert!(room.is_none());
+    assert_eq!(heap.borrow().reclaims, 3);
+
+    // A short span is refused without asking: no hole that small is the cause.
+    let asked = core::cell::Cell::new(false);
+    let room = room_for(
+        RECLAIMING_SPAN_BYTES - 1,
+        |_| {
+            asked.set(true);
+            1
+        },
+        |_, _| false,
+    );
+    assert!(room.is_none() && !asked.get());
+}
+
+#[test]
+fn a_span_with_no_room_is_refused_as_out_of_memory() {
+    // A length no heap holds: the caller lets go of nothing. A report's
+    // text is read whole (a library's is read a piece at a time).
+    let mut memory = Memory::default();
+    let shared = SharedService::new(service(), HOST);
+    let connection = connect(&mut shared.try_turn().unwrap());
+    let request = wire::ReportRequest {
+        text: Span {
+            address: 0x1000,
+            length: isize::MAX as u64 + 1,
+        },
+    };
+    let record = gate_call(&mut memory, Operation::Report, wire::bytes(&request), 0);
+    GateService::serve(&shared, connection, record, &mut memory).unwrap();
+    assert_eq!(
+        completed(&mut memory, record).status,
+        Status::OutOfMemory.raw()
+    );
+}
