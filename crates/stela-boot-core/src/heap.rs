@@ -26,6 +26,13 @@
 //! keeps the heap's end out of the main bins ([`Heap::reserve_tail`]): a
 //! large request the main bins cannot serve takes it. Linux keeps
 //! `ZONE_MOVABLE` and CMA apart from unmovable allocations for the same reason.
+//! A free extent on each side of the reserve's start never coalesces, so a
+//! request neither side serves alone lowers the reserve's start to join them.
+//!
+//! What fails even then first asks the heap's owner to let go of what it
+//! keeps only to save work ([`Heap::set_reclaim_hook`]), and tries again: a
+//! fragmented heap whose large request finds no extent would otherwise end
+//! the boot in `handle_alloc_error` with most of its bytes free.
 use core::{
     alloc::{GlobalAlloc, Layout},
     cell::UnsafeCell,
@@ -622,7 +629,20 @@ pub struct Heap {
     /// The heap's bytes not carved, the reserve's with the main bins'.
     room: AtomicUsize,
     waits: AtomicU64,
+    /// The owner's `fn(usize) -> usize` that frees what it keeps only to
+    /// save work, when a request finds no memory; zero for none.
+    reclaim_hook: AtomicUsize,
+    /// Who runs the hook now: [`NO_RECLAIMER`], a tagged core's index plus
+    /// one, or [`UNTAGGED_RECLAIMER`].
+    reclaimer: AtomicUsize,
+    /// Requests that found no memory and were served after the hook ran.
+    reclaims: AtomicU64,
 }
+
+const NO_RECLAIMER: usize = 0;
+const UNTAGGED_RECLAIMER: usize = usize::MAX;
+/// The hook's runs for one request, while each frees something.
+const RECLAIM_ROUNDS: usize = 3;
 // SAFETY: all list/header mutations use the real acquire/release exclusion.
 // UEFI callers mask local interrupts before acquiring the lock. Critical
 // sections cannot migrate/block; NMI and fault handlers never reenter the heap.
@@ -664,6 +684,9 @@ impl Heap {
             carved: AtomicUsize::new(0),
             room: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
+            reclaim_hook: AtomicUsize::new(0),
+            reclaimer: AtomicUsize::new(NO_RECLAIMER),
+            reclaims: AtomicU64::new(0),
             state: UnsafeCell::new(State {
                 start: 0,
                 end: 0,
@@ -1098,6 +1121,75 @@ impl Heap {
         self.failures.load(Ordering::Relaxed)
     }
 
+    /// Have an ordinary allocation that finds no memory call `hook` with its
+    /// bytes, outside the heap's lock, and try again while the hook says it
+    /// freed something. The hook lets go of what its owner keeps only to save
+    /// work. It may allocate and free, but must not wait for a lock that an
+    /// allocating caller can hold: a request that fails inside it does not
+    /// call it again.
+    pub fn set_reclaim_hook(&self, hook: fn(usize) -> usize) {
+        self.reclaim_hook.store(hook as usize, Ordering::Release);
+    }
+
+    /// Allocations that found no memory and were served once the reclaim
+    /// hook had freed some.
+    pub fn reclaims(&self) -> u64 {
+        self.reclaims.load(Ordering::Relaxed)
+    }
+
+    /// Run the reclaim hook for a request of `bytes` that found no memory,
+    /// then make it again with `attempt`; null when there is no hook, it
+    /// frees nothing, or the request still fails. A request on a core
+    /// whose hook is already running (one made by the hook) does not wait
+    /// for it; one on another core waits, then tries again.
+    fn reclaimed(&self, bytes: usize, attempt: impl Fn() -> *mut u8) -> *mut u8 {
+        let me = self.cpu().map_or(UNTAGGED_RECLAIMER, |cpu| cpu + 1);
+        for _ in 0..RECLAIM_ROUNDS {
+            let hook = self.reclaim_hook.load(Ordering::Acquire);
+            if hook == 0 {
+                return ptr::null_mut();
+            }
+            match self.reclaimer.compare_exchange(
+                NO_RECLAIMER,
+                me,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {}
+                // This core's own hook allocated, or an untagged context
+                // that cannot tell whether it is the one running it.
+                Err(owner) if owner == me || me == UNTAGGED_RECLAIMER => {
+                    return ptr::null_mut();
+                }
+                Err(_) => {
+                    while self.reclaimer.load(Ordering::Acquire) != NO_RECLAIMER {
+                        core::hint::spin_loop();
+                    }
+                    let block = attempt();
+                    if !block.is_null() {
+                        self.reclaims.fetch_add(1, Ordering::Relaxed);
+                        return block;
+                    }
+                    continue;
+                }
+            }
+            // SAFETY: only `set_reclaim_hook` stores a nonzero value, a
+            // `fn(usize) -> usize`.
+            let hook: fn(usize) -> usize = unsafe { core::mem::transmute(hook) };
+            let freed = hook(bytes);
+            self.reclaimer.store(NO_RECLAIMER, Ordering::Release);
+            let block = attempt();
+            if !block.is_null() {
+                self.reclaims.fetch_add(1, Ordering::Relaxed);
+                return block;
+            }
+            if freed == 0 {
+                break;
+            }
+        }
+        ptr::null_mut()
+    }
+
     /// Acquisitions of the heap's lock that found it held: with every PE
     /// on a core of its own, the cores' allocations meet there.
     pub fn waits(&self) -> u64 {
@@ -1320,20 +1412,26 @@ unsafe impl GlobalAlloc for Heap {
         allocation_begins();
         let class = class(layout);
         let cpu = self.cpu();
-        let block = if let (Some(class), Some(cpu)) = (class, cpu) {
-            let flags = interrupts_off();
-            // SAFETY: on this core, with interrupts disabled.
-            let block = unsafe { self.take_cached(cpu, class) };
-            restore_interrupts(flags);
-            block
-        } else {
-            let _guard = self.lock();
-            // SAFETY: the guard excludes all free-list writers, while
-            // CPU-local cache ownership is already exclusive to this core.
-            let state = unsafe { &mut *self.state.get() };
-            // SAFETY: the guard owns this state for the entire operation.
-            unsafe { allocate_locked(state, layout, class) }
+        let attempt = || {
+            if let (Some(class), Some(cpu)) = (class, cpu) {
+                let flags = interrupts_off();
+                // SAFETY: on this core, with interrupts disabled.
+                let block = unsafe { self.take_cached(cpu, class) };
+                restore_interrupts(flags);
+                block
+            } else {
+                let _guard = self.lock();
+                // SAFETY: the guard excludes all free-list writers, while
+                // CPU-local cache ownership is already exclusive to this core.
+                let state = unsafe { &mut *self.state.get() };
+                // SAFETY: the guard owns this state for the entire operation.
+                unsafe { allocate_locked(state, layout, class) }
+            }
         };
+        let mut block = attempt();
+        if block.is_null() {
+            block = self.reclaimed(layout.size(), attempt);
+        }
         if block.is_null() {
             self.failures.fetch_add(1, Ordering::Relaxed);
             failure::report(self, layout);
@@ -1608,7 +1706,8 @@ unsafe fn carve(state: &mut State, pool: usize, size: usize, alignment: usize) -
 
 /// [`carve`] from the main bins, then from the reserve for a large request,
 /// giving the classes' empty slabs back to the bins and trying both when
-/// that fails.
+/// that fails, and last joining the free extents on both sides of the
+/// reserve's start ([`join_across_floor`]).
 ///
 /// # Safety
 /// The heap's lock is held and `state` is initialized.
@@ -1631,7 +1730,71 @@ unsafe fn carve_draining(state: &mut State, size: usize, alignment: usize) -> *m
         }
     }
     // SAFETY: as above.
-    unsafe { carve(state, RESERVE, size, alignment) }
+    let block = unsafe { carve(state, RESERVE, size, alignment) };
+    if !block.is_null() {
+        return block;
+    }
+    // SAFETY: as above.
+    if unsafe { join_across_floor(state, size, alignment) } {
+        // SAFETY: as above.
+        return unsafe { carve(state, RESERVE, size, alignment) };
+    }
+    ptr::null_mut()
+}
+
+/// Join the free block that ends at the reserve's start with the free block
+/// that begins it, by lowering the start to the first, when together they
+/// hold `bytes` aligned to `alignment` and neither alone does. No
+/// block crosses the floor, so the two never coalesce by themselves: a
+/// heap whose main part ends free beside a free reserve could hold a large
+/// extent and still refuse a large request. The main part gives that block
+/// up for good; the block before it is allocated, or it would have merged.
+///
+/// # Safety
+/// The heap's lock is held and `state` is initialized.
+unsafe fn join_across_floor(state: &mut State, bytes: usize, alignment: usize) -> bool {
+    let floor = state.floor;
+    if floor >= state.end {
+        return false;
+    }
+    let reserve = floor as *mut Header;
+    // SAFETY: the guard; the block at the floor has a current header, and
+    // when the one before it is free its `previous` names that block.
+    unsafe {
+        let flags = (*reserve).size;
+        if flags & FREE == 0 || flags & PREVIOUS_FREE == 0 {
+            return false;
+        }
+        let below = (*reserve).previous as *mut Header;
+        let joined = size(below) + size(reserve);
+        let end = below as usize + joined;
+        let alignment = alignment.max(GRANULE);
+        let Some(payload) = aligned(bytes.max(1), GRANULE) else {
+            return false;
+        };
+        let Some(user) = aligned(below as usize + HEADER_BYTES, alignment) else {
+            return false;
+        };
+        let gap = user - HEADER_BYTES - below as usize;
+        let user = if gap != 0 && gap < MIN_BLOCK {
+            aligned(user + MIN_BLOCK - gap, alignment)
+        } else {
+            Some(user)
+        };
+        if user
+            .and_then(|user| user.checked_add(payload))
+            .is_none_or(|used| used > end)
+        {
+            return false;
+        }
+        state.remove(below);
+        state.remove(reserve);
+        state.floor = below as usize;
+        (*below).size = joined | FREE | (*below).size & PREVIOUS_FREE;
+        state.tell_following(below);
+        state.insert(below);
+    }
+    true
 }
 
 /// Give each class's empty slab back to the bins: whether there was any.

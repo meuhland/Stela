@@ -1011,5 +1011,139 @@ fn the_room_is_what_no_block_was_carved_from_and_comes_back_when_freed() {
     assert_eq!(heap.room(), total);
 }
 
+#[test]
+fn free_extents_on_both_sides_of_the_reserve_start_serve_a_large_request_together() {
+    let heap = Heap::new();
+    let floor = reserving(&heap, 2);
+    let block = Layout::from_size_align(256 << 10, 16).unwrap();
+    // More than four blocks hold, less than eight.
+    let large = Layout::from_size_align(3 << 19, 16).unwrap();
+    // SAFETY: valid layouts; every block is freed once with its layout.
+    unsafe {
+        let mut main = Vec::new();
+        let mut reserve = Vec::new();
+        loop {
+            let served = heap.alloc(block);
+            if served.is_null() {
+                break;
+            }
+            if (served as usize) < floor {
+                main.push(served);
+            } else {
+                reserve.push(served);
+            }
+        }
+        assert!(main.len() > 8 && reserve.len() > 4);
+        // The main part ends free, and the reserve begins free: each side
+        // holds about a mebibyte, apart.
+        for &freed in &main[main.len() - 4..] {
+            heap.dealloc(freed, block);
+        }
+        for &freed in &reserve[..4] {
+            heap.dealloc(freed, block);
+        }
+        assert!(heap.usage().largest < large.size());
+        let big = heap.alloc(large);
+        assert!(!big.is_null());
+        assert!((big as usize) < floor);
+        assert!(big as usize + large.size() > floor);
+        big.write_bytes(0xa5, large.size());
+        for &kept in main[..main.len() - 4].iter().chain(&reserve[4..]) {
+            // Neighbours on both sides keep their bytes.
+            kept.write_bytes(0x5a, block.size());
+        }
+        assert!(
+            core::slice::from_raw_parts(big, large.size())
+                .iter()
+                .all(|&byte| byte == 0xa5)
+        );
+        heap.dealloc(big, large);
+        for &kept in main[..main.len() - 4].iter().chain(&reserve[4..]) {
+            heap.dealloc(kept, block);
+        }
+    }
+    let usage = heap.usage();
+    assert_eq!((usage.extents, usage.carved, usage.live), (2, 0, 0));
+}
+
+/// The heap the reclaim-hook test fragments, the blocks its hook may let
+/// go, and the hook's calls.
+static RECLAIMING: Heap = Heap::new();
+static RECLAIMABLE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static RECLAIM_CALLS: AtomicUsize = AtomicUsize::new(0);
+const RECLAIMED_BLOCK: usize = 256 << 10;
+
+fn reclaim_cached(bytes: usize) -> usize {
+    RECLAIM_CALLS.fetch_add(1, Ordering::Relaxed);
+    assert!(bytes > 0);
+    // A request the hook makes that fails does not call it again.
+    let huge = Layout::from_size_align(64 << 20, 16).unwrap();
+    // SAFETY: a valid layout that fails.
+    assert!(unsafe { RECLAIMING.alloc(huge) }.is_null());
+    let layout = Layout::from_size_align(RECLAIMED_BLOCK, 16).unwrap();
+    let blocks = core::mem::take(&mut *RECLAIMABLE.lock().unwrap());
+    for &block in &blocks {
+        // SAFETY: blocks the test allocated with this layout and gave up.
+        unsafe { RECLAIMING.dealloc(block as *mut u8, layout) };
+    }
+    blocks.len() * RECLAIMED_BLOCK
+}
+
+#[test]
+fn a_large_request_no_extent_holds_frees_what_the_hook_keeps_and_is_served() {
+    let layout = Layout::from_size_align(8 << 20, 4096).unwrap();
+    // SAFETY: a nonzero layout; the test leaks this backing.
+    let ram = unsafe { std::alloc::alloc(layout) };
+    // SAFETY: exclusive backing for the test's whole run.
+    unsafe { RECLAIMING.initialize(ram, layout.size()) };
+    let block = Layout::from_size_align(RECLAIMED_BLOCK, 16).unwrap();
+    let large = Layout::from_size_align(1 << 20, 16).unwrap();
+    let mut kept = Vec::new();
+    // SAFETY: valid layouts; kept blocks stay live for the test.
+    unsafe {
+        let mut served = Vec::new();
+        loop {
+            let block = RECLAIMING.alloc(block);
+            if block.is_null() {
+                break;
+            }
+            served.push(block as usize);
+        }
+        // Every other block is free: a fragmented heap, most of whose holes
+        // are a quarter of what the large request needs.
+        let (cached, rest) = served.split_at(8);
+        for (index, &block_at) in rest.iter().enumerate() {
+            if index % 2 == 0 {
+                RECLAIMING.dealloc(block_at as *mut u8, block);
+            } else {
+                kept.push(block_at);
+            }
+        }
+        // The first eight are a cache the hook may let go of.
+        *RECLAIMABLE.lock().unwrap() = cached.to_vec();
+        assert!(RECLAIMING.usage().largest < large.size());
+        // No hook: the request fails, for a fallible caller to survive.
+        assert!(RECLAIMING.alloc(large).is_null());
+        let failures = RECLAIMING.failures();
+        RECLAIMING.set_reclaim_hook(reclaim_cached);
+        let big = RECLAIMING.alloc(large);
+        assert!(!big.is_null());
+        assert_eq!(RECLAIM_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(RECLAIMING.reclaims(), 1);
+        // Only the request the hook made counts as failed.
+        assert_eq!(RECLAIMING.failures(), failures + 1);
+        // With nothing left to let go of, the request fails after one call.
+        let more = Layout::from_size_align(4 << 20, 16).unwrap();
+        assert!(RECLAIMING.alloc(more).is_null());
+        assert_eq!(RECLAIM_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(RECLAIMING.failures(), failures + 3);
+        RECLAIMING.dealloc(big, large);
+        for &block_at in &kept {
+            RECLAIMING.dealloc(block_at as *mut u8, block);
+        }
+    }
+    assert_eq!(RECLAIMING.usage().live, 0);
+}
+
 #[path = "replay.rs"]
 mod replay;
