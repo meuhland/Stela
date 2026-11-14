@@ -899,3 +899,76 @@ fn a_spin_at_el0_starts_no_lease() {
     assert_eq!(clocks[0].spin_started(), None);
     assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
 }
+
+#[test]
+fn a_pe_released_for_good_holds_the_count_no_more() {
+    let (shared, mut first, mut second) = pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    second.busy(|| 1000, 0, None);
+    let limit = 1000 + FREQUENCY * STALL_MILLIS / 1000;
+    // The first PE's machine stopped after it published 1000, and its core
+    // went to a fatal stop; the second runs and looks.
+    let mut retired = 0;
+    for host in (1010..1000 + LONG_STALL).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+    }
+    assert_eq!(second.read(|| 1000 + LONG_STALL), limit);
+    assert_eq!(shared.holder(), Some((0, false, 1000)));
+    // Released, it holds the count no more: it goes on from the limit at
+    // once, before any other PE looks.
+    shared.release(0, || 1000 + LONG_STALL);
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
+    assert_eq!(shared.holder(), None);
+    assert_eq!(second.read(|| 1100 + LONG_STALL), limit + 100);
+    // Whatever its clock publishes after, a stop in the kernel included.
+    first.mark(|| 1200 + LONG_STALL, 1, None);
+    assert!(first.leave(|| 1300 + LONG_STALL, 0, false));
+    for host in (1300 + LONG_STALL..1300 + 3 * LONG_STALL).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+    }
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
+    assert!(second.read(|| 1300 + 3 * LONG_STALL) >= limit + 300 + 2 * LONG_STALL);
+}
+
+#[test]
+fn a_pe_stopped_in_the_kernel_and_released_lifts_its_ceiling_at_once() {
+    let (shared, mut first, mut second) = pair();
+    assert!(first.leave(|| 2000, 0, false));
+    // Held at the stop's limit, 1200 counts past it.
+    assert_eq!(second.read(|| 6000), 3200);
+    assert_eq!(shared.holder(), Some((0, true, 2000)));
+    shared.release(0, || 6000);
+    assert_eq!(second.read(|| 6100), 3300);
+    assert_eq!(shared.holder(), None);
+    // A resume after the release publishes nothing either.
+    first.resume(|| 6200, 0);
+    assert_eq!(shared.slot(0), IDLE);
+}
+
+/// A released PE that was spinning holds no lease, and a wake sent to it
+/// after its release makes it wait for nothing.
+#[test]
+fn a_released_pe_keeps_no_spin_and_takes_no_wake() {
+    let (shared, mut clocks) = busy_clocks(2, FREQUENCY);
+    let spin = FREQUENCY * SPIN_MILLIS / 1000;
+    let mut host = 1000;
+    while host < 1000 + spin + 100 {
+        clocks[0].spin(|| host, 0, None, false);
+        clocks[1].mark(|| host, host, None);
+        host += 1;
+    }
+    assert_eq!(clocks[0].spin_started(), Some(1000));
+    shared.release(0, || host);
+    assert_eq!(shared.slots[0].spin.load(Ordering::Relaxed), IDLE);
+    shared.pending(0, 1);
+    assert_eq!(shared.slot(0), IDLE);
+    for _ in 0..FREQUENCY / 10 {
+        clocks[1].mark(|| host, host, None);
+        assert_eq!(clocks[1].read(|| host), host);
+        host += 1;
+    }
+}
