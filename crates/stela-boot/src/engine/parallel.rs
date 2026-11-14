@@ -9,6 +9,8 @@ use super::{SLICE, WAIT_POLLS_PER_SECOND, host, output};
 use crate::Result;
 use crate::{apic::Apic, native_smp::executor::Executors};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use stela_boot_core::staged_frame::Share;
 use stela_contracts::refuse;
 use stela_engine::machine::Cpu;
@@ -16,6 +18,7 @@ use stela_engine::machine::Host;
 use stela_engine::machine::Machine;
 use stela_engine::machine::Stop;
 use stela_engine::machine::ctrr;
+use stela_engine::machine::engine::Hub;
 use stela_engine::machine::engine::Kick;
 use stela_engine::machine::engine::SharedDevices;
 pub(crate) use stela_engine::machine::engine::SourcePhase;
@@ -186,6 +189,7 @@ impl Pe {
             let mut host = owner.host();
             hub.first_start(pe, || host.wait_for_interrupt())
         };
+        register_for_fatal(&hub, pe);
         let cpu = Cpu::of(profile.chip(), address, Pstate::reset(2));
         // This core's own allocations, which other PEs' leave alone.
         let own = || crate::ALLOCATOR.own().unwrap_or(0);
@@ -221,7 +225,7 @@ impl Pe {
         // Waits return to this loop, which publishes the counts.
         machine.set_wait_limit(Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND));
         if let Err(stop) = machine.start_parallel(Arc::clone(&hub), core_locks, address) {
-            stopped(pe, stop);
+            stopped(&hub, pe, stop);
         }
         output::arguments(format_args!(
             "PARALLEL PE {pe} starts at {address:#x} count={}\n",
@@ -311,7 +315,7 @@ impl Pe {
                         });
                     }
                 }
-                stop => stopped(pe, stop),
+                stop => stopped(&hub, pe, stop),
             }
             hub.publish(pe, machine.counts());
             if machine.step_timing().is_some() {
@@ -447,8 +451,52 @@ pub(super) fn report_source_observations<H: Host>(home: &Machine<H, Board>) {
     }
 }
 
+/// The hub and the processor each remote PE runs on, for a fatal stop on
+/// that processor ([`release_clock_for_fatal`]).
+static FATAL_HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
+const FATAL_PES: usize = 64;
+static FATAL_PROCESSORS: [AtomicU32; FATAL_PES] = [const { AtomicU32::new(u32::MAX) }; FATAL_PES];
+
+/// Name this processor as PE `pe`'s, on `hub`, for a fatal stop here.
+fn register_for_fatal(hub: &Arc<Hub>, pe: usize) {
+    if FATAL_HUB.load(Ordering::Acquire).is_null() {
+        let raw = Arc::into_raw(Arc::clone(hub)).cast_mut();
+        if FATAL_HUB
+            .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // SAFETY: the clone just made, which nothing else saw.
+            drop(unsafe { Arc::from_raw(raw) });
+        }
+    }
+    if let Some(processor) = FATAL_PROCESSORS.get(pe) {
+        processor.store(host::processor(), Ordering::Release);
+    }
+}
+
+/// A fatal stop on a remote PE's processor ends with it halted, so its
+/// clock slot goes first: one left held would stop guest time on every
+/// other PE (`SharedClock::release`).
+/// Nothing on another processor, or before the PEs run.
+pub(crate) fn release_clock_for_fatal() {
+    // SAFETY: a published hub is leaked, so it lives for the boot.
+    let Some(hub) = (unsafe { FATAL_HUB.load(Ordering::Acquire).as_ref() }) else {
+        return;
+    };
+    let processor = host::processor();
+    for (pe, slot) in FATAL_PROCESSORS.iter().enumerate() {
+        if slot.load(Ordering::Acquire) == processor {
+            hub.release_clock(pe, host::fresh_counter);
+        }
+    }
+}
+
 /// A PE's machine stopped, which only the home machine may: the board stops.
-fn stopped(pe: usize, stop: Stop) -> ! {
+/// Its clock slot goes first: the fatal stop may wait (the GPUs, the log)
+/// and ends with this core halted, and a slot it left held would stop guest
+/// time on every other PE meanwhile.
+fn stopped(hub: &Hub, pe: usize, stop: Stop) -> ! {
+    hub.release_clock(pe, host::fresh_counter);
     output::arguments(format_args!("PARALLEL PE {pe} stopped: {stop:?}\n"));
     output::fatal("a PE on its own host core stopped")
 }
