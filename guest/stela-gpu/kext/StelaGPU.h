@@ -50,10 +50,9 @@ public:
 	 * connection of gate page `page`, answering the handle, 0 on failure.
 	 */
 	uint64_t importMemory(uint64_t page, task_t task, mach_vm_address_t address, mach_vm_size_t length);
-	/* The sandbox patcher's connection type, else IOService's user client. */
-	using IOAccelerator::newUserClient;
-	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
-	    IOUserClient **handler) override;
+	/* Opens the sandbox patcher's connection (kStelaGPUSandboxClientType). */
+	IOReturn newSandboxClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+	    IOUserClient **handler);
 
 private:
 	/*
