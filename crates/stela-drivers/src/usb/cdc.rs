@@ -27,7 +27,7 @@
 //! NetworkConnection notifications on the interrupt endpoint set the
 //! carrier (ECM 6.3.1, and alike in NCM); until one arrives the link is
 //! taken to be up. Frames above the 1514-byte Ethernet maximum are refused.
-mod ntb;
+pub mod ntb;
 
 use super::descriptor::{
     DEVICE_TO_HOST, Endpoint, Interface, RECIPIENT_INTERFACE, SET_INTERFACE, TYPE_CLASS, setup,
