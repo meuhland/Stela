@@ -199,15 +199,24 @@ impl AppleDevices {
             .ok_or(refuse!("no USB Ethernet adapter is attached"))
     }
 
-    /// A frame from the host network for the guest's USB Ethernet adapter;
-    /// dropped as the adapter's filter and queue decide.
+    /// A frame from the host network for the guest's USB Ethernet adapter
+    /// (or StelaNet adapter); dropped as the adapter's filter and queue
+    /// decide.
     pub fn network_deliver(&mut self, frame: &[u8]) -> Result<()> {
+        if let Some(net) = self.stela_net() {
+            net.deliver_owned(frame.to_vec());
+            return Ok(());
+        }
         self.usb_network()?.deliver(frame);
         Ok(())
     }
 
-    /// Hand the USB Ethernet adapter an owned frame from the host link.
+    /// Hand the guest's network adapter an owned frame from the host link.
     pub fn network_deliver_owned(&mut self, frame: Vec<u8>) -> Result<()> {
+        if let Some(net) = self.stela_net() {
+            net.deliver_owned(frame);
+            return Ok(());
+        }
         self.usb_network()?.deliver_owned(frame);
         Ok(())
     }
@@ -273,6 +282,9 @@ impl AppleDevices {
     /// Whether the guest has its USB Ethernet link up, and the adapter's
     /// counters; `None` without an adapter.
     pub fn network_status(&mut self) -> Option<(bool, UsbNetworkCounters)> {
+        if let Some(net) = self.stela_net() {
+            return Some((net.up(), net.counters()));
+        }
         let network = self.usb_network().ok()?;
         Some((network.up(), network.counters()))
     }
@@ -280,16 +292,26 @@ impl AppleDevices {
     /// Whether the guest's USB Ethernet adapter has room for a frame from
     /// the host network; false without an adapter.
     pub fn network_room(&mut self) -> bool {
+        if let Some(net) = self.stela_net() {
+            return net.has_room();
+        }
         self.usb_network().is_ok_and(|network| network.has_room())
     }
 
-    /// The next frame the guest sent through its USB Ethernet adapter.
+    /// The next frame the guest sent through its network adapter.
     pub fn network_take(&mut self) -> Option<Vec<u8>> {
+        if let Some(net) = self.stela_net() {
+            return net.take();
+        }
         self.usb_network().ok()?.take()
     }
 
-    /// Return the host link's finished frame storage to the USB assembler.
+    /// Return the host link's finished frame storage to the adapter.
     pub fn network_recycle(&mut self, frame: Vec<u8>) {
+        if let Some(net) = self.stela_net() {
+            net.recycle(frame);
+            return;
+        }
         if let Ok(network) = self.usb_network() {
             network.recycle_outbound(frame);
         }
