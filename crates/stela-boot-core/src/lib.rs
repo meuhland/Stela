@@ -84,6 +84,7 @@ pub mod staged_frame;
 pub mod stop_keys;
 pub mod stop_record;
 pub mod storage;
+pub mod store_packs;
 pub mod topology;
 pub mod tsc;
 pub mod usb_legacy;
