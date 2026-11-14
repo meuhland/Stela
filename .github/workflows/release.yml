@@ -47,8 +47,8 @@ jobs:
             echo "::error::Cargo.toml has no [workspace.package] version"
             exit 1
           fi
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version)"
+          if [[ "$GITHUB_REF_NAME" != "v$version" && "$GITHUB_REF_NAME" != "v$version-"* ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version or v$version-<suffix>)"
             exit 1
           fi
           for path in LICENSE NOTICE LICENSES; do
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     env:
-      SOURCE: stela-v${{ needs.version.outputs.version }}-source
+      SOURCE: stela-${{ github.ref_name }}-source
     steps:
       - uses: actions/checkout@v5
 
@@ -230,7 +230,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      ARCHIVE: stela-v${{ needs.version.outputs.version }}-${{ matrix.platform }}
+      ARCHIVE: stela-${{ github.ref_name }}-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
 
