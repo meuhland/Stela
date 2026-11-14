@@ -618,31 +618,55 @@ stela_metal_sampler_states(const void *air, size_t size,
 }
 
 /* The binding data of the metal_abi callbacks, which read its first member,
- * and of the threadgroup callback. */
+ * and of the threadgroup callback, which notes in notice (of
+ * STELA_METAL_NOTICE_BYTES) the lengths it gave in place of the dispatch's. */
 struct binding {
    struct stela_metal_stage stage;
    const struct stela_metal_specialization *specialization;
+   char *notice;
 };
 
-/* The dispatch's setThreadgroupMemoryLength:atIndex: of the buffer. */
+#define STELA_METAL_NOTICE_BYTES sizeof(((struct stela_air_error *)0)->detail)
+
+/* The dispatch's setThreadgroupMemoryLength:atIndex: of the buffer. A slot
+ * it never sized, or sized short of the argument's type, runs on Apple GPUs:
+ * only the validation layer refuses it. Such a slot gets the type's bytes,
+ * rounded up to Metal's 16-byte threadgroup granule (16 for a stitched
+ * read, which declares none), and the compilation's notice says so. */
 static bool
 bind_threadgroup(const struct stela_air_buffer *buffer, struct stela_air_threadgroup_view *view,
                  void *data)
 {
-   const struct stela_metal_specialization *specialization =
-      ((const struct binding *)data)->specialization;
-   for (unsigned i = 0; i < specialization->threadgroup_length_count; i++) {
-      const struct stela_metal_threadgroup_length *length = &specialization->threadgroup_lengths[i];
-      if (length->index != buffer->index)
-         continue;
-      *view = (struct stela_air_threadgroup_view){
-         .size = length->bytes,
-         .alignment = MAX2(buffer->type_alignment, STELA_METAL_THREADGROUP_ALIGNMENT),
-         .available_access = STELA_AIR_READ_WRITE,
-      };
-      return length->bytes != 0;
+   const struct binding *binding = data;
+   const struct stela_metal_specialization *specialization = binding->specialization;
+   const struct stela_metal_threadgroup_length *length = NULL;
+   for (unsigned i = 0; i < specialization->threadgroup_length_count && !length; i++) {
+      if (specialization->threadgroup_lengths[i].index == buffer->index)
+         length = &specialization->threadgroup_lengths[i];
    }
-   return false;
+   uint64_t granule = STELA_METAL_THREADGROUP_ALIGNMENT;
+   uint64_t declared = MAX2(((uint64_t)buffer->type_size + granule - 1) & ~(granule - 1), granule);
+   uint64_t bytes = length ? length->bytes : 0;
+   if (bytes < declared) {
+      size_t used = strlen(binding->notice);
+      char *at = binding->notice + used;
+      size_t room = STELA_METAL_NOTICE_BYTES - used;
+      const char *separator = used ? "; " : "";
+      if (room > 1 && bytes) {
+         snprintf(at, room, "%sthreadgroup arg %u short: %llu bytes, using %llu", separator,
+                  buffer->index, (unsigned long long)bytes, (unsigned long long)declared);
+      } else if (room > 1) {
+         snprintf(at, room, "%sthreadgroup arg %u unset: using %llu", separator, buffer->index,
+                  (unsigned long long)declared);
+      }
+      bytes = declared;
+   }
+   *view = (struct stela_air_threadgroup_view){
+      .size = bytes,
+      .alignment = MAX2(buffer->type_alignment, STELA_METAL_THREADGROUP_ALIGNMENT),
+      .available_access = STELA_AIR_READ_WRITE,
+   };
+   return true;
 }
 
 /* stela_air_fetch_attribute over the pipeline's stage-in layout: at a
@@ -894,6 +918,7 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    }
    struct stela_metal_reflection *owned_reflection = NULL;
    nir_shader *shader = NULL;
+   char notice[STELA_METAL_NOTICE_BYTES] = "";
    if (!reflection) {
       owned_reflection = malloc(sizeof(*owned_reflection));
       if (!owned_reflection) {
@@ -940,7 +965,7 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       fail(error, STELA_AIR_INPUT, "vertex input words for a function that does not take them");
       goto done;
    }
-   struct binding binding = {{stage_table(stage)}, specialization};
+   struct binding binding = {{stage_table(stage)}, specialization, notice};
    struct stela_air_options resources = {
       .max_instructions = target->max_instructions,
       .bind_buffer = stela_metal_bind_buffer,
@@ -1069,6 +1094,10 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    };
    shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
 done:
+   /* A compilation that succeeded tells what it gave in place of the
+    * dispatch, in its error's detail, which stays of kind STELA_AIR_OK. */
+   if (shader && notice[0])
+      snprintf(error->detail, sizeof(error->detail), "%s", notice);
    free(owned_reflection);
    return shader;
 }

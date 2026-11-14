@@ -154,6 +154,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 }
             }
         };
+        // What a compilation gave in place of what the call asked, such as
+        // a threadgroup buffer's bytes, joins the call's note.
+        while let Some(notice) = self.device.take_notice() {
+            self.noted = Some(match self.noted.take() {
+                Some(noted) => format!("{noted}; {notice}"),
+                None => notice,
+            });
+        }
         self.served = (call.operation, status);
         call.status = status.raw();
         call.reason_length = reason.len() as u64;
