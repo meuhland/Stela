@@ -140,6 +140,9 @@ pub mod features {
 
     /// What this device offers.
     pub const OFFERED: u64 = MAC | EVENT_IDX | VERSION_1;
+    /// The checksum offloads a boot may add to [`OFFERED`]: partial transmit
+    /// checksums completed, received ones verified.
+    pub const CHECKSUMS: u64 = CSUM | GUEST_CSUM;
     /// What a driver must accept.
     pub const REQUIRED: u64 = VERSION_1;
 }

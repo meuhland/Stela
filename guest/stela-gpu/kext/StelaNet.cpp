@@ -28,6 +28,9 @@ static const uint32_t kBufferBytes = 2048;
 static const uint32_t kPage = 0x4000;
 /* An event index this far ahead of the used index never comes. */
 static const uint16_t kNever = 0x8000;
+/* virtio_net_hdr_v1 flags. */
+static const uint8_t kNeedsCsum = 1;
+static const uint8_t kDataValid = 2;
 
 static_assert(STELA_NET_HEADER_BYTES + STELA_NET_FRAME_MAX <= kBufferBytes, "a frame fits a buffer");
 static_assert(kPage % kBufferBytes == 0, "no buffer crosses a page");
@@ -129,7 +132,10 @@ StelaNet::start(IOService *provider)
 		stop(provider);
 		return false;
 	}
-	accepted = offered & (STELA_NET_F_VERSION_1 | STELA_NET_F_MAC | STELA_NET_F_EVENT_IDX);
+	// Checksum offloads are taken when offered: the host completes partial
+	// transmit checksums and vouches for received ones.
+	accepted = offered & (STELA_NET_F_VERSION_1 | STELA_NET_F_MAC | STELA_NET_F_EVENT_IDX | STELA_NET_F_CSUM |
+	    STELA_NET_F_GUEST_CSUM);
 	uint64_t station = read(STELA_NET_MAC);
 	for (int index = 0; index < ETHER_ADDR_LEN; index++) {
 		mac[index] = uint8_t(station >> (8 * index));
@@ -310,6 +316,15 @@ StelaNet::attachInterface()
 		return false;
 	}
 	bpf_attach(ifp, DLT_EN10MB, ETHER_HDR_LEN, nullptr, nullptr);
+	if (accepted & STELA_NET_F_CSUM) {
+		// The stack then leaves TCP and UDP checksums partial, the pseudo
+		// header's sum in the field, for transmit() to mark.
+		error = ifnet_set_offload(ifp, IFNET_CSUM_TCP | IFNET_CSUM_UDP | IFNET_CSUM_TCPIPV6 | IFNET_CSUM_UDPIPV6);
+		if (error != 0) {
+			IOLog("StelaNet: ifnet_set_offload: %d\n", error);
+		}
+	}
+	__atomic_store_n(&attached, true, __ATOMIC_RELEASE);
 	return true;
 }
 
@@ -330,7 +345,7 @@ StelaNet::stop(IOService *provider)
 		workLoop->removeEventSource(interrupt);
 		OSSafeReleaseNULL(interrupt);
 	}
-	if (ifp) {
+	if (ifp && __atomic_exchange_n(&attached, false, __ATOMIC_ACQ_REL)) {
 		// ifDetached releases the interface and this object.
 		ifnet_detach(ifp);
 	}
@@ -395,6 +410,7 @@ StelaNet::transmit(mbuf_t packet)
 			uint8_t *data = buffer(&tx, slot);
 			bzero(data, STELA_NET_HEADER_BYTES);
 			if (mbuf_copydata(packet, 0, length, data + STELA_NET_HEADER_BYTES) == 0) {
+				markPartialChecksum(packet, data, length);
 				uint64_t physical = bufferPhysical(&tx, slot);
 				descriptors(&tx)[slot] = {physical, uint32_t(STELA_NET_HEADER_BYTES + length), 0, 0};
 				*availSlot(&tx, tx.avail) = slot;
@@ -418,6 +434,44 @@ StelaNet::transmit(mbuf_t packet)
 	}
 	mbuf_freem(packet);
 	return sent ? 0 : ENOBUFS;
+}
+
+/*
+ * Marks a packet whose TCP or UDP checksum the stack left partial
+ * (`mbuf_get_csum_requested`) NEEDS_CSUM in its virtio_net_hdr, from the
+ * transport header to the end, the field at its offset in that header.
+ */
+void
+StelaNet::markPartialChecksum(mbuf_t packet, uint8_t *data, size_t length)
+{
+	if (!(accepted & STELA_NET_F_CSUM)) {
+		return;
+	}
+	mbuf_csum_request_flags_t request = 0;
+	u_int32_t value = 0;
+	if (mbuf_get_csum_requested(packet, &request, &value) != 0) {
+		return;
+	}
+	bool tcp = request & (MBUF_CSUM_REQ_TCP | MBUF_CSUM_REQ_TCPIPV6);
+	bool udp = request & (MBUF_CSUM_REQ_UDP | MBUF_CSUM_REQ_UDPIPV6);
+	if (!tcp && !udp) {
+		return;
+	}
+	const uint8_t *frame = data + STELA_NET_HEADER_BYTES;
+	size_t network;
+	if (request & (MBUF_CSUM_REQ_TCPIPV6 | MBUF_CSUM_REQ_UDPIPV6)) {
+		network = 40;
+	} else {
+		network = size_t(frame[ETHER_HDR_LEN] & 0xf) * 4;
+	}
+	uint16_t start = uint16_t(ETHER_HDR_LEN + network);
+	uint16_t offset = tcp ? 16 : 6;
+	if (size_t(start) + offset + 2 > length) {
+		return;
+	}
+	data[0] = kNeedsCsum;
+	memcpy(data + 6, &start, sizeof start);
+	memcpy(data + 8, &offset, sizeof offset);
 }
 
 void
@@ -446,6 +500,7 @@ StelaNet::harvestReceive()
 			return;
 		}
 		uint16_t old = rx.avail;
+		bool deliver = __atomic_load_n(&attached, __ATOMIC_ACQUIRE);
 		mbuf_t first = nullptr;
 		mbuf_t last = nullptr;
 		uint32_t packets = 0;
@@ -459,9 +514,20 @@ StelaNet::harvestReceive()
 			}
 			uint32_t length = element.length - STELA_NET_HEADER_BYTES;
 			mbuf_t packet = nullptr;
-			if (element.length > STELA_NET_HEADER_BYTES + ETHER_HDR_LEN && element.length <= kBufferBytes &&
-			    mbuf_getpacket(MBUF_DONTWAIT, &packet) == 0) {
-				memcpy(mbuf_data(packet), buffer(&rx, slot) + STELA_NET_HEADER_BYTES, length);
+			if (deliver && element.length > STELA_NET_HEADER_BYTES + ETHER_HDR_LEN &&
+			    element.length <= kBufferBytes && mbuf_getpacket(MBUF_DONTWAIT, &packet) == 0) {
+				const uint8_t *data = buffer(&rx, slot);
+				memcpy(mbuf_data(packet), data + STELA_NET_HEADER_BYTES, length);
+				if ((accepted & STELA_NET_F_GUEST_CSUM) && (data[0] & kDataValid)) {
+					// The host verified the TCP or UDP checksum, and an IPv4
+					// header's, so the stack skips them.
+					bool ipv4 = data[STELA_NET_HEADER_BYTES + 12] == 0x08 &&
+					    data[STELA_NET_HEADER_BYTES + 13] == 0x00;
+					mbuf_set_csum_performed(packet,
+					    MBUF_CSUM_DID_DATA | MBUF_CSUM_PSEUDO_HDR |
+					        (ipv4 ? MBUF_CSUM_DID_IP | MBUF_CSUM_IP_GOOD : 0),
+					    0xffff);
+				}
 				mbuf_setlen(packet, length);
 				mbuf_pkthdr_setlen(packet, length);
 				mbuf_pkthdr_setrcvif(packet, ifp);
@@ -514,7 +580,7 @@ StelaNet::interruptOccurred(OSObject *owner, IOInterruptEventSource *, int)
 		IOLockUnlock(net->txLock);
 		return;
 	}
-	if ((cause & STELA_NET_CAUSE_RX) && net->ifp) {
+	if (cause & STELA_NET_CAUSE_RX) {
 		net->harvestReceive();
 	}
 	if (cause & STELA_NET_CAUSE_TX) {

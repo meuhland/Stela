@@ -7,12 +7,25 @@ use crate::stela_net::Net;
 
 impl AppleDevices {
     /// The StelaNet adapter with station address `mac`, its register page at
-    /// `physical` and its interrupt at `irq`. One per board.
-    pub fn add_stela_net(&mut self, physical: u64, mac: Mac, irq: AicInput) -> Result<(), String> {
+    /// `physical` and its interrupt at `irq`, offering the checksum offloads
+    /// when `checksums` says so. One per board.
+    pub fn add_stela_net(
+        &mut self,
+        physical: u64,
+        mac: Mac,
+        irq: AicInput,
+        checksums: bool,
+    ) -> Result<(), String> {
         if self.stela_net.is_some() {
             return Err(String::from("the board has a StelaNet adapter already"));
         }
-        let device = self.bus.add(Box::new(Net::new(mac.0, irq)));
+        let mut offered = stela_contracts::net::features::OFFERED;
+        if checksums {
+            offered |= stela_contracts::net::features::CHECKSUMS;
+        }
+        let device = self
+            .bus
+            .add(Box::new(Net::with_features(mac.0, irq, offered)));
         self.bus
             .map(device, physical, stela_contracts::net::window::BYTES, 0)
             .map_err(|error| format!("StelaNet placement: {error:?}"))?;
@@ -91,11 +104,11 @@ mod tests {
     fn the_board_network_calls_reach_the_adapter() {
         let mut devices = AppleDevices::for_boot_processor(0);
         devices
-            .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a0))
+            .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a0), false)
             .unwrap();
         assert!(
             devices
-                .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a1))
+                .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a1), false)
                 .is_err()
         );
         assert_eq!(devices.network_status().map(|(up, _)| up), Some(false));
@@ -120,6 +133,8 @@ mod tests {
         // Transmit: a 64-byte frame after its header, then a kick.
         let mut sent = vec![0x5au8; 12 + 64];
         sent[12..18].copy_from_slice(&[0xff; 6]);
+        // A plain virtio_net_hdr: no offload asked for.
+        sent[..12].fill(0);
         ram.write(buffers, &sent);
         let descriptor = [
             buffers.to_le_bytes().as_slice(),

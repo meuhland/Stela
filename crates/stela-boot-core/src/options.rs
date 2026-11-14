@@ -360,6 +360,10 @@ pub struct System {
     /// (`--guest-network-stelanet`, which also gives the guest the network).
     /// A prototype: the StelaGPU kext's StelaNet front end drives it.
     pub guest_network_stelanet: bool,
+    /// The StelaNet adapter also offers checksum offloads: partial transmit
+    /// checksums completed and received ones verified natively
+    /// (`--guest-network-stelanet-csum`, which implies the adapter).
+    pub guest_network_stelanet_csum: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -457,6 +461,7 @@ impl Default for System {
             external_disks: false,
             guest_network: false,
             guest_network_stelanet: false,
+            guest_network_stelanet_csum: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -876,7 +881,11 @@ impl fmt::Display for System {
         line.flag("--guest-network", self.guest_network)?;
         line.flag(
             "--guest-network-stelanet",
-            self.guest_network && self.guest_network_stelanet,
+            self.guest_network && self.guest_network_stelanet && !self.guest_network_stelanet_csum,
+        )?;
+        line.flag(
+            "--guest-network-stelanet-csum",
+            self.guest_network && self.guest_network_stelanet && self.guest_network_stelanet_csum,
         )?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(

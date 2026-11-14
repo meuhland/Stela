@@ -1138,11 +1138,16 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             (placement.irq % per_die) as u16,
         );
         devices
-            .add_stela_net(placement.physical, network.mac(), irq)
+            .add_stela_net(
+                placement.physical,
+                network.mac(),
+                irq,
+                options.guest_network_stelanet_csum,
+            )
             .unwrap_or_else(|error| output::fatal(&error));
         output::arguments(format_args!(
-            "GUEST NETWORK StelaNet /arm-io/stela-net0 at {:#x} aic input {:#x}\n",
-            placement.physical, placement.irq
+            "GUEST NETWORK StelaNet /arm-io/stela-net0 at {:#x} aic input {:#x} checksums={}\n",
+            placement.physical, placement.irq, options.guest_network_stelanet_csum
         ));
     }
     // Device placement has copied the carried firmware. This function

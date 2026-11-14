@@ -6,8 +6,9 @@
  * vtables) named stn0, which the user configures with ifconfig. Frames move
  * through two virtio split virtqueues the kext allocates: receive buffers of
  * 2 KiB each posted once and reposted as they are harvested, and transmit
- * slots of 2 KiB each that every packet is copied into. Nothing is
- * offloaded: the guest checksums and segments every frame itself.
+ * slots of 2 KiB each that every packet is copied into. When the device
+ * offers them, TCP and UDP checksums are offloaded both ways; the guest
+ * still segments every frame itself.
  *
  * The personality matches only the node `--guest-network-stelanet` places,
  * so without it nothing of this class runs.
@@ -55,6 +56,8 @@ private:
 	/* With txLock held: takes back the transmit slots the device completed. */
 	void reclaimTransmit();
 	errno_t transmit(mbuf_t packet);
+	/* Marks the slot's header NEEDS_CSUM when the stack left a checksum partial. */
+	void markPartialChecksum(mbuf_t packet, uint8_t *data, size_t length);
 	/* Writes KICK if the device asked to hear of `queue` moving from `old`. */
 	void kick(Queue *queue, uint16_t old, uint64_t which);
 
@@ -78,6 +81,13 @@ private:
 	uint64_t accepted = 0;
 	uint8_t mac[6] = {};
 	ifnet_t ifp = nullptr;
+	/*
+	 * Set once the interface is attached and cleared before it detaches:
+	 * received frames go up the stack only meanwhile. Before, they are
+	 * dropped, but their buffers are still reposted and the interrupt
+	 * re-armed, or the first frame to arrive early would stall receive.
+	 */
+	bool attached = false;
 	/* With txLock held: the device runs and output may queue. */
 	bool running = false;
 	uint64_t txDropped = 0;
