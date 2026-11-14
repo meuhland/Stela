@@ -37,6 +37,7 @@ impl ParseState<'_> {
             "--serialized" => options.parallel = false,
             "--profile" => options.profile = true,
             "--page-relative" => options.page_relative = true,
+            "--shared-aliases" => options.shared_aliases = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,

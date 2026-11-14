@@ -13,7 +13,7 @@
 //!
 //! The index changes under the board's code lock; a [`Finder`] beside it
 //! answers a fetch without that lock.
-use super::{Block, FETCH_PAGE, VariantId, board::Records};
+use super::{Block, FETCH_PAGE, VariantId, board::Records, same_offset_and_half};
 use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::ops::Index;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -76,6 +76,48 @@ fn tag_runs(entries: &[Entry], tags: &[u16]) -> Vec<core::ops::Range<usize>> {
         }
     }
     runs
+}
+
+/// The PC a shared block ([`Block::shared`]) is listed by in the
+/// [`Finder`]: one list per frame offset for every page that maps it. No
+/// block's PC, which is a multiple of 4.
+const SHARED_PC: u64 = 1;
+
+/// The PC `block` is listed by in the [`Finder`].
+fn finder_pc(block: &Block) -> u64 {
+    if block.shared { SHARED_PC } else { block.pc }
+}
+
+/// The shared block among `entries` (a frame's list) at `offset` in
+/// `variant` that serves `pc` ([`Block::serves`]), whatever guest page it
+/// was installed for: each guest page's run at the offset.
+fn shared_in(
+    blocks: &impl Index<usize, Output = Block>,
+    entries: &[Entry],
+    pc: u64,
+    offset: u16,
+    variant: VariantId,
+) -> Option<usize> {
+    let mut run = 0;
+    while run < entries.len() {
+        let run_tag = entries[run].tag;
+        let end = run + entries[run..].partition_point(|entry| entry.tag == run_tag);
+        let part = &entries[run..end];
+        let start = part.partition_point(|entry| entry.offset < offset);
+        let found = part[start..]
+            .iter()
+            .take_while(|entry| entry.offset == offset)
+            .map(|entry| entry.slot as usize)
+            .find(|&slot| {
+                let block = &blocks[slot];
+                block.shared && block.variant == variant && same_offset_and_half(block.pc, pc)
+            });
+        if found.is_some() {
+            return found;
+        }
+        run = end;
+    }
+    None
 }
 
 /// The finder's hash of a block's physical address and PC.
@@ -143,9 +185,41 @@ impl BlockIndex {
         Some(&self.entries[page])
     }
 
-    /// The block at `pc`, `physical` and `variant`: only the entries of
-    /// its guest page's run at its offset load their blocks.
+    /// The block at `pc`, `physical` and `variant`: one installed for `pc`,
+    /// else with `aliases`, a shared block of the frame offset installed
+    /// for any page ([`Block::serves`]). Only the entries of the guest
+    /// page's run at its offset load their blocks, but for the shared
+    /// block's search, which visits each page's run at the offset.
     pub(super) fn get(
+        &mut self,
+        blocks: &impl Index<usize, Output = Block>,
+        pc: u64,
+        physical: u64,
+        variant: VariantId,
+        aliases: bool,
+    ) -> Option<usize> {
+        let (frame, offset) = split(physical);
+        let key = (page_tag(pc), offset);
+        let entries = self.list(frame)?;
+        let start = entries.partition_point(|entry| entry.order() < key);
+        let own = entries[start..]
+            .iter()
+            .take_while(|entry| entry.order() == key)
+            .map(|entry| entry.slot as usize)
+            .find(|&slot| {
+                let block = &blocks[slot];
+                !block.shared && block.pc == pc && block.variant == variant
+            });
+        if own.is_some() || !aliases {
+            return own;
+        }
+        shared_in(blocks, entries, pc, offset, variant)
+    }
+
+    /// The shared block at `physical` in `variant` that serves `pc`
+    /// ([`Block::serves`]), not one installed for `pc` alone: what a
+    /// shared block's link in its page may enter at every page it runs at.
+    pub(super) fn get_shared(
         &mut self,
         blocks: &impl Index<usize, Output = Block>,
         pc: u64,
@@ -153,14 +227,27 @@ impl BlockIndex {
         variant: VariantId,
     ) -> Option<usize> {
         let (frame, offset) = split(physical);
-        let key = (page_tag(pc), offset);
         let entries = self.list(frame)?;
+        shared_in(blocks, entries, pc, offset, variant)
+    }
+
+    /// Whether the block in `slot` is the one the index holds for its key.
+    pub(super) fn contains(
+        &mut self,
+        blocks: &impl Index<usize, Output = Block>,
+        slot: usize,
+    ) -> bool {
+        let block = &blocks[slot];
+        let (frame, offset) = split(block.physical);
+        let key = (page_tag(block.pc), offset);
+        let Some(entries) = self.list(frame) else {
+            return false;
+        };
         let start = entries.partition_point(|entry| entry.order() < key);
         entries[start..]
             .iter()
             .take_while(|entry| entry.order() == key)
-            .map(|entry| entry.slot as usize)
-            .find(|&slot| blocks[slot].pc == pc && blocks[slot].variant == variant)
+            .any(|entry| entry.slot as usize == slot)
     }
 
     /// What else `physical`'s frame offset holds besides a block of `pc`
@@ -290,7 +377,9 @@ impl BlockIndex {
             .take_while(|entry| entry.order() == (tag, offset))
             .position(|entry| {
                 let other = &blocks[entry.slot as usize];
-                other.pc == block.pc && other.variant == block.variant
+                other.pc == block.pc
+                    && other.variant == block.variant
+                    && other.shared == block.shared
             });
         match same {
             Some(position) => {
@@ -299,7 +388,8 @@ impl BlockIndex {
                     return None;
                 }
                 self.finder.unlink(replaced);
-                self.finder.link(slot as u32, block.physical, block.pc);
+                self.finder
+                    .link(slot as u32, block.physical, finder_pc(block));
                 Some(replaced as usize)
             }
             None => {
@@ -311,7 +401,8 @@ impl BlockIndex {
                         slot: slot as u32,
                     },
                 );
-                self.finder.link(slot as u32, block.physical, block.pc);
+                self.finder
+                    .link(slot as u32, block.physical, finder_pc(block));
                 None
             }
         }
@@ -486,6 +577,9 @@ pub(super) struct Finder {
     partial: AtomicBool,
     /// The index's pages, for counts read without the lock.
     pages: AtomicUsize,
+    /// A shared block was listed ([`SHARED_PC`]): a fetch that finds no
+    /// block of its own PC looks there too.
+    shares: AtomicBool,
 }
 
 impl Finder {
@@ -504,6 +598,7 @@ impl Finder {
             listed: Records::new(slots),
             partial: AtomicBool::new(false),
             pages: AtomicUsize::new(0),
+            shares: AtomicBool::new(false),
         }
     }
 
@@ -516,27 +611,53 @@ impl Finder {
         self.pages.load(Ordering::Relaxed)
     }
 
-    /// The block at `pc`, `physical` and `variant` among `blocks`, or
-    /// `None` when the lists cannot say (the locked index can). A reader
-    /// inside its section, or holding the lock.
+    /// The block at `pc`, `physical` and `variant` among `blocks`, as the
+    /// locked index's [`BlockIndex::get`] finds it (a shared one with
+    /// `aliases`), or `None` when the lists cannot say (the locked index
+    /// can). A reader inside its section, or holding the lock.
     pub(super) fn find(
         &self,
         blocks: &super::board::Blocks,
         pc: u64,
         physical: u64,
         variant: VariantId,
+        aliases: bool,
     ) -> Option<Option<usize>> {
         if self.partial.load(Ordering::Relaxed) {
             return None;
         }
+        let own = self.walk(blocks, physical, pc, |block| {
+            !block.shared
+                && block.physical == physical
+                && block.pc == pc
+                && block.variant == variant
+        })?;
+        if own.is_some() || !aliases || !self.shares.load(Ordering::Relaxed) {
+            return Some(own);
+        }
+        self.walk(blocks, physical, SHARED_PC, |block| {
+            block.shared
+                && block.physical == physical
+                && block.variant == variant
+                && same_offset_and_half(block.pc, pc)
+        })
+    }
+
+    /// The first live block of the list of `physical` and `pc` that
+    /// `matches`, or `None` when the list is longer than [`FIND_STEPS`].
+    fn walk(
+        &self,
+        blocks: &super::board::Blocks,
+        physical: u64,
+        pc: u64,
+        matches: impl Fn(&Block) -> bool,
+    ) -> Option<Option<usize>> {
         let mut link = self.heads[self.bucket_of(physical, pc)].load(Ordering::Acquire);
         for _ in 0..FIND_STEPS {
             let Some(slot) = link.checked_sub(1) else {
                 return Some(None);
             };
-            let found = blocks.get(slot as usize).is_some_and(|block| {
-                block.physical == physical && block.pc == pc && block.variant == variant
-            });
+            let found = blocks.get(slot as usize).is_some_and(&matches);
             if found && blocks.record(slot as usize).live() {
                 return Some(Some(slot as usize));
             }
@@ -556,6 +677,9 @@ impl Finder {
         };
         if listed.load(Ordering::Relaxed) != 0 {
             return;
+        }
+        if pc == SHARED_PC {
+            self.shares.store(true, Ordering::Relaxed);
         }
         let bucket = self.bucket_of(physical, pc);
         let head = &self.heads[bucket];
@@ -628,6 +752,7 @@ mod tests {
             installer: 0,
             part: super::super::board::NO_PART,
             device_stub: false,
+            shared: false,
         }
     }
 
@@ -667,7 +792,7 @@ mod tests {
         for (copy, &base) in copies.iter().enumerate() {
             for (n, offset) in [0x10, 0x40, 0x80].into_iter().enumerate() {
                 assert_eq!(
-                    index.get(&blocks, base + offset, FRAME + offset, id(0)),
+                    index.get(&blocks, base + offset, FRAME + offset, id(0), false),
                     Some(slots[copy * 3 + n])
                 );
             }
@@ -705,7 +830,7 @@ mod tests {
         for (copy, &base) in copies.iter().enumerate() {
             for (n, offset) in [0x10, 0x40, 0x80].into_iter().enumerate() {
                 let slot = slots[copy * 3 + n];
-                let found = index.get(&blocks, base + offset, FRAME + offset, id(0));
+                let found = index.get(&blocks, base + offset, FRAME + offset, id(0), false);
                 assert_eq!(
                     found,
                     (!gone.contains(&slot)).then_some(slot),
@@ -718,7 +843,7 @@ mod tests {
         let other = slots[0];
         index.forget_marked_in(FRAME, Some(&tags), |slot| slot as usize == other);
         assert_eq!(
-            index.get(&blocks, copies[0] + 0x10, FRAME + 0x10, id(0)),
+            index.get(&blocks, copies[0] + 0x10, FRAME + 0x10, id(0), false),
             Some(other)
         );
     }
@@ -735,26 +860,41 @@ mod tests {
         let variant = add(&mut blocks, &mut index, block(0x1010, PAGE + 0x10, 1));
         let next = add(&mut blocks, &mut index, block(0x5000, PAGE + FETCH_PAGE, 0));
         let id = VariantId;
-        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x10, id(0)), Some(early));
-        assert_eq!(index.get(&blocks, 0x9010, PAGE + 0x10, id(0)), Some(alias));
         assert_eq!(
-            index.get(&blocks, 0x1010, PAGE + 0x10, id(1)),
+            index.get(&blocks, 0x1010, PAGE + 0x10, id(0), false),
+            Some(early)
+        );
+        assert_eq!(
+            index.get(&blocks, 0x9010, PAGE + 0x10, id(0), false),
+            Some(alias)
+        );
+        assert_eq!(
+            index.get(&blocks, 0x1010, PAGE + 0x10, id(1), false),
             Some(variant)
         );
-        assert_eq!(index.get(&blocks, 0x1040, PAGE + 0x40, id(0)), Some(late));
-        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x14, id(0)), None);
-        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x10, id(2)), None);
+        assert_eq!(
+            index.get(&blocks, 0x1040, PAGE + 0x40, id(0), false),
+            Some(late)
+        );
+        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x14, id(0), false), None);
+        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x10, id(2), false), None);
 
         // A recompilation of a key takes its place.
         let again = push(&mut blocks, block(0x1040, PAGE + 0x40, 0));
         assert_eq!(index.insert(&blocks, again), Some(late));
-        assert_eq!(index.get(&blocks, 0x1040, PAGE + 0x40, id(0)), Some(again));
+        assert_eq!(
+            index.get(&blocks, 0x1040, PAGE + 0x40, id(0), false),
+            Some(again)
+        );
         assert_eq!(index.sweep(None).count(), 5);
         // Forgetting one block keeps the rest of its page.
         assert!(!index.forget(PAGE + 0x40, late));
         assert!(index.forget(PAGE + 0x40, again));
-        assert_eq!(index.get(&blocks, 0x1040, PAGE + 0x40, id(0)), None);
-        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x10, id(0)), Some(early));
+        assert_eq!(index.get(&blocks, 0x1040, PAGE + 0x40, id(0), false), None);
+        assert_eq!(
+            index.get(&blocks, 0x1010, PAGE + 0x10, id(0), false),
+            Some(early)
+        );
         assert_eq!(index.sweep(None).count(), 4);
 
         // A sweep goes on past its cursor, across pages.
@@ -766,7 +906,7 @@ mod tests {
 
         assert!(index.forget_page(PAGE));
         assert!(!index.forget_page(PAGE));
-        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x10, id(0)), None);
+        assert_eq!(index.get(&blocks, 0x1010, PAGE + 0x10, id(0), false), None);
         assert_eq!(
             index.sweep(None).map(|(_, slot)| slot).collect::<Vec<_>>(),
             [next]
@@ -794,7 +934,7 @@ mod tests {
         index.forget_marked(PAGE, |slot| slot as usize != slots[1]);
         assert_eq!(index.page(PAGE).collect::<Vec<_>>(), [slots[1]]);
         assert_eq!(
-            index.get(&blocks, 0x1020, PAGE + 0x20, VariantId(0)),
+            index.get(&blocks, 0x1020, PAGE + 0x20, VariantId(0), false),
             Some(slots[1])
         );
         index.forget_marked(PAGE, |_| true);
@@ -823,6 +963,76 @@ mod tests {
         (blocks, index, slots)
     }
 
+    /// A shared block installed for one guest page serves every page of
+    /// its frame offset, variant and half, with aliases asked for, both
+    /// locked and without the lock; a block of the PC's own comes first,
+    /// and a shared block's link finds only a shared one.
+    #[test]
+    fn a_shared_block_serves_every_page_of_its_frame() {
+        const PAGE: u64 = 0x8000_0000;
+        let blocks = super::super::board::Blocks::new(64);
+        let grace = super::super::board::Grace::new(1);
+        let mut index = BlockIndex::with_finder(Arc::new(Finder::new(64)));
+        let finder = Arc::clone(&index.finder);
+        let install = |index: &mut BlockIndex, pc: u64, variant: u32, shared: bool| {
+            let slot = blocks.take(&grace, Some(0)).unwrap();
+            blocks.fill(
+                slot,
+                Block {
+                    shared,
+                    ..block(pc, PAGE + (pc & 0xfff), variant)
+                },
+            );
+            assert_eq!(index.insert(&blocks, slot), None);
+            slot
+        };
+        let (p, q) = (0x1_0000_0040, 0x7_4321_5040);
+        let body = install(&mut index, p, 0, true);
+        let id = VariantId;
+        for pc in [p, q] {
+            assert_eq!(index.get(&blocks, pc, PAGE + 0x40, id(0), true), Some(body));
+            assert_eq!(
+                finder.find(&blocks, pc, PAGE + 0x40, id(0), true),
+                Some(Some(body))
+            );
+            // Without aliases, not even at the PC it was installed for.
+            assert_eq!(index.get(&blocks, pc, PAGE + 0x40, id(0), false), None);
+            assert_eq!(
+                finder.find(&blocks, pc, PAGE + 0x40, id(0), false),
+                Some(None)
+            );
+        }
+        // Another variant, offset or half is another block.
+        assert_eq!(index.get(&blocks, q, PAGE + 0x40, id(1), true), None);
+        assert_eq!(index.get(&blocks, q + 4, PAGE + 0x44, id(0), true), None);
+        let upper = q | 1 << 55;
+        assert_eq!(index.get(&blocks, upper, PAGE + 0x40, id(0), true), None);
+        assert_eq!(
+            finder.find(&blocks, upper, PAGE + 0x40, id(0), true),
+            Some(None)
+        );
+        // A block of Q's own comes first; the shared one stays for others.
+        let own = install(&mut index, q, 0, false);
+        assert_eq!(index.get(&blocks, q, PAGE + 0x40, id(0), true), Some(own));
+        assert_eq!(
+            finder.find(&blocks, q, PAGE + 0x40, id(0), true),
+            Some(Some(own))
+        );
+        assert_eq!(index.get_shared(&blocks, q, PAGE + 0x40, id(0)), Some(body));
+        let r = 0x2_0000_0040;
+        assert_eq!(index.get(&blocks, r, PAGE + 0x40, id(0), true), Some(body));
+        assert!(index.contains(&blocks, body) && index.contains(&blocks, own));
+        // Forgotten, it serves no page.
+        index.forget_marked(PAGE, |slot| slot as usize == body);
+        assert!(!index.contains(&blocks, body));
+        assert_eq!(index.get(&blocks, r, PAGE + 0x40, id(0), true), None);
+        assert_eq!(
+            finder.find(&blocks, r, PAGE + 0x40, id(0), true),
+            Some(None)
+        );
+        assert_eq!(index.get(&blocks, q, PAGE + 0x40, id(0), true), Some(own));
+    }
+
     /// Many copies of one frame at other PCs are each found without the
     /// lock, by their own PC, and the locked index finds each too
     /// (build 49: they shared one list of the finder, every insert walked
@@ -835,16 +1045,16 @@ mod tests {
         for (alias, &slot) in slots.iter().enumerate() {
             let pc = 0x1_0000_0010 + ((alias as u64) << 14);
             assert_eq!(
-                finder.find(&blocks, pc, PAGE + 0x10, VariantId(0)),
+                finder.find(&blocks, pc, PAGE + 0x10, VariantId(0), false),
                 Some(Some(slot)),
                 "alias {alias}"
             );
             assert_eq!(
-                index.get(&blocks, pc, PAGE + 0x10, VariantId(0)),
+                index.get(&blocks, pc, PAGE + 0x10, VariantId(0), false),
                 Some(slot)
             );
             assert_eq!(
-                finder.find(&blocks, pc, PAGE + 0x10, VariantId(1)),
+                finder.find(&blocks, pc, PAGE + 0x10, VariantId(1), false),
                 Some(None)
             );
         }
@@ -852,17 +1062,20 @@ mod tests {
         index.forget_marked(PAGE, |slot| slot as usize == slots[7]);
         let pc = |alias: u64| 0x1_0000_0010 + (alias << 14);
         assert_eq!(
-            finder.find(&blocks, pc(7), PAGE + 0x10, VariantId(0)),
+            finder.find(&blocks, pc(7), PAGE + 0x10, VariantId(0), false),
             Some(None)
         );
-        assert_eq!(index.get(&blocks, pc(7), PAGE + 0x10, VariantId(0)), None);
         assert_eq!(
-            finder.find(&blocks, pc(8), PAGE + 0x10, VariantId(0)),
+            index.get(&blocks, pc(7), PAGE + 0x10, VariantId(0), false),
+            None
+        );
+        assert_eq!(
+            finder.find(&blocks, pc(8), PAGE + 0x10, VariantId(0), false),
             Some(Some(slots[8]))
         );
         assert!(index.forget_page(PAGE));
         assert_eq!(
-            finder.find(&blocks, pc(8), PAGE + 0x10, VariantId(0)),
+            finder.find(&blocks, pc(8), PAGE + 0x10, VariantId(0), false),
             Some(None)
         );
     }
@@ -885,11 +1098,15 @@ mod tests {
                 let pc = 0x1_0000_0010 + (alias << 14);
                 if index
                     .finder
-                    .find(&blocks, pc, PAGE + 0x10, VariantId(0))
+                    .find(&blocks, pc, PAGE + 0x10, VariantId(0), false)
                     .is_none()
                 {
                     locked += 1;
-                    assert!(index.get(&blocks, pc, PAGE + 0x10, VariantId(0)).is_some());
+                    assert!(
+                        index
+                            .get(&blocks, pc, PAGE + 0x10, VariantId(0), false)
+                            .is_some()
+                    );
                 }
             }
             let find = started.elapsed().as_nanos() / count as u128;

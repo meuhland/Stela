@@ -292,6 +292,20 @@ fn static_ipv4_and_dns_round_trip_and_stay_in_their_subnet() {
     }
 }
 
+/// Shared alias blocks are off unless asked for, and ride with
+/// page-relative code on choices.cfg's line.
+#[test]
+fn shared_aliases_are_off_by_default_and_round_trip() {
+    let plain = System::parse("--system").unwrap();
+    assert!(!plain.shared_aliases);
+    assert!(!plain.page_relative);
+    assert!(!System::default().shared_aliases);
+    let line = "--system --page-relative --shared-aliases";
+    let options = round_trip(line);
+    assert!(options.page_relative && options.shared_aliases);
+    assert_eq!(options.to_string(), line);
+}
+
 #[test]
 fn native_checks_imply_serialized_execution_without_writing_it() {
     let options = round_trip("--system --native-cores 2 --native-rounds");

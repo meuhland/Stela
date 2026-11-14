@@ -221,11 +221,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let block = &self.code.blocks[index];
         let terminal = block.terminal;
-        if pc == block.terminal_pc() {
+        if pc == block.terminal_at(pc) {
             return terminal;
         }
         let mut bytes = [0; 4];
-        let physical = block.physical.wrapping_add(pc.wrapping_sub(block.pc));
+        let physical = block
+            .physical
+            .wrapping_add(pc.wrapping_sub(block.start_at(pc)));
         if self.host.read_ram(physical, &mut bytes) {
             self.admit(u32::from_le_bytes(bytes))
         } else {

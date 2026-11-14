@@ -553,7 +553,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !matches!(kind, Ok(ExitKind::Indirect | ExitKind::Call)) {
             return Ok(0);
         }
-        let terminal = self.code.blocks[index].terminal_pc();
+        // Where the block ran: a shared block's page is the run's.
+        let terminal = self.code.blocks[index].terminal_at(self.ran_page);
         let word = self.word(index, terminal)?;
         let register = ((word >> 5) & 31) as u8;
         Ok(match word & REGISTER_BRANCH {
