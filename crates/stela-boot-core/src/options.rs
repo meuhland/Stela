@@ -370,6 +370,10 @@ pub struct System {
     pub shared_aliases: bool,
     /// Their limits for bisection, a bit per [`SHARED_LIMITS`] option.
     pub shared_limits: u16,
+    /// Show the guest its PCIe root complexes (`apcie`) and their DARTs,
+    /// each register window backed by a logging stub (`--probe-apcie`), to
+    /// record how far macOS's own root-complex driver brings its ports up.
+    pub probe_apcie: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -490,6 +494,7 @@ impl Default for System {
             page_relative: false,
             shared_aliases: false,
             shared_limits: 0,
+            probe_apcie: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -968,6 +973,7 @@ impl fmt::Display for System {
         for (bit, name) in SHARED_LIMITS.iter().enumerate() {
             line.flag(name, self.shared_limits & 1 << bit != 0)?;
         }
+        line.flag("--probe-apcie", self.probe_apcie)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

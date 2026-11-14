@@ -246,6 +246,20 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     }
     add_soc_banks(&mut devices, board)?;
     add_memory_controllers(&mut devices, board, programmed, native_memory, log)?;
+    // The PCIe root-complex probe (`--probe-apcie`; empty without it), after
+    // the eFuse block whose bytes its `reg[5]` shares and before power
+    // resources are bound, since it owns the complex's. A probe that cannot
+    // be placed is reported, never a reason to stop.
+    for apcie in &board.apcie {
+        match devices.add_apcie_probe(apcie) {
+            Ok(line) => log(format_args!("{line}")),
+            Err(error) => log(format_args!(
+                "APCIE PROBE /arm-io/{} not placed: {error:?}
+",
+                apcie.name
+            )),
+        }
+    }
     log(format_args!(
         "DEVICES uart={:#x}+{:#x} irq={} wdt={:#x}+{:#x} irq={} aic={:#x} nr_irq={} \
          lockdown-blocks={} amcc-apertures={} darts={} aes={} aic-timebase=unplaced\n",

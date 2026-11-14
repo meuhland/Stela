@@ -48,6 +48,7 @@ impl ParseState<'_> {
             "--table-insert-throttled" => options.table_insert_throttled = true,
             "--page-relative" => options.page_relative = true,
             "--shared-aliases" => options.shared_aliases = true,
+            "--probe-apcie" => options.probe_apcie = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,

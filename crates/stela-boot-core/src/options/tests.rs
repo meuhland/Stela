@@ -138,6 +138,15 @@ fn scanout_mirror_round_trips() {
 }
 
 #[test]
+fn the_apcie_probe_is_off_unless_asked_for_and_round_trips() {
+    assert!(!round_trip("--system").probe_apcie);
+    assert!(!round_trip(&format!("--system --preboot {DISK}")).probe_apcie);
+    let probe = round_trip(&format!("--system --preboot {DISK} --probe-apcie"));
+    assert!(probe.probe_apcie);
+    assert!(probe.to_string().contains("--probe-apcie"));
+}
+
+#[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));
     assert!(!ordinary.maintenance_write);

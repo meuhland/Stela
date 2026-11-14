@@ -26,6 +26,10 @@
 //!
 //! `T8112CLPC::isRunningOnSilicon` (0xfffffe0009f78cf0) reads `0x80c` and
 //! takes bits 31:28 of 0 for a real die, so 0 there is the silicon answer.
+//!
+//! With the PCIe root-complex probe on (`--probe-apcie`), every other word
+//! reads 0 as well rather than refusing, so the probed driver's PHY
+//! calibration copy cannot stop the machine.
 use {
     stela_contracts::bus::Access, stela_contracts::bus::Direction,
     stela_contracts::bus::MmioDevice, stela_contracts::bus::MmioError, stela_contracts::bus::Width,
@@ -50,6 +54,11 @@ impl MmioDevice for AonFuses {
 
     fn read(&mut self, offset: u64, width: Width, _: &mut Access<'_>) -> Result<u64, MmioError> {
         if width == Width::Word && DESCRIBED.contains(&offset) {
+            Ok(0)
+        } else if width == Width::Word && stela_soc_data::board::apcie_probe::apcie() {
+            // The PCIe probe's driver copies PHY calibration from here
+            // (`AppleT8112PCIe::_initializePhy`, `0x490` and `0x494`, through
+            // its own `reg[5]` view of this block); an emulated die has none.
             Ok(0)
         } else {
             Err(refuse(
