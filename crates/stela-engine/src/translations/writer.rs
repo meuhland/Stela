@@ -214,6 +214,9 @@ pub struct Writer<'a> {
     quiet_since: Option<u64>,
     failed: bool,
     stats: Stats,
+    /// This boot's used-key list counts toward the ages of the records it
+    /// did not use ([`super::pack::ages_records`]).
+    ages: bool,
 }
 
 /// A boot's view of its pack file as the loader read it.
@@ -255,7 +258,15 @@ impl<'a> Writer<'a> {
             quiet_since: None,
             failed: false,
             stats: Stats::default(),
+            ages: true,
         }
+    }
+
+    /// Whether this boot's used-key list ages the records it did not use,
+    /// or only refreshes those it did ([`super::pack::ages_records`]); before
+    /// [`Self::stop`].
+    pub fn set_ages(&mut self, ages: bool) {
+        self.ages = ages;
     }
 
     pub fn stats(&self) -> Stats {
@@ -701,6 +712,11 @@ impl<'a> Writer<'a> {
         stopped.records = self.added_keys.len().min(MAX_USED_KEYS + 1);
         if self.count(USED_BLOB) < MAX_USED_LISTS {
             let list = self.used_list(entries.found_keys());
+            let list = if self.ages {
+                list
+            } else {
+                UsedKeys::refresh_only(list)
+            };
             change.blobs.push(Blob::new(USED_BLOB, list));
         }
         stopped.bytes = change.blobs.iter().map(Blob::length).sum();
