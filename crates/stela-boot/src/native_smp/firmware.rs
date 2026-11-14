@@ -2,7 +2,7 @@
 //! Every callback returns before ExitBootServices; persistent executors use
 //! Stela's own INIT/SIPI entry, stacks and control memory afterward.
 pub(crate) use record::Capture;
-use stela_boot_core::record;
+use stela_boot_core::{firmware_retry, record};
 
 use super::{
     memory_types::amd,
@@ -612,28 +612,101 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
     })
 }
 
-/// Run Stela's observation on the AP at `processor` through MP Services,
-/// bounded at 500 ms.
+/// The bounds of each try to observe an AP, in milliseconds. One 500 ms
+/// try failed in about 1 boot of 6 of a Proxmox VM (OVMF, 8 pinned vCPUs)
+/// with `EFI_TIMEOUT` or a busy AP, after the previous boot's stop, and the
+/// next boot of the same EFI observed it: a vCPU the host schedules late, or
+/// an AP the firmware still holds, misses a bound it meets the next time.
+/// The observation only reads (CPUID, MSRs, XCR0) and EDK2 returns a
+/// timed-out AP to idle (`ResetProcessorToIdleState`) before it answers, so
+/// trying again observes the same state, and an AP that answers runs a PE
+/// instead of being left out.
+const OBSERVE_TIMEOUTS_MS: [u64; 3] = [500, 2_000, 5_000];
+/// The pause before another try, for an AP the firmware is still resetting.
+const OBSERVE_RETRY_PAUSE_MS: u64 = 10;
+
+/// Run Stela's observation on the AP at `processor` through MP Services:
+/// up to one try for each of [`OBSERVE_TIMEOUTS_MS`], each logged when it
+/// fails. An observation the AP finished counts even if the firmware's
+/// answer came too late.
 fn observe_one(mp: &MpServices, processor: Processor) -> Result<Snapshot, Error> {
-    let mut callback = Callback {
-        observation: UnsafeCell::new(None),
-        complete: AtomicBool::new(false),
-    };
-    mp.startup_this_ap(
-        processor.processor_number as usize,
-        observe_ap,
-        (&raw mut callback).cast(),
-        None,
-        Some(Duration::from_millis(500)),
-    )
-    .map_err(|_| Error::SnapshotTimeout)?;
-    if !callback.complete.load(Ordering::Acquire) {
-        return Err(Error::SnapshotCallback);
+    /// How one try ended short of an observation: an MP Services error,
+    /// logged with its status, which another try may get past, or a failure
+    /// it would repeat.
+    enum Short {
+        Status,
+        Failed(Error),
     }
-    callback
-        .observation
-        .into_inner()
-        .ok_or(Error::SnapshotCallback)?
+    let tsc_hz = crate::firmware::tsc_hz().max(1);
+    // SAFETY: RDTSC has no preconditions at CPL0.
+    let started = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_ms = || {
+        // SAFETY: as above.
+        let now = unsafe { core::arch::x86_64::_rdtsc() };
+        now.wrapping_sub(started) / (tsc_hz / 1000).max(1)
+    };
+    let observed = firmware_retry::bounded(
+        &OBSERVE_TIMEOUTS_MS,
+        |short| matches!(short, Short::Status),
+        |try_index, timeout| {
+            if try_index != 0 {
+                boot::stall(Duration::from_millis(OBSERVE_RETRY_PAUSE_MS));
+            }
+            // Each try's record outlives it unless the AP finished with it:
+            // a firmware that answered without stopping the AP leaves it this
+            // one.
+            let callback = Box::into_raw(Box::new(Callback {
+                observation: UnsafeCell::new(None),
+                complete: AtomicBool::new(false),
+            }));
+            let started = mp.startup_this_ap(
+                processor.processor_number as usize,
+                observe_ap,
+                callback.cast(),
+                None,
+                Some(Duration::from_millis(timeout)),
+            );
+            // SAFETY: the record just leaked, which the AP only writes before
+            // it publishes `complete`.
+            let complete = unsafe { (*callback).complete.load(Ordering::Acquire) };
+            if complete {
+                // SAFETY: the AP published its observation and no longer
+                // touches the record.
+                let callback = unsafe { Box::from_raw(callback) };
+                if let Err(error) = &started {
+                    crate::output::arguments(format_args!(
+                        "NATIVE AP {} observed though MP Services answered {:?} after {} ms\n",
+                        processor.processor_number,
+                        error.status(),
+                        elapsed_ms(),
+                    ));
+                }
+                return match callback.observation.into_inner() {
+                    Some(observation) => observation.map_err(Short::Failed),
+                    None => Err(Short::Failed(Error::SnapshotCallback)),
+                };
+            }
+            // The firmware says it ran, and nothing was published.
+            let status = started
+                .err()
+                .map(|error| error.status())
+                .ok_or(Short::Failed(Error::SnapshotCallback))?;
+            crate::output::arguments(format_args!(
+                "NATIVE AP {} apic={:#x} observation try {} of {} ({} ms) failed: {status:?} after {} ms in all\n",
+                processor.processor_number,
+                processor.apic_id,
+                try_index + 1,
+                OBSERVE_TIMEOUTS_MS.len(),
+                timeout,
+                elapsed_ms(),
+            ));
+            Err(Short::Status)
+        },
+    );
+    observed.map_err(|(short, _)| match short {
+        Short::Failed(error) => error,
+        Short::Status => Error::SnapshotTimeout,
+    })
 }
 
 /// Report an AP left out of the PEs, once each.
@@ -642,7 +715,7 @@ fn left_out(processor: Processor, reason: Error) {
         "HOST PROCESSOR {} left out: {}\n",
         processor.processor_number,
         match reason {
-            Error::SnapshotTimeout => "it did not run Stela's check within 500 ms",
+            Error::SnapshotTimeout => "it did not run Stela's check in 3 tries of up to 5 s",
             Error::SnapshotCallback => "Stela's check on it did not finish",
             _ => "its APIC ID differs from the one the firmware lists",
         }
