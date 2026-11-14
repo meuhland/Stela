@@ -298,6 +298,7 @@ fn start(handoff: u64) -> Started {
     stela_soc_data::board::apcie_probe::set_apcie(options.probe_apcie);
     if options.probe_apcie {
         stela_soc::apcie::set_sink(apcie_line);
+        stela_soc_data::board::apcie_probe::set_sink(apcie_line);
         output::arguments(format_args!(
             "APCIE PROBE on: the guest is shown its PCIe root complexes and their              DARTs over a logging register stub; no endpoint is modeled
 "
