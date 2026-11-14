@@ -1001,6 +1001,24 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             ));
         }
     }
+    // The StelaNet adapter carries the guest network instead of a USB
+    // Ethernet adapter (`--guest-network-stelanet`). Placed after the GPU
+    // gates, it takes the next free window and AIC input. A tree with no
+    // room keeps the USB adapter.
+    let stela_net = match (assigned.as_mut(), &guest_network) {
+        (Some(assigned), Some(_)) if options.guest_network_stelanet => {
+            match stela_loader::stela_net::place_net(&mut assigned.tree) {
+                Ok(placement) => Some(placement),
+                Err(error) => {
+                    output::arguments(format_args!(
+                        "GUEST NETWORK StelaNet not placed, USB adapter kept: {error}\n"
+                    ));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
     // The same loader bytes are for every subsequent native CPU and synchronous device writer.
@@ -1086,7 +1104,11 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             board_flash,
             rtc_anchor: host_nor.as_ref().and_then(nor::HostNor::loaded_anchor),
             usb_disks,
-            guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
+            // With StelaNet placed, the hub has no USB Ethernet adapter.
+            guest_mac: guest_network
+                .as_ref()
+                .filter(|_| stela_net.is_none())
+                .map(network::GuestNetwork::mac),
             guest_bluetooth: host_bluetooth.is_some(),
         },
         board.as_ref(),
@@ -1108,6 +1130,20 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 .add_gpu_gate(placement.physical, irq, service)
                 .unwrap_or_else(|error| output::fatal(&error));
         }
+    }
+    if let (Some(placement), Some(board), Some(network)) = (stela_net, &board, &guest_network) {
+        let per_die = u32::from(board.aic.layout.max_irq());
+        let irq = stela_contracts::interrupt::AicInput::new(
+            (placement.irq / per_die) as u8,
+            (placement.irq % per_die) as u16,
+        );
+        devices
+            .add_stela_net(placement.physical, network.mac(), irq)
+            .unwrap_or_else(|error| output::fatal(&error));
+        output::arguments(format_args!(
+            "GUEST NETWORK StelaNet /arm-io/stela-net0 at {:#x} aic input {:#x}\n",
+            placement.physical, placement.irq
+        ));
     }
     // Device placement has copied the carried firmware. This function
     // never returns, so release the remaining input buffers here.

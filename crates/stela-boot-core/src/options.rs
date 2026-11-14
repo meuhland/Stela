@@ -355,6 +355,11 @@ pub struct System {
     /// Give the guest a USB Ethernet adapter bridged to a host network
     /// adapter of its own (`--guest-network`).
     pub guest_network: bool,
+    /// The guest's network is the StelaNet paravirtual adapter at
+    /// `/arm-io/stela-net0` instead of a USB Ethernet adapter
+    /// (`--guest-network-stelanet`, which also gives the guest the network).
+    /// A prototype: the StelaGPU kext's StelaNet front end drives it.
+    pub guest_network_stelanet: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -451,6 +456,7 @@ impl Default for System {
             usb4_approved: Vec::new(),
             external_disks: false,
             guest_network: false,
+            guest_network_stelanet: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -868,6 +874,10 @@ impl fmt::Display for System {
         }
         line.flag(EXTERNAL_DISKS, self.external_disks)?;
         line.flag("--guest-network", self.guest_network)?;
+        line.flag(
+            "--guest-network-stelanet",
+            self.guest_network && self.guest_network_stelanet,
+        )?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,
