@@ -249,4 +249,5 @@ pub fn models<'a>(name: &str, property: impl Fn(&str) -> Option<&'a [u8]>) -> bo
                 && claim.compatible == name
                 && property(claim.property.0) == Some(claim.property.1)
         })
+        || super::apcie_probe::claims(name, &property)
 }

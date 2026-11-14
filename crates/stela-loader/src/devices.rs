@@ -89,6 +89,13 @@
 //! selects those by hardware straps. An unused bus needs no selection. If
 //! both alternatives serve kept consumers, both remain and mounting
 //! explicitly refuses their overlapping ownership rather than choosing one.
+//!
+//! The PCIe root-complex probe (`--probe-apcie`, `board::apcie_probe`)
+//! counts each `apcie,*` root complex and its `apcie-port` children as
+//! modeled, so they keep `compatible`, and so do the DARTs, mappers and GPIO
+//! banks they name through `iommu-parent` and their platform functions. It
+//! never provides a name-matched client's required function. Without the
+//! probe nothing here changes.
 use crate::apple_device_tree::{DeviceTree, Node};
 use alloc::{format, string::String, vec::Vec};
 use stela_soc_data::board;
@@ -275,6 +282,54 @@ fn client_providers(node: &Node, parents: &mut Vec<u32>) {
     }
 }
 
+/// The providers a probed root complex (`--probe-apcie`,
+/// `board::apcie_probe`) and its ports name through platform functions
+/// (`function-perst`, `function-dart_force_active`, ...): each function's
+/// first cell is its provider's phandle. The driver resolves them while it
+/// creates its ports, so a GPIO bank or DART they name stays visible. A
+/// function that names a DART itself, not one of its mappers, keeps the
+/// DART's mappers too: a modeled DART stays only with a kept mapper.
+fn apcie_providers(root: &Node, parents: &mut Vec<u32>) {
+    fn functions(node: &Node, inside: bool, providers: &mut Vec<u32>) {
+        let claimed = compatibles(node).any(board::apcie_probe::is_root_complex)
+            || inside && node.property("apcie-port").is_some();
+        if claimed {
+            providers.extend(
+                node.properties
+                    .iter()
+                    .filter(|property| property.name().starts_with("function-"))
+                    .filter_map(|property| property.value.first_chunk::<4>())
+                    .map(|cell| u32::from_le_bytes(*cell)),
+            );
+        }
+        for child in &node.children {
+            functions(child, claimed || inside, providers);
+        }
+    }
+    fn mappers_of(node: &Node, darts: &[u32], parents: &mut Vec<u32>) {
+        if is_dart(node)
+            && node
+                .property(PHANDLE)
+                .and_then(|p| p.as_u32())
+                .is_some_and(|phandle| darts.contains(&phandle))
+        {
+            parents.extend(
+                node.children
+                    .iter()
+                    .filter(|child| named(child, board::IOMMU_MAPPER))
+                    .filter_map(|child| child.property(PHANDLE).and_then(|p| p.as_u32())),
+            );
+        }
+        for child in &node.children {
+            mappers_of(child, darts, parents);
+        }
+    }
+    let mut providers = Vec::new();
+    functions(root, false, &mut providers);
+    mappers_of(root, &providers, parents);
+    parents.extend(providers);
+}
+
 fn kept_mapper(node: &Node, parents: &[u32]) -> bool {
     named(node, board::IOMMU_MAPPER)
         && node
@@ -359,6 +414,9 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
     hide_incomplete_external_outputs(tree, &mut hidden);
     let mut parents = Vec::new();
     client_providers(&tree.root, &mut parents);
+    if board::apcie_probe::apcie() {
+        apcie_providers(&tree.root, &mut parents);
+    }
     visit(&mut tree.root, "", &parents, &[], &mut hidden);
     hide_unprovided_buttons(tree, &mut hidden);
     hide_unprovided_clients(tree, &mut hidden);
@@ -718,6 +776,11 @@ fn platform_clients(
             provided: false,
         });
     } else if node.property(COMPATIBLE).is_some()
+        // A probed root complex (`--probe-apcie`) has no endpoint behind it,
+        // so it provides no function a name-matched client could use: the
+        // AMFM and its WLAN stay ignored rather than power a port up.
+        && !compatibles(node).any(board::apcie_probe::is_root_complex)
+        && node.property("apcie-port").is_none()
         && let Some(phandle) = phandle
     {
         roots.push(phandle);

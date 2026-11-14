@@ -29,6 +29,7 @@ pub mod agx;
 pub mod aic;
 pub mod aic1;
 pub mod amcc;
+pub mod apcie;
 pub mod ans;
 pub mod asc;
 pub mod atc_phy;

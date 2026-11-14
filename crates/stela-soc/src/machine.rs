@@ -3,6 +3,7 @@
 //! [`InterruptLatch`] for the wires, AIC input forwarding and reset requests.
 //! The models own every register decision; this adapter only routes accesses
 //! and time, and turns each `MmioError` into an explicit refusal.
+mod apcie_probe;
 mod buses;
 mod call_gates;
 mod coprocessors;
