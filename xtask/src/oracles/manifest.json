@@ -4913,5 +4913,16 @@
     "kind": "manual",
     "inputs": [],
     "reason": "needs a supported host Clang and llvm-nm; simulates a distribution Clang that hardens by default; run on request"
+  },
+  {
+    "package": "stela-loader",
+    "test": "a_built_kext_links_against_a_real_boot_collection",
+    "source": "crates/stela-loader/src/aux_kc/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_BOOT_KC",
+      "STELA_KEXT"
+    ],
+    "reason": "requires a boot kernel collection (STELA_BOOT_KC) and a kext built by cargo xtask guest (STELA_KEXT); links it as a boot would"
   }
 ]
