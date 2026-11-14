@@ -329,7 +329,7 @@ fn provide_pack(root: &mut Directory, translator: &Digest, bound: u64) {
                 }
                 None => output::arguments(format_args!(
                     "TRANSLATIONS no spare and no other pack of {bound} bytes for {own}: \
-                     this boot keeps its translations in memory; `stela setup repair` \
+                     this boot keeps its translations in memory; `stela update` \
                      prepares a spare\n"
                 )),
             }
