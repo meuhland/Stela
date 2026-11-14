@@ -584,6 +584,11 @@ pub struct Statistics {
     /// direct exits out of their page), and the transfers those made.
     pub lookups: u64,
     pub lookup_hits: u64,
+    /// Fetches that found their block, by what they did about its block
+    /// table entry, in `compilation::Remember`'s order: linked a waiting
+    /// exit instead, found it held, took none, found the block unindexed,
+    /// throttled, found the lock busy, raced, put it in first, again.
+    pub remembers: [u64; super::compilation::REMEMBERS],
     /// Native runs that ended in an exit to the engine, by `ExitKind`
     /// (Fallthrough, Direct, Indirect, Call, Return, Trap, PAC, Clock,
     /// ThreadRegister, FloatingPoint, ScalableNumerical, System, AMX).
@@ -810,6 +815,7 @@ impl core::ops::AddAssign for Statistics {
             unlinks,
             lookups,
             lookup_hits,
+            remembers,
             exit_kinds,
             lookup_misses,
             lookup_forgets,
@@ -886,6 +892,9 @@ impl core::ops::AddAssign for Statistics {
         }
         self.replaced_retired = self.replaced_retired.saturating_add(replaced_retired);
         for (total, count) in self.exit_kinds.iter_mut().zip(exit_kinds) {
+            *total += count;
+        }
+        for (total, count) in self.remembers.iter_mut().zip(remembers) {
             *total += count;
         }
         for (total, count) in self.amx_moves.iter_mut().zip(amx_moves) {

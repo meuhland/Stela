@@ -1997,6 +1997,17 @@ impl Heartbeat {
             let mut paths = String::from(
                 "PES FETCHPATH fast/fast_btype/itlb_miss/table_miss/btype_refused/single",
             );
+            // Per PE: its fetches that found their block (found, jump,
+            // indexed, installed), by what they did about the block's
+            // block table entry: linked the waiting direct exit instead,
+            // found the entry held, took none (one instruction, a trace),
+            // found the block left the index, were refused by the block's
+            // insert throttle, found the code lock busy, lost a race with
+            // the index, put the entry in as this PE's first of it, or again
+            // after it left its set (capacity).
+            let mut remembers = String::from(
+                "PES REMEMBER linked/held/excluded/unindexed/throttled/busy/raced/first/again",
+            );
             // Per PE: its ITLB fills by why the page was missing (a fill
             // took its entry's place, a TLBI by VA dropped it, its context
             // was forgotten, no trace of it); the live entries fills took
@@ -2231,6 +2242,7 @@ impl Heartbeat {
                     lookups.push_str(&format!("{}", now.saturating_sub(*before)));
                 }
                 deltas(&mut paths, pe, &now.fetch_paths, &before.fetch_paths);
+                deltas(&mut remembers, pe, &now.remembers, &before.remembers);
                 let concat = |counts: &parallel::Counts| {
                     let mut all = [0u64; 13];
                     all[..4].copy_from_slice(&counts.itlb_misses);
@@ -2473,6 +2485,7 @@ impl Heartbeat {
             output::arguments(format_args!("{device_work}\n"));
             output::arguments(format_args!("{lookups}\n"));
             output::arguments(format_args!("{paths}\n"));
+            output::arguments(format_args!("{remembers}\n"));
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
             output::arguments(format_args!("{transitions}\n"));
