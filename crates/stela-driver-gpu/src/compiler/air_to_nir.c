@@ -1509,6 +1509,11 @@ compute_arguments(struct translator *t, const struct stela_air_kernel *kernel)
             return false;
          continue;
       }
+      /* A threadgroup buffer the function never touches binds no memory:
+       * Apple's compiler drops the argument (air.arg_unused), so its
+       * dispatches need not size it. */
+      if (argument->is_buffer && argument->buffer.address_space == 3 && !LLVMGetFirstUse(param))
+         continue;
       if (argument->is_buffer && argument->buffer.array) {
          if (!buffer_array(t, argument))
             return false;
