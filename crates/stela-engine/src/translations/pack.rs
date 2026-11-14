@@ -1965,7 +1965,7 @@ impl<'a> Store<'a> {
     /// the added entries, which the next boot needs, stay too. The decoded
     /// records come back, to drop outside a lock, with the bytes the store
     /// charged for both.
-    pub fn release_caches(&mut self) -> (Vec<Arc<Record>>, usize) {
+    pub fn release_caches(&mut self) -> (Vec<Arc<StoredRecord>>, usize) {
         let charged = self.decoded.bytes + self.shared_usage();
         let decoded_bound = self.decoded.bound;
         let evicted = self.decoded.shrink(0);
