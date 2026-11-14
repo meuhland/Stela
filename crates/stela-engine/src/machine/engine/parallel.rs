@@ -600,8 +600,10 @@ pub struct Counts {
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail and its probe
-    /// transfers ([`super::Statistics::lookup_hits`]).
-    pub stamped: [u64; chain::STAMP_COUNTS + 4],
+    /// transfers ([`super::Statistics::lookup_hits`]), then its native
+    /// entries that moved its jump cache's serial and those that kept it
+    /// ([`super::Statistics::jump_serials`]).
+    pub stamped: [u64; chain::STAMP_COUNTS + 6],
     /// PAC results its service computed since boot, each a memo miss.
     pub pac_fills: u64,
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
@@ -2670,12 +2672,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             transition_misses: statistics.transition_misses,
             branch_misses: statistics.branch_misses,
             stamped: {
-                let mut stamped = [0; chain::STAMP_COUNTS + 4];
+                let mut stamped = [0; chain::STAMP_COUNTS + 6];
                 stamped[..chain::STAMP_COUNTS].copy_from_slice(&self.chain.stamp_counts());
                 stamped[chain::STAMP_COUNTS] = statistics.stamped_tails;
                 stamped[chain::STAMP_COUNTS + 1] = statistics.stamped_in_use;
                 stamped[chain::STAMP_COUNTS + 2] = statistics.predicted_tails;
                 stamped[chain::STAMP_COUNTS + 3] = statistics.lookup_hits;
+                stamped[chain::STAMP_COUNTS + 4..].copy_from_slice(&statistics.jump_serials);
                 stamped
             },
             pac_fills: self.pointer.fills,

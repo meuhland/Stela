@@ -304,6 +304,19 @@ fn profile_keep_pack_implies_profile_and_round_trips() {
     assert!(plain.profile && !plain.profile_keep_pack);
 }
 
+/// The jump cache keeps its entries across native entries unless
+/// `--jump-serial-always` asks for the old start over at each, which
+/// round-trips.
+#[test]
+fn jump_serial_always_is_off_by_default_and_round_trips() {
+    assert!(!System::default().jump_serial_always);
+    let line = "--system --jump-serial-always";
+    let options = round_trip(line);
+    assert!(options.jump_serial_always);
+    assert_eq!(options.to_string(), line);
+    assert!(!round_trip("--system").jump_serial_always);
+}
+
 /// Shared alias blocks are off unless asked for, and ride with
 /// page-relative code on choices.cfg's line.
 #[test]

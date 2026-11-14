@@ -111,6 +111,9 @@ pub(crate) struct Settings {
     /// `--shared-*` limits.
     pub shared_aliases: bool,
     pub shared_limits: u16,
+    /// `--jump-serial-always`, as the home machine starts its jump cache
+    /// over at every native entry.
+    pub jump_serial_always: bool,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -145,6 +148,7 @@ pub(crate) fn spawn<H: Host>(
             page_relative: settings.page_relative,
             shared_aliases: settings.shared_aliases,
             shared_limits: settings.shared_limits,
+            jump_serial_always: settings.jump_serial_always,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -170,6 +174,7 @@ struct Pe {
     page_relative: bool,
     shared_aliases: bool,
     shared_limits: u16,
+    jump_serial_always: bool,
 }
 
 impl Pe {
@@ -185,6 +190,7 @@ impl Pe {
             page_relative,
             shared_aliases,
             shared_limits,
+            jump_serial_always,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -211,6 +217,7 @@ impl Pe {
         machine.set_page_relative(page_relative);
         machine.set_shared_aliases(shared_aliases);
         machine.set_shared_limits(super::shared_limits(shared_limits));
+        machine.set_jump_serial_always(jump_serial_always);
         if step_timing {
             host::pmu::start(pe);
         }

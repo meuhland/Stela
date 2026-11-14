@@ -44,6 +44,7 @@ impl ParseState<'_> {
                 options.profile = true;
                 options.profile_keep_pack = true;
             }
+            "--jump-serial-always" => options.jump_serial_always = true,
             "--page-relative" => options.page_relative = true,
             "--shared-aliases" => options.shared_aliases = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,

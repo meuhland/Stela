@@ -176,6 +176,14 @@ pub(super) struct Code {
     /// On a line of its own, as every fetch reads it: which also puts the
     /// `Arc`'s counts, which clones write, on a line of their own.
     pub(super) epoch: Padded<AtomicU64>,
+    /// Advances after each change that may leave a PE's native jump cache
+    /// naming a block the block table no longer would give, and before
+    /// each grace a release of code or slots waits for
+    /// ([`Self::note_unpublished`]): a PE keeps its jump cache across a
+    /// native entry only while this has not moved since its serial last
+    /// did (`chain_control::JumpBasis`). On a line of its own, as every
+    /// native entry reads it.
+    pub(super) unpublished: Padded<AtomicU64>,
     pub(super) events: Events,
     /// The ghosts of blocks that left the index ([`super::churn`]): written
     /// under the lock, read by compiles without it.
@@ -687,6 +695,7 @@ impl Code {
             ghosts: super::churn::Churn::new(slots),
             arena: window.map(Arena::new),
             epoch: Padded(AtomicU64::new(0)),
+            unpublished: Padded(AtomicU64::new(0)),
             events: Events::default(),
             retiring: Mutex::new(None),
             retire_pending: AtomicBool::new(false),
@@ -696,6 +705,23 @@ impl Code {
             rebases: super::rebase::Rebases::new(super::rebase::BOUND),
             known_keys: Default::default(),
         }
+    }
+
+    /// Blocks were unpublished, or their code or slots are about to be
+    /// released: every PE's next native entry that sees this starts its
+    /// jump cache over. Called after the block table or index changed (so
+    /// a PE that sees the new count probes the changed table) and before
+    /// any grace snapshot that release waits for: a PE that passes the
+    /// grace afterwards ([`Grace::pass`], [`Grace::enter`], both SeqCst)
+    /// then reads it at its next native entry ([`Self::unpublished`]),
+    /// as SeqCst operations are totally ordered.
+    pub(super) fn note_unpublished(&self) {
+        self.unpublished.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The count [`Self::note_unpublished`] advances.
+    pub(super) fn unpublished(&self) -> u64 {
+        self.unpublished.load(Ordering::SeqCst)
     }
 
     /// The board's code lock, counted ([`LockCounts`]) as [`LockSite::Other`].
@@ -854,6 +880,8 @@ impl Code {
         cache.index.clear();
         cache.code_slots = CodeSlots::default();
         cache.dispatchers.clear();
+        drop(cache);
+        self.note_unpublished();
     }
 }
 

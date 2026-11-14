@@ -1369,6 +1369,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         page_relative: options.page_relative,
         shared_aliases: options.shared_aliases,
         shared_limits: options.shared_limits,
+        jump_serial_always: options.jump_serial_always,
     };
     // The loader handle's last RAM copy preceded canonical registration; its
     // borrow has ended. It never executes a guest instruction.

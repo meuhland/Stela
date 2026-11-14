@@ -1025,6 +1025,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// is on (`--profile-keep-pack`), so the translation context, and with
     /// it the pack, stays that of an untimed boot.
     loop_counts_off: bool,
+    /// Every native entry starts the jump cache over, as before it could
+    /// keep it while nothing its entries rest on changed
+    /// (`--jump-serial-always`, [`chain_control::JumpBasis`]).
+    jump_serial_always: bool,
     /// Whether a page-relative block serves every guest page that maps its
     /// frame (`--shared-aliases`, [`Block::shared`]): off unless asked for,
     /// and only with [`Self::page_relative`].
@@ -1499,6 +1503,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self_loops: true,
             page_relative: false,
             loop_counts_off: false,
+            jump_serial_always: false,
             shared_aliases: false,
             shared_limits: SharedLimits::default(),
             shared_verified: BTreeMap::new(),
