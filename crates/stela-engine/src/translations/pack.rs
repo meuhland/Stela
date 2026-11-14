@@ -2405,11 +2405,15 @@ mod tests {
         )
         .to_vec();
         let mut store = Store::new(translator, Some(&bytes)).0;
-        let one = Record::new(translator, keys[0]).retained_bytes();
+        // The cache charges a record its decoded index over the encoded
+        // bytes (`StoredRecord`), alike for records alike.
+        let one = store.record(&keys[0]).unwrap().retained_bytes();
+        drop(store.release_caches());
         drop(store.set_bounds(Bounds {
             decoded: 8 * one,
             ..Bounds::default()
         }));
+        store.counters.decoded = 0;
         for key in &keys {
             drop(store.record(key).unwrap());
         }
