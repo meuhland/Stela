@@ -683,3 +683,64 @@ fn received_checksums_the_host_verified_are_marked_valid() {
     bad[last] ^= 1;
     assert_eq!(header_flags(all, &bad), 0, "left for the guest to judge");
 }
+
+#[test]
+fn a_link_change_reaches_link_and_raises_its_cause_once() {
+    let mut rig = Rig::new(8, features::OFFERED);
+    rig.step();
+    assert!(!rig.net.due());
+    rig.net.set_link(true);
+    assert!(!rig.net.due(), "no change");
+    rig.net.set_link(false);
+    assert_eq!(rig.read(LINK), 1000 << 32);
+    assert!(rig.net.due());
+    rig.step();
+    assert!(rig.line());
+    assert_eq!(rig.read(CAUSE), CAUSE_LINK);
+    rig.write(ACK, CAUSE_LINK).unwrap();
+    assert!(!rig.line());
+    assert!(!rig.net.due());
+    // A stopped device only keeps LINK; the driver reads it as it starts.
+    rig.write(ENABLE, 0).unwrap();
+    rig.net.set_link(true);
+    assert!(!rig.net.due());
+    rig.write(ENABLE, 1).unwrap();
+    assert_eq!(rig.read(LINK), 1000 << 32 | 1);
+    rig.step();
+    assert_eq!(rig.read(CAUSE), 0);
+    assert!(!rig.line());
+}
+
+/// An Ethernet ARP frame from `sender` claiming `address`.
+fn arp(sender: [u8; 6], address: [u8; 4], op: u8) -> Vec<u8> {
+    let mut frame = vec![0u8; 42];
+    frame[..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&sender);
+    frame[12..22].copy_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, op]);
+    frame[22..28].copy_from_slice(&sender);
+    frame[28..32].copy_from_slice(&address);
+    frame[38..42].copy_from_slice(&[10, 0, 69, 1]);
+    frame
+}
+
+#[test]
+fn the_guest_address_comes_from_arp_frames_it_sends() {
+    let mut rig = Rig::new(8, features::OFFERED);
+    let sent = |rig: &mut Rig, frame: Vec<u8>, slot| {
+        rig.send(&frame, slot);
+        rig.write(KICK, KICK_TX).unwrap();
+        rig.step();
+        assert_eq!(rig.net.take(), Some(frame));
+    };
+    // A probe claims no address, and another station's frame is not the
+    // guest's.
+    sent(&mut rig, arp(MAC_ADDRESS, [0; 4], 1), 0);
+    sent(&mut rig, arp([0x02, 9, 9, 9, 9, 9], [10, 0, 69, 9], 1), 1);
+    assert_eq!(rig.net.guest_address(), None);
+    sent(&mut rig, arp(MAC_ADDRESS, [10, 0, 69, 74], 1), 2);
+    assert_eq!(rig.net.guest_address(), Some([10, 0, 69, 74]));
+    sent(&mut rig, arp(MAC_ADDRESS, [10, 0, 69, 80], 2), 3);
+    assert_eq!(rig.net.guest_address(), Some([10, 0, 69, 80]));
+    sent(&mut rig, frame([0xff; 6], 60, 0x08), 4);
+    assert_eq!(rig.net.guest_address(), Some([10, 0, 69, 80]));
+}

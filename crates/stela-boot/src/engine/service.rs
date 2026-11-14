@@ -368,17 +368,25 @@ impl Service {
         if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, &mut turn)) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
-            let (frames, status, room, fault) = devices.with(|devices| {
+            let (frames, status, room, stela_net) = devices.with(|devices| {
                 let frames = network.queued(devices);
                 (
                     frames,
                     devices.network_status(),
                     devices.network_room(),
-                    devices.stela_net_error(),
+                    devices
+                        .has_stela_net()
+                        .then(|| (devices.stela_net_error(), devices.stela_net_address())),
                 )
             });
             network.status(status);
-            network.fault(fault);
+            // StelaNet's link follows the host adapter's carrier; the USB
+            // adapter's does not.
+            let carrier = stela_net.and_then(|(fault, address)| {
+                network.fault(fault);
+                network.address(address);
+                network.carrier_now(now, *tsc_hz)
+            });
             let reusable = network.transmit(frames);
             network.receive(room);
             devices.serve(|devices| {
@@ -386,6 +394,9 @@ impl Service {
                     devices.network_recycle(frame);
                 }
                 network.deliver(devices);
+                if let Some(up) = carrier {
+                    devices.stela_net_set_link(up);
+                }
             });
             lap.part(Part::Network);
         }
