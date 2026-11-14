@@ -28,14 +28,24 @@
 //! - port `0x208` bits 0 and 2 (`PORT_LINKSTS` up and busy) read clear: no
 //!   link, and nothing in flight;
 //! - port `0x80c` reads 0 (no outstanding transactions; the disable path
-//!   waits on it); port `0x100` (`PORT_INTSTAT`) is write-one-to-clear.
+//!   waits on it); port `0x100` (`PORT_INTSTAT`) is write-one-to-clear;
+//! - each port's LTSSM debug block `0x30` bit 12 reads set: the tracer
+//!   snapshot is ready. `_captureLTSSMDebugTracer` (0xfffffe0009fa06e4)
+//!   writes `0x38 = 1` and polls it with no timeout when a link-training
+//!   timer fires (probe3: 20 million reads of `ltssm1+0x30`, port 1's
+//!   disable never ran). The status's entry count reads 0, an empty tracer.
 //!
 //! In ECAM each port's own type-1 header (bus `bus-range`[0], device N,
 //! function 0) is a root port with a PCIe capability at 0x70, which
 //! `_initializeRootComplex` requires, and RAM-backed DesignWare port-logic
 //! registers; every other function reads all-ones (no device) and drops
-//! writes. So no endpoint is ever found, every link times out after the
-//! driver's `ltssm-timeout`, and it disables the port.
+//! writes. So no endpoint is found, the link times out after the driver's
+//! `ltssm-timeout`, and it disables the port.
+//!
+//! With the root-complex model (`--apcie`, [`ApcieProbe::with_model`]) one
+//! port is a real one ([`link`]): its link trains, its interrupt reaches the
+//! AIC, and an endpoint answers on its secondary bus, with a RAM-backed BAR
+//! in the complex's memory window. The other ports stay as above.
 //!
 //! No access is ever refused: a probe must not stop the machine. Each access
 //! is logged as one `APCIE` line (the guest PC is not known at the device
@@ -50,8 +60,15 @@ use core::fmt;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use stela_contracts::Refusal;
 use stela_contracts::bus::{Access, Lifecycle, LifecycleState, MmioDevice, MmioError, Width};
+use stela_contracts::interrupt::{AicInput, Wire};
+
+pub mod link;
+use link::{Endpoint, Training};
 
 const NAME: &str = "apcie-probe";
+/// Most `APCIE LINK`/`ENUM` model events a boot prints; they are never
+/// subject to the access log's cap.
+const EVENT_CAP: u32 = 256;
 
 /// A stored register's key is its window's `reg` index shifted by this,
 /// then its offset in the window.
@@ -98,6 +115,8 @@ pub enum Window {
     PhyGlue(usize),
     PhyIpLane(usize),
     Intr2Axi(usize),
+    /// The complex's Nth PCI memory window (`ranges`), with the model on.
+    Memory(usize),
     /// A placed address no window holds, by its physical address.
     Outside,
 }
@@ -137,6 +156,7 @@ impl Window {
             Self::PhyGlue(n) => 8 + 5 * n,
             Self::PhyIpLane(n) => 9 + 5 * n,
             Self::Intr2Axi(n) => 10 + 5 * n,
+            Self::Memory(n) => 0xe_0000 + n,
             Self::Outside => 0xf_ffff,
         }
     }
@@ -156,6 +176,7 @@ impl fmt::Display for Window {
             Self::PhyGlue(n) => write!(f, "phy-glue{n}"),
             Self::PhyIpLane(n) => write!(f, "phy-ip-lane{n}"),
             Self::Intr2Axi(n) => write!(f, "intr2axi{n}"),
+            Self::Memory(n) => write!(f, "mem{n}"),
             Self::Outside => f.write_str("pa"),
         }
     }
@@ -212,6 +233,9 @@ struct Stat {
 struct RootPort {
     device: u8,
     bytes: Box<[u8; CONFIG_BYTES]>,
+    /// Its link is up (only the modeled port's ever is): `LNKSTA` and the
+    /// LTSSM state read as a trained link.
+    link_up: bool,
 }
 
 /// Configuration bytes software cannot change, unless DBI writes to
@@ -258,13 +282,46 @@ impl RootPort {
         // LNKCAP2: 2.5, 5 and 8 GT/s; LNKCTL2: target 8 GT/s.
         put(EXPRESS + 0x2c, 0x0000_000e);
         put(EXPRESS + 0x30, 0x0000_0003);
-        Self { device, bytes }
+        Self {
+            device,
+            bytes,
+            link_up: false,
+        }
+    }
+
+    fn stored(&self, register: usize, bytes: usize) -> u64 {
+        (0..bytes).fold(0, |value, at| {
+            value | u64::from(self.bytes.get(register + at).copied().unwrap_or(0xff)) << (8 * at)
+        })
+    }
+
+    /// One byte as software reads it: stored, except the link's status
+    /// while the link is up.
+    fn byte(&self, offset: usize) -> u8 {
+        if self.link_up {
+            let status = link::link_status(
+                self.stored(link::LNKCAP, 4) as u32,
+                self.stored(link::LNKCTL2, 2) as u16,
+            );
+            match offset {
+                o if o == link::LNKSTA => return status as u8,
+                o if o == link::LNKSTA + 1 => return (status >> 8) as u8,
+                o if o == link::PL_DEBUG0 => return link::LTSSM_L0 as u8,
+                _ => {}
+            }
+        }
+        self.bytes.get(offset).copied().unwrap_or(0xff)
     }
 
     fn read(&self, register: usize, bytes: usize) -> u64 {
         (0..bytes).fold(0, |value, at| {
-            value | u64::from(self.bytes.get(register + at).copied().unwrap_or(0xff)) << (8 * at)
+            value | u64::from(self.byte(register + at)) << (8 * at)
         })
+    }
+
+    /// The secondary bus number, when one is set below this port.
+    fn secondary(&self) -> u8 {
+        self.bytes[0x19]
     }
 
     fn write(&mut self, register: usize, bytes: usize, value: u64) {
@@ -298,6 +355,21 @@ pub struct ApcieProbe {
     beats: u32,
     disables: u32,
     lifecycle: Option<LifecycleState>,
+    model: Option<Model>,
+}
+
+/// The root-complex model's port (`--apcie`, [`link`]).
+struct Model {
+    /// The port's index, which is also its root port's device number.
+    port: usize,
+    /// The port's AIC input (the complex's `interrupts[port]`).
+    irq: Option<AicInput>,
+    level: bool,
+    training: Training,
+    endpoint: Endpoint,
+    /// Each PCI memory window: guest PA, bytes, PCI address.
+    memory: Vec<(u64, u64, u64)>,
+    events: u32,
 }
 
 impl ApcieProbe {
@@ -329,12 +401,198 @@ impl ApcieProbe {
             beats: 0,
             disables: 0,
             lifecycle: None,
+            model: None,
         }
+    }
+
+    /// Make port `port` a real one (`--apcie`): its link trains, `irq` is
+    /// its AIC input, and an endpoint answers behind it, whose BAR decodes
+    /// in `memory`, the complex's PCI memory windows as (guest PA, bytes,
+    /// PCI address). The windows are placed at device offsets equal to their
+    /// guest PAs, like the register windows. A port with no root port header
+    /// stays a stub.
+    pub fn with_model(
+        mut self,
+        port: usize,
+        irq: Option<AicInput>,
+        memory: &[(u64, u64, u64)],
+    ) -> Self {
+        if !self
+            .ports
+            .iter()
+            .any(|root| usize::from(root.device) == port)
+        {
+            return self;
+        }
+        for (index, &(physical, bytes, _)) in memory.iter().enumerate() {
+            self.windows.push((Window::Memory(index), physical, bytes));
+        }
+        self.windows
+            .sort_by_key(|&(window, _, bytes)| (bytes, core::cmp::Reverse(window.index())));
+        self.model = Some(Model {
+            port,
+            irq,
+            level: false,
+            training: Training::Down,
+            endpoint: Endpoint::new(),
+            memory: memory.to_vec(),
+            events: 0,
+        });
+        self
+    }
+
+    /// The modeled port, if any.
+    pub fn modeled_port(&self) -> Option<usize> {
+        self.model.as_ref().map(|model| model.port)
+    }
+
+    /// Whether the modeled port's link is up.
+    pub fn link_up(&self) -> bool {
+        self.model
+            .as_ref()
+            .is_some_and(|model| model.training == Training::Up)
     }
 
     /// The device numbers of the root ports' own headers.
     pub fn root_ports(&self) -> Vec<u8> {
         self.ports.iter().map(|port| port.device).collect()
+    }
+
+    /// One model event line (`APCIE LINK`, `APCIE ENUM`), outside the
+    /// access log's cap but within its own.
+    fn event(&mut self, args: fmt::Arguments<'_>) {
+        if let Some(model) = &mut self.model
+            && model.events < EVENT_CAP
+        {
+            model.events += 1;
+            self.flush();
+            emit(args);
+        }
+    }
+
+    /// Complete link training that is due at `now`.
+    fn settle(&mut self, access: &mut Access<'_>) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        let Training::Until(at) = model.training else {
+            return;
+        };
+        if access.now < at {
+            return;
+        }
+        model.training = Training::Up;
+        let port = model.port;
+        let speed;
+        {
+            let root = self
+                .ports
+                .iter_mut()
+                .find(|root| usize::from(root.device) == port);
+            speed = root.map_or(0, |root| {
+                root.link_up = true;
+                root.read(link::LNKSTA, 2) & 0xf
+            });
+        }
+        // The link-up interrupt: status, then the AIC input if unmasked.
+        let status = self.stored(Window::Port(port), 0x100) | link::LINK_UP;
+        self.store(Window::Port(port), 0x100, status);
+        let name = self.name.clone();
+        let irq = self.model.as_ref().and_then(|model| model.irq);
+        self.event(format_args!(
+            "APCIE LINK {name} port{port} up: gen{speed} x1, endpoint {:04x}:{:04x} class {:06x} \
+             on its secondary bus; INTSTAT LINK_UP, aic {}\n",
+            link::VENDOR,
+            link::DEVICE,
+            link::CLASS_REVISION >> 8,
+            irq.map_or(-1, |irq| i64::from(irq.irq)),
+        ));
+        self.update_irq(access);
+    }
+
+    /// The modeled port's link goes down (`why`).
+    fn link_down(&mut self, why: &str) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        if model.training == Training::Down {
+            return;
+        }
+        model.training = Training::Down;
+        let port = model.port;
+        if let Some(root) = self
+            .ports
+            .iter_mut()
+            .find(|root| usize::from(root.device) == port)
+        {
+            root.link_up = false;
+        }
+        let name = self.name.clone();
+        self.event(format_args!("APCIE LINK {name} port{port} down: {why}\n"));
+    }
+
+    /// Drive the modeled port's AIC input from its unmasked status.
+    fn update_irq(&mut self, access: &mut Access<'_>) {
+        let Some(port) = self.modeled_port() else {
+            return;
+        };
+        let pending =
+            self.stored(Window::Port(port), 0x100) & !self.stored(Window::Port(port), 0x104);
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        let level = pending != 0;
+        if level != model.level {
+            model.level = level;
+            if let Some(irq) = model.irq {
+                access.interrupts.set_level(Wire::Aic(irq), level);
+            }
+        }
+    }
+
+    /// The modeled port's root port and endpoint, when `offset` (ECAM)
+    /// names the endpoint: the port's secondary bus, device 0, function 0,
+    /// with the link up.
+    fn endpoint(&mut self, offset: u64) -> Option<(&mut Endpoint, usize)> {
+        let (bus, device, function, register) = ecam(offset);
+        let model = self.model.as_mut()?;
+        let root = self
+            .ports
+            .iter()
+            .find(|root| usize::from(root.device) == model.port)?;
+        let secondary = root.secondary();
+        (model.training == Training::Up
+            && bus != self.first_bus
+            && bus == secondary
+            && device == 0
+            && function == 0)
+            .then_some((&mut model.endpoint, register as usize))
+    }
+
+    /// Where an access to memory window `index` at `offset` lands in the
+    /// endpoint's BAR: the BAR decodes its PCI address (or, as a host
+    /// bridge without translation would program it, its guest PA), and the
+    /// root port forwards it.
+    fn bar_offset(&self, index: usize, offset: u64) -> Option<usize> {
+        let model = self.model.as_ref()?;
+        if model.training != Training::Up {
+            return None;
+        }
+        let &(physical, _, pci) = model.memory.get(index)?;
+        let root = self
+            .ports
+            .iter()
+            .find(|root| usize::from(root.device) == model.port)?;
+        let bar = model.endpoint.bar()?;
+        let header = |register: usize, bytes: usize| root.read(register, bytes);
+        [pci.wrapping_add(offset), physical.wrapping_add(offset)]
+            .into_iter()
+            .find(|&address| {
+                address >= bar
+                    && address - bar < link::BAR_BYTES as u64
+                    && link::forwards(&header, address)
+            })
+            .map(|address| (address - bar) as usize)
     }
 
     fn stored(&self, window: Window, offset: u64) -> u32 {
@@ -356,8 +614,13 @@ impl ApcieProbe {
             (Window::Common, 0x28) => stored | 0x10,
             (Window::Phy | Window::PhyGlue(_), 0x0) => stored | (stored & 3) << 2,
             (Window::Port(_), 0x804) => stored & !1 | self.stored(window, 0x800) & 1,
-            (Window::Port(_), 0x208) => stored & !0b101,
+            // LINKSTS: link up only on the modeled port with its link up.
+            (Window::Port(port), 0x208) => {
+                stored & !0b101 | u32::from(self.modeled_port() == Some(port) && self.link_up())
+            }
             (Window::Port(_), 0x80c) => 0,
+            // The LTSSM debug tracer's snapshot is ready, and empty.
+            (Window::Ltssm(_), 0x30) => stored & !0x7f | 0x1000,
             _ => stored,
         }
     }
@@ -374,15 +637,55 @@ impl ApcieProbe {
     }
 
     fn read_config(&mut self, offset: u64, bytes: u64) -> u64 {
-        match self.root_port(offset) {
-            Some((port, register)) => port.read(register, bytes as usize),
-            None => Width::from_bytes(bytes).map_or(u64::MAX, Width::mask),
+        if let Some((port, register)) = self.root_port(offset) {
+            return port.read(register, bytes as usize);
         }
+        if let Some((endpoint, register)) = self.endpoint(offset) {
+            return endpoint.read(register, bytes as usize);
+        }
+        Width::from_bytes(bytes).map_or(u64::MAX, Width::mask)
     }
 
     fn write_config(&mut self, offset: u64, bytes: u64, value: u64) {
         if let Some((port, register)) = self.root_port(offset) {
+            let device = port.device;
+            let before = (port.stored(0x18, 4), port.stored(0x04, 2));
             port.write(register, bytes as usize, value);
+            let after = (port.stored(0x18, 4), port.stored(0x04, 2));
+            if self.modeled_port() == Some(usize::from(device)) && before != after {
+                let name = self.name.clone();
+                let first = self.first_bus;
+                let (buses, command) = after;
+                self.event(format_args!(
+                    "APCIE ENUM {name} [{first:02x}:{device:02x}.0] root port: buses primary={} \
+                     secondary={} subordinate={} command={command:#06x}\n",
+                    buses & 0xff,
+                    buses >> 8 & 0xff,
+                    buses >> 16 & 0xff,
+                ));
+            }
+            return;
+        }
+        let Some((endpoint, register)) = self.endpoint(offset) else {
+            return;
+        };
+        let before = (endpoint.bar_register(), endpoint.command());
+        endpoint.write(register, bytes as usize, value);
+        let after = (endpoint.bar_register(), endpoint.command());
+        // Sizing (all ones) is not an assignment worth a line.
+        if before != after && after.0 != 0xffff_f000 {
+            let name = self.name.clone();
+            let (bus, ..) = ecam(offset);
+            let (bar, command) = after;
+            self.event(format_args!(
+                "APCIE ENUM {name} [{bus:02x}:00.0] endpoint: BAR0={bar:#010x} \
+                 command={command:#06x}{}\n",
+                if command & 2 != 0 {
+                    " (memory decoding on)"
+                } else {
+                    ""
+                }
+            ));
         }
     }
 
@@ -396,7 +699,7 @@ impl ApcieProbe {
         })
     }
 
-    fn write_register(&mut self, window: Window, offset: u64, bytes: u64, value: u64) {
+    fn write_register(&mut self, window: Window, offset: u64, bytes: u64, value: u64, now: u64) {
         let mut at = 0;
         while at < bytes {
             let here = offset + at;
@@ -417,7 +720,46 @@ impl ApcieProbe {
             {
                 self.port_disabled(port);
             }
+            if let Window::Port(port) = window
+                && self.modeled_port() == Some(port)
+            {
+                self.port_written(port, here & !3, stored, next, now);
+            }
             at += 4;
+        }
+    }
+
+    /// The modeled port's register `offset` went from `stored` to `next`:
+    /// LTSSM start trains the link; LTSSM, APPCLK or PERST# off drops it.
+    fn port_written(&mut self, port: usize, offset: u64, stored: u32, next: u32, now: u64) {
+        let rose = stored & 1 == 0 && next & 1 != 0;
+        let fell = stored & 1 != 0 && next & 1 == 0;
+        match offset {
+            0x80 if rose => {
+                if let Some(model) = &mut self.model
+                    && model.training == Training::Down
+                {
+                    let at = now.saturating_add(link::TRAINING_TICKS);
+                    model.training = Training::Until(at);
+                    let name = self.name.clone();
+                    self.event(format_args!(
+                        "APCIE LINK {name} port{port} training: LTSSM started, link up in {} ms\n",
+                        link::TRAINING_TICKS / 24_000
+                    ));
+                }
+            }
+            0x80 if fell => self.link_down("LTSSM stopped"),
+            0x800 if fell => self.link_down("APPCLK off"),
+            0x814 if fell => self.link_down("PERST# asserted"),
+            _ => {}
+        }
+    }
+
+    /// Deadline of the modeled port's link training, if it is training.
+    fn training_deadline(&self) -> Option<u64> {
+        match self.model.as_ref()?.training {
+            Training::Until(at) => Some(at),
+            _ => None,
         }
     }
 
@@ -556,7 +898,7 @@ impl ApcieProbe {
 }
 
 fn is_power_of_ten(mut value: u64) -> bool {
-    while value >= 10 && value % 10 == 0 {
+    while value >= 10 && value.is_multiple_of(10) {
         value /= 10;
     }
     value == 1
@@ -577,10 +919,16 @@ impl MmioDevice for ApcieProbe {
         width: Width,
         access: &mut Access<'_>,
     ) -> Result<u64, MmioError> {
+        self.settle(access);
         let place = self.place(offset);
         let bytes = width.bytes();
         let value = match place.0 {
             Window::Config => self.read_config(place.1, bytes),
+            Window::Memory(index) => match (self.bar_offset(index, place.1), &self.model) {
+                (Some(at), Some(model)) => model.endpoint.read_bar(at, bytes as usize),
+                // Nothing decodes it: an unsupported request reads all ones.
+                _ => width.mask(),
+            },
             window => self.read_register(window, place.1, bytes),
         };
         self.record(Direction::Read, place, bytes, value, access);
@@ -594,34 +942,48 @@ impl MmioDevice for ApcieProbe {
         value: u64,
         access: &mut Access<'_>,
     ) -> Result<(), MmioError> {
+        self.settle(access);
         let place = self.place(offset);
         let bytes = width.bytes();
         let value = value & width.mask();
         self.record(Direction::Write, place, bytes, value, access);
         match place.0 {
             Window::Config => self.write_config(place.1, bytes, value),
-            window => self.write_register(window, place.1, bytes, value),
+            Window::Memory(index) => {
+                if let Some(at) = self.bar_offset(index, place.1)
+                    && let Some(model) = &mut self.model
+                {
+                    model.endpoint.write_bar(at, bytes as usize, value);
+                }
+            }
+            window => {
+                self.write_register(window, place.1, bytes, value, access.now);
+                self.update_irq(access);
+            }
         }
         Ok(())
     }
 
     fn advance(&mut self, access: &mut Access<'_>) -> Result<Option<u64>, MmioError> {
-        let beat = BEAT_SECONDS * TICKS_PER_SECOND;
-        match self.next_beat {
-            Some(at) if access.now >= at => {
-                if self.changed && self.beats < SUMMARY_CAP {
+        self.settle(access);
+        let beat = match self.next_beat {
+            Some(at) if access.now < at => at,
+            due => {
+                if due.is_some() && self.changed && self.beats < SUMMARY_CAP {
                     self.beats += 1;
                     self.changed = false;
                     self.flush();
                     self.summary("beat");
                 }
+                let next = access.now.saturating_add(BEAT_SECONDS * TICKS_PER_SECOND);
+                self.next_beat = Some(next);
+                next
             }
-            Some(at) => return Ok(Some(at)),
-            None => {}
-        }
-        let next = access.now.saturating_add(beat);
-        self.next_beat = Some(next);
-        Ok(Some(next))
+        };
+        Ok(Some(
+            self.training_deadline()
+                .map_or(beat, |training| training.min(beat)),
+        ))
     }
 }
 

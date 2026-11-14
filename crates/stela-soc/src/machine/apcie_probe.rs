@@ -5,6 +5,7 @@ use super::*;
 use crate::Result;
 use crate::apcie::{ApcieProbe, Window};
 use core::fmt::Write as _;
+use stela_contracts::interrupt::AicInput;
 use stela_soc_data::board::apcie_probe::Apcie;
 
 impl AppleDevices {
@@ -44,16 +45,47 @@ impl AppleDevices {
                 }
             }
         }
-        let device = self.bus.add(Box::new(ApcieProbe::new(
-            &apcie.name,
-            apcie.first_bus,
-            &ports,
-            &windows,
-        )));
+        let mut probe = ApcieProbe::new(&apcie.name, apcie.first_bus, &ports, &windows);
+        // The root-complex model's port (`--apcie`): its interrupt is the
+        // complex's `interrupts[port]`, its endpoint's BAR decodes in the
+        // complex's PCI memory windows.
+        let memory: Vec<(u64, u64, u64)> = apcie
+            .memory
+            .iter()
+            .filter_map(|window| {
+                let physical = window.physical?;
+                physical
+                    .checked_add(window.bytes)
+                    .map(|_| (physical, window.bytes, window.pci))
+            })
+            .collect();
+        let mut model = String::new();
+        if let Some(port) = apcie.model {
+            let irq = apcie
+                .interrupts
+                .get(port as usize)
+                .and_then(|&irq| u16::try_from(irq).ok())
+                .map(|irq| AicInput::new(0, irq));
+            probe = probe.with_model(port as usize, irq, &memory);
+            let _ = write!(
+                model,
+                " model=port{port}(aic {}, memory windows {}{})",
+                irq.map_or(-1, |irq| i64::from(irq.irq)),
+                memory.len(),
+                if probe.modeled_port().is_some() {
+                    ""
+                } else {
+                    "; no root port header, not modeled"
+                }
+            );
+        }
+        let modeled = probe.modeled_port().is_some();
+        let device = self.bus.add(Box::new(probe));
         // Runs of overlapping windows, by start.
         let mut sorted = windows.clone();
         sorted.sort_by_key(|&(_, physical, _)| physical);
-        let mut runs: Vec<(u64, u64, Vec<(usize, u64, u64)>)> = Vec::new();
+        type Run = (u64, u64, Vec<(usize, u64, u64)>);
+        let mut runs: Vec<Run> = Vec::new();
         for window in sorted {
             let (_, physical, bytes) = window;
             match runs.last_mut() {
@@ -98,6 +130,37 @@ impl AppleDevices {
                 }
             }
         }
+        // The endpoint's BAR space, when modeled: each memory window whole.
+        // One another model owns stays unbacked; nothing reaches it before
+        // a driver maps the endpoint's BAR.
+        for (index, window) in apcie.memory.iter().enumerate() {
+            let name = Window::Memory(index);
+            let pci = window.pci;
+            match window.physical {
+                Some(physical) if modeled && memory.contains(&(physical, window.bytes, pci)) => {
+                    match place(physical, window.bytes) {
+                        Ok(()) => {
+                            let _ = write!(
+                                ranges,
+                                " {name}={physical:#x}+{:#x}(pci {pci:#x})",
+                                window.bytes
+                            );
+                        }
+                        Err(error) => {
+                            let _ = write!(
+                                skipped,
+                                " {name}={physical:#x}+{:#x}({error:?})",
+                                window.bytes
+                            );
+                        }
+                    }
+                }
+                Some(_) if !modeled => {}
+                _ => {
+                    let _ = write!(skipped, " {name}(pci {pci:#x}, untranslated)");
+                }
+            }
+        }
         if let Some(physical) = apcie.windows.first().and_then(|window| window.physical) {
             self.register_power_device(physical, device, false)?;
         }
@@ -115,7 +178,7 @@ impl AppleDevices {
             .join(",");
         Ok(format!(
             "APCIE PROBE nodes=/arm-io/{} windows={} ports=[{ports}] root-ports={:?} \
-             first-bus={} interrupts=[{interrupts}] ranges=[{} ] shared=[{} ]\n",
+             first-bus={} interrupts=[{interrupts}] ranges=[{} ] shared=[{} ]{model}\n",
             apcie.name,
             apcie.windows.len(),
             self.bus
@@ -132,8 +195,9 @@ impl AppleDevices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apcie::link;
     use stela_engine::machine::engine::Devices as _;
-    use stela_soc_data::board::apcie_probe::{ApciePort, ApcieWindow};
+    use stela_soc_data::board::apcie_probe::{ApcieMemory, ApciePort, ApcieWindow};
 
     const FUSES: u64 = 0x2_3d2b_c000;
 
@@ -169,6 +233,8 @@ mod tests {
                 index: 0,
             }],
             first_bus: 0,
+            memory: vec![],
+            model: None,
         };
         let line = devices.add_apcie_probe(&apcie).unwrap();
         assert!(line.starts_with("APCIE PROBE nodes=/arm-io/apcie windows=7"));
@@ -201,6 +267,8 @@ mod tests {
             interrupts: vec![],
             ports: vec![],
             first_bus: 0,
+            memory: vec![],
+            model: None,
         };
         let line = devices.add_apcie_probe(&apcie).unwrap();
         assert!(
@@ -209,5 +277,78 @@ mod tests {
         );
         devices.write(0, phy + 0x4000, 4, 1, 0).unwrap();
         assert_eq!(devices.read(0, phy + 0x4000, 4, 0), Ok(5));
+    }
+
+    #[test]
+    fn the_modeled_port_trains_its_link_and_shows_an_endpoint_through_the_bus() {
+        let mut devices = AppleDevices::new();
+        let ecam = 0x6_9000_0000;
+        let port0 = 0x6_8100_0000;
+        let space = 0x6_c000_0000;
+        let apcie = Apcie {
+            name: "apcie".into(),
+            windows: vec![
+                window(0, Some(ecam), 0x1000_0000),
+                window(1, Some(0x6_8000_0000), 0x4000),
+                window(6, Some(port0), 0x8000),
+            ],
+            interrupts: vec![781],
+            ports: vec![ApciePort {
+                name: "pci-bridge0".into(),
+                index: 0,
+            }],
+            first_bus: 0,
+            memory: vec![ApcieMemory {
+                pci: 0xc000_0000,
+                physical: Some(space),
+                bytes: 0x4000_0000,
+                prefetchable: false,
+            }],
+            model: Some(0),
+        };
+        let line = devices.add_apcie_probe(&apcie).unwrap();
+        assert!(
+            line.contains("model=port0(aic 781, memory windows 1)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("mem0=0x6c0000000+0x40000000(pci 0xc0000000)"),
+            "{line}"
+        );
+        // Start the LTSSM: 5 ms later the link is up. (Interrupts stay
+        // masked: this machine has no AIC to take the port's line.)
+        devices.write(0, port0 + 0x104, 4, 0xffff_ffff, 0).unwrap();
+        devices.write(0, port0 + 0x80, 4, 1, 0).unwrap();
+        assert_eq!(
+            devices.read(0, port0 + 0x208, 4, 1000).map(|v| v & 1),
+            Ok(0)
+        );
+        let later = link::TRAINING_TICKS + 1;
+        assert_eq!(
+            devices.read(0, port0 + 0x208, 4, later).map(|v| v & 1),
+            Ok(1)
+        );
+        assert_eq!(
+            devices.read(0, port0 + 0x100, 4, later),
+            Ok(u64::from(link::LINK_UP))
+        );
+        // Bus 1 behind the root port: the endpoint answers there.
+        devices
+            .write(0, ecam + 0x18, 4, 0x0001_0100, later)
+            .unwrap();
+        let endpoint = ecam + (1 << 20);
+        assert_eq!(devices.read(0, endpoint, 4, later), Ok(0x0005_1b36));
+        // The BAR, once assigned and decoded on both sides, is RAM.
+        devices
+            .write(0, endpoint + 0x10, 4, 0xc000_0000, later)
+            .unwrap();
+        devices.write(0, endpoint + 0x04, 2, 0x6, later).unwrap();
+        devices
+            .write(0, ecam + 0x20, 4, 0xc000_c000, later)
+            .unwrap();
+        devices.write(0, ecam + 0x04, 2, 0x6, later).unwrap();
+        devices.write(0, space + 8, 4, 0x1234_5678, later).unwrap();
+        assert_eq!(devices.read(0, space + 8, 4, later), Ok(0x1234_5678));
+        assert_eq!(devices.read(0, space + 0x2000, 4, later), Ok(0xffff_ffff));
     }
 }

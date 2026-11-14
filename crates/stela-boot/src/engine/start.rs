@@ -336,14 +336,28 @@ fn start(handoff: u64) -> Started {
         Err(error) => output::fatal(error),
     };
     // Before any boot bundle is prepared or board placed: both ask it.
-    stela_soc_data::board::apcie_probe::set_apcie(options.probe_apcie);
-    if options.probe_apcie {
+    // The root-complex model (`--apcie`) is the probe with one port real.
+    let apcie = options.probe_apcie || options.apcie;
+    stela_soc_data::board::apcie_probe::set_apcie(apcie);
+    stela_soc_data::board::apcie_probe::set_model_port(
+        options
+            .apcie
+            .then_some(stela_soc_data::board::apcie_probe::MODELED_PORT),
+    );
+    if apcie {
         stela_soc::apcie::set_sink(apcie_line);
         stela_soc_data::board::apcie_probe::set_sink(apcie_line);
         output::arguments(format_args!(
-            "APCIE PROBE on: the guest is shown its PCIe root complexes and their              DARTs over a logging register stub; no endpoint is modeled
-"
+            "APCIE PROBE on: the guest is shown its PCIe root complexes and their \
+             DARTs over a logging register stub\n"
         ));
+        if options.apcie {
+            output::arguments(format_args!(
+                "APCIE MODEL on: port {} is a root port whose link trains, with a minimal \
+                 endpoint behind it\n",
+                stela_soc_data::board::apcie_probe::MODELED_PORT
+            ));
+        }
     }
     // SAFETY: the loader handoff and all reservations stay pinned in the physmap.
     let native_processors = unsafe { crate::native_smp::validate(handoff, options.native_cores) }

@@ -229,7 +229,7 @@ fn board_tree() -> Vec<u8> {
             ("#ports", &cells(&[1])),
             (
                 "ranges",
-                &cells(&[0x4200_0000, 0, 0x8000_0000, 0, 0x8000_0000, 0, 0x4000_0000]),
+                &cells(&[0x4200_0000, 0x8000_0000, 0, 0x8000_0000, 0, 0x4000_0000, 0]),
             ),
         ],
         &[port, second],
@@ -319,4 +319,46 @@ fn the_probes_prepared_tree_passes_the_board_model() {
     assert!(apcie.windows.iter().all(|window| window.physical.is_some()));
     assert_eq!(apcie.ports.len(), 2);
     assert_eq!(apcie.interrupts, [0x300]);
+}
+
+#[test]
+fn the_model_removes_the_modeled_ports_endpoint_nodes_only() {
+    let _one = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    apcie_probe::set_apcie(true);
+    apcie_probe::set_model_port(Some(0));
+    let mut on = tree();
+    let hidden = hide_unmodeled(&mut on);
+    let bytes = board_tree();
+    let mut modeled = DeviceTree::parse(&bytes).unwrap();
+    hide_unmodeled(&mut modeled);
+    let found = board::board(&modeled.serialize());
+    apcie_probe::set_model_port(None);
+    apcie_probe::set_apcie(false);
+    // The port keeps its node and properties; its endpoint node is gone.
+    assert!(on.node("/arm-io/apcie/pci-bridge0").is_some());
+    assert!(
+        on.property("/arm-io/apcie/pci-bridge0", "apcie-port")
+            .is_some()
+    );
+    assert!(on.node("/arm-io/apcie/pci-bridge0/wlan").is_none());
+    assert!(
+        hidden
+            .iter()
+            .any(|entry| entry == "/arm-io/apcie/pci-bridge0/wlan removed")
+    );
+    // The board names the modeled port and the complex's memory window.
+    let found = found.unwrap();
+    let apcie = &found.apcie[0];
+    assert_eq!(apcie.model, Some(0));
+    assert_eq!(apcie.memory.len(), 1);
+    assert_eq!(apcie.memory[0].pci, 0x8000_0000);
+    assert_eq!(apcie.memory[0].bytes, 0x4000_0000);
+    assert!(apcie.memory[0].prefetchable);
+
+    // Off, a model port alone changes nothing.
+    apcie_probe::set_model_port(Some(0));
+    let mut off = tree();
+    hide_unmodeled(&mut off);
+    apcie_probe::set_model_port(None);
+    assert!(off.node("/arm-io/apcie/pci-bridge0/wlan").is_some());
 }

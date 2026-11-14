@@ -272,3 +272,245 @@ fn an_access_belongs_to_the_smallest_window_holding_it() {
     assert_eq!(stub.read(phy + 0x4000, Width::Word, access), Ok(0xf));
     assert_eq!(stub.read(phy + 0x4004, Width::Word, access), Ok(0x8000));
 }
+
+#[test]
+fn the_ltssm_tracer_snapshot_is_ready_and_empty() {
+    // probe3: _captureLTSSMDebugTracer polled ltssm1+0x30 bit 12 forever.
+    let mut latch = InterruptLatch::new();
+    let access = &mut Access::new(0, 0, &mut latch);
+    let stub = &mut probe();
+    w(stub, access, Window::Ltssm(1), 0x38, 1);
+    let status = r(stub, access, Window::Ltssm(1), 0x30);
+    assert_eq!(status & 0x1000, 0x1000);
+    assert_eq!(status & 0x7f, 0);
+}
+
+const MEMORY: u64 = 0x20_0000_0000;
+const PCI: u64 = 0x8000_0000;
+const AIC: u16 = 787;
+
+/// The probe with port 1 modeled and one 256 MiB memory window.
+fn model() -> ApcieProbe {
+    probe().with_model(
+        1,
+        Some(AicInput::new(0, AIC)),
+        &[(MEMORY, 0x1000_0000, PCI)],
+    )
+}
+
+fn config(bus: u64, device: u64, function: u64, register: u64) -> u64 {
+    at(
+        Window::Config,
+        bus << 20 | device << 15 | function << 12 | register,
+    )
+}
+
+fn levels(latch: &mut InterruptLatch) -> Vec<bool> {
+    latch
+        .take_aic_inputs()
+        .into_iter()
+        .filter(|(input, _)| *input == AicInput::new(0, AIC))
+        .map(|(_, level)| level)
+        .collect()
+}
+
+#[test]
+fn link_status_is_x1_at_the_target_speed_within_the_capability() {
+    // LNKCAP 8 GT/s; LNKCTL2 target 2.5 GT/s (lan-1gb's maximum-link-speed).
+    assert_eq!(link::link_status(0x0010_0013, 1), 0x3011);
+    assert_eq!(link::link_status(0x0010_0013, 3), 0x3013);
+    // A target above the capability, or none, trains at the capability.
+    assert_eq!(link::link_status(0x0010_0012, 3), 0x3012);
+    assert_eq!(link::link_status(0x0010_0012, 0), 0x3012);
+    // Width is always 1: handleLinkUp panics on anything else.
+    assert_eq!(link::link_status(0x0010_0013, 2) >> 4 & 0x3f, 1);
+}
+
+#[test]
+fn the_modeled_port_trains_after_ltssm_start_and_raises_its_interrupt() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut model();
+    assert_eq!(stub.modeled_port(), Some(1));
+    {
+        let access = &mut Access::new(0, 0, &mut latch);
+        // The reset burst masks everything; enableInterrupts unmasks LINK_UP.
+        w(stub, access, Window::Port(1), 0x104, 0x0fff_ffff);
+        w(stub, access, Window::Port(1), 0x800, 0x100101);
+        w(stub, access, Window::Port(1), 0x814, 1);
+        w(stub, access, Window::Port(1), 0x104, 0xfb51_27ff);
+        // enableLinkTraining: LTSSM start. Nothing yet.
+        w(stub, access, Window::Port(1), 0x80, 1);
+        assert_eq!(r(stub, access, Window::Port(1), 0x208) & 1, 0);
+        assert_eq!(r(stub, access, Window::Port(1), 0x100), 0);
+    }
+    assert!(levels(&mut latch).is_empty());
+    // The device asks to be advanced when training ends.
+    let deadline = {
+        let access = &mut Access::new(0, 1, &mut latch);
+        stub.advance(access).unwrap()
+    };
+    assert_eq!(deadline, Some(link::TRAINING_TICKS));
+    {
+        let access = &mut Access::new(0, link::TRAINING_TICKS, &mut latch);
+        stub.advance(access).unwrap();
+        assert!(stub.link_up());
+        // LINKSTS up, INTSTAT LINK_UP; other ports stay down.
+        assert_eq!(r(stub, access, Window::Port(1), 0x208) & 1, 1);
+        assert_eq!(r(stub, access, Window::Port(0), 0x208) & 1, 0);
+        assert_eq!(
+            r(stub, access, Window::Port(1), 0x100),
+            u64::from(link::LINK_UP)
+        );
+    }
+    assert_eq!(levels(&mut latch), [true]);
+    {
+        let access = &mut Access::new(0, link::TRAINING_TICKS, &mut latch);
+        // handleInterrupt clears LINK_UP (write one to clear): the line drops.
+        w(
+            stub,
+            access,
+            Window::Port(1),
+            0x100,
+            u64::from(link::LINK_UP),
+        );
+        assert_eq!(r(stub, access, Window::Port(1), 0x100), 0);
+    }
+    assert_eq!(levels(&mut latch), [false]);
+    {
+        let access = &mut Access::new(0, link::TRAINING_TICKS, &mut latch);
+        // The root port's LNKSTA: data link active, x1, at LNKCTL2's 2.5 GT/s.
+        stub.write(config(0, 1, 0, 0xa0), Width::Half, 1, access)
+            .unwrap();
+        let lnksta = stub
+            .read(config(0, 1, 0, 0x82), Width::Half, access)
+            .unwrap();
+        assert_eq!(lnksta & 0x2000, 0x2000);
+        assert_eq!(lnksta >> 4 & 0x3f, 1);
+        assert_eq!(lnksta & 0xf, 1);
+        // The port logic's LTSSM state is L0, not the errata's S_L1_IDLE.
+        let ltssm = stub
+            .read(config(0, 1, 0, 0x728), Width::Word, access)
+            .unwrap();
+        assert_eq!(ltssm & 0x3f, u64::from(link::LTSSM_L0));
+        // Port 0's root port has no link.
+        assert_eq!(stub.read(config(0, 0, 0, 0x82), Width::Half, access), Ok(0));
+        // The disable path's PERST# assert drops the link.
+        w(stub, access, Window::Port(1), 0x814, 0);
+        assert!(!stub.link_up());
+        assert_eq!(r(stub, access, Window::Port(1), 0x208) & 1, 0);
+    }
+}
+
+/// A modeled probe whose link is up, with bus 1 behind port 1.
+fn linked(latch: &mut InterruptLatch) -> ApcieProbe {
+    let mut stub = model();
+    let access = &mut Access::new(0, 0, latch);
+    w(&mut stub, access, Window::Port(1), 0x80, 1);
+    let access = &mut Access::new(0, link::TRAINING_TICKS, latch);
+    stub.advance(access).unwrap();
+    stub.write(config(0, 1, 0, 0x18), Width::Word, 0x0001_0100, access)
+        .unwrap();
+    stub
+}
+
+#[test]
+fn the_endpoint_answers_on_the_secondary_bus_with_a_header_macos_enumerates() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut linked(&mut latch);
+    let access = &mut Access::new(0, link::TRAINING_TICKS, &mut latch);
+    let mut read =
+        |stub: &mut ApcieProbe, address, width| stub.read(address, width, access).unwrap();
+    let endpoint = config(1, 0, 0, 0);
+    assert_eq!(read(stub, endpoint, Width::Half), u64::from(link::VENDOR));
+    assert_eq!(
+        read(stub, endpoint + 2, Width::Half),
+        u64::from(link::DEVICE)
+    );
+    assert_eq!(
+        read(stub, endpoint + 8, Width::Word),
+        u64::from(link::CLASS_REVISION)
+    );
+    // Type 0, single function, no interrupt pin.
+    assert_eq!(read(stub, endpoint + 0x0e, Width::Byte), 0);
+    assert_eq!(read(stub, endpoint + 0x3d, Width::Byte), 0);
+    // A PCIe v2 endpoint capability, x1 at 2.5 GT/s, then no more.
+    assert_eq!(read(stub, endpoint + 6, Width::Half) & 0x10, 0x10);
+    let cap = read(stub, endpoint + 0x34, Width::Byte);
+    assert_eq!(read(stub, endpoint + cap, Width::Word), 0x0002_0010);
+    assert_eq!(read(stub, endpoint + cap + 0x12, Width::Half) & 0x3ff, 0x11);
+    assert_eq!(read(stub, endpoint + 0x100, Width::Word), 0);
+    // Only device 0, function 0, only on the secondary bus.
+    for address in [config(1, 1, 0, 0), config(1, 0, 1, 0), config(2, 0, 0, 0)] {
+        assert_eq!(read(stub, address, Width::Word), 0xffff_ffff);
+    }
+}
+
+#[test]
+fn the_endpoint_bar_sizes_assigns_and_decodes_through_the_root_port() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut linked(&mut latch);
+    let access = &mut Access::new(0, link::TRAINING_TICKS, &mut latch);
+    let endpoint = config(1, 0, 0, 0);
+    let port = config(0, 1, 0, 0);
+    // Sizing: a 4 KiB 32-bit memory BAR; the others are absent.
+    stub.write(endpoint + 0x10, Width::Word, 0xffff_ffff, access)
+        .unwrap();
+    assert_eq!(
+        stub.read(endpoint + 0x10, Width::Word, access),
+        Ok(0xffff_f000)
+    );
+    stub.write(endpoint + 0x14, Width::Word, 0xffff_ffff, access)
+        .unwrap();
+    assert_eq!(stub.read(endpoint + 0x14, Width::Word, access), Ok(0));
+    // Assigned at the window's PCI base, but no decoding yet: all ones.
+    stub.write(endpoint + 0x10, Width::Word, PCI | 0x123, access)
+        .unwrap();
+    assert_eq!(stub.read(endpoint + 0x10, Width::Word, access), Ok(PCI));
+    assert_eq!(stub.read(MEMORY, Width::Word, access), Ok(0xffff_ffff));
+    // Memory decoding on the endpoint, then the root port's window and
+    // memory space: the BAR is RAM.
+    stub.write(endpoint + 4, Width::Half, 0x6, access).unwrap();
+    assert_eq!(stub.read(MEMORY, Width::Word, access), Ok(0xffff_ffff));
+    stub.write(port + 0x20, Width::Word, 0x8000_8000, access)
+        .unwrap();
+    stub.write(port + 4, Width::Half, 0x6, access).unwrap();
+    stub.write(MEMORY + 0xff8, Width::Double, 0x0123_4567_89ab_cdef, access)
+        .unwrap();
+    assert_eq!(
+        stub.read(MEMORY + 0xff8, Width::Double, access),
+        Ok(0x0123_4567_89ab_cdef)
+    );
+    // Past the BAR nothing decodes; writes there go nowhere.
+    stub.write(MEMORY + 0x1000, Width::Word, 0, access).unwrap();
+    assert_eq!(
+        stub.read(MEMORY + 0x1000, Width::Word, access),
+        Ok(0xffff_ffff)
+    );
+    // Memory decoding off on the endpoint hides the BAR again.
+    stub.write(endpoint + 4, Width::Half, 0, access).unwrap();
+    assert_eq!(
+        stub.read(MEMORY + 0xff8, Width::Word, access),
+        Ok(0xffff_ffff)
+    );
+}
+
+#[test]
+fn without_the_model_no_link_comes_up_and_the_memory_window_is_unknown() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut probe();
+    let access = &mut Access::new(0, 0, &mut latch);
+    w(stub, access, Window::Port(1), 0x80, 1);
+    let access = &mut Access::new(0, 10 * link::TRAINING_TICKS, &mut latch);
+    assert_eq!(
+        stub.advance(access).unwrap(),
+        Some(10 * link::TRAINING_TICKS + BEAT_SECONDS * TICKS_PER_SECOND)
+    );
+    assert!(!stub.link_up());
+    assert_eq!(r(stub, access, Window::Port(1), 0x208) & 1, 0);
+    assert_eq!(
+        stub.place(MEMORY),
+        Place(Window::Outside, MEMORY & ((1 << WINDOW_SHIFT) - 1))
+    );
+    // A port with no root port header cannot be modeled.
+    assert_eq!(probe().with_model(7, None, &[]).modeled_port(), None);
+}
