@@ -14,6 +14,7 @@
 //! used entries (`VIRTIO_F_EVENT_IDX`), and holds it until the guest
 //! acknowledges every cause. A ring that breaks the format stops the device
 //! with `CAUSE_ERROR` instead of stopping the machine.
+pub mod offload;
 pub mod queue;
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,9 @@ const DEFAULT_FILTER: u64 = FILTER_DIRECTED | FILTER_BROADCAST | FILTER_ALL_MULT
 pub struct Net {
     irq: AicInput,
     mac: [u8; 6],
+    /// `FEATURES`: [`features::OFFERED`], with [`features::CHECKSUMS`] when
+    /// the boot offers them.
+    offered: u64,
     accepted: u64,
     control: u64,
     rx_ring: u64,
@@ -76,9 +80,15 @@ pub struct Net {
 
 impl Net {
     pub fn new(mac: [u8; 6], irq: AicInput) -> Self {
+        Self::with_features(mac, irq, features::OFFERED)
+    }
+
+    /// A device offering `offered`, which must hold [`features::REQUIRED`].
+    pub fn with_features(mac: [u8; 6], irq: AicInput, offered: u64) -> Self {
         Self {
             irq,
             mac,
+            offered: offered | features::REQUIRED,
             accepted: 0,
             control: 0,
             rx_ring: 0,
@@ -221,7 +231,7 @@ impl Net {
         if self.up() {
             return;
         }
-        if self.accepted & !features::OFFERED != 0
+        if self.accepted & !self.offered != 0
             || self.accepted & features::REQUIRED != features::REQUIRED
         {
             return self.fail("ACCEPT is not a subset of FEATURES with VERSION_1", access);
@@ -312,12 +322,28 @@ impl Net {
                 self.tx_errors += 1;
                 self.counters.malformed += 1;
             } else {
+                let mut header = [0u8; HEADER_BYTES as usize];
+                chain.read(memory, 0, &mut header)?;
+                let header = offload::Header::parse(&header);
                 let mut data = self.spare.pop().unwrap_or_default();
                 data.resize(frame as usize, 0);
                 chain.read(memory, HEADER_BYTES, &mut data)?;
-                self.outbound.push_back(data);
-                self.counters.to_host += 1;
-                self.service_due = true;
+                // A partial checksum is completed only when CSUM was
+                // accepted; a driver that marks one otherwise breaks the
+                // contract and its frame goes as it is.
+                let checksummed = header.flags & offload::NEEDS_CSUM == 0
+                    || self.accepted & features::CSUM == 0
+                    || offload::complete(&mut data, header.csum_start, header.csum_offset)
+                        .is_some();
+                if header.gso_type != offload::GSO_NONE || !checksummed {
+                    self.tx_errors += 1;
+                    self.counters.malformed += 1;
+                    self.recycle(data);
+                } else {
+                    self.outbound.push_back(data);
+                    self.counters.to_host += 1;
+                    self.service_due = true;
+                }
             }
             tx.push_used(memory, chain.head, 0)?;
         }
@@ -372,6 +398,9 @@ impl Net {
                 continue;
             }
             let mut header = [0u8; HEADER_BYTES as usize];
+            if self.accepted & features::GUEST_CSUM != 0 && offload::verified(&frame) {
+                header[0] = offload::DATA_VALID;
+            }
             // num_buffers: one buffer holds the frame.
             header[10..12].copy_from_slice(&1u16.to_le_bytes());
             chain.write(memory, 0, &header)?;
@@ -443,7 +472,7 @@ impl MmioDevice for Net {
         mac[..6].copy_from_slice(&self.mac);
         Ok(match offset {
             VERSION => MAGIC << 32 | LAYOUT_VERSION,
-            FEATURES => features::OFFERED,
+            FEATURES => self.offered,
             ACCEPT => self.accepted,
             MAC => u64::from_le_bytes(mac),
             LINK => LINK_MBPS << 32 | 1,
