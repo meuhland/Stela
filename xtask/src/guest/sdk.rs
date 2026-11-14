@@ -16,6 +16,7 @@
 use anyhow::{Context, Result, bail};
 use std::{fmt::Write as _, fs, path::Path};
 use stela_contracts::gate::window;
+use stela_contracts::net;
 
 /// The MIG interfaces `mach/mach_interface.h` includes.
 const MIG_INTERFACES: [&str; 16] = [
@@ -94,6 +95,7 @@ pub fn generate(xnu: &Path, include: &Path) -> Result<()> {
     let stela = include.join("stela");
     fs::create_dir_all(&stela)?;
     fs::write(stela.join("gate.h"), gate_header())?;
+    fs::write(stela.join("net.h"), net_header())?;
     Ok(())
 }
 
@@ -216,6 +218,65 @@ fn gate_header() -> String {
     header
 }
 
+/// `stela/net.h`: the StelaNet register page, its feature bits and its
+/// virtqueue layout, from `stela_contracts::net`.
+fn net_header() -> String {
+    use net::{features, ring};
+    let mut header = String::from(
+        "/* The StelaNet adapter's layout, from stela_contracts::net. */\n\
+         #pragma once\n",
+    );
+    for (name, value) in net::window::LAYOUT {
+        writeln!(header, "#define STELA_NET_{name} {value:#x}ULL").unwrap();
+    }
+    for (name, value) in [
+        ("CSUM", features::CSUM),
+        ("GUEST_CSUM", features::GUEST_CSUM),
+        ("GUEST_TSO4", features::GUEST_TSO4),
+        ("GUEST_TSO6", features::GUEST_TSO6),
+        ("HOST_TSO4", features::HOST_TSO4),
+        ("HOST_TSO6", features::HOST_TSO6),
+        ("MRG_RXBUF", features::MRG_RXBUF),
+        ("MAC", features::MAC),
+        ("EVENT_IDX", features::EVENT_IDX),
+        ("VERSION_1", features::VERSION_1),
+        ("OFFERED", features::OFFERED),
+        ("REQUIRED", features::REQUIRED),
+    ] {
+        writeln!(header, "#define STELA_NET_F_{name} {value:#x}ULL").unwrap();
+    }
+    for (name, value) in [
+        ("DESC_F_NEXT", ring::DESC_F_NEXT),
+        ("DESC_F_WRITE", ring::DESC_F_WRITE),
+        ("DESC_F_INDIRECT", ring::DESC_F_INDIRECT),
+        ("AVAIL_F_NO_INTERRUPT", ring::AVAIL_F_NO_INTERRUPT),
+        ("USED_F_NO_NOTIFY", ring::USED_F_NO_NOTIFY),
+    ] {
+        writeln!(header, "#define STELA_NET_{name} {value:#x}").unwrap();
+    }
+    writeln!(
+        header,
+        "#define STELA_NET_DESCRIPTOR_BYTES {}ULL",
+        ring::DESCRIPTOR_BYTES
+    )
+    .unwrap();
+    writeln!(
+        header,
+        "#define STELA_NET_USED_ALIGN {}ULL",
+        ring::USED_ALIGN
+    )
+    .unwrap();
+    // The same arithmetic as ring::avail, ring::used and ring::bytes.
+    header.push_str(
+        "#define STELA_NET_RING_AVAIL(size) (STELA_NET_DESCRIPTOR_BYTES * (size))\n\
+         #define STELA_NET_RING_USED(size) \\\n\
+         \t(((STELA_NET_RING_AVAIL(size) + 4 + 2 * (size) + 2 + STELA_NET_USED_ALIGN - 1) \\\n\
+         \t/ STELA_NET_USED_ALIGN) * STELA_NET_USED_ALIGN)\n\
+         #define STELA_NET_RING_BYTES(size) (STELA_NET_RING_USED(size) + 4 + 8 * (size) + 2)\n",
+    );
+    header
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +318,16 @@ typedef int After;
     #[test]
     fn an_unclosed_class_is_refused() {
         assert!(kernel_header("class KERNEL Widget : public OSObject\n{\n").is_err());
+    }
+
+    #[test]
+    fn the_net_header_names_registers_features_and_ring_layout() {
+        let header = net_header();
+        assert!(header.contains("#define STELA_NET_KICK 0x58ULL\n"));
+        assert!(header.contains("#define STELA_NET_MAGIC 0x534e4554ULL\n"));
+        assert!(header.contains("#define STELA_NET_F_VERSION_1 0x100000000ULL\n"));
+        assert!(header.contains("#define STELA_NET_DESC_F_WRITE 0x2\n"));
+        assert!(header.contains("#define STELA_NET_RING_BYTES(size)"));
     }
 
     #[test]
