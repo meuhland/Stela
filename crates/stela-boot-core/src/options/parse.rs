@@ -154,6 +154,11 @@ impl ParseState<'_> {
                 options.guest_network = true;
                 options.guest_network_stelanet = true;
             }
+            "--guest-network-stelanet-csum" => {
+                options.guest_network = true;
+                options.guest_network_stelanet = true;
+                options.guest_network_stelanet_csum = true;
+            }
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {

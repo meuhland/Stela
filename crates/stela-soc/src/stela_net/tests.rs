@@ -145,10 +145,14 @@ struct Rig {
 
 impl Rig {
     fn new(size: u16, accept: u64) -> Self {
+        Self::offering(size, features::OFFERED, accept)
+    }
+
+    fn offering(size: u16, offered: u64, accept: u64) -> Self {
         let mut rig = Self {
             ram: Ram::new(RAM, 0x10_0000),
             latch: InterruptLatch::new(),
-            net: Net::new(MAC_ADDRESS, IRQ),
+            net: Net::with_features(MAC_ADDRESS, IRQ, offered),
             rx: Driver::new(RX, size),
             tx: Driver::new(TX, size),
         };
@@ -196,8 +200,12 @@ impl Rig {
     }
 
     fn send(&mut self, frame: &[u8], slot: u64) -> u16 {
+        self.send_with(frame, slot, [0; 12])
+    }
+
+    fn send_with(&mut self, frame: &[u8], slot: u64, header: [u8; 12]) -> u16 {
         let address = BUFFERS + 0x8_0000 + slot * 0x800;
-        let mut buffer = vec![0u8; HEADER_BYTES as usize];
+        let mut buffer = header.to_vec();
         buffer.extend_from_slice(frame);
         assert!(self.ram.write(address, &buffer));
         let head = self
@@ -601,4 +609,77 @@ fn chains_refuse_bad_shapes() {
     assert!(Queue::new(0, 4).is_err());
     assert!(Queue::new(RX, 0).is_err());
     assert!(Queue::new(u64::MAX & !15, 4).is_err());
+}
+
+/// A header marking a partial checksum from `start`, its field at `offset`.
+fn partial(start: u16, offset: u16) -> [u8; 12] {
+    let mut header = [0u8; 12];
+    header[0] = offload::NEEDS_CSUM;
+    header[6..8].copy_from_slice(&start.to_le_bytes());
+    header[8..10].copy_from_slice(&offset.to_le_bytes());
+    header
+}
+
+#[test]
+fn checksum_offloads_are_offered_only_when_the_boot_asks() {
+    let mut rig = Rig::new(8, features::OFFERED);
+    assert_eq!(rig.read(FEATURES) & features::CHECKSUMS, 0);
+    rig.write(ENABLE, 0).unwrap();
+    rig.write(ACCEPT, features::OFFERED | features::CSUM)
+        .unwrap();
+    rig.write(ENABLE, 1).unwrap();
+    assert!(!rig.net.up(), "CSUM was not offered");
+    let all = features::OFFERED | features::CHECKSUMS;
+    let mut rig = Rig::offering(8, all, all);
+    assert_eq!(rig.read(FEATURES), all);
+    assert!(rig.net.up());
+}
+
+#[test]
+fn a_partial_transmit_checksum_is_completed() {
+    let all = features::OFFERED | features::CHECKSUMS;
+    let mut rig = Rig::offering(8, all, all);
+    let mut good = offload::tests::tcp4(b"partial checksum");
+    good[..6].copy_from_slice(&[0xff; 6]);
+    assert_ne!(good[50..52], [0, 0]);
+    // The stack leaves the pseudo-header sum in the field.
+    let mut pseudo = good[26..34].to_vec();
+    pseudo.extend_from_slice(&[0, 6, 0, 20 + 16]);
+    let mut sent = good.clone();
+    sent[50..52].copy_from_slice(&(!offload::tests::reference(&pseudo)).to_be_bytes());
+    rig.send_with(&sent, 0, partial(34, 16));
+    // A field past the frame, and a segmentation request, are refused.
+    rig.send_with(&sent, 1, partial(34, 4000));
+    let mut segmented = [0u8; 12];
+    segmented[1] = 1;
+    rig.send_with(&sent, 2, segmented);
+    rig.write(KICK, KICK_TX).unwrap();
+    rig.step();
+    assert_eq!(rig.net.take(), Some(good));
+    assert_eq!(rig.net.take(), None);
+    assert_eq!(rig.read(TX_ERRORS), 2);
+    assert_eq!(rig.tx.reap(&mut rig.ram).len(), 3);
+}
+
+#[test]
+fn received_checksums_the_host_verified_are_marked_valid() {
+    let all = features::OFFERED | features::CHECKSUMS;
+    let header_flags = |accept: u64, frame: &[u8]| {
+        let mut rig = Rig::offering(8, all, accept);
+        rig.post(0, 1, 2048);
+        rig.net.deliver_owned(frame.to_vec());
+        rig.step();
+        assert_eq!(rig.rx.reap(&mut rig.ram).len(), 1);
+        let mut flags = [0u8];
+        assert!(rig.ram.read(BUFFERS, &mut flags));
+        flags[0]
+    };
+    let mut good = offload::tests::tcp4(b"verified on the host");
+    good[..6].copy_from_slice(&MAC_ADDRESS);
+    assert_eq!(header_flags(all, &good), offload::DATA_VALID);
+    assert_eq!(header_flags(features::OFFERED, &good), 0, "not accepted");
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert_eq!(header_flags(all, &bad), 0, "left for the guest to judge");
 }
