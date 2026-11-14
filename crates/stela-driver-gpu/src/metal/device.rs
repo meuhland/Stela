@@ -18,7 +18,7 @@ use super::{
         object::{Buffer, BufferInfo, Memory, MemoryRequest, Semaphore},
     },
 };
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::{ptr::NonNull, sync::atomic::AtomicU32};
 
 /// A word the GPU writes after each submission's work, which the host reads
@@ -328,6 +328,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The compiler's detail of the last function it refused, once.
     pub fn take_refusal(&mut self) -> Option<Refusal> {
         self.compiler.take_refusal()
+    }
+
+    /// What a compilation gave in place of what its call asked, once each.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.compiler.take_notice()
     }
 
     /// Opens the device, refusing Vulkan devices that lack a feature the
