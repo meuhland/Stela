@@ -130,6 +130,13 @@ impl RootLink {
         Some(self.send(frame))
     }
 
+    /// [`Link::carrier`] for a service turn, as [`Self::transmit_now`].
+    fn carrier_now(&mut self) -> Option<bool> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.device.carrier())
+    }
+
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
     fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
         // SAFETY: as in `carrier`.
@@ -632,6 +639,11 @@ pub struct GuestNetwork {
     retargeted: bool,
     /// Why the StelaNet adapter last stopped itself, as last reported.
     fault: Option<&'static str>,
+    /// The guest's IPv4 address as StelaNet last reported it.
+    address: Option<[u8; 4]>,
+    /// The host adapter's carrier as last read for StelaNet, and when (TSC).
+    carrier: Option<bool>,
+    carrier_read: Option<u64>,
 }
 
 /// The APIC ID of the core the guest network's receive signal goes to once
@@ -677,6 +689,9 @@ impl GuestNetwork {
             unsent: alloc::collections::VecDeque::new(),
             retargeted: false,
             fault: None,
+            address: None,
+            carrier: None,
+            carrier_read: None,
         })
     }
 
@@ -725,6 +740,41 @@ impl GuestNetwork {
             ));
         }
         self.fault = fault;
+    }
+
+    /// Report the IPv4 address the guest claimed through StelaNet, once per
+    /// new address: how a run finds a guest whose address DHCP chose.
+    pub fn address(&mut self, address: Option<[u8; 4]>) {
+        if let Some([a, b, c, d]) = address
+            && self.address != address
+        {
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet guest address {a}.{b}.{c}.{d}\n"
+            ));
+            self.address = address;
+        }
+    }
+
+    /// The host adapter's carrier for StelaNet's link, read at most once a
+    /// second (`now` and `tsc_hz` in TSC ticks) and never waiting for the
+    /// host drivers' lock; `None` when not read this turn.
+    pub fn carrier_now(&mut self, now: u64, tsc_hz: u64) -> Option<bool> {
+        if self
+            .carrier_read
+            .is_some_and(|at| now.wrapping_sub(at) < tsc_hz)
+        {
+            return None;
+        }
+        let up = self.link.carrier_now()?;
+        self.carrier_read = Some(now);
+        if self.carrier.is_some_and(|was| was != up) || self.carrier.is_none() && !up {
+            output::arguments(format_args!(
+                "GUEST NETWORK host carrier {}\n",
+                if up { "up" } else { "down" }
+            ));
+        }
+        self.carrier = Some(up);
+        Some(up)
     }
 
     /// The beat report's line: the frames the guest adapter moved each way

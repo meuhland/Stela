@@ -76,6 +76,15 @@ pub struct Net {
     tx_errors: u64,
     /// Why the device last stopped itself.
     error: Option<&'static str>,
+    /// `LINK` bit 0: the host adapter's carrier, as the host's service last
+    /// reported it ([`Net::set_link`]).
+    link: bool,
+    /// The link changed since the guest last heard: the next step raises
+    /// `CAUSE_LINK`.
+    link_changed: bool,
+    /// The IPv4 address the guest last claimed as an ARP sender, for the
+    /// boot log: how a run finds a guest whose address DHCP chose.
+    address: Option<[u8; 4]>,
 }
 
 impl Net {
@@ -111,7 +120,24 @@ impl Net {
             rx_drops: 0,
             tx_errors: 0,
             error: None,
+            link: true,
+            link_changed: false,
+            address: None,
         }
+    }
+
+    /// The host adapter's carrier: `LINK` follows it, and a running device
+    /// raises `CAUSE_LINK` at its next step when it changes.
+    pub fn set_link(&mut self, up: bool) {
+        if self.link != up {
+            self.link = up;
+            self.link_changed = true;
+        }
+    }
+
+    /// The IPv4 address the guest last announced in an ARP frame it sent.
+    pub fn guest_address(&self) -> Option<[u8; 4]> {
+        self.address
     }
 
     /// Whether the guest runs the device: its link, as the host sees it.
@@ -192,13 +218,14 @@ impl Net {
         core::mem::take(&mut self.service_due)
     }
 
-    /// Whether the DMA step has work: a kick, rings not yet checked, frames
-    /// for posted buffers, or transmit chains left for want of room that
-    /// now has some.
+    /// Whether the DMA step has work: a kick, rings not yet checked, a link
+    /// change to raise, frames for posted buffers, or transmit chains left
+    /// for want of room that now has some.
     pub fn due(&self) -> bool {
         self.up()
             && (self.kicked != 0
                 || !self.checked
+                || self.link_changed
                 || !self.inbound.is_empty() && !self.starved
                 || self.blocked && self.outbound.len() < QUEUE_FRAMES)
     }
@@ -244,6 +271,8 @@ impl Net {
                 self.rx = Some(rx);
                 self.tx = Some(tx);
                 self.error = None;
+                // The driver reads LINK as it starts the device.
+                self.link_changed = false;
             }
             (Err(why), _) | (_, Err(why)) => self.fail(why, access),
         }
@@ -254,6 +283,9 @@ impl Net {
     pub fn step(&mut self, memory: &mut dyn Memory, access: &mut Access<'_>) {
         if !self.up() {
             return;
+        }
+        if core::mem::take(&mut self.link_changed) {
+            self.raise(CAUSE_LINK, access);
         }
         if let Err(error) = self.transfer(memory, access) {
             let why = match error {
@@ -340,6 +372,9 @@ impl Net {
                     self.counters.malformed += 1;
                     self.recycle(data);
                 } else {
+                    if let Some(address) = arp_sender(&data, &self.mac) {
+                        self.address = Some(address);
+                    }
                     self.outbound.push_back(data);
                     self.counters.to_host += 1;
                     self.service_due = true;
@@ -424,6 +459,19 @@ impl Net {
     }
 }
 
+/// The sender's IPv4 address of an Ethernet ARP frame from `mac` (request,
+/// reply or announcement), but not a probe's 0.0.0.0.
+fn arp_sender(frame: &[u8], mac: &[u8; 6]) -> Option<[u8; 4]> {
+    // Ethernet header, then htype 1, ptype IPv4, hlen 6, plen 4, an op,
+    // the sender's hardware and protocol addresses.
+    const ARP: [u8; 8] = [0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4];
+    if frame.len() < 42 || frame[12..20] != ARP || frame[22..28] != *mac {
+        return None;
+    }
+    let address: [u8; 4] = frame[28..32].try_into().unwrap();
+    (address != [0; 4]).then_some(address)
+}
+
 impl MmioDevice for Net {
     fn advance_policy(&self) -> AdvancePolicy {
         AdvancePolicy::Passive
@@ -475,7 +523,7 @@ impl MmioDevice for Net {
             FEATURES => self.offered,
             ACCEPT => self.accepted,
             MAC => u64::from_le_bytes(mac),
-            LINK => LINK_MBPS << 32 | 1,
+            LINK => LINK_MBPS << 32 | u64::from(self.link),
             CONTROL => self.control,
             RX_RING => self.rx_ring,
             RX_SIZE => self.rx_size,
