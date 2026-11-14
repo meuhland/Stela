@@ -554,7 +554,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Ok(0);
         }
         // Where the block ran: a shared block's page is the run's.
-        let terminal = self.code.blocks[index].terminal_at(self.ran_page);
+        let block = &self.code.blocks[index];
+        let terminal = block.terminal_at(block.ran_at(self.ran_page, self.aliasing()));
         let word = self.word(index, terminal)?;
         let register = ((word >> 5) & 31) as u8;
         Ok(match word & REGISTER_BRANCH {

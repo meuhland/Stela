@@ -94,8 +94,8 @@ fn frame_number(physical: u64) -> u64 {
 /// A block's PC as retirement and detach list it: bit 0 (no PC has it) set
 /// for a shared block ([`Block::shared`]), which links into it reach from
 /// every guest page of its frame, at its offset.
-fn listed_pc(block: &Block) -> u64 {
-    block.pc | u64::from(block.shared)
+fn listed_pc(block: &Block, aliasing: bool) -> u64 {
+    block.pc | u64::from(block.shared && aliasing)
 }
 
 /// The page offsets of the shared blocks among `pcs` ([`listed_pc`]),
@@ -1266,6 +1266,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         pcs: &mut Vec<u64>,
         cause: churn::Gone,
     ) -> u64 {
+        let aliasing = self.aliasing();
         let code = Arc::clone(&self.code);
         let blocks = &code.blocks;
         let slots: Vec<u32> = step.iter().map(|&(_, slot)| slot).collect();
@@ -1319,7 +1320,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         for &slot in &slots {
             let block = &blocks[slot as usize];
-            pcs.push(listed_pc(block));
+            pcs.push(listed_pc(block, aliasing));
             for key in block_keys(block) {
                 visits += cache.targets.forget_block(block.pc, key, slot) as u64;
             }
@@ -1572,6 +1573,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// may be the one it reached), and their lookup and jump cache
     /// entries go. Under the board's lock, `cache`.
     pub(super) fn detach(&mut self, cache: &mut board::Cache, slots: &[u32]) {
+        let aliasing = self.aliasing();
         let blocks = &self.code.blocks;
         let marked = mark(&mut cache.marked, blocks.len(), slots);
         let detached = |slot: usize| bit_set(&marked, slot as u32);
@@ -1579,7 +1581,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .iter()
             .map(|&slot| {
                 let block = &blocks[slot as usize];
-                (block.physical & !(FETCH_PAGE - 1), listed_pc(block))
+                (
+                    block.physical & !(FETCH_PAGE - 1),
+                    listed_pc(block, aliasing),
+                )
             })
             .collect();
         gone.sort_unstable();
