@@ -27,8 +27,29 @@ pub struct Placement {
 
 /// Adds the node of GPU `index`'s gate for a window of `bytes`, a power of two.
 pub fn place_gpu_gate(tree: &mut DeviceTree, index: usize, bytes: u64) -> Result<Placement> {
+    place_window(
+        tree,
+        &format!("stela-gpu{index}"),
+        COMPATIBLE,
+        b"stela-gpu\0",
+        bytes,
+    )
+}
+
+/// Adds `/arm-io/<name>` with `compatible` and `device_type` (each with its
+/// NUL), a register window of `bytes`, a power of two, in the last aligned
+/// gap of `/arm-io`'s `ranges` no device uses, and one AIC input past every
+/// one the tree's AIC clients use: the placement the StelaGPU gates and the
+/// StelaNet adapter share.
+pub fn place_window(
+    tree: &mut DeviceTree,
+    name: &str,
+    compatible: &[u8],
+    device_type: &[u8],
+    bytes: u64,
+) -> Result<Placement> {
     require!(bytes.is_power_of_two(), "the gate window is a power of two");
-    let name = format!("stela-gpu{index}");
+    let name = String::from(name);
     let arm_io = tree
         .node(ARM_IO)
         .ok_or(refuse!("DeviceTree has no /arm-io"))?;
@@ -58,7 +79,7 @@ pub fn place_gpu_gate(tree: &mut DeviceTree, index: usize, bytes: u64) -> Result
             gap(range[0], range[2], bytes, &used)
                 .map(|offset| (offset, range[1] + (offset - range[0])))
         })
-        .ok_or(refuse!("/arm-io has no gap for the StelaGPU gate"))?;
+        .ok_or(refuse!("/arm-io has no gap for {name}", name))?;
     let aic = tree
         .property(AIC, PHANDLE)
         .and_then(|phandle| phandle.as_u32())
@@ -71,10 +92,10 @@ pub fn place_gpu_gate(tree: &mut DeviceTree, index: usize, bytes: u64) -> Result
         .map_or(Some(0), |last| last.checked_add(1))
         .ok_or(refuse!("the AIC has no input past its clients'"))?;
     let mut node = Node::named(&name)?;
-    node.set_property("compatible", COMPATIBLE.to_vec())?;
+    node.set_property("compatible", compatible.to_vec())?;
     node.set_property(INTERRUPT_PARENT, aic.to_le_bytes().to_vec())?;
     node.set_property("interrupts", irq.to_le_bytes().to_vec())?;
-    node.set_property("device_type", b"stela-gpu\0".to_vec())?;
+    node.set_property("device_type", device_type.to_vec())?;
     node.set_property("reg", [offset, bytes].map(u64::to_le_bytes).concat())?;
     tree.node_mut(ARM_IO)
         .ok_or(refuse!("DeviceTree has no /arm-io"))?
