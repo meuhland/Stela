@@ -598,8 +598,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.note_gone(&mut cache, slot, churn::Gone::Invalidated);
         }
         self.unlink_sources(&page);
-        cache.targets.forget_frames(frame..=frame, |_| true);
+        // The index first, then the table: an insert made without the code
+        // lock that saw the blocks indexed is in the table before the
+        // forget, or refuses its entry ([`board::Targets`]).
         let forgot = cache.index.forget_page(physical & !(FETCH_PAGE - 1));
+        code.note_departures();
+        cache.targets.forget_frames(frame..=frame, |_| true);
         drop(cache);
         // Every PE's native jump cache may name the page's blocks.
         code.note_unpublished();
@@ -1302,6 +1306,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         cache
             .index
             .forget_marked_in(frame, Some(&tags), |slot| bit_set(&marked, slot));
+        // Out of the index before their table entries go ([`board::Targets`]).
+        code.note_departures();
         unmark(&mut cache.marked, marked, &slots);
         let mut visits = (slots.len() + listed / 16) as u64;
         let mut unlinks = Vec::new();
@@ -1522,6 +1528,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     fn forget_shared_code(&mut self) {
         let mut cache = self.code.cache_at(board::LockSite::Discard);
         cache.index.clear();
+        self.code.note_departures();
         cache.targets.clear();
         drop(cache);
         self.code.epoch.fetch_add(1, Ordering::AcqRel);
@@ -1582,6 +1589,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// may be the one it reached), and their lookup and jump cache
     /// entries go. Under the board's lock, `cache`.
     pub(super) fn detach(&mut self, cache: &mut board::Cache, slots: &[u32]) {
+        // The caller replaced them in the index: they left it before their
+        // table entries go ([`board::Targets`]).
+        self.code.note_departures();
         let aliasing = self.aliasing();
         let blocks = &self.code.blocks;
         let marked = mark(&mut cache.marked, blocks.len(), slots);

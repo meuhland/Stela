@@ -2124,12 +2124,22 @@ fn board_code(
     // Block table entries jump cache hits would add: taken, refused under
     // the lock, refused without it, put off.
     let (targets, was_targets) = (now.targets, was.targets);
+    // The block table's own lock, which every access of the table takes
+    // and a fetch's insert takes alone: acquisitions, those that found it
+    // held, microseconds held and waited, and the longest hold.
+    let (table, was_table) = (now.table_lock, was.table_lock);
     let targets = format!(
-        " targets=inserted/raced/unindexed/deferred:{}/{}/{}/{}",
+        " targets=inserted/raced/unindexed/deferred:{}/{}/{}/{} \
+         table_lock=acquired/contended/held_us/waited_us/longest_held_us:{}/{}/{}/{}/{}",
         targets.inserted.saturating_sub(was_targets.inserted),
         targets.raced.saturating_sub(was_targets.raced),
         targets.unindexed.saturating_sub(was_targets.unindexed),
         targets.deferred.saturating_sub(was_targets.deferred),
+        table.acquired.saturating_sub(was_table.acquired),
+        table.contended.saturating_sub(was_table.contended),
+        micros(table.held.saturating_sub(was_table.held)),
+        micros(table.waited.saturating_sub(was_table.waited)),
+        micros(table.longest_held),
     );
     // Installs: never on the board before; again after their block went
     // with its ring part, an IC IVAU, a part taken for want of a slot or

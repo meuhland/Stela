@@ -59,7 +59,7 @@ mod scheduler;
 mod system_access;
 mod timing;
 mod transitions;
-pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
+pub use board::{CodeReport, LockCounts, LockSite, SiteCounts, TableLockCounts};
 pub use churn::ChurnCounts;
 pub use install_census::InstallCauses;
 pub use monitor::{MonitorEvent, MonitorKind, MonitorLocation};
@@ -1039,6 +1039,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// entry's first insert on a PE went in regardless
     /// (`--table-insert-throttled`).
     table_insert_throttled: bool,
+    /// A fetch's block table insert checks the index under the board's
+    /// code lock, as before it took the table's own lock alone
+    /// (`--table-insert-locked`, [`board::Targets`]).
+    table_insert_locked: bool,
     /// Whether a page-relative block serves every guest page that maps its
     /// frame (`--shared-aliases`, [`Block::shared`]): off unless asked for,
     /// and only with [`Self::page_relative`].
@@ -1509,6 +1513,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             jump_serial_always: false,
             remembered: vec![0; compilation::REMEMBERED].into_boxed_slice(),
             table_insert_throttled: false,
+            table_insert_locked: false,
             shared_aliases: false,
             shared_limits: SharedLimits::default(),
             shared_verified: BTreeMap::new(),

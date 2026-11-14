@@ -1629,7 +1629,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// another board holds its first board's.
     pub(super) fn attach_stamps(&mut self) {
         let code = Arc::clone(&self.code);
-        let mut cache = code.cache_at(super::board::LockSite::Other);
+        let cache = code.cache_at(super::board::LockSite::Other);
         let cells = cache.targets.stamped_cells();
         let (stamps, held) = self.chain.stamps();
         if held == cells && cache.targets.holds_stamps(stamps) {

@@ -1112,24 +1112,29 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, bytes) else {
             return false;
         };
-        let current = self.current_key(next_pc).and_then(|key| {
-            let held = cache
-                .targets
-                .find(cache.targets.slot(next_pc, key), next_pc, key);
-            (held.pc == next_pc && held.key == key).then_some(held)
-        });
-        let cell = cache.targets.link_cell(site, next_pc, current);
-        let number = cache.targets.site_cell_number(site);
-        if let Some(number) = number.filter(|_| stamped) {
-            let link = chain::CellLink {
-                site,
-                pc: next_pc,
-                retired,
-                word,
-                btype,
-            };
-            cache.targets.note_link(number, link);
-        }
+        let key = self.current_key(next_pc);
+        // In one hold of the table's lock, so that no insert comes between
+        // the entry the cell starts with and the cell's link.
+        let (current, cell, number) = {
+            let mut table = cache.targets.lock();
+            let current = key.and_then(|key| {
+                let held = table.find(table.slot(next_pc, key), next_pc, key);
+                (held.pc == next_pc && held.key == key).then_some(held)
+            });
+            let cell = table.link_cell(site, next_pc, current);
+            let number = table.site_cell_number(site);
+            if let Some(number) = number.filter(|_| stamped) {
+                let link = chain::CellLink {
+                    site,
+                    pc: next_pc,
+                    retired,
+                    word,
+                    btype,
+                };
+                table.note_link(number, link);
+            }
+            (current, cell, number)
+        };
         let at = tail.0 as u64;
         let entry = probe + chain::CELL_PROBE_ENTRY as u64;
         let stamped = hot

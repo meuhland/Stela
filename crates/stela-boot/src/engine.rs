@@ -1063,6 +1063,12 @@ fn run_machine<H: Host>(
 "
         ));
     }
+    machine.set_table_insert_locked(options.table_insert_locked);
+    if options.table_insert_locked {
+        output::arguments(format_args!(
+            "ENGINE block table inserts checked under the code lock\n"
+        ));
+    }
     machine.set_table_insert_throttled(options.table_insert_throttled);
     if options.table_insert_throttled {
         output::arguments(format_args!(

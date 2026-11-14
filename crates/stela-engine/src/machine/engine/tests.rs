@@ -3155,7 +3155,7 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     // Other exits hold the first cells, so this exit's cell number takes a
     // 32-bit displacement in its stamp's address, as a booted guest's do.
     {
-        let mut cache = machine.code.cache();
+        let cache = machine.code.cache();
         for other in 0..300 {
             cache
                 .targets
@@ -3168,7 +3168,7 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
     let (number, cells) = {
-        let mut cache = machine.code.cache();
+        let cache = machine.code.cache();
         (
             cache.targets.site_cell_number(site).expect("a cell"),
             cache.targets.stamped_cells(),
@@ -7004,7 +7004,7 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
             .0 as u64;
         let site = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
         let (number, cells, held) = {
-            let mut cache = machine.code.cache();
+            let cache = machine.code.cache();
             assert_eq!(cache.targets.site_cell(site).map(|cell| cell.pc), Some(far));
             let number = cache.targets.site_cell_number(site).expect("a cell");
             let slot = cache.targets.slot(far, target_key);

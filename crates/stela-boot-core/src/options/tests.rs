@@ -447,3 +447,16 @@ fn table_insert_throttled_is_off_by_default_and_round_trips() {
     assert_eq!(options.to_string(), line);
     assert!(!round_trip("--system").table_insert_throttled);
 }
+
+/// A fetch's block table insert takes the table's own lock unless
+/// `--table-insert-locked` asks for the old check under the code lock,
+/// which round-trips.
+#[test]
+fn table_insert_locked_is_off_by_default_and_round_trips() {
+    assert!(!System::default().table_insert_locked);
+    let line = "--system --table-insert-throttled --table-insert-locked";
+    let options = round_trip(line);
+    assert!(options.table_insert_locked && options.table_insert_throttled);
+    assert_eq!(options.to_string(), line);
+    assert!(!round_trip("--system").table_insert_locked);
+}

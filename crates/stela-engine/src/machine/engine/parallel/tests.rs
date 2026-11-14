@@ -2835,7 +2835,7 @@ fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
     let (number, cells, stamps_held) = {
-        let mut cache = machine.code.cache();
+        let cache = machine.code.cache();
         let number = cache.targets.site_cell_number(site).expect("a cell");
         let control = machine.chain.snapshot();
         (
@@ -3044,7 +3044,7 @@ fn a_pe_that_joins_the_board_takes_stamps_of_its_table() {
     assert!(Arc::ptr_eq(&second.code, &shared));
     second.adopt_parallel_control(control);
     let control = second.chain.snapshot();
-    let mut cache = shared.cache();
+    let cache = shared.cache();
     assert_eq!(control.cells, cache.targets.stamped_cells());
     assert!(cache.targets.holds_stamps(control.stamps));
 }

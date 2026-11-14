@@ -732,13 +732,21 @@ fn a_jump_cache_hit_on_a_forgotten_block_takes_no_code_lock() {
 
 /// A block whose block table entry keeps going (here forgotten by hand,
 /// on a board by other inserts into its set) is added again at its first
-/// few jump cache hits, then at one in [`board::REMEMBER_EVERY`]: the lock
-/// is taken a bounded share of the hits.
+/// few jump cache hits, then at one in [`board::REMEMBER_EVERY`]: the
+/// table's lock is taken for a bounded share of the hits, and the code
+/// lock (`--table-insert-locked`) for the same share.
 #[test]
 fn a_block_whose_entry_keeps_going_takes_the_code_lock_a_bounded_share_of_its_hits() {
+    for locked in [false, true] {
+        a_block_whose_entry_keeps_going_inserts_a_bounded_share_of_its_hits(locked);
+    }
+}
+
+fn a_block_whose_entry_keeps_going_inserts_a_bounded_share_of_its_hits(locked: bool) {
     const HITS: u64 = 256;
     let mut memory = vec![0u8; WINDOW];
     let mut machine = arena_machine(&mut memory);
+    machine.set_table_insert_locked(locked);
     let pc = machine.cpu.pc;
     let Ok(Fetched::Block(slot)) = machine.fetch_block(pc, false) else {
         panic!("a block")
@@ -756,12 +764,13 @@ fn a_block_whose_entry_keeps_going_takes_the_code_lock_a_bounded_share_of_its_hi
             matches!(machine.fetch_block(pc, false), Ok(Fetched::Block(found)) if found == slot)
         );
     }
-    let taken = acquired(&machine, board::LockSite::Target) - before;
-    // The fill's own insert was the first of the block's free ones.
-    let due = u64::from(board::REMEMBERS_FREE) - 1 + HITS / u64::from(board::REMEMBER_EVERY);
-    assert!(taken <= due, "{taken} acquisitions for {HITS} hits");
     let report = machine.code.report();
-    assert_eq!(report.targets.inserted, taken + 1);
+    // The fill's own insert was the first of the block's free ones.
+    let taken = report.targets.inserted - 1;
+    let due = u64::from(board::REMEMBERS_FREE) - 1 + HITS / u64::from(board::REMEMBER_EVERY);
+    assert!(taken <= due, "{taken} inserts for {HITS} hits");
+    let code_taken = acquired(&machine, board::LockSite::Target) - before;
+    assert_eq!(code_taken, if locked { taken } else { 0 });
     assert_eq!(report.targets.deferred, HITS - taken);
     // The PE put the entry in at the install, so each insert after was
     // one again, and each refusal the throttle's (`PES REMEMBER`).
@@ -1896,4 +1905,169 @@ fn a_block_whose_part_is_chosen_before_it_publishes_is_installed_again() {
         "the block installed again is the one indexed"
     );
     assert_eq!(live_codes(&machine), [block.code.0]);
+}
+
+/// The block table's lock's acquisitions so far.
+fn table_acquired(machine: &Machine<FakeHost, NoDevices>) -> u64 {
+    machine.code.targets.lock().guard_counts().acquired
+}
+
+/// A fetch puts its block's entry in under the block table's own lock
+/// alone: the board's code lock is not taken, so installs and links do
+/// not wait on inserts, nor inserts on them. `--table-insert-locked`
+/// checks the index under the code lock as before.
+#[test]
+fn a_fetchs_insert_takes_the_table_lock_and_not_the_code_lock() {
+    for locked in [false, true] {
+        let mut memory = vec![0u8; WINDOW];
+        let mut machine = arena_machine(&mut memory);
+        machine.set_table_insert_locked(locked);
+        let pc = machine.cpu.pc;
+        let Ok(Fetched::Block(slot)) = machine.fetch_block(pc, false) else {
+            panic!("a block")
+        };
+        let key = target_key(&machine, pc);
+        let frame = chain::key_frame(key);
+        machine
+            .code
+            .cache()
+            .targets
+            .forget_frames(frame..=frame, |_| true);
+        let (code_before, table_before) = (
+            acquired(&machine, board::LockSite::Target),
+            table_acquired(&machine),
+        );
+        assert!(
+            matches!(machine.fetch_block(pc, false), Ok(Fetched::Block(found)) if found == slot)
+        );
+        let held = machine.code.table.find(target_slot(&machine, pc), pc, key);
+        assert_eq!((held.pc, held.block), (pc, slot as u32), "locked: {locked}");
+        let code_taken = acquired(&machine, board::LockSite::Target) - code_before;
+        assert_eq!(code_taken, u64::from(locked), "locked: {locked}");
+        // The insert's hold and the counting one here.
+        assert!(table_acquired(&machine) >= table_before + 2);
+        assert_eq!(machine.code.report().targets.inserted, 2);
+    }
+}
+
+/// A block that leaves the index after an insert checked it without the
+/// code lock (here an IC IVAU of its page between the check and the
+/// table's lock) has no entry put in: the departure count moved.
+#[test]
+fn an_insert_whose_block_left_the_index_since_its_check_is_refused() {
+    let mut memory = vec![0u8; WINDOW];
+    let mut machine = arena_machine(&mut memory);
+    let pc = machine.cpu.pc;
+    let Ok(Fetched::Block(slot)) = machine.fetch_block(pc, false) else {
+        panic!("a block")
+    };
+    let key = target_key(&machine, pc);
+    let at = target_slot(&machine, pc);
+    let target = machine.code.table.find(at, pc, key);
+    assert_eq!(target.block, slot as u32);
+    let departures = machine.code.departures();
+    let physical = machine.code.blocks[slot].physical;
+    machine.invalidate_code_page(physical);
+    assert_ne!(machine.code.departures(), departures);
+    assert_ne!(machine.code.table.find(at, pc, key).pc, pc, "forgotten");
+    let code = Arc::clone(&machine.code);
+    assert!(!super::super::compilation::insert_target_unlocked(
+        &code, departures, pc, at, target
+    ));
+    assert_ne!(machine.code.table.find(at, pc, key).pc, pc, "not put back");
+    assert_eq!(machine.code.report().targets.raced, 1);
+    // With no departure since, the same insert goes in.
+    let departures = code.departures();
+    assert!(super::super::compilation::insert_target_unlocked(
+        &code, departures, pc, at, target
+    ));
+}
+
+/// Inserts on two threads without the code lock against a third that
+/// takes blocks out of the "index" (a flag each here, as the finder
+/// reads it) and forgets their entries, as retirement and IC IVAU do:
+/// after them, no block out of the index has an entry.
+#[test]
+fn inserts_without_the_code_lock_never_outlive_their_blocks_departure() {
+    use core::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    const BLOCKS: usize = 512;
+    const ROUNDS: usize = 20_000;
+    let mut memory = vec![0u8; WINDOW];
+    let machine = arena_machine(&mut memory);
+    let code = Arc::clone(&machine.code);
+    let entry = |block: usize| {
+        let pc = 0x4000_0000 + (block as u64) * 0x40;
+        let key = chain::block_key(0x8000_0000 + (block as u64) * 0x1000, 2);
+        chain::LookupEntry {
+            pc,
+            key,
+            entry: 0x1000 + block as u64,
+            block: block as u32,
+            targets: 0xf,
+        }
+    };
+    let indexed: Vec<AtomicBool> = (0..BLOCKS).map(|_| AtomicBool::new(true)).collect();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for thread in 0..2u64 {
+            let (code, indexed, done) = (&code, &indexed, &done);
+            scope.spawn(move || {
+                let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ thread;
+                while !done.load(SeqCst) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let block = x as usize % BLOCKS;
+                    let target = entry(block);
+                    // As `remember_entry`: the count, then the finder.
+                    let departures = code.departures();
+                    if indexed[block].load(SeqCst) {
+                        let slot = code.table.slot(target.pc, target.key);
+                        super::super::compilation::insert_target_unlocked(
+                            code, departures, target.pc, slot, target,
+                        );
+                    }
+                }
+            });
+        }
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..ROUNDS {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let block = x as usize % BLOCKS;
+            let target = entry(block);
+            // As `unindex` under the code lock: out of the index, the
+            // count, then the table's entries.
+            let cache = code.cache();
+            indexed[block].store(false, SeqCst);
+            code.note_departures();
+            cache
+                .targets
+                .forget_block(target.pc, target.key, target.block);
+            drop(cache);
+            // Most come back (a block of the same PC indexed again).
+            if round % 4 != 0 {
+                indexed[block].store(true, SeqCst);
+            }
+        }
+        done.store(true, SeqCst);
+    });
+    let mut out = 0;
+    for (block, flag) in indexed.iter().enumerate() {
+        if !flag.load(SeqCst) {
+            out += 1;
+            let target = entry(block);
+            let held = code.table.find(
+                code.table.slot(target.pc, target.key),
+                target.pc,
+                target.key,
+            );
+            assert!(
+                !(held.pc == target.pc && held.block == target.block),
+                "block {block} left the index but kept its entry"
+            );
+        }
+    }
+    assert!(out > 0, "some blocks ended out of the index");
 }

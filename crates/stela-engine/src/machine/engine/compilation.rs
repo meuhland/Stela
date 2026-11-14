@@ -63,28 +63,58 @@ fn insert_target(
     target: chain::LookupEntry,
 ) -> bool {
     let block = &code.blocks[index];
-    if cache.index.get(
+    let indexed = cache.index.get(
         &code.blocks,
         pc,
         block.physical,
         block.variant,
         block.shared,
-    ) != Some(index)
-    {
-        cache.targets_raced += 1;
+    ) == Some(index);
+    put_target(code, &mut cache.targets.lock(), indexed, pc, slot, target)
+}
+
+/// Put `target` in slot `slot` of the block table, locked (`table`), if
+/// the caller found its block still the indexed one (`indexed`), and count
+/// it either way. Whether the table took it.
+fn put_target(
+    code: &board::Code,
+    table: &mut board::TargetsGuard<'_>,
+    indexed: bool,
+    pc: u64,
+    slot: usize,
+    target: chain::LookupEntry,
+) -> bool {
+    table.count_insert(indexed);
+    if !indexed {
         return false;
     }
     // An entry of the same PC and key that names another block (or other
     // BTYPEs) changes what a probe of them finds: a native jump cache
     // filled from the old one goes too.
-    let held = cache.targets.find(slot, pc, target.key);
+    let held = table.find(slot, pc, target.key);
     let replaced = held.pc == pc && held.key == target.key && held != target;
-    cache.targets.insert(slot, target);
-    cache.targets_inserted += 1;
+    table.insert(slot, target);
     if replaced {
         code.note_unpublished();
     }
     true
+}
+
+/// [`insert_target`] without the code lock: the block's entry goes in
+/// under the table's lock alone while no block left the index since
+/// `departures` ([`board::Code::departures`]), which the caller read
+/// before it found the block indexed without the lock. A departure since
+/// refuses it, as the index check under the code lock would have.
+pub(super) fn insert_target_unlocked(
+    code: &board::Code,
+    departures: u64,
+    pc: u64,
+    slot: usize,
+    target: chain::LookupEntry,
+) -> bool {
+    let mut table = code.targets.lock();
+    let indexed = code.departures() == departures;
+    put_target(code, &mut table, indexed, pc, slot, target)
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
@@ -446,6 +476,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.table_insert_throttled = throttled;
     }
 
+    /// Check a fetch's block table insert against the index under the
+    /// board's code lock, as before it took the table's own lock alone
+    /// (`--table-insert-locked`, [`board::Targets`]).
+    pub fn set_table_insert_locked(&mut self, locked: bool) {
+        self.table_insert_locked = locked;
+    }
+
     /// Record that a fetch at `pc` runs block `index` while the page of
     /// `pc` translates to the block's frame in the fetch state its key
     /// names ([`Self::block_key`]), for lookup dispatchers: every address
@@ -489,36 +526,45 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // retired since it was found would be reachable again, and links
         // out of it are cut by no detach ([`Self::detach`] visits the
         // indexed blocks of a target's page). The finder answers without
-        // the lock; the lock checks again before the insert.
+        // the lock; the lock checks again before the insert. Without the
+        // code lock (the default), the count of departures from the index
+        // read before the finder stands for that check: the table's lock
+        // takes the entry only while none came since ([`board::Targets`]).
         let code = &self.code;
         let shared = block.shared;
-        match code
+        let departures = code.departures();
+        let unlocked = match code
             .finder
             .find(&code.blocks, pc, physical, variant_id, shared)
         {
-            Some(Some(found)) if found == index => {}
+            Some(Some(found)) if found == index => !self.table_insert_locked,
             Some(_) => {
                 board::Events::count(&code.events.targets_unindexed);
                 return Remember::Unindexed;
             }
-            None => {}
-        }
+            // The finder cannot tell: the index decides, under the code lock.
+            None => false,
+        };
         // A first insert counts in the block's throttle too, so that the
         // entries it keeps putting back stay as bounded as before.
         if !code.blocks.record(index).remember() && !free {
             board::Events::count(&code.events.targets_deferred);
             return Remember::Throttled;
         }
-        // An entry is an optimization the next fetch of the block can add as
-        // well: with the lock held elsewhere this fetch does not wait for it
-        // and gives its attempt back ([`board::Record::unremember`]).
-        let Some(mut cache) = code.try_cache_at(board::LockSite::Target) else {
-            code.blocks.record(index).unremember();
-            self.statistics.target_skips += 1;
-            return Remember::Busy;
+        let inserted = if unlocked {
+            insert_target_unlocked(code, departures, pc, slot, target)
+        } else {
+            // An entry is an optimization the next fetch of the block can
+            // add as well: with the lock held elsewhere this fetch does not
+            // wait for it and gives its attempt back
+            // ([`board::Record::unremember`]).
+            let Some(mut cache) = code.try_cache_at(board::LockSite::Target) else {
+                code.blocks.record(index).unremember();
+                self.statistics.target_skips += 1;
+                return Remember::Busy;
+            };
+            insert_target(code, &mut cache, pc, index, slot, target)
         };
-        let inserted = insert_target(code, &mut cache, pc, index, slot, target);
-        drop(cache);
         if !inserted {
             return Remember::Raced;
         }

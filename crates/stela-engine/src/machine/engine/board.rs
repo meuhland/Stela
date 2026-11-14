@@ -37,12 +37,15 @@ use core::sync::atomic::{
 use stela_compiler::x86_64::chain::{self, LookupTable, TableReader};
 
 mod ring;
+mod targets;
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 pub(super) use ring::Why;
 pub(super) use ring::{AGE_TURNS, Advance, MIN_PARTS, Place, Ring, TENURED, YOUNG};
+pub use targets::TableLockCounts;
+pub(super) use targets::{Targets, TargetsGuard};
 
 /// One PE's word, on a cache line of its own: its PE writes it often.
 #[repr(align(64))]
@@ -167,6 +170,16 @@ pub(super) struct Code {
     pub(super) cache: Mutex<Cache>,
     /// The block table's entries, for reads without the lock.
     pub(super) table: TableReader,
+    /// The block table, behind a lock of its own ([`Targets`]), which a
+    /// fetch's insert takes without the code lock
+    /// ([`Self::departures`]).
+    pub(super) targets: Arc<Targets>,
+    /// Advances under the code lock each time blocks leave the block index
+    /// ([`Self::note_departures`]), after the index changed and before
+    /// their table entries are forgotten: an insert that checked the index
+    /// without the code lock puts its entry in only while this has not
+    /// moved since, under the table's lock.
+    pub(super) departures: Padded<AtomicU64>,
     /// The block index's blocks, for reads without the lock.
     pub(super) finder: Arc<Finder>,
     /// The code arena, when the engine allocates code itself.
@@ -360,7 +373,10 @@ impl Arena {
 /// block's fault recovery is its record's ([`Record::recovery`]).
 pub(super) struct Cache {
     pub(super) index: BlockIndex,
-    pub(super) targets: LookupTable,
+    /// The block table, behind a lock of its own ([`Targets`]): the same
+    /// as [`Code::targets`], here for the code lock holders that change
+    /// it, who take its lock inside this one.
+    pub(super) targets: Arc<Targets>,
     pub(super) code_slots: CodeSlots,
     /// The blocks of a page being detached, kept for its capacity.
     pub(super) page_blocks: Vec<usize>,
@@ -371,10 +387,6 @@ pub(super) struct Cache {
     pub(super) dispatchers: Vec<(u32, [Option<u64>; 4])>,
     /// How the lock was taken, counted by its holder.
     pub(super) lock: LockCounts,
-    /// Block table entries taken and refused under the lock
-    /// ([`TargetCounts`]).
-    pub(super) targets_inserted: u64,
-    pub(super) targets_raced: u64,
     /// Why blocks were installed on a shared board, with `--profile`:
     /// one census for the board, as its blocks are.
     pub(super) census: Option<Box<super::install_census::Census>>,
@@ -521,6 +533,8 @@ pub struct CodeReport {
     /// block) and those put off (the block's entry keeps being displaced).
     pub targets: TargetCounts,
     pub lock: LockCounts,
+    /// The block table's own lock ([`Targets`]).
+    pub table_lock: TableLockCounts,
     /// Installs of blocks the board held before, by why they went
     /// ([`super::ChurnCounts`]).
     pub churn: super::ChurnCounts,
@@ -664,7 +678,7 @@ pub(super) fn slot_capacity(code_bytes: Option<usize>) -> u32 {
 }
 
 impl Cache {
-    fn new(targets: LookupTable, finder: Arc<Finder>) -> Self {
+    fn new(targets: Arc<Targets>, finder: Arc<Finder>) -> Self {
         Self {
             index: BlockIndex::with_finder(finder),
             targets,
@@ -673,8 +687,6 @@ impl Cache {
             marked: Vec::new(),
             dispatchers: Vec::new(),
             lock: LockCounts::default(),
-            targets_inserted: 0,
-            targets_raced: 0,
             census: None,
             churn: super::ChurnCounts::default(),
         }
@@ -685,11 +697,15 @@ impl Code {
     /// Room for `slots` blocks and a block table of `entries`
     /// (`chain::lookup_entries`).
     pub(super) fn new(slots: u32, entries: usize, window: Option<CodeWindow>) -> Self {
-        let targets = LookupTable::with_entries(entries);
+        let table = LookupTable::with_entries(entries);
+        let reader = table.reader();
+        let targets = Arc::new(Targets::new(table));
         let finder = Arc::new(Finder::new(slots));
         Self {
             blocks: Blocks::new(slots),
-            table: targets.reader(),
+            table: reader,
+            targets: Arc::clone(&targets),
+            departures: Padded(AtomicU64::new(0)),
             finder: Arc::clone(&finder),
             cache: Mutex::new(Cache::new(targets, finder)),
             ghosts: super::churn::Churn::new(slots),
@@ -722,6 +738,19 @@ impl Code {
     /// The count [`Self::note_unpublished`] advances.
     pub(super) fn unpublished(&self) -> u64 {
         self.unpublished.load(Ordering::SeqCst)
+    }
+
+    /// Blocks left the block index: called under the code lock after the
+    /// index changed and before their table entries are forgotten, so
+    /// that an insert checked without the code lock refuses its entry
+    /// ([`Self::departures`], [`Targets`]).
+    pub(super) fn note_departures(&self) {
+        self.departures.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The count [`Self::note_departures`] advances.
+    pub(super) fn departures(&self) -> u64 {
+        self.departures.load(Ordering::SeqCst)
     }
 
     /// The board's code lock, counted ([`LockCounts`]) as [`LockSite::Other`].
@@ -809,17 +838,18 @@ impl Code {
 
     /// What the board's code came to; the lock's longest wait starts over.
     pub(super) fn report(&self) -> CodeReport {
-        let (lock, inserted, raced, churn) = {
+        let (lock, churn) = {
             let mut cache = self.cache_at(LockSite::Report);
             let lock = cache.lock;
-            let counts = (cache.targets_inserted, cache.targets_raced);
             let churn = cache.churn;
             cache.lock.longest = 0;
             for site in &mut cache.lock.sites {
                 site.longest_held = 0;
             }
-            (lock, counts.0, counts.1, churn)
+            (lock, churn)
         };
+        let table_lock = self.targets.take_counts();
+        let (inserted, raced) = (table_lock.inserted, table_lock.raced);
         let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CodeReport {
             window: self.arena.as_ref().map_or(0, |arena| arena.window.bytes),
@@ -847,6 +877,7 @@ impl Code {
                 deferred: count(&self.events.targets_deferred),
             },
             lock,
+            table_lock,
             churn,
             generations: self
                 .arena
@@ -875,9 +906,10 @@ impl Code {
             *arena = Arena::new(arena.window);
         }
         let mut cache = self.cache_at(LockSite::Discard);
+        cache.index.clear();
+        self.note_departures();
         cache.targets.release_cells(0..=u64::MAX);
         cache.targets.clear();
-        cache.index.clear();
         cache.code_slots = CodeSlots::default();
         cache.dispatchers.clear();
         drop(cache);
