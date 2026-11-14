@@ -74,6 +74,7 @@ pub mod sep;
 pub mod smc;
 pub mod spi;
 pub mod spmi;
+pub mod stela_net;
 pub mod typec;
 pub mod uart;
 pub mod wake;
