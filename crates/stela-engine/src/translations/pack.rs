@@ -11,8 +11,11 @@
 //! hold for it, merged. While the guest runs, the entries the boot added go
 //! to the file as a new segment ([`Delta`]); every few boots the segments
 //! and used-key lists are merged into one segment ([`Merge`]), the records
-//! no boot used for [`MAX_UNUSED_BOOTS`] boots in a row left out. Each is
-//! built a step at a time, so no step holds a processor for long.
+//! no boot used for [`MAX_UNUSED_BOOTS`] boots in a row left out. Only a
+//! boot that ran long and stopped in order counts toward that
+//! ([`ages_records`]); a short or crashed boot's list only refreshes what
+//! it used. Each is built a step at a time, so no step holds a processor
+//! for long.
 //!
 //! The store hands the engine the pack's records and keeps the stored form
 //! of each block the engine compiled anew, which its compiler made as it
@@ -49,8 +52,22 @@ const AGE_SHIFT: u32 = 56;
 pub const LENGTH_MASK: u64 = (1 << AGE_SHIFT) - 1;
 /// A record no boot looked up for more boots in a row than this leaves the
 /// next pack: the pack keeps what boots use, and what they stopped using
-/// costs no read time for long. Every boot reads the whole pack.
-pub const MAX_UNUSED_BOOTS: u8 = 3;
+/// costs no read time for long. Every boot reads the whole pack. Only boots
+/// that age records count ([`ages_records`]). Three let a few days without
+/// a build forget the compiler's translations (1.91 GB to 1.19 GB, x264 10%
+/// slower, 2026-11-13); a pack past its bound drops its oldest ages first
+/// ([`Merge`]), so a longer memory costs no more than the bound.
+pub const MAX_UNUSED_BOOTS: u8 = 8;
+/// The guest run time from which a boot that stopped in order ages the
+/// records it did not use: an idle check or a boot a crash cut short shows
+/// nothing of what its user runs.
+pub const AGING_SECONDS: u64 = 30 * 60;
+
+/// Whether a boot that ran its guest for `seconds` and stopped in order or
+/// not (a watchdog's reset, a panic) counts toward the records' ages.
+pub fn ages_records(orderly: bool, seconds: u64) -> bool {
+    orderly && seconds >= AGING_SECONDS
+}
 const CHECKSUM_BYTES: usize = DIGEST_BYTES;
 /// The most records a pack holds.
 pub const MAX_RECORDS: usize = 1 << 22;
@@ -80,6 +97,9 @@ const USED_MAGIC: [u8; 8] = *b"STLTUSED";
 const USED_HEADER_BYTES: usize = 8 + DIGEST_BYTES + 4 + 4;
 /// The list names no keys: its boot used more than [`MAX_USED_KEYS`].
 const USED_EVERY: u32 = 1;
+/// A list that refreshes the records it names but ages none: its boot was
+/// short or did not stop in order ([`ages_records`]).
+const USED_REFRESH: u32 = 2;
 /// The index bytes a merge step hashes at a time.
 const INDEX_HASH_BYTES: usize = 64 << 10;
 
@@ -901,6 +921,8 @@ impl journal::Source for Layout<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsedKeys {
     every: bool,
+    /// Its boot ages the records it did not use ([`ages_records`]).
+    ages: bool,
     prefixes: Vec<u64>,
 }
 
@@ -940,6 +962,17 @@ impl UsedKeys {
         bytes
     }
 
+    /// `list`, an encoded list, made one that refreshes the records it
+    /// names and ages none.
+    pub fn refresh_only(mut list: Vec<u8>) -> Vec<u8> {
+        let at = 8 + DIGEST_BYTES;
+        if let Some(word) = list.get_mut(at..at + 4) {
+            let flags = u32::from_le_bytes((&*word).try_into().expect("a word")) | USED_REFRESH;
+            word.copy_from_slice(&flags.to_le_bytes());
+        }
+        list
+    }
+
     /// The list `bytes` holds for `translator`: `None` for another's, a
     /// damaged one or one of unsorted keys.
     pub fn parse(bytes: &[u8], translator: &Digest) -> Option<Self> {
@@ -950,7 +983,7 @@ impl UsedKeys {
         }
         let flags = word(8 + DIGEST_BYTES);
         let count = word(12 + DIGEST_BYTES) as usize;
-        if flags & !USED_EVERY != 0
+        if flags & !(USED_EVERY | USED_REFRESH) != 0
             || count > MAX_USED_KEYS
             || bytes.len() != USED_HEADER_BYTES + count * 8
         {
@@ -967,6 +1000,7 @@ impl UsedKeys {
             .all(|pair| pair[0] < pair[1])
             .then_some(Self {
                 every: flags & USED_EVERY != 0,
+                ages: flags & USED_REFRESH == 0,
                 prefixes,
             })
     }
@@ -975,6 +1009,12 @@ impl UsedKeys {
     /// counts as used.
     pub fn every(&self) -> bool {
         self.every
+    }
+
+    /// Whether its boot counts toward the ages of the records it did not
+    /// use.
+    pub fn ages(&self) -> bool {
+        self.ages
     }
 
     /// Whether its boot used `key`.
@@ -1028,7 +1068,8 @@ impl Delta {
 /// one several hold decoded, merged and encoded again; then the records
 /// that fit are chosen and indexed. A record's age is the boots in a row
 /// since one used it: those of its segments, plus the boots of the used-key
-/// lists since the last that names it.
+/// lists since the last that names it, counting only lists whose boots age
+/// records ([`UsedKeys::ages`]). Past the bound, the oldest ages go first.
 pub struct Merge<'a> {
     translator: Digest,
     segments: Vec<Segment<'a>>,
@@ -1167,10 +1208,12 @@ impl<'a> Merge<'a> {
 
     /// The age of a record whose segments gave it `age`.
     fn age(&self, key: &Digest, age: u8) -> u8 {
-        let boots = self.used.len();
+        let aging = |lists: &[UsedKeys]| {
+            u8::try_from(lists.iter().filter(|list| list.ages()).count()).unwrap_or(u8::MAX)
+        };
         let age = match self.used.iter().rposition(|used| used.contains(key)) {
-            Some(last) => (boots - 1 - last) as u8,
-            None => age.saturating_add(boots as u8),
+            Some(last) => aging(&self.used[last + 1..]),
+            None => age.saturating_add(aging(&self.used)),
         };
         match &self.protect {
             Some(protect) if protect.contains(key) => 0,
@@ -2889,7 +2932,7 @@ mod tests {
                 assert_eq!(pack.age(&unused), None);
             }
         }
-        // Several boots' lists folded at once count each boot.
+        // Several boots' lists folded at once count each boot that ages.
         let mut store = Store::new(translator, None).0;
         store.offer(offer(0x1_0000_4008, used));
         store.offer(offer(0x1_0000_8008, unused));
@@ -2914,6 +2957,75 @@ mod tests {
         let pack = Pack::parse(&kept, &translator).unwrap();
         assert_eq!(pack.records(), 1);
         assert_eq!(pack.age(&used), Some(0));
+    }
+
+    #[test]
+    fn only_long_orderly_boots_age_records_and_the_oldest_leave_first() {
+        assert!(ages_records(true, AGING_SECONDS));
+        assert!(!ages_records(true, AGING_SECONDS - 1));
+        assert!(!ages_records(false, 24 * 3600));
+        let translator = translator_id();
+        let (used, unused) = (Digest::of(b"used page"), Digest::of(b"unused page"));
+        let mut keys = [used, unused];
+        keys.sort_unstable();
+        let piece = |key: Digest| Piece::New(Record::new(translator, key).encode());
+        let bytes = Layout::new(
+            &translator,
+            keys.iter().map(|&key| (key, piece(key))).collect(),
+        )
+        .to_vec();
+        let segments = vec![Segment::from(Pack::parse(&bytes, &translator).unwrap())];
+        let list = |keys: &[Digest], ages: bool| {
+            let bytes = UsedKeys::encode(&translator, keys.iter());
+            let bytes = if ages {
+                bytes
+            } else {
+                UsedKeys::refresh_only(bytes)
+            };
+            let list = UsedKeys::parse(&bytes, &translator).unwrap();
+            assert_eq!(list.ages(), ages);
+            list
+        };
+        let merged = |lists: Vec<UsedKeys>, bound: u64| {
+            let merged = Merge::new(translator, segments.clone(), lists, bound).finish();
+            let bytes = merged.layout.to_vec();
+            let pack = Pack::parse(&bytes, &translator).unwrap();
+            (pack.age(&used), pack.age(&unused))
+        };
+        // A long boot used one record; seven short or crashed boots used
+        // neither: they age nothing.
+        let mut lists = vec![list(&[used], true)];
+        lists.extend(core::iter::repeat_n(list(&[], false), 7));
+        assert_eq!(merged(lists, u64::MAX), (Some(0), Some(1)));
+        // A short boot still refreshes what it used.
+        let lists = vec![list(&[], true), list(&[], true), list(&[unused], false)];
+        assert_eq!(merged(lists, u64::MAX), (Some(2), Some(0)));
+        // Long boots age every record they did not use, which stays up to
+        // the cap and leaves past it.
+        let cap = usize::from(MAX_UNUSED_BOOTS);
+        assert_eq!(cap, 8);
+        let lists = vec![list(&[], true); cap];
+        assert_eq!(merged(lists, u64::MAX), (Some(8), Some(8)));
+        let lists = vec![list(&[], true); cap + 1];
+        let expired = Merge::new(translator, segments.clone(), lists, u64::MAX).finish();
+        assert_eq!((expired.layout.records(), expired.expired), (0, 2));
+        // Past the bound the oldest go first, whichever key sorts first.
+        let one = Layout::new(&translator, alloc::vec![(used, piece(used))])
+            .to_vec()
+            .len() as u64;
+        for (young, old) in [(used, unused), (unused, used)] {
+            let lists = vec![list(&[old], true), list(&[young], true)];
+            let merged = Merge::new(translator, segments.clone(), lists, one).finish();
+            assert_eq!((merged.layout.records(), merged.evicted), (1, 1));
+            let bytes = merged.layout.to_vec();
+            let pack = Pack::parse(&bytes, &translator).unwrap();
+            assert_eq!((pack.age(&young), pack.age(&old)), (Some(0), None));
+        }
+        // A list of an older build's flags still parses; an unknown flag
+        // does not.
+        let mut unknown = UsedKeys::encode(&translator, keys.iter());
+        unknown[8 + DIGEST_BYTES] |= 4;
+        assert!(UsedKeys::parse(&unknown, &translator).is_none());
     }
 
     /// The time a store's lookup of a page key takes over one segment and
