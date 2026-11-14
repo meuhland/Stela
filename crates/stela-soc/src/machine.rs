@@ -9,6 +9,7 @@ mod coprocessors;
 mod memory_control;
 mod power;
 mod processors;
+mod stela_net;
 pub mod t6000_pmgr;
 mod timekeeping;
 mod transfer_times;
@@ -223,6 +224,9 @@ pub struct AppleDevices {
     nor_touch: core::cell::Cell<bool>,
     /// StelaGPU's call gates (`gpu_gate`), a GPU's each.
     gpu_gates: Vec<DeviceId>,
+    /// The StelaNet adapter (`stela_net`), the guest's network in place of
+    /// the USB Ethernet adapter when the boot places it.
+    stela_net: Option<DeviceId>,
     storage_masters: Vec<(DeviceId, DeviceId)>,
     /// The GFX coprocessor's ASC and the `sgx` block whose UAT it masters
     /// memory through.
@@ -685,6 +689,7 @@ impl AppleDevices {
             nor_shared: None,
             nor_touch: Default::default(),
             gpu_gates: Vec::new(),
+            stela_net: None,
             sep_masters: Vec::new(),
             dcp_masters: Vec::new(),
             frame_presented: false,
@@ -1375,11 +1380,13 @@ impl Devices for AppleDevices {
     }
 
     fn take_host_service(&mut self) -> bool {
+        let net = self.stela_net_take_service_due();
         self.usb_masters
             .iter_mut()
             .fold(core::mem::take(&mut self.frame_presented), |due, master| {
                 master.session.take_due() | due
             })
+            | net
     }
 
     fn device_name(&self, physical: u64) -> Option<&'static str> {
@@ -1446,6 +1453,8 @@ impl Devices for AppleDevices {
             })
             .chain(self.native_pmp_dma_deadline())
             .chain(self.native_pmp_services_deadline())
+            // StelaNet frames to move, now.
+            .chain(self.stela_net_due().then_some(0))
             // A SEP passcode derivation runs one bounded slice per step,
             // so it finishes while every PE waits.
             .chain(
@@ -1525,7 +1534,12 @@ impl Devices for AppleDevices {
                 3 => self.transfer_gfx(cpu, memory, now),
                 4 => self.transfer_sep(cpu, memory, now),
                 5 => self.transfer_dcp(cpu, memory, now),
-                _ => self.transfer_usb(cpu, memory, now),
+                // StelaNet moves the guest network's frames beside USB.
+                _ => {
+                    let usb = self.transfer_usb(cpu, memory, now);
+                    self.transfer_stela_net(cpu, memory, now);
+                    usb
+                }
             };
             lap.end(&mut self.transfer_times, index + 1);
         }
