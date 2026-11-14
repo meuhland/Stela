@@ -36,6 +36,12 @@
 //! before that boot starts. If that repair fails, the next normal boot finds
 //! the plugin missing with no record and asks for the repair as above.
 //!
+//! A plugin file the kext can neither read nor rewrite (`EIO`: a boot
+//! stopped while the guest wrote it, run of 2026-11-12) takes the same
+//! repair, which first removes the plugin's files ([`remove_files`]): the
+//! next boot's kext creates them again, where a stop would leave the boot
+//! failing until someone removed them by hand in a single-user boot.
+//!
 //! The manual remedy's `xattr -w com.apple.rootless ...` is not a step: it
 //! failed with EPERM in every manual installation (runs 20261106-070021,
 //! 20261106-083218, 20261107-060417, and in this repair's first run), even
@@ -169,7 +175,8 @@ pub enum Decision {
     /// Stop with the manual remedy; `attempted` when the automatic repair
     /// already ran and did not help, or cannot run.
     StopMissing { attempted: bool },
-    /// The kext failed to write the plugin; its lines say why.
+    /// The kext failed to write the plugin, and the automatic repair
+    /// already ran or cannot run; its lines say why.
     StopFailed,
 }
 
@@ -181,17 +188,33 @@ pub fn decide(report: Report, boot: Boot, record: Record, persistent: bool) -> D
             Decision::Continue((record != Record::None).then_some(Change::Forget))
         }
         (Report::Missing | Report::Failed, Boot::SingleUser | Boot::Repair) => Decision::Log,
-        (Report::Failed, Boot::Normal) => Decision::StopFailed,
-        (Report::Missing, Boot::Normal) => match record {
+        (report, Boot::Normal) => match record {
+            // A damaged file is removed by the repair, which the kext then
+            // writes whole.
             Record::None | Record::Other if persistent => Decision::Repair,
             // A request this boot did not take means NVRAM was not read
             // for it; another request would loop.
+            Record::None | Record::Other | Record::Pending | Record::Installed
+                if report == Report::Failed =>
+            {
+                Decision::StopFailed
+            }
             Record::None | Record::Other | Record::Pending | Record::Installed => {
                 Decision::StopMissing { attempted: false }
             }
+            Record::Attempted if report == Report::Failed => Decision::StopFailed,
             Record::Attempted => Decision::StopMissing { attempted: true },
         },
     }
+}
+
+/// The step that removes the plugin's files, when its bundle exists, so the
+/// kext writes them again: one it can neither read nor rewrite stops every
+/// boot. Directories stay, with their owner and flags. Optional: a file
+/// that cannot be removed leaves the kext's report to say so.
+pub fn remove_files() -> String {
+    let bundle = format!("{PLUGINS}/{}", DIRECTORIES[0]);
+    format!("/bin/test ! -d {bundle} || /usr/bin/find {bundle} -type f -delete")
 }
 
 /// One console command and the seconds it may take.
@@ -228,6 +251,7 @@ pub fn steps() -> Vec<Step> {
         step("/usr/libexec/init_data_protection".into(), 180),
         step("/sbin/mount -P 2".into(), 180),
         step(format!("/bin/test -d {PLUGINS}"), 30),
+        optional(remove_files(), 60),
         // Each named last, so `-m` gives each its mode.
         step(format!("/bin/mkdir -p -m 0755 {directories}"), 30),
         step(format!("/usr/sbin/chown root:wheel {directories}"), 30),

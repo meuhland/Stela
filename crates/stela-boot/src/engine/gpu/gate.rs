@@ -442,6 +442,14 @@ fn bundle(report: BundleReport) {
                 "GPU StelaGPU.bundle is not installed ({report:?}); this single-user boot may install it\n"
             ));
         }
+        (Decision::Repair, BundleReport::Failed) => {
+            output::arguments(format_args!(
+                "GPU StelaGPU.bundle could not be read or written (its StelaGPU lines say \
+                 why); restarting once into a single-user boot that removes its files for \
+                 the kext to write again\n"
+            ));
+            super::super::service::request_restart();
+        }
         (Decision::Repair, _) => {
             output::arguments(format_args!(
                 "GPU StelaGPU.bundle is not installed and a kext cannot create its \
@@ -460,7 +468,10 @@ fn bundle(report: BundleReport) {
              recorded: boot macOS once with --single-user and install it there by hand",
         ),
         (Decision::StopFailed, _) => stop(
-            "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say why",
+            "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say \
+             why. The automatic single-user repair already ran or cannot be recorded: boot macOS \
+             once with --single-user and remove the files in \
+             /Library/GPUBundles/StelaGPU.bundle there",
         ),
     }
 

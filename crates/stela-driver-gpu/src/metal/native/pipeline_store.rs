@@ -198,6 +198,101 @@ fn push_entry(nir: &mut Vec<u8>, key: &[u8; 32], blob: &[u8]) {
     nir.extend_from_slice(blob);
 }
 
+/// A section of NIR entries ([`NirEntries`]) that is never gathered into
+/// one buffer: a stored section the boot already holds, then entries the
+/// store shares, read a piece at a time ([`Self::read_at`]) as a journal
+/// writes it. A boot that compiled many shaders added tens of MiB of NIR,
+/// and one buffer of it (and a copy for the write) ran a fragmented engine
+/// heap out of memory as the guest stopped.
+#[derive(Clone, Debug, Default)]
+pub struct NirPieces {
+    stored: &'static [u8],
+    entries: Vec<([u8; 32], Arc<[u8]>)>,
+    /// Where each entry starts in the section.
+    starts: Vec<u64>,
+    length: u64,
+}
+
+impl NirPieces {
+    fn new(stored: &'static [u8]) -> Self {
+        Self {
+            stored,
+            length: stored.len() as u64,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, key: [u8; 32], blob: Arc<[u8]>) {
+        self.starts.push(self.length);
+        self.length += 36 + blob.len() as u64;
+        self.entries.push((key, blob));
+    }
+
+    /// The section's bytes in all.
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// The entries added after the stored section, in order.
+    pub fn entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Fill `into` with the section's bytes from `offset`.
+    ///
+    /// # Panics
+    /// When `offset` and `into` reach past [`Self::len`].
+    pub fn read_at(&self, offset: u64, into: &mut [u8]) {
+        let end = offset
+            .checked_add(into.len() as u64)
+            .filter(|&end| end <= self.length);
+        assert!(end.is_some(), "a read past the NIR section");
+        let mut offset = offset;
+        let mut into = into;
+        let stored = self.stored.len() as u64;
+        if offset < stored {
+            let count = into.len().min((stored - offset) as usize);
+            let at = offset as usize;
+            into[..count].copy_from_slice(&self.stored[at..at + count]);
+            offset += count as u64;
+            into = &mut core::mem::take(&mut into)[count..];
+        }
+        while !into.is_empty() {
+            // The entry holding `offset`: the last to start at or before it.
+            let index = self.starts.partition_point(|&start| start <= offset) - 1;
+            let (key, blob) = &self.entries[index];
+            let mut head = [0; 36];
+            head[..32].copy_from_slice(key);
+            head[32..].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+            let mut within = (offset - self.starts[index]) as usize;
+            for part in [&head[..], &blob[..]] {
+                if within >= part.len() {
+                    within -= part.len();
+                    continue;
+                }
+                let count = into.len().min(part.len() - within);
+                into[..count].copy_from_slice(&part[within..within + count]);
+                offset += count as u64;
+                into = &mut core::mem::take(&mut into)[count..];
+                within = 0;
+            }
+        }
+    }
+
+    /// The whole section in one buffer, for a small one.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut bytes = self.stored.to_vec();
+        for (key, blob) in &self.entries {
+            push_entry(&mut bytes, key, blob);
+        }
+        bytes
+    }
+}
+
 /// The payload of `stored`, a store's file or its first bytes, when it holds
 /// `key`'s pipelines within `bound` bytes.
 pub fn payload<'a>(stored: &'a [u8], key: &Key, bound: u64) -> Result<&'a [u8], Rejection> {
@@ -321,8 +416,9 @@ pub struct Store {
     /// The keys of the matched NIR, verified once at the claim, so that
     /// adding NIR does not hash the stored file again.
     stored_keys: alloc::collections::BTreeSet<[u8; 32]>,
-    /// NIR compiled this boot, by key, and its bytes.
-    nir: alloc::collections::BTreeMap<[u8; 32], Vec<u8>>,
+    /// NIR compiled this boot, by key, and its bytes, shared with the
+    /// updates that write it.
+    nir: alloc::collections::BTreeMap<[u8; 32], Arc<[u8]>>,
     nir_bytes: u64,
 }
 
@@ -365,14 +461,14 @@ impl Store {
         {
             return;
         }
-        if self.nir.insert(key, blob.to_vec()).is_none() {
+        if self.nir.insert(key, Arc::from(blob)).is_none() {
             self.nir_bytes += bytes;
         }
     }
 
     /// The serialized NIR of `key` that [`Self::add_nir`] kept this boot.
     pub fn recall_nir(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
-        self.nir.get(key).cloned()
+        self.nir.get(key).map(|blob| blob.to_vec())
     }
 
     /// The store for a backend of `gpu`. A newer backend of the same key
@@ -443,11 +539,11 @@ impl Store {
             }
             _ => None,
         };
-        let mut nir = Vec::new();
+        let mut nir = NirPieces::default();
         let mut nir_keys = Vec::new();
         for (entry, blob) in &self.nir {
             if !self.written_nir.contains(entry) {
-                push_entry(&mut nir, entry, blob);
+                nir.push(*entry, blob.clone());
                 nir_keys.push(*entry);
             }
         }
@@ -469,15 +565,16 @@ impl Store {
     }
 
     /// Every NIR entry the store holds for `key`, stored and added, as one
-    /// section: what a store rewritten whole keeps.
-    pub fn all_nir(&self, key: &Key) -> Vec<u8> {
+    /// section: what a store rewritten whole keeps. The stored entries stay
+    /// in the boot's copy of the file and the added ones in the store.
+    pub fn all_nir(&self, key: &Key) -> NirPieces {
         let stored = match self.matched {
             Some(matched) if matched == *key => nir_section(self.stored, key, self.bound),
             _ => &[],
         };
-        let mut nir = stored.to_vec();
+        let mut nir = NirPieces::new(stored);
         for (entry, blob) in &self.nir {
-            push_entry(&mut nir, entry, blob);
+            nir.push(*entry, blob.clone());
         }
         nir
     }
@@ -490,7 +587,7 @@ pub struct Update {
     /// The newest cache snapshot, which replaces the written one.
     pub cache: Option<Arc<Vec<u8>>>,
     /// NIR entries ([`NirEntries`]) added to the written ones.
-    pub nir: Vec<u8>,
+    pub nir: NirPieces,
     cache_version: u64,
     nir_keys: Vec<[u8; 32]>,
 }
@@ -623,7 +720,7 @@ pub fn written(update: &Update) {
 }
 
 /// Every NIR entry the boot's store holds for `key` ([`Store::all_nir`]).
-pub fn all_nir(key: &Key) -> Vec<u8> {
+pub fn all_nir(key: &Key) -> NirPieces {
     with_store(|slot| {
         slot.as_ref()
             .map(|store| store.all_nir(key))
