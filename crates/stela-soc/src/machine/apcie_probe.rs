@@ -3,15 +3,19 @@
 
 use super::*;
 use crate::Result;
-use crate::apcie::{ApcieProbe, WINDOW_SHIFT, Window};
+use crate::apcie::{ApcieProbe, Window};
 use core::fmt::Write as _;
 use stela_soc_data::board::apcie_probe::Apcie;
 
 impl AppleDevices {
     /// Back every `reg` window of root complex `apcie` with one logging
-    /// stub, and own its power resource (its first window's PA). A window
-    /// that is untranslated, or that another model already owns (the PMGR
-    /// eFuses, `reg[5]`, are the always-on fuse block's), stays as it is.
+    /// stub, and own its power resource (its first window's PA). Windows
+    /// overlap (J473AP's PHY window holds the PHY IP and the ports' PHY
+    /// glue), so each run of overlapping windows is placed whole at device
+    /// offsets equal to its guest PAs, and the stub names an access by the
+    /// smallest window holding it. A run another model already owns (the
+    /// PMGR eFuses, `reg[5]`, are the always-on fuse block's) falls back to
+    /// its free windows one by one; an untranslated window stays as it is.
     /// Returns the `APCIE PROBE` description of what the guest is shown.
     pub fn add_apcie_probe(&mut self, apcie: &Apcie) -> Result<String> {
         let mut ports: Vec<u8> = apcie
@@ -25,38 +29,72 @@ impl AppleDevices {
             let groups = apcie.windows.len().saturating_sub(6) / 5;
             ports.extend((0..groups.min(32)).map(|index| index as u8));
         }
+        let mut skipped = String::new();
+        let mut windows = Vec::new();
+        for window in &apcie.windows {
+            let name = Window::of(window.index);
+            match window.physical {
+                Some(physical)
+                    if window.bytes != 0 && physical.checked_add(window.bytes).is_some() =>
+                {
+                    windows.push((window.index, physical, window.bytes));
+                }
+                _ => {
+                    let _ = write!(skipped, " {name}(untranslated)");
+                }
+            }
+        }
         let device = self.bus.add(Box::new(ApcieProbe::new(
             &apcie.name,
             apcie.first_bus,
             &ports,
+            &windows,
         )));
-        let mut ranges = String::new();
-        let mut skipped = String::new();
-        for window in &apcie.windows {
-            let name = Window::of(window.index);
-            let Some(physical) = window.physical else {
-                let _ = write!(skipped, " {name}(untranslated)");
-                continue;
-            };
-            if window.bytes == 0 || window.bytes >= 1 << WINDOW_SHIFT {
-                let _ = write!(skipped, " {name}(size {:#x})", window.bytes);
-                continue;
+        // Runs of overlapping windows, by start.
+        let mut sorted = windows.clone();
+        sorted.sort_by_key(|&(_, physical, _)| physical);
+        let mut runs: Vec<(u64, u64, Vec<(usize, u64, u64)>)> = Vec::new();
+        for window in sorted {
+            let (_, physical, bytes) = window;
+            match runs.last_mut() {
+                Some((_, end, members)) if physical < *end => {
+                    *end = (*end).max(physical + bytes);
+                    members.push(window);
+                }
+                _ => runs.push((physical, physical + bytes, vec![window])),
             }
-            let offset = (window.index as u64) << WINDOW_SHIFT;
-            match self
-                .bus
-                .check_free(physical, window.bytes)
-                .and_then(|()| self.bus.map(device, physical, window.bytes, offset))
-            {
+        }
+        let mut ranges = String::new();
+        let mut place = |start: u64, bytes: u64| {
+            self.bus
+                .check_free(start, bytes)
+                .and_then(|()| self.bus.map(device, start, bytes, start))
+        };
+        for (start, end, members) in runs {
+            let names = members
+                .iter()
+                .map(|&(index, ..)| format!("{}", Window::of(index)))
+                .collect::<Vec<_>>()
+                .join("/");
+            match place(start, end - start) {
                 Ok(()) => {
-                    let _ = write!(ranges, " {name}={physical:#x}+{:#x}", window.bytes);
+                    let _ = write!(ranges, " {names}={start:#x}+{:#x}", end - start);
                 }
                 Err(error) => {
-                    let _ = write!(
-                        skipped,
-                        " {name}={physical:#x}+{:#x}({error:?})",
-                        window.bytes
-                    );
+                    for (index, physical, bytes) in members {
+                        let name = Window::of(index);
+                        match place(physical, bytes) {
+                            Ok(()) => {
+                                let _ = write!(ranges, " {name}={physical:#x}+{bytes:#x}");
+                            }
+                            Err(own) => {
+                                let _ = write!(
+                                    skipped,
+                                    " {name}={physical:#x}+{bytes:#x}({own:?}; run {error:?})"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -147,5 +185,29 @@ mod tests {
         assert_eq!(devices.read(0, port0 + 0x804, 4, 0), Ok(1));
         // The fuse block keeps its own model.
         assert!(devices.read(0, FUSES + 0x4c4, 4, 0).is_ok());
+    }
+
+    #[test]
+    fn overlapping_windows_are_placed_as_one_run() {
+        let mut devices = AppleDevices::new();
+        let phy = 0x6_8008_4000;
+        let apcie = Apcie {
+            name: "apcie".into(),
+            windows: vec![
+                window(2, Some(phy), 0x6_0000),
+                window(3, Some(phy + 0x4_0000), 0x1_0000),
+                window(8, Some(phy + 0x4000), 0x4000),
+            ],
+            interrupts: vec![],
+            ports: vec![],
+            first_bus: 0,
+        };
+        let line = devices.add_apcie_probe(&apcie).unwrap();
+        assert!(
+            line.contains("phy/phy-glue0/phy-ip=0x680084000+0x60000"),
+            "{line}"
+        );
+        devices.write(0, phy + 0x4000, 4, 1, 0).unwrap();
+        assert_eq!(devices.read(0, phy + 0x4000, 4, 0), Ok(5));
     }
 }
