@@ -16,6 +16,16 @@ use stela_contracts::gate::{CallerFault, CallerMemory};
 /// largest; variable data travels in spans the operation names.
 const MAX_RECORD_BYTES: u64 = size_of::<Block>() as u64;
 
+/// A span at least this long that finds no room asks the caller to let go
+/// of what it holds only to save work ([`CallerMemory::reclaim`]) before it
+/// fails: the heap's free bytes, in holes between live blocks, may hold no
+/// extent this long, and its callers (a library's parse, say) need it whole.
+pub(super) const RECLAIMING_SPAN_BYTES: usize = 1 << 20;
+
+/// How many times a span asks the caller to let go, while each lets go of
+/// something.
+const RECLAIM_ROUNDS: usize = 3;
+
 /// The calling thread's memory, as the service reads and writes spans.
 struct Caller<'a>(&'a mut dyn CallerMemory);
 
@@ -23,8 +33,12 @@ impl GuestMemory for Caller<'_> {
     fn read(&mut self, span: Span) -> Result<Vec<u8>, Fault> {
         let length = usize::try_from(span.length)
             .map_err(|_| Fault::malformed("span length").value(span.length))?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length).map_err(|_| {
+        let mut bytes = room_for(
+            length,
+            |bytes| self.0.reclaim(bytes),
+            |vec, length| vec.try_reserve_exact(length).is_ok(),
+        )
+        .ok_or_else(|| {
             Fault::new(Status::OutOfMemory, "out of memory for a span of bytes").value(span.length)
         })?;
         bytes.resize(length, 0);
@@ -38,6 +52,33 @@ impl GuestMemory for Caller<'_> {
         }
         self.0.write(span.address, bytes).map_err(fault)
     }
+}
+
+/// An empty vector with room for `length` bytes, as `reserve` makes it,
+/// or `None`. A span of [`RECLAIMING_SPAN_BYTES`] or more `reserve` finds no
+/// room for asks `reclaim` to let go of memory and tries again, up to
+/// [`RECLAIM_ROUNDS`] times while it lets go of some.
+pub(super) fn room_for(
+    length: usize,
+    mut reclaim: impl FnMut(usize) -> usize,
+    mut reserve: impl FnMut(&mut Vec<u8>, usize) -> bool,
+) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if reserve(&mut bytes, length) {
+        return Some(bytes);
+    }
+    if length < RECLAIMING_SPAN_BYTES {
+        return None;
+    }
+    for _ in 0..RECLAIM_ROUNDS {
+        if reclaim(length) == 0 {
+            return None;
+        }
+        if reserve(&mut bytes, length) {
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 fn fault(error: CallerFault) -> Fault {
