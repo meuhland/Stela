@@ -59,7 +59,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .and_then(|address| self.code_owner(address))
             .map(|slot| self.board_slot(slot));
         let failure = Arc::new(NativeFailure {
-            pc: block.map_or(self.cpu.pc, |block| block.pc),
+            pc: block.map_or(self.cpu.pc, |block| block.start_at(self.ran_page)),
             code: block.map(|block| block.code),
             native_offset: fault.offset,
             address: fault.address,
@@ -158,7 +158,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some(block) = self.code.blocks.get(index) else {
             return Err(self.fail_native(index, fault, NativeFailureReason::UnknownCode));
         };
-        let (entry_pc, physical, source_bytes) = (block.pc, block.physical, block.source_bytes());
+        let (entry_pc, physical, source_bytes) = (
+            block.start_at(self.ran_page),
+            block.physical,
+            block.source_bytes(),
+        );
+        // The rows are the block's as installed, at its own PC: a shared
+        // block's settle at that PC, which moves to the page it ran at.
+        let installed_pc = block.pc;
         // The rows are the block's, under its record's lock: no board lock.
         // Borrowed from the board without a clone of its `Arc`, whose count
         // every PE's would write at each fault.
@@ -180,7 +187,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let mut owner = recovery.get_mut(&index);
             match owner.as_deref_mut() {
                 Some(owner) => owner
-                    .qualify(entry_pc, record.as_deref())
+                    .qualify(installed_pc, record.as_deref())
                     .map(|rows| rows.rows_at_reusing(fault.offset, &mut self.recovery_scratch)),
                 None => Err(NativeFailureReason::UnknownCode),
             }
@@ -254,7 +261,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return Err(self.fail_native(index, fault, NativeFailureReason::Recovery(error)));
             }
         };
-        let pc = settlement.position.pc.0;
+        let pc = settlement
+            .position
+            .pc
+            .0
+            .wrapping_sub(installed_pc)
+            .wrapping_add(entry_pc);
         let count = u64::from(settlement.position.retired_instructions);
         if settlement.phase != RetirementPhase::Before
             || settlement.site.kind() != site
@@ -287,7 +299,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // the whole DC ZVA block (Arm `AArch64_DataMemZero`), or adopting the
         // monitor the frame holds, whatever stopped the access.
         let (terminal, word) = (
-            self.code.blocks[index].terminal_pc(),
+            self.code.blocks[index].terminal_at(pc),
             self.code.blocks[index].terminal,
         );
         if pc == terminal && completes_natively(pc, word, self.block_variant(index).system) {
@@ -385,7 +397,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             requirement.address = Some(address);
             return Err(Stop::Unsupported(requirement));
         }
-        let page = block.physical.wrapping_add(pc.wrapping_sub(block.pc)) & !(FETCH_PAGE - 1);
+        let page = block
+            .physical
+            .wrapping_add(pc.wrapping_sub(block.start_at(pc)))
+            & !(FETCH_PAGE - 1);
         self.translated_pages.insert(page);
         self.first_translated.get_or_insert((pc, address));
         self.statistics.translated_pages += 1;

@@ -91,6 +91,33 @@ fn frame_number(physical: u64) -> u64 {
     chain::key_frame(chain::block_key(physical, 1))
 }
 
+/// A block's PC as retirement and detach list it: bit 0 (no PC has it) set
+/// for a shared block ([`Block::shared`]), which links into it reach from
+/// every guest page of its frame, at its offset.
+fn listed_pc(block: &Block) -> u64 {
+    block.pc | u64::from(block.shared)
+}
+
+/// The page offsets of the shared blocks among `pcs` ([`listed_pc`]),
+/// sorted: a chained exit to any of them may be linked to one.
+fn shared_offsets(pcs: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut offsets: Vec<u64> = pcs
+        .into_iter()
+        .filter(|pc| pc & 1 != 0)
+        .map(|pc| pc & (FETCH_PAGE - 1) & !1)
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+/// Whether a chained exit to `target` may be linked to a block of `pcs`
+/// (sorted, [`listed_pc`]) or of the shared blocks' `offsets`.
+fn links_to(pcs: &[u64], offsets: &[u64], target: u64) -> bool {
+    pcs.binary_search(&target).is_ok()
+        || (!offsets.is_empty() && offsets.binary_search(&(target & (FETCH_PAGE - 1))).is_ok())
+}
+
 impl<H: Host, D: Devices> Machine<H, D> {
     /// Check the next [`STALE_CHECKS`] reachable compiled blocks against
     /// the guest bytes they were compiled from, a sweep that goes on where
@@ -1245,12 +1272,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Only blocks still in the index leave a ghost: one an IC IVAU
         // forgot has its own, and a lost install's key is the winner's.
         for &slot in &slots {
-            let block = &blocks[slot as usize];
-            if cache
-                .index
-                .get(blocks, block.pc, block.physical, block.variant)
-                == Some(slot as usize)
-            {
+            if cache.index.contains(blocks, slot as usize) {
                 self.note_gone(cache, slot as usize, cause);
             }
         }
@@ -1280,9 +1302,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
         unmark(&mut cache.marked, marked, &slots);
         let mut visits = (slots.len() + listed / 16) as u64;
         let mut unlinks = Vec::new();
+        // A shared block has entries at every PC of its offset that fetched
+        // it: they go by the frame's sets, in one walk.
+        let mut shared: Vec<u32> = slots
+            .iter()
+            .copied()
+            .filter(|&slot| blocks[slot as usize].shared)
+            .collect();
+        if !shared.is_empty() {
+            shared.sort_unstable();
+            let number = frame_number(frame);
+            cache.targets.forget_frames(number..=number, |entry| {
+                shared.binary_search(&entry.block).is_ok()
+            });
+            visits += 1;
+        }
         for &slot in &slots {
             let block = &blocks[slot as usize];
-            pcs.push(block.pc);
+            pcs.push(listed_pc(block));
             for key in block_keys(block) {
                 visits += cache.targets.forget_block(block.pc, key, slot) as u64;
             }
@@ -1331,9 +1368,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let blocks = &code.blocks;
         // A chained link stays in its guest page ([`board::Record::chained`]):
-        // only the runs of the retired PCs' pages can hold one into them.
-        let tags = super::block_index::page_tags(pcs.iter().copied());
-        let (sources, listed) = cache.index.page_tags_part(frame, &tags, from, most);
+        // only the runs of the retired PCs' pages can hold one into them,
+        // but for a shared block's, which every page's run may hold, to its
+        // offset.
+        let offsets = shared_offsets(pcs.iter().copied());
+        let (sources, listed) = if offsets.is_empty() {
+            let tags = super::block_index::page_tags(pcs.iter().copied());
+            cache.index.page_tags_part(frame, &tags, from, most)
+        } else {
+            let (sources, listed) = cache.index.page_part(frame, from, most);
+            (sources.collect(), listed)
+        };
         let mut visited = 0;
         let mut relevant = 0u64;
         let mut unlinks = Vec::new();
@@ -1345,7 +1390,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             relevant += u64::from(pages.binary_search(&(blocks[source].pc >> 12)).is_ok());
             let record = blocks.record(source);
             for (position, exit) in blocks[source].successors.iter().enumerate() {
-                if record.chained(position) && pcs.binary_search(&exit.target.0).is_ok() {
+                if record.chained(position) && links_to(pcs, &offsets, exit.target.0) {
                     record.set_linked(position, false, false);
                     // Linked, so its point is patchable and in reach.
                     unlinks.push(
@@ -1534,7 +1579,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .iter()
             .map(|&slot| {
                 let block = &blocks[slot as usize];
-                (block.physical & !(FETCH_PAGE - 1), block.pc)
+                (block.physical & !(FETCH_PAGE - 1), listed_pc(block))
             })
             .collect();
         gone.sort_unstable();
@@ -1543,14 +1588,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let mut unlinks = Vec::new();
         let (mut visited, mut relevant) = (0u64, 0u64);
         for page in gone.chunk_by(|a, b| a.0 == b.0) {
-            // Links stay in their guest page: only its runs can hold one.
-            let tags = super::block_index::page_tags(page.iter().map(|&(_, pc)| pc));
-            sources.extend(
-                cache
-                    .index
-                    .page_tags_part(page[0].0, &tags, 0, usize::MAX)
-                    .0,
-            );
+            // Links stay in their guest page: only its runs can hold one,
+            // but for a shared block's, which every page's run may hold.
+            let offsets = shared_offsets(page.iter().map(|&(_, pc)| pc));
+            let pcs: Vec<u64> = page.iter().map(|&(_, pc)| pc).collect();
+            if offsets.is_empty() {
+                let tags = super::block_index::page_tags(pcs.iter().copied());
+                sources.extend(
+                    cache
+                        .index
+                        .page_tags_part(page[0].0, &tags, 0, usize::MAX)
+                        .0,
+                );
+            } else {
+                sources.extend(cache.index.page_part(page[0].0, 0, usize::MAX).0);
+            }
             let mut guest: Vec<u64> = page.iter().map(|&(_, pc)| pc >> 12).collect();
             guest.sort_unstable();
             guest.dedup();
@@ -1562,9 +1614,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 relevant += u64::from(guest.binary_search(&(blocks[source].pc >> 12)).is_ok());
                 let record = blocks.record(source);
                 for (position, exit) in blocks[source].successors.iter().enumerate() {
-                    if record.chained(position)
-                        && page.binary_search(&(page[0].0, exit.target.0)).is_ok()
-                    {
+                    if record.chained(position) && links_to(&pcs, &offsets, exit.target.0) {
                         record.set_linked(position, false, false);
                         // Linked, so its point is patchable and in reach.
                         let unlink = chain::unlinked(exit.site, exit.slot.into())
@@ -1590,7 +1640,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     detached(entry.block as usize)
                 });
         }
-        // A jump cache entry sits in its PC's slot alone.
+        // A jump cache entry sits in its PC's slot alone; a shared block's
+        // at other PCs is refused by its slot's incarnation once retired.
         for &(_, pc) in &gone {
             let entry = &mut self.jump[(pc / INSTRUCTION) as usize % JUMP_CACHE];
             if entry.as_ref().is_some_and(|entry| detached(entry.block)) {

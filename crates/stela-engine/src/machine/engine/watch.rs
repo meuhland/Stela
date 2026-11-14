@@ -344,7 +344,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     "{detail} ({:?} at native offset {:#x} of the block at {:#x}, address {:#x})",
                     fault.cause,
                     fault.offset,
-                    self.code.blocks[index].pc,
+                    self.code.blocks[index].start_at(pc),
                     fault.address,
                 ),
             })
@@ -386,7 +386,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     // with its tag cleared.
                     mmu::Outcome::Mapped(_) => {
                         let block = &self.code.blocks[index];
-                        let physical = block.physical.wrapping_add(pc.wrapping_sub(block.pc));
+                        let physical = block
+                            .physical
+                            .wrapping_add(pc.wrapping_sub(block.start_at(pc)));
                         let plain = self.block_variant(index).checks.top_byte
                             == stela_compiler::x86_64::TopByte::Kept;
                         // The retry's accesses are untagged: their
@@ -443,7 +445,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     }
                     mmu::Outcome::Mapped(_) => {
                         let block = &self.code.blocks[index];
-                        let physical = block.physical.wrapping_add(pc.wrapping_sub(block.pc));
+                        let physical = block
+                            .physical
+                            .wrapping_add(pc.wrapping_sub(block.start_at(pc)));
                         self.learn_two_sided_page(physical, true);
                         self.timed_check(step_timing::Check::Translated);
                         Ok(())
@@ -465,7 +469,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     fault.cause,
                     fault.trap,
                     fault.offset,
-                    machine.code.blocks[index].pc,
+                    machine.code.blocks[index].start_at(pc),
                     fault.address,
                 ),
             });
@@ -512,7 +516,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let el = self.cpu.pstate.el;
         let result = match self.fetch_block(pc, true) {
-            Ok(super::Fetched::Block(index)) => self.execute(index, 0),
+            Ok(super::Fetched::Block(index)) => self.execute(index, pc, 0),
             Ok(super::Fetched::Exception(exception)) => {
                 self.take(exception);
                 Ok(())
@@ -628,7 +632,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.watch.pass = [pages.first().copied(), pages.get(1).copied()];
         self.sync_regime();
         let result = match self.fetch_block(pc, true) {
-            Ok(super::Fetched::Block(index)) => self.execute(index, 0),
+            Ok(super::Fetched::Block(index)) => self.execute(index, pc, 0),
             Ok(super::Fetched::Exception(exception)) => {
                 self.take(exception);
                 Ok(())

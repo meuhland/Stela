@@ -183,6 +183,20 @@ impl<'a> Template<'a> {
             Self::Stored { entry, .. } => usize::from(entry.source_bytes),
         }
     }
+    /// Whether its code holds no guest address that moves with its page:
+    /// it records relocations, and none (page-relative code, whose fields
+    /// hold page offsets), so it runs at any page that maps its frame.
+    pub(super) fn page_independent(&self) -> bool {
+        match self {
+            Self::Compiled(emission) => emission
+                .block
+                .native
+                .relocations
+                .as_ref()
+                .is_some_and(|fields| fields.is_empty()),
+            Self::Stored { entry, .. } => entry.relocations.is_empty(),
+        }
+    }
     /// The native template's direct exits to static successors.
     pub(super) fn direct_exits(&self) -> &[DirectExit] {
         match self {

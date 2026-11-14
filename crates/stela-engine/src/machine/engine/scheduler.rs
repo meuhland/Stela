@@ -233,7 +233,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return Ok(());
             }
         }
-        let step = self.execute(index, if single { 0 } else { self.chain_budget() });
+        let step = self.execute(index, pc, if single { 0 } else { self.chain_budget() });
         if self.native_failure.is_some() {
             return step;
         }
@@ -289,9 +289,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         anchors
     }
 
-    /// Run compiled block `index` and the blocks it chains into, up to
-    /// `budget` of them, and complete the last one's exit or fault.
-    pub(super) fn execute(&mut self, index: usize, budget: u64) -> Step {
+    /// Run compiled block `index`, fetched at `pc`, and the blocks it
+    /// chains into, up to `budget` of them, and complete the last one's
+    /// exit or fault.
+    pub(super) fn execute(&mut self, index: usize, pc: u64, budget: u64) -> Step {
         let (budget, sampled) = self.sampled_budget(budget);
         let entry = self.code.blocks[index].code;
         self.finish_transition(budget);
@@ -313,8 +314,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.cpu.state.lower_limit = self.lower_limit();
         // A page-relative block's addresses add the page it runs at
         // (`NativeSystem::page_relative`); a native transfer into another
-        // page's block sets it again.
-        self.cpu.state.page_base = page_base(self.code.blocks[index].pc);
+        // page's block sets it again. A shared block runs at the page of
+        // the PC it was fetched at.
+        let block = &self.code.blocks[index];
+        debug_assert!(
+            block.serves(pc, true),
+            "block {index} at {:#x} entered for {pc:#x}",
+            block.pc
+        );
+        self.cpu.state.page_base = page_base(block.start_at(pc));
         let entered = self.timing_start();
         self.set_doing(0);
         // SAFETY: installed by this machine since the last discard, for the system-mode block ABI;
@@ -345,6 +353,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.adopt_native_state();
         }
         let returned = self.timing_charge(step_timing::Phase::Native, entered);
+        // The page the run ended in: every transfer into another page's
+        // block set it, so a shared last block ran at its offset there.
+        self.ran_page = self.cpu.state.page_base.0;
+        // Kept for the exit's link: completing the exit may run another
+        // block (a device site's, a watched access's).
+        let ran_page = self.ran_page;
         self.leave_amx_cell();
         self.cpu.pstate.daif = self.cpu.state.daif as u8;
         self.cpu.pstate.sp = self.mirrors.selected != 0;
@@ -366,6 +380,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
             budget - remaining
         };
         let last = (block & u64::from(u32::MAX)) as usize;
+        // On exit, the page base and the last block's offset are the PC
+        // the block ran at: its own for one that is not shared.
+        #[cfg(debug_assertions)]
+        if self.page_relative
+            && let NativeExit::Exit { .. } = exit
+            && let Some(ran) = self.code.blocks.get(last)
+        {
+            debug_assert!(
+                ran.shared || ran.pc & !(FETCH_PAGE - 1) == self.ran_page,
+                "block {last} at {:#x} ended a run in page {:#x}",
+                ran.pc,
+                self.ran_page
+            );
+        }
         // A block another PE retired since this run entered it is still
         // in its slot: the slot is given again only after this PE's grace.
         if let NativeExit::Fault(fault) = exit
@@ -380,17 +408,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
             && let Some(block) = self.code.blocks.get(last)
         {
             let level = step_timing::Level::of(self.cpu.pstate.el, self.cpu.pstate.guarded);
+            let ran = block.start_at(self.ran_page);
             // Kernel and guarded PCs as offsets from this PE's vector base
             // at its EL, which moves with the kernel's slide.
             let pc = if level == step_timing::Level::User {
-                block.pc
+                ran
             } else {
                 let vbar = if self.cpu.pstate.el == 2 {
                     SystemRegister::VBAR_EL2
                 } else {
                     SystemRegister::VBAR_EL1
                 };
-                block.pc.wrapping_sub(self.cpu.read(vbar) & !0x7ff)
+                ran.wrapping_sub(self.cpu.read(vbar) & !0x7ff)
             };
             self.hot_samples.push((pc, level));
             // Its RET, BLR or BR form's transfer, at most as many as the
@@ -412,7 +441,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 };
                 self.dynamic_samples.push(step_timing::DynamicSample {
                     form,
-                    site: block.pc,
+                    site: ran,
                     target: next_pc,
                 });
             }
@@ -482,7 +511,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         Ok(kind @ (ExitKind::Fallthrough | ExitKind::Direct | ExitKind::Call))
                             if btype == 0 =>
                         {
-                            self.link(last, next_pc, ExitWord { kind, skipped });
+                            self.link_from(last, ran_page, next_pc, ExitWord { kind, skipped });
                         }
                         Ok(ExitKind::Return | ExitKind::Indirect | ExitKind::Call) => {
                             self.link_dynamic(last, btype, next_pc);
@@ -578,16 +607,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let kind = ExitKind::try_from(kind).ok()?;
         let dynamic = dynamic_branch(block.terminal)
             .or_else(|| transitions::transition_branch(block.terminal));
+        let ran = block.start_at(self.ran_page);
         let unlinked = if dynamic.is_some() && kind != ExitKind::Direct {
             block.dynamic_site.is_some() && record.dynamic_open()
-        } else if (next_pc ^ block.pc) & !(FETCH_PAGE - 1) != 0
+        } else if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0
             && matches!(
                 kind,
                 ExitKind::Fallthrough | ExitKind::Direct | ExitKind::Call
             )
         {
+            let target = installed_target(block, ran, next_pc);
             block.successors.iter().enumerate().any(|(position, exit)| {
-                !record.linked(position) && exit.target.0 == next_pc && exit.kind == kind as u8
+                !record.linked(position) && exit.target.0 == target && exit.kind == kind as u8
             })
         } else {
             return None;
@@ -622,8 +653,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// instead ([`Self::link_through_cell`]). An exit in the page whose
     /// target has no block yet waits for the fetch that compiles it
     /// ([`Machine::direct_exit`]). Whether the exit is linked now.
+    #[cfg(test)]
     pub(super) fn link(&mut self, index: usize, next_pc: u64, word: impl Into<ExitWord>) -> bool {
-        let word = word.into();
+        let page = self.ran_page;
+        self.link_from(index, page, next_pc, word.into())
+    }
+
+    /// [`Self::link`] for block `index` run in guest page `page`: a
+    /// shared block's exits are those of the page it ran at, its
+    /// successors those of the page it was installed for. A shared block
+    /// links in its page only into a shared block, which serves every page
+    /// it runs at, and through a cell (whose probe compares the target)
+    /// out of it, never a stamped tail (whose hit does not).
+    fn link_from(&mut self, index: usize, page: u64, next_pc: u64, word: ExitWord) -> bool {
+        // The successor's target as the block's successors hold it, and the
+        // block's first PC where it ran.
+        let (target, ran) = {
+            let block = &self.code.blocks[index];
+            let ran = block.start_at(page);
+            (installed_target(block, ran, next_pc), ran)
+        };
         let unlinked = |code: &board::Code| {
             let block = &code.blocks[index];
             let record = code.blocks.record(index);
@@ -632,7 +681,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .iter()
                 .enumerate()
                 .position(|(position, exit)| {
-                    !record.linked(position) && exit.target.0 == next_pc && exit.word() == word
+                    !record.linked(position) && exit.target.0 == target && exit.word() == word
                 })
         };
         // Nearly every exit finds nothing to link: decided on the board
@@ -653,16 +702,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // it all again there ([`Self::link_direct_exit`]). In a launch
             // nearly every new block is reached so, and the lock taken here
             // found nothing to do.
-            if (next_pc ^ block.pc) & !(FETCH_PAGE - 1) == 0 {
-                let physical = block.physical.wrapping_add(next_pc.wrapping_sub(block.pc));
+            if (next_pc ^ ran) & !(FETCH_PAGE - 1) == 0 {
+                let physical = block.physical.wrapping_add(next_pc.wrapping_sub(ran));
                 let code = &self.code;
+                let aliases = block.shared || self.aliases_at(next_pc);
                 if code
                     .finder
-                    .find(&code.blocks, next_pc, physical, block.variant)
+                    .find(&code.blocks, next_pc, physical, block.variant, aliases)
                     == Some(None)
                 {
                     let incarnation = code.blocks.record(index).incarnation();
                     self.direct_exit = Some((index, incarnation, next_pc, word));
+                    self.direct_exit_page = page;
                     return false;
                 }
             }
@@ -682,28 +733,38 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Only an indexed block links out: a detach finds the sources of
         // its links among the indexed blocks of the target's page, so a
         // link from a block an IC IVAU forgot would outlive its target.
-        let indexed = cache
-            .index
-            .get(&code.blocks, block.pc, block.physical, block.variant)
-            == Some(index);
+        let indexed = cache.index.contains(&code.blocks, index);
         let Some(position) = find().filter(|_| indexed) else {
             return false;
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
-        if (next_pc ^ block.pc) & !(FETCH_PAGE - 1) != 0 {
+        if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0 {
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0) {
+            let stamped = !block.shared;
+            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, stamped) {
                 record.settle(position);
                 return true;
             }
             return false;
         }
-        let physical = block.physical.wrapping_add(next_pc.wrapping_sub(block.pc));
-        let Some(target) = cache
-            .index
-            .get(&code.blocks, next_pc, physical, block.variant)
-        else {
-            self.direct_exit = Some((index, record.incarnation(), next_pc, word));
+        let physical = block.physical.wrapping_add(next_pc.wrapping_sub(ran));
+        let found = if block.shared {
+            cache
+                .index
+                .get_shared(&code.blocks, next_pc, physical, block.variant)
+        } else {
+            let aliases = self.aliases_at(next_pc);
+            cache
+                .index
+                .get(&code.blocks, next_pc, physical, block.variant, aliases)
+        };
+        let Some(target) = found else {
+            // A shared block waits for a shared target, which a fetch of a
+            // block of its own PC does not give.
+            if !block.shared {
+                self.direct_exit = Some((index, record.incarnation(), next_pc, word));
+                self.direct_exit_page = page;
+            }
             return false;
         };
         let exit = block.successors[position];
@@ -771,7 +832,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             Some((block, incarnation, target, word))
                 if target == pc && self.code.blocks.record(block).incarnation() == incarnation =>
             {
-                let linked = self.link(block, target, word);
+                let page = self.direct_exit_page;
+                let linked = self.link_from(block, page, target, word);
                 // The block of the fetch is another variant's.
                 self.direct_exit = None;
                 linked
@@ -894,7 +956,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // is linked first, so no predicted transfer returns to the engine.
         self.patch_native(tail, &code);
         let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
-        if !self.link_through_cell(cache, exit, target, retired, word, btype) {
+        // Taken only when RAX is `target`: a stamped tail's hit holds.
+        if !self.link_through_cell(cache, exit, target, retired, word, btype, true) {
             return false;
         }
         self.patch_point(NativeCode(site as usize), jump);
@@ -959,6 +1022,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// a nonzero `btype` uses the probes of `btype`, whose cell probes take
     /// only entries that accept it, and gets a stamped tail only for a block
     /// that accepts it.
+    ///
+    /// Not `stamped`, the exit of a shared block, whose target moves with
+    /// the page it runs at: it keeps a cell tail, whose cell probe compares
+    /// the target, and is never promoted ([`Self::promote_hot_exits`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn link_through_cell(
         &mut self,
         cache: &mut board::Cache,
@@ -967,16 +1035,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         retired: u32,
         word: ExitWord,
         btype: u8,
+        stamped: bool,
     ) -> bool {
         if !chain::patchable(site) {
             return false;
         }
         // An exit whose cell probe transfers made it hot gets a stamped
         // tail ([`chain::stamped_tail`]); every other a cell tail.
-        let hot = cache
-            .targets
-            .site_cell_number(site)
-            .is_some_and(|cell| cache.targets.cell_heat(cell) >= chain::HOT_CELL);
+        let hot = stamped
+            && cache
+                .targets
+                .site_cell_number(site)
+                .is_some_and(|cell| cache.targets.cell_heat(cell) >= chain::HOT_CELL);
         let bytes = if hot {
             chain::STAMPED_TAIL_BYTES
         } else {
@@ -993,7 +1063,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         });
         let cell = cache.targets.link_cell(site, next_pc, current);
         let number = cache.targets.site_cell_number(site);
-        if let Some(number) = number {
+        if let Some(number) = number.filter(|_| stamped) {
             let link = chain::CellLink {
                 site,
                 pc: next_pc,
@@ -1070,6 +1140,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 // Hot once: tried now whatever the link finds.
                 cache.targets.settle_heat(cell);
             }
+            // Noted only for exits that may be stamped.
             self.link_through_cell(
                 &mut cache,
                 link.site,
@@ -1077,6 +1148,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 link.retired,
                 link.word,
                 link.btype,
+                true,
             );
         }
         self.statistics.stamped_in_use = cache.targets.stamped_tails() as u64;
@@ -1152,6 +1224,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);
         Some(installed.0 as u64)
     }
+}
+
+/// The target `next_pc` of an exit of `block`, which ran at `ran`, as the
+/// block's successors hold it: where it was installed. A shared block's
+/// exits move with the page it runs at; any other block's run where it was
+/// installed.
+fn installed_target(block: &Block, ran: u64, next_pc: u64) -> u64 {
+    next_pc.wrapping_sub(ran).wrapping_add(block.pc)
 }
 
 /// [`stela_compiler::GuestState::page_base`] for a block at `pc`: its fetch
