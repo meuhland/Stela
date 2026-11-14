@@ -1056,6 +1056,13 @@ fn run_machine<H: Host>(
         ));
     }
     machine.set_step_timing(options.profile);
+    machine.set_loop_counts_off(options.profile_keep_pack);
+    if options.profile_keep_pack {
+        output::arguments(format_args!(
+            "ENGINE profile without self-loop counts: the pack serves this boot
+"
+        ));
+    }
     machine.set_page_relative(options.page_relative);
     if options.page_relative {
         output::arguments(format_args!("ENGINE page-relative code\n"));

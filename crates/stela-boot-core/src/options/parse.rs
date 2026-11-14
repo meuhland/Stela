@@ -40,6 +40,10 @@ impl ParseState<'_> {
             "--parallel" => options.parallel = true,
             "--serialized" => options.parallel = false,
             "--profile" => options.profile = true,
+            "--profile-keep-pack" => {
+                options.profile = true;
+                options.profile_keep_pack = true;
+            }
             "--page-relative" => options.page_relative = true,
             "--shared-aliases" => options.shared_aliases = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,
