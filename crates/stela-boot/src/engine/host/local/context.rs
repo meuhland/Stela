@@ -201,7 +201,8 @@ impl RootIdentity {
         // SAFETY: a CPL0 control register read.
         unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
         let context = if cr4 & CR4_PCIDE != 0 { 0xfff } else { 0 };
-        if current & !ADDRESS & !context != 0 || !self.roots.roots().contains(&(current & ADDRESS)) {
+        if current & !ADDRESS & !context != 0 || !self.roots.roots().contains(&(current & ADDRESS))
+        {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
