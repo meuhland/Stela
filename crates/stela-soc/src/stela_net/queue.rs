@@ -135,7 +135,7 @@ impl Queue {
         if size == 0 || !size.is_power_of_two() || size > QUEUE_MAX {
             return Err("a queue's size is not a power of two up to QUEUE_MAX");
         }
-        if base == 0 || base % 16 != 0 {
+        if base == 0 || !base.is_multiple_of(16) {
             return Err("a queue's block is not 16-byte aligned");
         }
         base.checked_add(ring::bytes(size))
