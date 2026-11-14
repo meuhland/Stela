@@ -2,7 +2,7 @@
 //! Every callback returns before ExitBootServices; persistent executors use
 //! Stela's own INIT/SIPI entry, stacks and control memory afterward.
 pub(crate) use record::Capture;
-use stela_boot_core::record;
+use stela_boot_core::{firmware_retry, record};
 
 use super::{
     memory_types::amd,
@@ -39,7 +39,16 @@ pub(crate) enum Error {
     WrongBootstrapProcessor,
     SnapshotCapacity,
     SnapshotCallback,
-    SnapshotTimeout,
+    /// MP Services did not run an AP's observation to its end in any of
+    /// [`OBSERVE_TIMEOUTS_MS`]: the AP's number and APIC ID, the tries, the
+    /// milliseconds they took and the last try's status.
+    SnapshotTimeout {
+        processor: u32,
+        apic_id: u64,
+        tries: u32,
+        waited_ms: u64,
+        status: uefi::Status,
+    },
     ProcessorIdentity,
     Memory,
     AmdMemoryControls,
@@ -89,7 +98,9 @@ impl Error {
             }
             Self::SnapshotCapacity => "native per-processor source observations exceed capacity",
             Self::SnapshotCallback => "firmware AP callback did not publish its source observation",
-            Self::SnapshotTimeout => "firmware AP source observation did not finish before timeout",
+            Self::SnapshotTimeout { .. } => {
+                "firmware AP source observation did not finish before timeout"
+            }
             Self::ProcessorIdentity => {
                 "native observed CPUID identity differs from firmware identity"
             }
@@ -98,7 +109,41 @@ impl Error {
             Self::AmdEncryption(reason) => reason,
         }
     }
+
+    /// [`Self::message`], with the AP that did not answer and how long it
+    /// was given, when that is the reason.
+    pub(crate) fn refusal(self) -> stela_contracts::Refusal {
+        match self {
+            Self::SnapshotTimeout {
+                processor,
+                apic_id,
+                tries,
+                waited_ms,
+                status,
+            } => stela_contracts::refuse!(
+                self.message(),
+                %processor,
+                apic_id,
+                %tries,
+                %waited_ms,
+                ?status
+            ),
+            _ => self.message().into(),
+        }
+    }
 }
+
+/// Each try's bound on one AP's observation, in milliseconds. One try of
+/// 500 ms stopped 2 of about 12 boots of a Proxmox VM (OVMF, 8 pinned
+/// vCPUs) with `EFI_TIMEOUT` or a busy AP, after the previous boot's stop
+/// and a rewrite of the stick, and the next boot went through: a vCPU the
+/// host schedules late, or an AP the firmware still holds, misses a bound
+/// it meets the next time. The observation only reads (CPUID, MSRs,
+/// XCR0) and EDK2 returns a timed-out AP to idle (`ResetProcessorToIdleState`)
+/// before it answers, so trying again observes the same state.
+const OBSERVE_TIMEOUTS_MS: [u64; 3] = [500, 2_000, 5_000];
+/// The pause before another try, for an AP the firmware is still resetting.
+const OBSERVE_RETRY_PAUSE_MS: u64 = 10;
 
 /// Opens only fixed-attribute read/write visibility, without changing routing,
 /// type, encryption or latent attributes. The original control/IF is restored
@@ -545,25 +590,7 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
             // SAFETY: UEFI executes the loader at CPL0 on the recorded BSP.
             unsafe { observe() }?
         } else {
-            let mut callback = Callback {
-                observation: UnsafeCell::new(None),
-                complete: AtomicBool::new(false),
-            };
-            mp.startup_this_ap(
-                processors[index].processor_number as usize,
-                observe_ap,
-                (&raw mut callback).cast(),
-                None,
-                Some(Duration::from_millis(500)),
-            )
-            .map_err(|_| Error::SnapshotTimeout)?;
-            if !callback.complete.load(Ordering::Acquire) {
-                return Err(Error::SnapshotCallback);
-            }
-            callback
-                .observation
-                .into_inner()
-                .ok_or(Error::SnapshotCallback)??
+            observe_on_ap(&mp, &processors[index])?
         };
         if !snapshot.matches(processors[index]) {
             return Err(Error::ProcessorIdentity);
@@ -593,6 +620,94 @@ pub(crate) fn capture(requested: usize) -> Result<Region, Error> {
     Ok(Region {
         physical: memory.as_ptr() as u64,
         bytes: (pages * PAGE as usize) as u64,
+    })
+}
+
+/// Observe `processor`, an AP, through MP Services: up to one try for each
+/// of [`OBSERVE_TIMEOUTS_MS`], each logged when it fails. An observation
+/// the AP finished counts even if the firmware's answer came too late.
+fn observe_on_ap(mp: &MpServices, processor: &Processor) -> Result<Snapshot, Error> {
+    /// How one try ended short of an observation: MP Services' status,
+    /// which another try may meet, or a failure it would repeat.
+    enum Short {
+        Status(uefi::Status),
+        Failed(Error),
+    }
+    let tsc_hz = crate::firmware::tsc_hz().max(1);
+    // SAFETY: RDTSC has no preconditions at CPL0.
+    let started = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_ms = || {
+        // SAFETY: as above.
+        let now = unsafe { core::arch::x86_64::_rdtsc() };
+        now.wrapping_sub(started) / (tsc_hz / 1000).max(1)
+    };
+    let observed = firmware_retry::bounded(
+        &OBSERVE_TIMEOUTS_MS,
+        |short| matches!(short, Short::Status(_)),
+        |try_index, timeout| {
+            if try_index != 0 {
+                boot::stall(Duration::from_millis(OBSERVE_RETRY_PAUSE_MS));
+            }
+            // Each try's record outlives it unless the AP finished with it:
+            // a firmware that answered without stopping the AP leaves it this
+            // one.
+            let callback = Box::into_raw(Box::new(Callback {
+                observation: UnsafeCell::new(None),
+                complete: AtomicBool::new(false),
+            }));
+            let started = mp.startup_this_ap(
+                processor.processor_number as usize,
+                observe_ap,
+                callback.cast(),
+                None,
+                Some(Duration::from_millis(timeout)),
+            );
+            // SAFETY: the record just leaked, which the AP only writes before
+            // it publishes `complete`.
+            let complete = unsafe { (*callback).complete.load(Ordering::Acquire) };
+            if complete {
+                // SAFETY: the AP published its observation and no longer
+                // touches the record.
+                let callback = unsafe { Box::from_raw(callback) };
+                if let Err(error) = &started {
+                    crate::output::arguments(format_args!(
+                        "NATIVE AP {} observed though MP Services answered {:?} after {} ms\n",
+                        processor.processor_number,
+                        error.status(),
+                        elapsed_ms(),
+                    ));
+                }
+                return match callback.observation.into_inner() {
+                    Some(observation) => observation.map_err(Short::Failed),
+                    None => Err(Short::Failed(Error::SnapshotCallback)),
+                };
+            }
+            // The firmware says it ran, and nothing was published.
+            let status = started
+                .err()
+                .map(|error| error.status())
+                .ok_or(Short::Failed(Error::SnapshotCallback))?;
+            crate::output::arguments(format_args!(
+                "NATIVE AP {} apic={:#x} observation try {} of {} ({} ms) failed: {status:?} after {} ms in all\n",
+                processor.processor_number,
+                processor.apic_id,
+                try_index + 1,
+                OBSERVE_TIMEOUTS_MS.len(),
+                timeout,
+                elapsed_ms(),
+            ));
+            Err(Short::Status(status))
+        },
+    );
+    observed.map_err(|(short, tries)| match short {
+        Short::Failed(error) => error,
+        Short::Status(status) => Error::SnapshotTimeout {
+            processor: processor.processor_number,
+            apic_id: processor.apic_id,
+            tries: tries as u32,
+            waited_ms: elapsed_ms(),
+            status,
+        },
     })
 }
 
