@@ -16,6 +16,7 @@ pub mod gate;
 pub mod identity;
 pub mod interrupt;
 pub mod masked;
+pub mod net;
 pub mod pauth;
 pub mod processor;
 pub mod refusal;
