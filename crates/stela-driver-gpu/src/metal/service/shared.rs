@@ -1499,6 +1499,7 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             let mut deferrable = Deferrable {
                 caller: &mut *caller,
                 lock: job_lock.map(|jobs| &*jobs.lock),
+                staging: Some(&self.staging),
             };
             if staged {
                 turn.staged_library = self.staged_library(connection, record);
@@ -1767,6 +1768,9 @@ fn answer(
 struct Deferrable<'a> {
     caller: &'a mut dyn CallerMemory,
     lock: Option<&'a CompileLock>,
+    /// Other calls' libraries read so far, which a span short of room lets
+    /// go of ([`CallerMemory::reclaim`]).
+    staging: Option<&'a Spin<Vec<Staging>>>,
 }
 
 impl CallerMemory for Deferrable<'_> {
@@ -1779,6 +1783,33 @@ impl CallerMemory for Deferrable<'_> {
             return Ok(());
         }
         self.caller.write(address, data)
+    }
+
+    /// Other calls' libraries read so far, oldest first, until `bytes` are
+    /// let go of: each is one large block, and its call, made again, reads
+    /// it from the start. Then the platform's.
+    fn reclaim(&mut self, bytes: usize) -> usize {
+        let released: Vec<Staging> = self.staging.map_or_else(Vec::new, |staging| {
+            staging.with(|staging| {
+                let mut held = 0;
+                let count = staging
+                    .iter()
+                    .take_while(|staged| {
+                        let more = held < bytes;
+                        held += staged.bytes.capacity();
+                        more
+                    })
+                    .count();
+                staging.drain(..count).collect()
+            })
+        });
+        let freed: usize = released.iter().map(|staged| staged.bytes.capacity()).sum();
+        // Freed outside the staging lock.
+        drop(released);
+        if freed >= bytes {
+            return freed;
+        }
+        freed + self.caller.reclaim(bytes - freed)
     }
 }
 
@@ -1861,6 +1892,49 @@ mod tests {
     }
 
     #[test]
+    fn a_span_short_of_room_lets_go_of_other_calls_libraries_oldest_first() {
+        struct Platform(usize);
+        impl CallerMemory for Platform {
+            fn read(&mut self, _: u64, _: &mut [u8]) -> Result<(), CallerFault> {
+                Ok(())
+            }
+            fn write(&mut self, _: u64, _: &[u8]) -> Result<(), CallerFault> {
+                Ok(())
+            }
+            fn reclaim(&mut self, bytes: usize) -> usize {
+                self.0 += bytes;
+                5
+            }
+        }
+        let staged = |record: u64, length: usize| Staging {
+            connection: 1,
+            record,
+            span: Span {
+                address: 0,
+                length: length as u64,
+            },
+            bytes: Vec::with_capacity(length),
+            digest: Sha256::new(),
+        };
+        let staging = Spin::new(alloc::vec![staged(1, 8), staged(2, 8), staged(3, 8)]);
+        let mut platform = Platform(0);
+        let mut deferrable = Deferrable {
+            caller: &mut platform,
+            lock: None,
+            staging: Some(&staging),
+        };
+        // Two blocks cover ten bytes; the newest stays.
+        assert!(deferrable.reclaim(10) >= 16);
+        let left: Vec<u64> = staging.with(|staging| staging.iter().map(|s| s.record).collect());
+        assert_eq!(left, [3]);
+        // Past what it holds, the platform lets go of the rest.
+        let freed = deferrable.reclaim(100);
+        assert!(freed >= 8 + 5);
+        assert!(staging.with(|staging| staging.is_empty()));
+        assert!(platform.0 > 0);
+    }
+
+    #[test]
     fn a_deferred_run_writes_nothing_to_its_caller() {
         struct Writes(u32);
         impl CallerMemory for Writes {
@@ -1877,6 +1951,7 @@ mod tests {
         let mut deferrable = Deferrable {
             caller: &mut writes,
             lock: Some(&lock),
+            staging: None,
         };
         deferrable.write(0, &[1]).unwrap();
         lock.set_deferred_for_tests(true);
