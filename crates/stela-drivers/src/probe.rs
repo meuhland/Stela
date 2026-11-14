@@ -3417,6 +3417,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = |device| Address {
             segment: 0,
