@@ -741,6 +741,73 @@ aggregates_load_and_store_by_leaf(void)
            &defaults, STELA_AIR_MEMORY);
 }
 
+/* The constant bytes `address` adds to `base`. */
+static uint64_t
+offset_from(nir_def *address, nir_def *base)
+{
+   if (address == base)
+      return 0;
+   nir_instr *instr = nir_def_instr(address);
+   assert(instr->type == nir_instr_type_alu);
+   nir_alu_instr *add = nir_instr_as_alu(instr);
+   assert(add->op == nir_op_iadd && add->src[0].src.ssa == base && nir_src_is_const(add->src[1].src));
+   return nir_src_as_uint(add->src[1].src);
+}
+
+/* A kernel's loop carries a struct of an array and a struct, loaded whole
+ * and stored whole, as a PHI per leaf, three here, which NAK compiles; the
+ * exit stores each leaf. air_stage.c checks the values they carry. */
+static void
+nested_aggregate_phis_carry_each_leaf(void)
+{
+   const char *body =
+      "entry:\n %start = load { [2 x float], { i32 } }, ptr addrspace(1) %out, align 4\n"
+      " %n = extractvalue { [2 x float], { i32 } } %start, 1, 0\n br label %header\n"
+      "header:\n %i = phi i32 [0, %entry], [%next, %latch]\n"
+      " %acc = phi { [2 x float], { i32 } } [%start, %entry], [%acc2, %latch]\n"
+      " %more = icmp ult i32 %i, %n\n br i1 %more, label %latch, label %exit\n"
+      "latch:\n %x = extractvalue { [2 x float], { i32 } } %acc, 0, 1\n"
+      " %y = fadd float %x, 1.5\n"
+      " %acc1 = insertvalue { [2 x float], { i32 } } %acc, float %y, 0, 1\n"
+      " %k = extractvalue { [2 x float], { i32 } } %acc, 1, 0\n %k2 = add i32 %k, 3\n"
+      " %acc2 = insertvalue { [2 x float], { i32 } } %acc1, i32 %k2, 1, 0\n"
+      " %next = add i32 %i, 1\n br label %header\n"
+      "exit:\n store { [2 x float], { i32 } } %acc, ptr addrspace(1) %out, align 4\nret void\n";
+   nir_shader *shader = compiled("", body);
+   nir_intrinsic_instr *stores[3];
+   assert(intrinsics_of(shader, nir_intrinsic_store_global, stores, 3) == 3);
+   nir_def *base = stores[0]->src[1].ssa;
+   /* The leaf no trip changes is the one loaded; each other joins the one
+    * loaded at its offset with its own step. */
+   static const nir_op steps[] = {nir_op_fadd, nir_op_iadd};
+   for (unsigned i = 0; i < 3; i++) {
+      assert(offset_from(stores[i]->src[1].ssa, base) == 4 * i);
+      nir_instr *value = nir_def_instr(stores[i]->src[0].ssa);
+      if (!i) {
+         assert(value->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(value)->intrinsic == nir_intrinsic_load_global &&
+                offset_from(nir_instr_as_intrinsic(value)->src[0].ssa, base) == 0);
+         continue;
+      }
+      assert(value->type == nir_instr_type_phi);
+      nir_phi_instr *phi = nir_instr_as_phi(value);
+      unsigned loads = 0, stepped = 0;
+      nir_foreach_phi_src(source, phi) {
+         nir_instr *from = nir_def_instr(source->src.ssa);
+         if (from->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *load = nir_instr_as_intrinsic(from);
+            loads += load->intrinsic == nir_intrinsic_load_global &&
+                     offset_from(load->src[0].ssa, base) == 4 * i;
+         } else if (from->type == nir_instr_type_alu) {
+            nir_alu_instr *step = nir_instr_as_alu(from);
+            stepped += step->op == steps[i - 1] && step->src[0].src.ssa == &phi->def;
+         }
+      }
+      assert(loads == 1 && stepped == 1);
+   }
+   ralloc_free(shader);
+}
+
 /* A pointer left in a stack slot keeps its provenance through promotion. */
 static void
 stack_pointers_keep_their_origin(void)
@@ -772,6 +839,7 @@ main(void)
    kernels_read_constant_buffers();
    rate_map_decoders_read_their_parameters();
    aggregates_load_and_store_by_leaf();
+   nested_aggregate_phis_carry_each_leaf();
    stack_pointers_keep_their_origin();
    unaliased_read_buffers_load_read_only();
    glsl_type_singleton_decref();

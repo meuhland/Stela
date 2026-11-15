@@ -622,19 +622,232 @@ aggregate_phi_semantics(void)
       "float -0.0,float poison,float 0.0,float 4.0");
    raw = bitcode(bad); free(bad); free(text);
    ralloc_free(translate(raw, "test_vertex", &o)); LLVMDisposeMemoryBuffer(raw);
-   const char *unsupported[] = {"<{double,<4 x float>}>", "<{<{float}>,<4 x float>}>"};
-   for (unsigned i = 0; i < ARRAY_SIZE(unsupported); i++) {
-      char body[1024];
-      snprintf(body, sizeof(body), "{\nentry:\n %%take = icmp eq i32 %%id, 0\n br i1 %%take, label %%a, label %%b\n"
-         "a:\n br label %%join\nb:\n br label %%join\njoin:\n %%bad = phi %s [undef,%%a],[undef,%%b]\n ret " STAGE_PAIR " undef\n}", unsupported[i]);
-      text = vertex_body(body);
-      refusal(text, "test_vertex", STELA_AIR_VERTEX, &o, STELA_AIR_TYPE);
-      free(text);
-   }
    const char *constant = "{\nentry:\n br label %join\njoin:\n %bad = phi " STAGE_PAIR " [zeroinitializer,%entry]\n ret " STAGE_PAIR " %bad\n}";
    text = vertex_body(constant); raw = bitcode(text); free(text);
    ralloc_free(translate(raw, "test_vertex", &o)); LLVMDisposeMemoryBuffer(raw);
-   puts("Packed aggregate PHIs: nested edges, cyclic swaps, exact FP32 bits, guarded predecessors and explicit missing/unsupported leaf refusals");
+   puts("Packed aggregate PHIs: nested edges, cyclic swaps, exact FP32 bits, guarded predecessors and missing leaves");
+}
+
+/* A refusal of the TYPE kind whose detail names `type`. */
+static void
+type_refusal(const char *text, const struct stela_air_stage_options *o, const char *type)
+{
+   LLVMMemoryBufferRef b = bitcode(text); struct stela_air_error e;
+   nir_shader *n = stela_air_stage_to_nir(LLVMGetBufferStart(b), LLVMGetBufferSize(b), "test_vertex",
+                                          &nir_options, o, &e);
+   if (n || e.kind != STELA_AIR_TYPE || !strstr(e.detail, type))
+      fprintf(stderr, "refusal naming %s got%u %s\n", type, e.kind, e.detail);
+   CHECK(!n && e.kind == STELA_AIR_TYPE && strstr(e.detail, type));
+   LLVMDisposeMemoryBuffer(b);
+}
+
+/* A STAGE_PAIR of `position` and `color`, each <4 x float>. */
+#define RETURN_PAIR(position, color) \
+   " %o0 = insertvalue " STAGE_PAIR " undef, <4 x float> " position ", 0\n" \
+   " %o1 = insertvalue " STAGE_PAIR " %o0, <4 x float> " color ", 1\n ret " STAGE_PAIR " %o1\n}"
+#define NEST "{ { float, <3 x float> }, [2 x <2 x float>] }"
+#define HEAD "{ float, <3 x float> }"
+#define ACCUMULATOR "{ [2 x float], { i32 } }"
+#define WRAPPED "{ { %Input }, <4 x float> }"
+
+/* Structs of structs and arrays, as MPSGraph's kernels carry through their
+ * loops, join leaf by leaf: one NIR PHI per scalar or vector, at the index
+ * path its aggregate has it. */
+static void
+nested_aggregate_phi_semantics(void)
+{
+   LLVMMemoryBufferRef initial = bitcode(fixture);
+   struct snapshot vs, fs; struct stela_air_error error;
+   CHECK(stela_air_inspect_stage(LLVMGetBufferStart(initial), LLVMGetBufferSize(initial), NULL,
+      "test_vertex", STELA_AIR_VERTEX, capture, &vs, &error));
+   CHECK(stela_air_inspect_stage(LLVMGetBufferStart(initial), LLVMGetBufferSize(initial), NULL,
+      "test_fragment", STELA_AIR_FRAGMENT, capture, &fs, &error));
+   LLVMDisposeMemoryBuffer(initial);
+   struct stela_air_varying_slot map[16]; unsigned count = 0, calls = 0;
+   CHECK(stela_air_link_stage_io(&vs.entry, &fs.entry, 16, map, 16, &count, &error));
+   struct stela_air_stage_options o = options(STELA_AIR_VERTEX, map, count, &calls);
+   static const nir_shader_compiler_options unroll = {.max_unroll_iterations = 16};
+
+   /* A struct of a struct and an array of vectors, built leaf by leaf on one
+    * edge, of whole inner aggregates on another and constant on the third,
+    * joined twice: every leaf keeps its exact bits, signed zero and a NaN
+    * payload included. */
+   const char *nested = "{\nentry:\n %inside = icmp ult i32 %id, 2\n"
+      " br i1 %inside, label %choose, label %right\n"
+      "choose:\n %first = icmp eq i32 %id, 0\n br i1 %first, label %a, label %b\n"
+      "a:\n %a0 = insertvalue " NEST " poison, float -0.0, 0, 0\n"
+      " %a1 = insertvalue " NEST " %a0, <3 x float> <float 0x7FF8000020000000,float 3.0,float 4.0>, 0, 1\n"
+      " %a2 = insertvalue " NEST " %a1, <2 x float> <float 5.0,float 6.0>, 1, 0\n"
+      " %a3 = insertvalue " NEST " %a2, <2 x float> <float 7.0,float 8.0>, 1, 1\n br label %inner\n"
+      "b:\n %h0 = insertvalue " HEAD " undef, float 9.0, 0\n"
+      " %h1 = insertvalue " HEAD " %h0, <3 x float> <float 10.0,float 11.0,float 12.0>, 1\n"
+      " %b0 = insertvalue " NEST " undef, " HEAD " %h1, 0\n"
+      " %b1 = insertvalue " NEST " %b0, [2 x <2 x float>] [<2 x float> <float 13.0,float 14.0>,"
+      " <2 x float> <float 15.0,float 16.0>], 1\n br label %inner\n"
+      "inner:\n %left = phi " NEST " [%b1,%b],[%a3,%a]\n br label %join\n"
+      "right:\n br label %join\n"
+      "join:\n %selected = phi " NEST " [%left,%inner],[{ " HEAD " { float 17.0, <3 x float>"
+      " <float 18.0,float 19.0,float 20.0> }, [2 x <2 x float>] [<2 x float> <float 21.0,float 22.0>,"
+      " <2 x float> <float 23.0,float 24.0>] },%right]\n"
+      " %head = extractvalue " NEST " %selected, 0\n"
+      " %f = extractvalue " HEAD " %head, 0\n"
+      " %v = extractvalue " NEST " %selected, 0, 1\n"
+      " %wide = shufflevector <3 x float> %v, <3 x float> poison, <4 x i32> <i32 0,i32 0,i32 1,i32 2>\n"
+      " %position = insertelement <4 x float> %wide, float %f, i32 0\n"
+      " %pair = extractvalue " NEST " %selected, 1\n"
+      " %c0 = extractvalue [2 x <2 x float>] %pair, 0\n"
+      " %c1 = extractvalue " NEST " %selected, 1, 1\n"
+      " %color = shufflevector <2 x float> %c0, <2 x float> %c1, <4 x i32> <i32 0,i32 1,i32 2,i32 3>\n"
+      RETURN_PAIR("%position", "%color");
+   char *text = vertex_body(nested); LLVMMemoryBufferRef raw = bitcode(text); free(text);
+   for (unsigned id = 0; id < 3; id++) {
+      nir_shader *nir = translate(raw, "test_vertex", &o);
+      uint32_t position[4], color[4], unused[4] = {0};
+      for (unsigned lane = 0; lane < 4; lane++) {
+         position[lane] = bits((float)(1 + 8 * id + lane));
+         color[lane] = bits((float)(5 + 8 * id + lane));
+      }
+      if (!id) {
+         position[0] = UINT32_C(0x80000000);
+         position[1] = UINT32_C(0x7fc00001);
+      }
+      specialize(nir, id, unused, 16, 0, 0, false);
+      outputs(nir, position, color);
+      ralloc_free(nir);
+   }
+   LLVMDisposeMemoryBuffer(raw);
+
+   /* A reduction's accumulator: each trip updates one leaf of a nested array
+    * and one of a nested struct from their values on the back edge, and the
+    * exit reads every leaf. Zero through three trips. */
+   const char *accumulate = "{\nentry:\n %trips = and i32 %id, 3\n br label %header\n"
+      "header:\n %i = phi i32 [0,%entry],[%next,%latch]\n"
+      " %acc = phi " ACCUMULATOR " [{ [2 x float] [float 0.25, float 0.0], { i32 } { i32 7 } },%entry],"
+      "[%acc2,%latch]\n"
+      " %more = icmp ult i32 %i, %trips\n br i1 %more, label %latch, label %exit\n"
+      "latch:\n %x = extractvalue " ACCUMULATOR " %acc, 0, 1\n %y = fadd float %x, 1.5\n"
+      " %acc1 = insertvalue " ACCUMULATOR " %acc, float %y, 0, 1\n"
+      " %n = extractvalue " ACCUMULATOR " %acc, 1, 0\n %m = add i32 %n, 3\n"
+      " %acc2 = insertvalue " ACCUMULATOR " %acc1, i32 %m, 1, 0\n"
+      " %next = add i32 %i, 1\n br label %header\n"
+      "exit:\n %s0 = extractvalue " ACCUMULATOR " %acc, 0, 0\n"
+      " %s1 = extractvalue " ACCUMULATOR " %acc, 0, 1\n"
+      " %k = extractvalue " ACCUMULATOR " %acc, 1, 0\n %kf = bitcast i32 %k to float\n"
+      " %r0 = insertelement <4 x float> <float 0.0,float 0.0,float 0.0,float 1.0>, float %s0, i32 0\n"
+      " %r1 = insertelement <4 x float> %r0, float %s1, i32 1\n"
+      " %result = insertelement <4 x float> %r1, float %kf, i32 2\n"
+      RETURN_PAIR("<float 0.0,float 0.0,float 0.0,float 1.0>", "%result");
+   text = vertex_body(accumulate); raw = bitcode(text); free(text);
+   for (unsigned trips = 0; trips < 4; trips++) {
+      nir_shader *nir = translate(raw, "test_vertex", &o);
+      uint32_t unused[4] = {0}, position[4] = {0, 0, 0, bits(1.f)};
+      uint32_t color[4] = {bits(0.25f), bits(1.5f * (float)trips), 7 + 3 * trips, bits(1.f)};
+      specialize(nir, trips, unused, 16, 0, 0, false);
+      nir->options = &unroll;
+      bool progress;
+      do { progress = nir_opt_loop_unroll(nir); fold(nir); } while (progress);
+      outputs(nir, position, color);
+      ralloc_free(nir);
+   }
+   LLVMDisposeMemoryBuffer(raw);
+
+   /* Arrays of named structs a'=b, b'=a: every leaf of both moves in
+    * parallel, so an odd trip count swaps whole outputs. */
+   const char *cycle = "{\nentry:\n %trips = and i32 %id, 3\n br label %header\n"
+      "header:\n %i = phi i32 [0,%entry],[%next,%latch]\n"
+      " %a = phi [2 x %Input] [[%Input { <4 x float> <float 1.0,float 2.0,float 3.0,float 4.0> },"
+      " %Input { <4 x float> <float 5.0,float 6.0,float 7.0,float 8.0> }],%entry],[%b,%latch]\n"
+      " %b = phi [2 x %Input] [[%Input { <4 x float> <float 9.0,float 10.0,float 11.0,float 12.0> },"
+      " %Input { <4 x float> <float 13.0,float 14.0,float 15.0,float 16.0> }],%entry],[%a,%latch]\n"
+      " %more = icmp ult i32 %i, %trips\n br i1 %more, label %latch, label %exit\n"
+      "latch:\n %next = add i32 %i, 1\n br label %header\n"
+      "exit:\n %p = extractvalue [2 x %Input] %a, 0, 0\n %c = extractvalue [2 x %Input] %a, 1, 0\n"
+      RETURN_PAIR("%p", "%c");
+   text = vertex_body(cycle); raw = bitcode(text); free(text);
+   for (unsigned trips = 0; trips < 4; trips++) {
+      nir_shader *nir = translate(raw, "test_vertex", &o);
+      uint32_t position[4], color[4], unused[4] = {0};
+      for (unsigned lane = 0; lane < 4; lane++) {
+         position[lane] = bits((float)(1 + 8 * (trips & 1) + lane));
+         color[lane] = bits((float)(5 + 8 * (trips & 1) + lane));
+      }
+      specialize(nir, trips, unused, 16, 0, 0, false);
+      nir->options = &unroll;
+      bool progress;
+      do { progress = nir_opt_loop_unroll(nir); fold(nir); } while (progress);
+      outputs(nir, position, color);
+      ralloc_free(nir);
+   }
+   LLVMDisposeMemoryBuffer(raw);
+
+   /* A nested struct loaded whole on one edge: its leaf is the bounded load
+   * of the buffer, zero outside its sixteen bytes. A leaf one edge never
+   * inserts is undefined there and leaves the others exact. */
+   const char *loaded = "{\nentry:\n %take = icmp eq i32 %id, 0\n br i1 %take, label %load, label %other\n"
+      "load:\n %l = load { %Input }, ptr addrspace(2) %buffer, align 16\n"
+      " %a0 = insertvalue " WRAPPED " undef, { %Input } %l, 0\n"
+      " %a1 = insertvalue " WRAPPED " %a0, <4 x float> <float 5.0,float 6.0,float 7.0,float 8.0>, 1\n"
+      " br label %join\n"
+      "other:\n %b0 = insertvalue " WRAPPED " undef, <4 x float> <float 13.0,float 14.0,float 15.0,float 16.0>, 1\n"
+      " br label %join\n"
+      "join:\n %selected = phi " WRAPPED " [%a1,%load],[%b0,%other]\n"
+      " %p = extractvalue " WRAPPED " %selected, 0, 0, 0\n %c = extractvalue " WRAPPED " %selected, 1\n"
+      RETURN_PAIR("%p", "%c");
+   text = vertex_body(loaded); raw = bitcode(text); free(text);
+   const unsigned sizes[] = {0, 15, 16, 32};
+   const uint32_t source[8] = {0x80000000, 0x7fc00001, 0x3f000000, 0x3f800000, 0, 0, 0, 0};
+   for (unsigned size = 0; size < ARRAY_SIZE(sizes); size++) {
+      nir_shader *nir = translate(raw, "test_vertex", &o);
+      uint32_t position[4], color[4];
+      for (unsigned lane = 0; lane < 4; lane++) {
+         position[lane] = sizes[size] >= 16 ? source[lane] : 0;
+         color[lane] = bits((float)(5 + lane));
+      }
+      specialize(nir, 0, source, sizes[size], 0, 0, false);
+      outputs(nir, position, color);
+      ralloc_free(nir);
+   }
+   /* Edge 1 leaves the position undefined: only its color is checked. */
+   nir_shader *nir = translate(raw, "test_vertex", &o);
+   uint32_t unused[4] = {0};
+   specialize(nir, 1, unused, 16, 0, 0, false);
+   bool colored = false;
+   nir_foreach_function_impl(impl, nir) nir_foreach_block(block, impl) nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic) continue;
+      nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+      if (i->intrinsic != nir_intrinsic_store_deref ||
+          nir_intrinsic_get_var(i, 0)->data.location != VARYING_SLOT_VAR0) continue;
+      CHECK(nir_src_is_const(i->src[1]) && !colored);
+      for (unsigned lane = 0; lane < 4; lane++)
+         CHECK(nir_src_comp_as_uint(i->src[1], lane) == bits((float)(13 + lane)));
+      colored = true;
+   }
+   CHECK(colored);
+   ralloc_free(nir); LLVMDisposeMemoryBuffer(raw);
+
+   /* What no PHI can hold is refused, its type named in full: a double, a
+    * pointer in an aggregate, a vector past four lanes, an empty array and
+    * an aggregate of more leaves than the bound. */
+   static const struct { const char *type, *named; } refused[] = {
+      {"<{double,<4 x float>}>", "not <{ double, <4 x float> }>"},
+      {"{ ptr addrspace(2), float }", "not { ptr addrspace(2), float }"},
+      {"<8 x float>", "not <8 x float>"},
+      {"[0 x float]", "not [0 x float]"},
+      {"%Holder", "not %Holder { %Input { <4 x float> }, ptr addrspace(2) }"},
+      {"[64 x [64 x float]]", "more than 1024 leaves: [64 x [64 x float]]"},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(refused); i++) {
+      char body[1024];
+      snprintf(body, sizeof(body), "{\nentry:\n %%take = icmp eq i32 %%id, 0\n br i1 %%take, label %%a, label %%b\n"
+         "a:\n br label %%join\nb:\n br label %%join\njoin:\n %%bad = phi %s [undef,%%a],[undef,%%b]\n ret " STAGE_PAIR " undef\n}",
+         refused[i].type);
+      char *body_text = vertex_body(body);
+      text = change(body_text, "%Input = type { <4 x float> }\n",
+                    "%Input = type { <4 x float> }\n%Holder = type { %Input, ptr addrspace(2) }\n");
+      type_refusal(text, &o, refused[i].named);
+      free(text); free(body_text);
+   }
+   puts("Nested aggregate PHIs: structs of structs and arrays, reduction accumulators, swaps, whole loads, undefined leaves and named refusals");
 }
 static void
 pointer_phi_stage_semantics(void)
@@ -1041,6 +1254,7 @@ int main(int argc,char **argv)
    output_oracle_controls();
    arithmetic_and_lane_semantics();
    aggregate_phi_semantics();
+   nested_aggregate_phi_semantics();
    pointer_phi_stage_semantics();
    pointer_equality_stage_semantics();
    integer_funnel_stage_semantics();
