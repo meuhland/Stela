@@ -638,14 +638,23 @@ struct Granule {
     limit: usize,
 }
 
-/// The groups [`LookupTable`]'s front holds, a power of two.
+/// The fewest groups [`LookupTable`]'s front holds, a power of two: an
+/// ITLB's.
 const FRONT_GROUPS: usize = 1 << 12;
+/// A block table's front holds a group for every this many entries, at
+/// most [`MAX_FRONT_GROUPS`]. A board's table of 2 Mi entries held some 60
+/// thousand frames, which a front of 4 Ki groups missed nearly always: each
+/// insert then walked `granules`, about half of the insert's time (420-800
+/// ns in all, 3 million a beat under the board's lock). At one group per 16
+/// entries most frames keep their own front slot.
+const ENTRIES_PER_FRONT_GROUP: usize = 16;
+const MAX_FRONT_GROUPS: usize = 1 << 18;
 /// A group no entry has: frame numbers and granules stay below it.
 const NO_GROUP: u64 = u64::MAX;
 
-/// The front slot of `group`.
-fn front_slot(group: u64) -> usize {
-    group as usize & (FRONT_GROUPS - 1)
+/// The slot of `group` in `front`, a power of two long.
+fn front_slot(front: &[(u64, u32)], group: u64) -> usize {
+    group as usize & (front.len() - 1)
 }
 
 /// A group's list starts compacting at this many sets.
@@ -795,13 +804,18 @@ pub const ITLB_DROPS: i32 = -((HEADER_SLOTS * size_of::<Slot>()) as i32);
 /// Slots before a table's first: one cache line.
 const HEADER_SLOTS: usize = 2;
 
-/// Buckets of [`LookupTable`]'s count of held cells by PC.
-const CELL_BUCKETS: usize = 1 << 16;
+/// Bits of the buckets of [`LookupTable`]'s count of held cells by PC: 4
+/// MiB of counts, once a table has a cell. With 64 Ki buckets a board's
+/// hundred thousand cells or more left few empty, and nearly every insert
+/// searched `cell_pcs` (a third of an insert's time in a model of 100
+/// thousand cells).
+const CELL_BUCKET_BITS: u32 = 20;
+const CELL_BUCKETS: usize = 1 << CELL_BUCKET_BITS;
 
 /// The bucket of a cell's target `pc`: the instruction index's low bits
 /// mixed with the high bits, so one page's PCs spread out.
 fn cell_bucket(pc: u64) -> usize {
-    ((pc >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48) as usize % CELL_BUCKETS
+    ((pc >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - CELL_BUCKET_BITS)) as usize
 }
 
 /// What an exit through a stamped cell was linked with
@@ -925,12 +939,18 @@ impl LookupTable {
         for drops in &sets.header()[..2] {
             drops.store(1, Ordering::Relaxed);
         }
+        let fronts = match grouping {
+            Grouping::Pc => FRONT_GROUPS,
+            Grouping::Frame => {
+                (entries / ENTRIES_PER_FRONT_GROUP).clamp(FRONT_GROUPS, MAX_FRONT_GROUPS)
+            }
+        };
         Self {
             sets,
             mask,
             grouping,
             granules: BTreeMap::new(),
-            front: vec![(NO_GROUP, 0); FRONT_GROUPS].into_boxed_slice(),
+            front: vec![(NO_GROUP, 0); fronts].into_boxed_slice(),
             lists: Vec::new(),
             free: Vec::new(),
             last: None,
@@ -1405,7 +1425,7 @@ impl LookupTable {
                 if self.sweep_from.is_some() || self.granules.len() >= self.sweep_at {
                     self.sweep_step();
                 }
-                let front = front_slot(group);
+                let front = front_slot(&self.front, group);
                 let place = match self.front[front] {
                     (cached, place) if cached == group => place,
                     _ => {
@@ -1501,7 +1521,8 @@ impl LookupTable {
     /// Let the `emptied` groups' lists go to the free lists.
     fn release(&mut self, emptied: Vec<u64>) {
         for group in emptied {
-            let front = &mut self.front[front_slot(group)];
+            let at = front_slot(&self.front, group);
+            let front = &mut self.front[at];
             if front.0 == group {
                 *front = (NO_GROUP, 0);
             }
@@ -3213,7 +3234,7 @@ mod tests {
         let put = |table: &mut LookupTable, entry: LookupEntry| {
             table.set(lookup_slot(entry.pc, entry.key), entry);
         };
-        let (first, other) = (5, 5 + FRONT_GROUPS as u64);
+        let (first, other) = (5, 5 + table.front.len() as u64);
         put(&mut table, entry(0x1000, first));
         assert!(table.forget_frames(first..=first, |_| true));
         // The freed list goes to a group of the same front slot.
