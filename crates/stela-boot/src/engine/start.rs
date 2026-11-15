@@ -1221,7 +1221,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_bluetooth,
                 guest_audio: options
                     .guest_audio
-                    .then(|| guest_audio::GuestAudio::new(display_audio)),
+                    .then(|| guest_audio::GuestAudio::new(display_audio, handoff.root)),
                 guest_network,
                 host_nor,
                 host_disks,
@@ -3195,7 +3195,12 @@ fn start_devices(
                     && let Some(mmio) = mmio
                 {
                     display_audio = guest_audio::claim_display_audio(
-                        work, mmio, remappers, handoff, host_clock,
+                        work,
+                        mmio,
+                        remappers,
+                        handoff,
+                        host_clock,
+                        options.guest_audio_hdmi,
                     );
                 }
             }

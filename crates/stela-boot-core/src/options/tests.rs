@@ -549,4 +549,16 @@ fn guest_audio_is_off_by_default_and_round_trips() {
             .to_string(),
         "--system --guest-audio"
     );
+    // The HDMI output implies the speaker, and the line writes it alone.
+    let line = "--system --guest-audio-hdmi";
+    let options = round_trip(line);
+    assert!(options.guest_audio && options.guest_audio_hdmi);
+    assert_eq!(options.to_string(), line);
+    for text in [
+        "--system --guest-audio --guest-audio-hdmi",
+        "--system --guest-audio-hdmi --guest-audio",
+    ] {
+        assert_eq!(System::parse(text).unwrap().to_string(), line, "{text}");
+    }
+    assert!(!round_trip("--system --guest-audio").guest_audio_hdmi);
 }

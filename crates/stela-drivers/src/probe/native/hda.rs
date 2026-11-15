@@ -89,6 +89,142 @@ impl Host {
 /// One codec's HDMI/DP entries by its address, or why it has none.
 pub type HdmiSurvey = (u8, Result<Vec<hda::hdmi::HdmiEntry>, audio::Error>);
 
+/// One HDMI/DP output the owner plays PCM to: a playback stream of the
+/// controller routed to one pin's device entry (`hda::hdmi`). The stream is
+/// allocated once; its route is prepared again after each loss.
+pub struct HdmiPlayback {
+    port: hda::hdmi::HdmiPortId,
+    stream: hda::StreamId,
+    converter: u8,
+    period: usize,
+    ring: usize,
+    running: bool,
+}
+
+impl HdmiPlayback {
+    pub fn converter(&self) -> u8 {
+        self.converter
+    }
+    pub fn stream_tag(&self) -> u8 {
+        self.stream.tag()
+    }
+    pub fn period_bytes(&self) -> usize {
+        self.period
+    }
+    /// Whether the route is prepared and its DMA runs.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+}
+
+impl Host {
+    /// Attach `owner`'s display-audio port on `target`, a codec's pin and
+    /// device entry, and allocate one playback stream of `periods`
+    /// periods of `period_bytes` in `format` for it, on the first digital
+    /// converter the pin connects to. Nothing starts: [`Self::start_hdmi`].
+    ///
+    /// # Safety
+    /// As [`hda::Controller::attach_hdmi_port`]: `owner` keeps and
+    /// coordinates this controller's function, the codec, pin and device
+    /// entry, and the GPU connector they belong to, through failures and
+    /// for the boot.
+    pub unsafe fn hdmi_playback(
+        &mut self,
+        (codec, pin, device): (u8, u8, u8),
+        owner: alloc::sync::Arc<dyn hda::hdmi::DisplayAudioPort>,
+        format: audio::PcmFormat,
+        period_bytes: usize,
+        periods: usize,
+    ) -> Result<HdmiPlayback, RetirementError> {
+        let graph = self
+            .codecs
+            .iter()
+            .find(|c| c.graph.address == codec)
+            .map(|c| c.graph.clone())
+            .ok_or(RetirementError::Controller(audio::Error::InvalidCodecGraph))?;
+        let connections = graph
+            .widget(pin)
+            .map(|w| w.connections.clone())
+            .unwrap_or_default();
+        let converter = connections
+            .iter()
+            .copied()
+            .find(|&node| {
+                graph.widget(node).is_some_and(|w| {
+                    w.kind == hda::WidgetKind::Output
+                        && w.capabilities & DIGITAL_WIDGET != 0
+                        && w.pcm.supports(format)
+                })
+            })
+            .ok_or(RetirementError::Controller(
+                audio::Error::UnsupportedTopology,
+            ))?;
+        let (controller, dma) = self.owner.controller()?;
+        // SAFETY: forwarded owner contract.
+        let port = unsafe { controller.attach_hdmi_port(&graph, pin, device, owner) }?;
+        let stream = controller.allocate_stream(
+            audio::Direction::Playback,
+            format,
+            period_bytes,
+            periods,
+            dma,
+        )?;
+        let ring = controller.stream_buffer_bytes(stream)?;
+        Ok(HdmiPlayback {
+            port,
+            stream,
+            converter,
+            period: period_bytes,
+            ring,
+            running: false,
+        })
+    }
+
+    /// Prepare the route (`hda::Controller::prepare_hdmi`, which reads the
+    /// sink's ELD again), fill the whole ring with silence and start its
+    /// DMA. A sink without a valid ELD is `SinkUnavailable`.
+    pub fn start_hdmi(&mut self, playback: &mut HdmiPlayback) -> Result<(), RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        playback.running = false;
+        controller.prepare_hdmi(playback.port, playback.stream, playback.converter, None)?;
+        let silence = alloc::vec![0u8; playback.ring];
+        controller.write_pcm(playback.stream, 0, &silence)?;
+        controller.start(playback.stream)?;
+        playback.running = true;
+        Ok(())
+    }
+
+    /// Refill the next completed period with `pcm`, exactly one period:
+    /// whether one was due. An error stopped the stream and closed the
+    /// route (an underrun, a sink change); [`Self::start_hdmi`] starts it
+    /// again.
+    pub fn refill_hdmi(
+        &mut self,
+        playback: &mut HdmiPlayback,
+        pcm: &[u8],
+    ) -> Result<bool, RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        match controller.refill_hdmi_period(playback.stream, pcm) {
+            Ok(done) => Ok(done.is_some()),
+            Err(error) => {
+                playback.running = false;
+                Err(RetirementError::Controller(error))
+            }
+        }
+    }
+
+    /// Stop the stream and close its route, if it runs.
+    pub fn stop_hdmi(&mut self, playback: &mut HdmiPlayback) -> Result<(), RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        playback.running = false;
+        controller.close_hdmi(playback.port)?;
+        Ok(())
+    }
+}
+
+/// A converter widget with digital output (HDA 7.3.4.6).
+const DIGITAL_WIDGET: u32 = 1 << 9;
+
 /// What vouches for the original users of the function an attach takes.
 enum Users {
     /// Nothing: the conventional controller is retained and refused.

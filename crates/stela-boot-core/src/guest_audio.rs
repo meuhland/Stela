@@ -200,6 +200,27 @@ pub fn audio_descriptor(
     text
 }
 
+/// Writes `frames`, 32-bit MSB-aligned stereo, into `out` as 16-bit
+/// little-endian stereo (each sample's top 16 bits), and silence after
+/// them; the frames written. `out` holds whole 4-byte frames, and frames
+/// beyond it are left unread.
+pub fn s16_period(frames: impl IntoIterator<Item = [i32; 2]>, out: &mut [u8]) -> usize {
+    let mut written = 0;
+    let mut frames = frames.into_iter();
+    for slot in out.as_chunks_mut::<4>().0 {
+        let [left, right] = match frames.next() {
+            Some(frame) => {
+                written += 1;
+                frame.map(|sample| (sample >> 16) as i16)
+            }
+            None => [0, 0],
+        };
+        slot[..2].copy_from_slice(&left.to_le_bytes());
+        slot[2..].copy_from_slice(&right.to_le_bytes());
+    }
+    written
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +348,24 @@ mod tests {
             "LPCM 8ch 32/44.1/48/88.2/96/176.4/192kHz 16-bit"
         );
         assert_eq!(audio_descriptor(2, 6, 0x04, 0), "coding2 6ch 48kHz");
+    }
+
+    #[test]
+    fn a_period_keeps_each_samples_top_16_bits_and_pads_silence() {
+        let mut out = [0xaa; 16];
+        let frames = [[0x1234_5678, -0x1234_5678], [i32::MIN, i32::MAX]];
+        assert_eq!(s16_period(frames, &mut out), 2);
+        assert_eq!(
+            out,
+            [
+                0x34, 0x12, 0xcb, 0xed, 0x00, 0x80, 0xff, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        // More frames than the period holds: the rest stay unread.
+        let mut out = [0; 4];
+        let mut frames = [[1 << 16, 2 << 16], [3 << 16, 4 << 16]].into_iter();
+        assert_eq!(s16_period(frames.by_ref(), &mut out), 1);
+        assert_eq!(out, [1, 0, 2, 0]);
+        assert_eq!(frames.next(), Some([3 << 16, 4 << 16]));
     }
 }
