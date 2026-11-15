@@ -51,6 +51,25 @@ pub(super) struct OriginalUsers {
     retained: ConfigRetention,
 }
 
+impl OriginalUsers {
+    /// The function's original users, retired by a Secondary Bus Reset of
+    /// its bus in this boot: a GPU's HDMI/DP audio function, parked and
+    /// contained through its GPU's cold reset and claimed after it.
+    ///
+    /// # Safety
+    /// `retained` is the function's own current configuration epoch. In this
+    /// boot a Secondary Bus Reset of the function's bus completed while the
+    /// function was parked in the contained fabric, which restored its
+    /// header with bus mastering, MSI, MSI-X and INTx disabled, and nothing
+    /// enabled any of them or ran the function since. Firmware's interrupt
+    /// delivery, EOI, DMA and agents did not survive that reset; no firmware,
+    /// SMM, ACPI or other driver uses the function, and no deferred work of
+    /// theirs can reach it.
+    pub(super) unsafe fn after_bus_reset(retained: ConfigRetention) -> Self {
+        Self { retained }
+    }
+}
+
 #[cfg(test)]
 impl OriginalUsers {
     /// # Safety
@@ -81,7 +100,7 @@ pub(super) struct Inputs<R, T> {
     pub bar: Bar,
     pub original_users: Option<OriginalUsers>,
 }
-struct Shared<R>(Rc<RefCell<R>>);
+pub(super) struct Shared<R>(Rc<RefCell<R>>);
 impl<R> Clone for Shared<R> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -120,7 +139,7 @@ impl<R: hda::Registers> hda::Registers for Shared<R> {
     }
 }
 type Pci<R> = hda::pci::PciRegisters<Shared<R>, Box<Function<OwnedConfig>>>;
-type Core<R, T> = hda::Controller<Shared<Pci<R>>, T>;
+pub(super) type Core<R, T> = hda::Controller<Shared<Pci<R>>, T>;
 type BindingFailure<R> = hda::pci::BindingFailure<Shared<R>, Box<Function<OwnedConfig>>>;
 
 /// Keep the actual legacy allocator error even though the protocol core's
@@ -361,6 +380,22 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             return Err(self.error.unwrap_or(Error::Terminal));
         }
         Ok(())
+    }
+    /// The live controller and its private DMA allocator, after discovery,
+    /// for the owner's own streams and HDMI routes. Its retirement stays
+    /// [`Self::close`]'s.
+    pub(super) fn controller(
+        &mut self,
+    ) -> Result<(&mut Core<R, T>, &mut DomainAllocator<'static>), Error> {
+        self.admit()?;
+        if !self.discovery_attempted {
+            return Err(Error::Terminal);
+        }
+        let r = self.owner.resources();
+        Ok((
+            r.controller.as_mut().expect("active HDA controller"),
+            r.dma.as_mut().expect("active HDA DMA"),
+        ))
     }
     pub fn discover_and_setup(&mut self) -> Result<Discovery, Error> {
         self.admit()?;

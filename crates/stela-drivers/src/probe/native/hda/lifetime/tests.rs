@@ -354,3 +354,39 @@ fn late_minimum_failure_cannot_return_active_host_or_retry_close() {
     assert_eq!(snapshot(&f.state), before);
     core::mem::forget(native);
 }
+
+/// A GPU's audio function claimed after its GPU's bus reset: the reset
+/// vouches for its original users, so the owner drains the original root,
+/// binds and allocates its rings as with any proved capability, and grants
+/// its controller only after discovery.
+#[test]
+fn a_bus_reset_vouches_for_original_users_and_binds_like_a_proved_capability() {
+    let mut f = fixture(false);
+    let mut inputs = f.inputs.take().unwrap();
+    let retained = inputs
+        .requester
+        .function_mut()
+        .config()
+        .retain_epoch()
+        .unwrap();
+    // SAFETY: the fixture's own configuration epoch; no symbolic original
+    // user survives in this model, as after a bus reset.
+    inputs.original_users = Some(unsafe { OriginalUsers::after_bus_reset(retained) });
+    let mut native = match Native::new(inputs) {
+        Ok(n) => n,
+        Err(e) => panic!("{:?}", e.error),
+    };
+    let events = lock(&f.state).events.clone();
+    let drain = events
+        .iter()
+        .position(|e| *e == Event::OriginalDrain)
+        .unwrap();
+    let bind = events.iter().position(|e| *e == Event::Bind).unwrap();
+    let allocate = events.iter().position(|e| *e == Event::Allocate).unwrap();
+    assert!(drain < bind && bind < allocate);
+    assert!(matches!(
+        native.controller(),
+        Err(RetirementError::Terminal)
+    ));
+    native.close().unwrap();
+}
