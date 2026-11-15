@@ -27,6 +27,8 @@ mod kext {
     ));
 }
 #[cfg(feature = "nvk")]
+pub(super) mod nvenc;
+#[cfg(feature = "nvk")]
 mod stack;
 #[cfg(feature = "nvk")]
 mod waiter;

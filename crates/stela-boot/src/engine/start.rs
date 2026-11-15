@@ -2964,6 +2964,12 @@ fn start_devices(
                 && let Ok(work) = work
                 && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
             {
+                // Before the display and Metal services take the GPUs, so
+                // its lines come right after the start's.
+                #[cfg(feature = "nvk")]
+                if options.probe_nvenc {
+                    gpu::nvenc::probe();
+                }
                 let firmware = handoff
                     .screen
                     .and_then(|screen| screen.pci_source)
@@ -2972,6 +2978,8 @@ fn start_devices(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
                 );
+            } else if options.probe_nvenc {
+                output::arguments(format_args!("NVENC PROBE skipped: no GPU started\n"));
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {

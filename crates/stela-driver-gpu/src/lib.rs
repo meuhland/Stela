@@ -16,6 +16,7 @@ pub mod nouveau;
 
 pub mod cold;
 pub mod nouveau_chip;
+pub mod nvenc;
 
 #[cfg(feature = "linux-kernel")]
 pub mod drm;

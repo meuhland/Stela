@@ -56,6 +56,8 @@ pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
 pub const SINGLE_USER: &str = "--single-user";
 /// Keeps the newest presented frame at one logged address.
 pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
+/// Checks each started GPU's video encoder before macOS (`NVENC PROBE` lines).
+pub const PROBE_NVENC: &str = "--probe-nvenc";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -388,6 +390,10 @@ pub struct System {
     pub monitor_trace: bool,
     /// Log every display swap's DCP calls, present and callback (`--display-trace`).
     pub display_trace: bool,
+    /// Once the GPUs start, before macOS, check that each one's video
+    /// encoder runs under GSP: a channel on its runlist, its class, and one
+    /// semaphore release, logged as `NVENC PROBE` lines (`--probe-nvenc`).
+    pub probe_nvenc: bool,
     /// Log every device access in these physical ranges (`--watch BASE,BYTES`).
     pub watches: Vec<(u64, u64)>,
     /// Guest virtual ranges the stop's report shows (`--dump BASE,BYTES`).
@@ -467,6 +473,7 @@ impl Default for System {
             traces: Vec::new(),
             monitor_trace: false,
             display_trace: false,
+            probe_nvenc: false,
             watches: Vec::new(),
             dumps: Vec::new(),
         }
@@ -878,6 +885,7 @@ impl fmt::Display for System {
         }
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
+        line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
