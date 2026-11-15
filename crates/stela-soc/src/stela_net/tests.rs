@@ -744,3 +744,168 @@ fn the_guest_address_comes_from_arp_frames_it_sends() {
     sent(&mut rig, frame([0xff; 6], 60, 0x08), 4);
     assert_eq!(rig.net.guest_address(), Some([10, 0, 69, 80]));
 }
+
+const ALL_OFFLOADS: u64 = features::OFFERED | features::CHECKSUMS | features::COALESCING;
+
+/// `count` in-order TCPv4 segments of `mss` to the device, the last with
+/// PSH and `last` bytes.
+fn segments(count: usize, mss: usize, last: usize) -> Vec<Vec<u8>> {
+    let mut sequence = 1000u32;
+    (0..count)
+        .map(|index| {
+            let final_one = index + 1 == count;
+            let length = if final_one { last } else { mss };
+            let data: Vec<u8> = (0..length).map(|i| (i + index * 3) as u8).collect();
+            let flags = if final_one { 0x18 } else { 0x10 };
+            let mut frame = offload::tests::tcp4_segment(sequence, flags, &data);
+            frame[..6].copy_from_slice(&MAC_ADDRESS);
+            sequence = sequence.wrapping_add(length as u32);
+            frame
+        })
+        .collect()
+}
+
+/// The bytes of each used entry's buffer (posted by [`Rig::post`]), in
+/// order.
+fn gather(rig: &mut Rig, used: &[(u32, u32)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for &(id, length) in used {
+        let mut buffer = vec![0u8; length as usize];
+        assert!(rig.ram.read(BUFFERS + u64::from(id) * 0x800, &mut buffer));
+        bytes.extend_from_slice(&buffer);
+    }
+    bytes
+}
+
+#[test]
+fn coalesced_segments_span_the_buffers_they_need() {
+    let mut rig = Rig::offering(16, ALL_OFFLOADS, ALL_OFFLOADS);
+    rig.post(0, 8, 2048);
+    rig.rx.set_used_event(&mut rig.ram, 0);
+    let frames = segments(5, 1448, 700);
+    for frame in &frames {
+        rig.net.deliver_owned(frame.clone());
+    }
+    // A frame of another kind after them goes on its own.
+    let other = frame(MAC_ADDRESS, 60, 0x44);
+    rig.net.deliver_owned(other.clone());
+    rig.step();
+    assert!(rig.line());
+    let used = rig.rx.reap(&mut rig.ram);
+    // 12 + 54 + 4 * 1448 + 700 = 6558 bytes: three full buffers and a
+    // fourth, then the other frame's.
+    let lengths: Vec<u32> = used.iter().map(|&(_, length)| length).collect();
+    assert_eq!(lengths, [2048, 2048, 2048, 414, 12 + 60]);
+    let bytes = gather(&mut rig, &used[..4]);
+    assert_eq!(bytes[0], offload::DATA_VALID);
+    assert_eq!(bytes[1], offload::GSO_TCPV4);
+    assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 54, "hdr_len");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 1448, "gso_size");
+    assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 4, "num_buffers");
+    let joined = &bytes[12..];
+    assert!(offload::verified(joined));
+    let payload: Vec<u8> = frames
+        .iter()
+        .flat_map(|frame| frame[54..].to_vec())
+        .collect();
+    assert_eq!(&joined[54..], &payload[..]);
+    let rest = gather(&mut rig, &used[4..]);
+    assert_eq!(u16::from_le_bytes([rest[10], rest[11]]), 1);
+    assert_eq!(&rest[12..], &other[..]);
+    assert_eq!(rig.read(RX_FRAMES), 6, "every frame from the host");
+    let stats = rig.net.stats();
+    assert_eq!(
+        (stats.rx_frames, stats.coalesced, stats.coalesced_segments),
+        (2, 1, 5)
+    );
+    assert_eq!((stats.interrupts, stats.rx_signals), (1, 1));
+}
+
+#[test]
+fn without_coalescing_each_segment_takes_its_own_buffer() {
+    let all = features::OFFERED | features::CHECKSUMS;
+    let mut rig = Rig::offering(16, ALL_OFFLOADS, all);
+    rig.post(0, 8, 2048);
+    for frame in segments(5, 1448, 700) {
+        rig.net.deliver_owned(frame);
+    }
+    rig.step();
+    let used = rig.rx.reap(&mut rig.ram);
+    assert_eq!(used.len(), 5);
+    for &(id, length) in &used {
+        let mut header = [0u8; 12];
+        assert!(rig.ram.read(BUFFERS + u64::from(id) * 0x800, &mut header));
+        assert_eq!(header[0], offload::DATA_VALID);
+        assert_eq!(header[1], offload::GSO_NONE);
+        assert_eq!(u16::from_le_bytes([header[10], header[11]]), 1);
+        assert!(length <= 2048);
+    }
+    assert_eq!(rig.net.stats().coalesced, 0);
+}
+
+#[test]
+fn a_coalesced_frame_waits_for_buffers_and_keeps_its_place() {
+    let mut rig = Rig::offering(16, ALL_OFFLOADS, ALL_OFFLOADS);
+    rig.post(0, 2, 2048);
+    for frame in segments(5, 1448, 700) {
+        rig.net.deliver_owned(frame);
+    }
+    let after = frame(MAC_ADDRESS, 60, 0x55);
+    rig.net.deliver_owned(after.clone());
+    rig.step();
+    // Two buffers hold no 6558-byte frame: they go back, and the device
+    // asks for the next receive kick.
+    assert!(rig.rx.reap(&mut rig.ram).is_empty());
+    assert!(!rig.line());
+    assert!(!rig.net.due(), "starved until a kick");
+    let old = rig.rx.avail;
+    rig.post(2, 4, 2048);
+    assert!(rig.rx.needs_kick(&mut rig.ram, old));
+    rig.write(KICK, KICK_RX).unwrap();
+    rig.step();
+    let used = rig.rx.reap(&mut rig.ram);
+    let lengths: Vec<u32> = used.iter().map(|&(_, length)| length).collect();
+    assert_eq!(lengths, [2048, 2048, 2048, 414, 12 + 60]);
+    assert_eq!(&gather(&mut rig, &used[4..])[12..], &after[..]);
+    assert_eq!(rig.read(RX_FRAMES), 6);
+}
+
+#[test]
+fn a_frame_longer_than_the_whole_ring_is_dropped() {
+    let mut rig = Rig::offering(2, ALL_OFFLOADS, ALL_OFFLOADS);
+    rig.post(0, 2, 2048);
+    for frame in segments(5, 1448, 700) {
+        rig.net.deliver_owned(frame);
+    }
+    let after = frame(MAC_ADDRESS, 60, 0x66);
+    rig.net.deliver_owned(after.clone());
+    rig.step();
+    let used = rig.rx.reap(&mut rig.ram);
+    assert_eq!(used.len(), 1);
+    assert_eq!(&gather(&mut rig, &used)[12..], &after[..]);
+    assert_eq!(rig.read(RX_DROPS), 5);
+    assert_eq!(rig.net.counters().oversized, 5);
+}
+
+#[test]
+fn interrupts_and_kicks_are_counted() {
+    let mut rig = Rig::new(8, features::OFFERED);
+    rig.post(0, 4, 2048);
+    rig.rx.set_used_event(&mut rig.ram, 0);
+    rig.net.deliver_owned(frame(MAC_ADDRESS, 64, 1));
+    rig.step();
+    // A second publish while the line is up raises no new interrupt.
+    rig.rx.set_used_event(&mut rig.ram, 1);
+    rig.net.deliver_owned(frame(MAC_ADDRESS, 64, 2));
+    rig.step();
+    let stats = rig.net.stats();
+    assert_eq!((stats.interrupts, stats.rx_signals), (1, 2));
+    rig.write(ACK, CAUSE_RX).unwrap();
+    rig.rx.set_used_event(&mut rig.ram, 2);
+    rig.net.deliver_owned(frame(MAC_ADDRESS, 64, 3));
+    rig.step();
+    rig.write(KICK, KICK_RX).unwrap();
+    let stats = rig.net.stats();
+    assert_eq!((stats.interrupts, stats.rx_signals, stats.kicks), (2, 3, 1));
+    assert_eq!(stats.rx_frames, 3);
+}
