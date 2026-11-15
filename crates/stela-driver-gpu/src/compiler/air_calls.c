@@ -506,13 +506,24 @@ pass_as(LLVMBuilderRef builder, LLVMValueRef value, LLVMTypeRef to)
                                                        stela_air_convert_layout(builder, value, to);
 }
 
+/* Whether fn is a stitched visible function, whose parameters are only the
+ * arguments its graph reads (STELA_AIR_STITCHED_FUNCTION). */
+static bool
+stitched_function(LLVMValueRef fn)
+{
+   return LLVMGetStringAttributeAtIndex(fn, LLVMAttributeFunctionIndex, STELA_AIR_STITCHED_FUNCTION,
+                                        strlen(STELA_AIR_STITCHED_FUNCTION)) != NULL;
+}
+
 /* Makes each call of a defined function whose call type differs from the
  * definition's only in structs of the same layout, or in numbers of the same
  * bits, call it with the definition's type, converting its arguments and
  * result. Linking keeps two modules' copies of one struct distinct types
  * (`T.3` and `T.127`), and a call whose type is not its callee's never
  * inlines: Core Image's stitched graphs call one library's filter with the
- * struct values another library's functions build. */
+ * struct values another library's functions build. A call of a stitched
+ * function may also pass arguments after those it takes, which its graph
+ * never reads, and calls it with those it takes. */
 static void
 match_call_types(LLVMModuleRef module)
 {
@@ -528,10 +539,11 @@ match_call_types(LLVMModuleRef module)
             if (!callee || !LLVMIsAFunction(callee) || LLVMIsDeclaration(callee))
                continue;
             LLVMTypeRef want = LLVMGlobalGetValueType(callee), have = LLVMGetCalledFunctionType(inst);
-            unsigned count = LLVMCountParamTypes(want);
-            if (want == have || count != LLVMCountParamTypes(have) || count > 64 ||
+            unsigned count = LLVMCountParamTypes(want), passed = LLVMCountParamTypes(have);
+            bool unread = passed > count && !LLVMIsFunctionVarArg(want) && stitched_function(callee);
+            if (want == have || (passed != count && !unread) || passed > 64 ||
                 LLVMIsFunctionVarArg(want) != LLVMIsFunctionVarArg(have) ||
-                LLVMGetNumArgOperands(inst) != count ||
+                LLVMGetNumArgOperands(inst) != passed ||
                 !passes_as(context, LLVMGetReturnType(have), LLVMGetReturnType(want)))
                continue;
             LLVMTypeRef wanted[64], had[64];
