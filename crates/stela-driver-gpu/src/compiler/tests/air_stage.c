@@ -843,12 +843,12 @@ nested_aggregate_phi_semantics(void)
    ralloc_free(nir); LLVMDisposeMemoryBuffer(raw);
 
    /* What no PHI can hold is refused, its type named in full: a double, a
-    * pointer in an aggregate, a vector past four lanes, an empty array and
-    * an aggregate of more leaves than the bound. */
+    * pointer in an aggregate, a vector of more lanes than NIR's, an empty
+    * array and an aggregate of more leaves than the bound. */
    static const struct { const char *type, *named; } refused[] = {
       {"<{double,<4 x float>}>", "not <{ double, <4 x float> }>"},
       {"{ ptr addrspace(2), float }", "not { ptr addrspace(2), float }"},
-      {"<8 x float>", "not <8 x float>"},
+      {"<32 x i8>", "not <32 x i8>"},
       {"[0 x float]", "not [0 x float]"},
       {"%Holder", "not %Holder { %Input { <4 x float> }, ptr addrspace(2) }"},
       {"[64 x [64 x float]]", "more than 1024 leaves: [64 x [64 x float]]"},

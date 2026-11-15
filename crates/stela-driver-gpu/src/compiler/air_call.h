@@ -46,10 +46,19 @@ bool stela_air_call_named(const char *name, size_t bytes, const char *expected);
 /* A scalar's or vector's element type and lanes (1 for a scalar). */
 LLVMTypeRef stela_air_call_element(LLVMTypeRef type, unsigned *lanes);
 
-/* A half or float scalar, or a vector of 2 to 4 of them. */
+/* Whether a vector of `lanes` is one NIR value: 2 to 4, 8 or 16 lanes, as
+ * NIR's vectors are. LLVM's vectorizers and SROA make 8- and 16-lane ones,
+ * such as <8 x i8>, of what Metal holds in arrays and structs. */
+static inline bool
+stela_air_vector_lanes(unsigned lanes)
+{
+   return (lanes >= 2 && lanes <= 4) || lanes == 8 || lanes == 16;
+}
+
+/* A half or float scalar, or a vector of them (stela_air_vector_lanes). */
 bool stela_air_call_floating(LLVMTypeRef type);
 
-/* A bfloat scalar, or a vector of 2 to 4 of them. */
+/* A bfloat scalar, or a vector of them (stela_air_vector_lanes). */
 bool stela_air_call_bfloat(LLVMTypeRef type);
 
 /* bfloats, which NIR holds as their 16 bits, in single precision: each is a
@@ -64,7 +73,8 @@ nir_def *stela_air_float_to_bfloat(nir_builder *b, nir_def *value);
  * nearest even bfloat, as their 16 bits. */
 nir_def *stela_air_int_to_bfloat(nir_builder *b, nir_def *value, bool is_signed);
 
-/* An 8-, 16-, 32- or 64-bit integer scalar, or a vector of 2 to 4 of them. */
+/* An 8-, 16-, 32- or 64-bit integer scalar, or a vector of them
+ * (stela_air_vector_lanes). */
 bool stela_air_call_integer(LLVMTypeRef type);
 
 /* A type's AIR overload: "f32", "v4f16", "v2bf16", "i32". */

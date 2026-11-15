@@ -82,7 +82,7 @@ struct value {
    uint64_t offset, steps;
    /* Partial values have no vector def until every lane is defined. Missing
     * lanes are tracked symbolically and read undefined (whole_value). */
-   nir_def *lanes[4];
+   nir_def *lanes[NIR_MAX_VEC_COMPONENTS];
    unsigned components, bits, aggregate_count;
    struct value **elements;
    /* Texture and sampler arguments, used only as texture call operands, and
@@ -256,13 +256,16 @@ named_md(struct translator *t, const char *name, LLVMValueRef *operands, unsigne
    return stela_air_named_md(&t->metadata, name, operands, count);
 }
 
+/* An integer scalar or vector. A vector is one NIR value of its lanes, 2 to
+ * 4, 8 or 16 (stela_air_vector_lanes), which every instruction holds as it
+ * does a narrower one; the backends split what their registers do not. */
 static bool
 shape(LLVMTypeRef type, unsigned *components, unsigned *bits)
 {
    *components = 1;
    if (LLVMGetTypeKind(type) == LLVMVectorTypeKind) {
       *components = LLVMGetVectorSize(type);
-      if (*components < 2 || *components > 4)
+      if (!stela_air_vector_lanes(*components))
          return false;
       type = LLVMGetElementType(type);
    }
@@ -282,7 +285,7 @@ float_shape(LLVMTypeRef type, unsigned *components, unsigned *bits)
       type = LLVMGetElementType(type);
    } else if (LLVMGetTypeKind(type) == LLVMVectorTypeKind) {
       *components = LLVMGetVectorSize(type);
-      if (*components < 2 || *components > 4)
+      if (!stela_air_vector_lanes(*components))
          return false;
       type = LLVMGetElementType(type);
    }
@@ -532,7 +535,7 @@ whole_value(struct translator *t, const struct value *v)
 {
    if (v->def || !v->components)
       return v->def;
-   nir_def *lanes[4];
+   nir_def *lanes[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < v->components; i++)
       lanes[i] = v->lanes[i] ? v->lanes[i] : nir_undef(&t->b, 1, v->bits);
    return nir_vec(&t->b, lanes, v->components);
@@ -604,7 +607,7 @@ get_value(struct translator *t, LLVMValueRef llvm)
    if (components > 1 && (LLVMIsAConstantVector(llvm) ||
                          LLVMIsAConstantDataVector(llvm) ||
                          LLVMIsAConstantFP(llvm) || LLVMIsAConstantInt(llvm))) {
-      nir_def *elements[4];
+      nir_def *elements[NIR_MAX_VEC_COMPONENTS];
       for (unsigned i = 0; i < components; i++) {
          LLVMValueRef element = LLVMGetAggregateElement(llvm, i);
          elements[i] = get_value(t, element);
@@ -2821,7 +2824,7 @@ vector_instruction(struct translator *t, LLVMValueRef inst, LLVMOpcode op)
       }
       nir_def *lane = get_value(t, LLVMGetOperand(inst, 1));
       if (!lane) return false;
-      nir_def *lanes[4];
+      nir_def *lanes[NIR_MAX_VEC_COMPONENTS];
       for (unsigned i = 0; i < a->components; i++)
          lanes[i] = i == channel ? lane : value_lane(t, a, i);
       return put_lanes(t, inst, lanes, a->components, a->bits);
@@ -2846,9 +2849,10 @@ vector_instruction(struct translator *t, LLVMValueRef inst, LLVMOpcode op)
       }
       return put_value(t, inst, nir_vec2(&t->b, lanes[0], lanes[1]), 0);
    }
-   if (!b || a->components != b->components || a->bits != b->bits || !n || n > 4)
+   if (!b || a->components != b->components || a->bits != b->bits ||
+       (n != 1 && !stela_air_vector_lanes(n)))
       return fail(t, STELA_AIR_TYPE, "unsupported shuffle shape");
-   nir_def *lanes[4] = {0};
+   nir_def *lanes[NIR_MAX_VEC_COMPONENTS] = {0};
    for (unsigned i = 0; i < n; i++) {
       int mask = LLVMGetMaskValue(inst, i);
       if (mask < 0) continue; /* Undefined result lane stays symbolic. */
@@ -2900,7 +2904,7 @@ matrix_elements(struct translator *t, LLVMValueRef inst, LLVMOpcode op)
       }
       if (!value_shape(LLVMTypeOf(inst), &components, &bits))
          return fail(t, STELA_AIR_TYPE, "SIMD-group matrix shuffles gather a vector of thread elements");
-      nir_def *lanes[4] = {0};
+      nir_def *lanes[NIR_MAX_VEC_COMPONENTS] = {0};
       for (unsigned i = 0; i < n; i++) {
          int mask = LLVMGetMaskValue(inst, i);
          if (mask > 1)
@@ -5078,6 +5082,84 @@ integer_funnel(struct translator *t, LLVMValueRef inst, LLVMValueRef callee,
    return put_value(t, inst, result, 0);
 }
 
+enum integer_reduction_operation {
+   INTEGER_REDUCE_ADD,
+   INTEGER_REDUCE_MUL,
+   INTEGER_REDUCE_AND,
+   INTEGER_REDUCE_OR,
+   INTEGER_REDUCE_XOR,
+   INTEGER_REDUCE_SMAX,
+   INTEGER_REDUCE_SMIN,
+   INTEGER_REDUCE_UMAX,
+   INTEGER_REDUCE_UMIN,
+};
+
+/* llvm.vector.reduce.<operation> of an integer vector: its lanes combined
+ * in order, which every operation's associativity makes exact. Bools combine
+ * as one-bit integers, true being -1 signed: a sum is their xor, a product,
+ * signed maximum or unsigned minimum their and, a signed minimum or unsigned
+ * maximum their or. */
+static bool
+integer_reduction(struct translator *t, LLVMValueRef inst, LLVMValueRef callee,
+                  enum integer_reduction_operation operation)
+{
+   unsigned components, bits;
+   LLVMValueRef operand = LLVMGetNumArgOperands(inst) == 1 ? LLVMGetOperand(inst, 0) : NULL;
+   LLVMTypeRef type = operand ? LLVMTypeOf(operand) : NULL;
+   if (!type || LLVMGetTypeKind(type) != LLVMVectorTypeKind || !shape(type, &components, &bits) ||
+       LLVMTypeOf(inst) != LLVMGetElementType(type) || !LLVMIsDeclaration(callee) ||
+       LLVMGetCalledFunctionType(inst) != LLVMGlobalGetValueType(callee) ||
+       LLVMGetNumOperandBundles(inst))
+      return fail(t, STELA_AIR_TYPE, "unsupported LLVM integer reduction signature");
+   nir_def *vector = get_value(t, operand);
+   if (!vector)
+      return false;
+   if (bits == 1) {
+      static const enum integer_reduction_operation bools[] = {
+         [INTEGER_REDUCE_ADD] = INTEGER_REDUCE_XOR, [INTEGER_REDUCE_MUL] = INTEGER_REDUCE_AND,
+         [INTEGER_REDUCE_AND] = INTEGER_REDUCE_AND, [INTEGER_REDUCE_OR] = INTEGER_REDUCE_OR,
+         [INTEGER_REDUCE_XOR] = INTEGER_REDUCE_XOR, [INTEGER_REDUCE_SMAX] = INTEGER_REDUCE_AND,
+         [INTEGER_REDUCE_SMIN] = INTEGER_REDUCE_OR, [INTEGER_REDUCE_UMAX] = INTEGER_REDUCE_OR,
+         [INTEGER_REDUCE_UMIN] = INTEGER_REDUCE_AND,
+      };
+      operation = bools[operation];
+   }
+   nir_builder *b = &t->b;
+   nir_def *result = nir_channel(b, vector, 0);
+   for (unsigned i = 1; i < components; i++) {
+      nir_def *lane = nir_channel(b, vector, i);
+      switch (operation) {
+      case INTEGER_REDUCE_ADD: result = nir_iadd(b, result, lane); break;
+      case INTEGER_REDUCE_MUL: result = nir_imul(b, result, lane); break;
+      case INTEGER_REDUCE_AND: result = nir_iand(b, result, lane); break;
+      case INTEGER_REDUCE_OR: result = nir_ior(b, result, lane); break;
+      case INTEGER_REDUCE_XOR: result = nir_ixor(b, result, lane); break;
+      case INTEGER_REDUCE_SMAX: result = nir_imax(b, result, lane); break;
+      case INTEGER_REDUCE_SMIN: result = nir_imin(b, result, lane); break;
+      case INTEGER_REDUCE_UMAX: result = nir_umax(b, result, lane); break;
+      case INTEGER_REDUCE_UMIN: result = nir_umin(b, result, lane); break;
+      }
+   }
+   return put_value(t, inst, result, 0);
+}
+
+/* A bitcast between a vector of bools and an integer of as many bits, lane
+ * 0 its lowest, as LLVM lays bool vectors out. */
+static nir_def *
+bool_bitcast(nir_builder *b, nir_def *value, unsigned components, unsigned bits)
+{
+   if (value->bit_size == 1) {
+      nir_def *packed = nir_imm_intN_t(b, 0, bits);
+      for (unsigned i = 0; i < value->num_components; i++)
+         packed = nir_ior(b, packed, nir_ishl_imm(b, nir_b2iN(b, nir_channel(b, value, i), bits), i));
+      return packed;
+   }
+   nir_def *lanes[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < components; i++)
+      lanes[i] = nir_i2b(b, nir_iand_imm(b, nir_ushr_imm(b, value, i), 1));
+   return nir_vec(b, lanes, components);
+}
+
 static bool same_pointer_resource(const struct value *a, const struct value *b);
 static const struct value *joined_pointer(const struct value *a, LLVMValueRef b_llvm,
                                            const struct value *b);
@@ -7193,7 +7275,7 @@ mesh_call(struct translator *t, LLVMValueRef inst, LLVMValueRef callee, const ch
 static nir_def *
 frozen_lanes(struct translator *t, struct value *v)
 {
-   nir_def *lanes[4];
+   nir_def *lanes[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < v->components; i++) {
       lanes[i] = value_lane(t, v, i);
       if (!lanes[i])
@@ -7525,11 +7607,17 @@ instruction(struct translator *t, LLVMValueRef inst)
          return true;
       }
       if (!value_shape(source, &src_components, &src_bits) ||
-          !value_shape(LLVMTypeOf(inst), &components, &bits) || src_bits == 1 || bits == 1 ||
+          !value_shape(LLVMTypeOf(inst), &components, &bits) ||
           src_components * src_bits != components * bits)
          return fail(t, STELA_AIR_TYPE, "bitcast between unsupported or differently sized types");
+      /* Bools are bits only in vectors that bitcast to an integer, such as
+       * a <8 x i1> comparison's mask as an i8. */
+      bool bools = src_bits == 1 || bits == 1;
+      if (bools && (src_bits == bits || (src_bits == 1 ? components : src_components) != 1))
+         return fail(t, STELA_AIR_TYPE, "bitcast of bools other than between a vector and an integer");
       nir_def *value = get_value(t, LLVMGetOperand(inst, 0));
-      return value && put_value(t, inst, nir_bitcast_vector(&t->b, value, bits), 0);
+      return value && put_value(t, inst, bools ? bool_bitcast(&t->b, value, components, bits) :
+                                                 nir_bitcast_vector(&t->b, value, bits), 0);
    }
    if (op == LLVMCall) {
       LLVMValueRef callee = LLVMGetCalledValue(inst);
@@ -7611,6 +7699,25 @@ instruction(struct translator *t, LLVMValueRef inst)
             unsigned expected = LLVMLookupIntrinsicID(funnels[operation], strlen(funnels[operation]));
             if (expected && intrinsic == expected)
                return integer_funnel(t, inst, callee, intrinsic, (enum integer_funnel_operation)operation);
+         }
+      }
+      if (LLVMIsAFunction(callee)) {
+         unsigned intrinsic = LLVMGetIntrinsicID(callee);
+         static const char *const reductions[] = {
+            [INTEGER_REDUCE_ADD] = "llvm.vector.reduce.add",
+            [INTEGER_REDUCE_MUL] = "llvm.vector.reduce.mul",
+            [INTEGER_REDUCE_AND] = "llvm.vector.reduce.and",
+            [INTEGER_REDUCE_OR] = "llvm.vector.reduce.or",
+            [INTEGER_REDUCE_XOR] = "llvm.vector.reduce.xor",
+            [INTEGER_REDUCE_SMAX] = "llvm.vector.reduce.smax",
+            [INTEGER_REDUCE_SMIN] = "llvm.vector.reduce.smin",
+            [INTEGER_REDUCE_UMAX] = "llvm.vector.reduce.umax",
+            [INTEGER_REDUCE_UMIN] = "llvm.vector.reduce.umin",
+         };
+         for (unsigned operation = 0; intrinsic && operation < ARRAY_SIZE(reductions); operation++) {
+            unsigned expected = LLVMLookupIntrinsicID(reductions[operation], strlen(reductions[operation]));
+            if (expected && intrinsic == expected)
+               return integer_reduction(t, inst, callee, (enum integer_reduction_operation)operation);
          }
       }
       size_t name_length = 0;
@@ -8807,8 +8914,8 @@ aggregate_leaves(LLVMTypeRef type, unsigned limit)
  * each leaf: a by-value array such as MPS's reduction state, [8 x i8], is
  * joined so when calls passing it share one body. At most
  * AIR_MAX_PHI_LEAVES leaves a PHI. A pointer in an aggregate has no
- * provenance to join, and a vector past four lanes no NIR value, so they
- * are refused, naming the type they are in. */
+ * provenance to join, and a double or a vector of other lanes than NIR's
+ * (shape) no NIR value, so they are refused, naming the type they are in. */
 static bool
 cfg_phi_shape(struct translator *t, LLVMTypeRef type, bool *aggregate)
 {

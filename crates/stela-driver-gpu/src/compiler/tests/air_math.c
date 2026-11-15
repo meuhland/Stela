@@ -658,8 +658,8 @@ refuses_misnamed_and_misplaced_functions(void)
        "call i16 @air.convert.s.i32.f.f32(float 1.0)", STELA_AIR_INSTRUCTION},
       {"declare float @air.convert.s.f32.f.f32(float)\n", "float",
        "call float @air.convert.s.f32.f.f32(float 1.0)", STELA_AIR_INSTRUCTION},
-      /* A bfloat vector has at most 4 lanes, as a half or float one does. */
-      {"", "<8 x bfloat>", "fadd <8 x bfloat> zeroinitializer, zeroinitializer", STELA_AIR_TYPE},
+      /* A bfloat vector has NIR's lanes, as a half or float one does. */
+      {"", "<6 x bfloat>", "fadd <6 x bfloat> zeroinitializer, zeroinitializer", STELA_AIR_TYPE},
       /* A function's name spells its overload. */
       {"declare float @air.sqrt.f16(float)\n", "float", "call float @air.sqrt.f16(float 1.0)",
        STELA_AIR_INSTRUCTION},

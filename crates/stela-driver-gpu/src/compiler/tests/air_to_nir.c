@@ -2831,6 +2831,400 @@ repeated_calls_passing_an_array_share_one_body(void)
    }
 }
 
+/* Vectors of 8 and 16 lanes, which LLVM's vectorizers and SROA make of
+ * Metal's arrays and structs, such as MPSGraph's <8 x i8>: NIR vectors of as
+ * many lanes, through PHIs, shuffles, element accesses, bitcasts, casts and
+ * memory. */
+static const char *wide_loop_body =
+   "entry:\nbr label %header\n"
+   "header:\n%i = phi i32 [0, %entry], [%next, %latch]\n"
+   "%acc = phi <8 x i8> [<i8 1, i8 2, i8 3, i8 4, i8 5, i8 6, i8 7, i8 -128>, %entry], [%acc4, %latch]\n"
+   "%hacc = phi <8 x half> [<half 0xH3C00, half 0xH4000, half 0xH4200, half 0xH4400,"
+   " half 0xH4500, half 0xH4600, half 0xH4700, half 0xH4800>, %entry], [%hnext, %latch]\n"
+   "%more = icmp ult i32 %i, 5\nbr i1 %more, label %latch, label %exit\n"
+   "latch:\n"
+   "%rot = shufflevector <8 x i8> %acc, <8 x i8> <i8 9, i8 9, i8 9, i8 9, i8 9, i8 9, i8 9, i8 9>,"
+   " <8 x i32> <i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8>\n"
+   "%sum = add <8 x i8> %rot, %acc\n"
+   "%word = bitcast <8 x i8> %sum to i64\n"
+   "%turned = xor i64 %word, 81985529216486895\n"
+   "%acc3 = bitcast i64 %turned to <8 x i8>\n"
+   "%lane = and i32 %i, 7\n"
+   "%old = extractelement <8 x i8> %acc3, i32 %lane\n"
+   "%new = add i8 %old, 100\n"
+   "%acc4 = insertelement <8 x i8> %acc3, i8 %new, i32 %lane\n"
+   "%hneg = fneg <8 x half> %hacc\n"
+   "%hnext = shufflevector <8 x half> %hneg, <8 x half> poison,"
+   " <8 x i32> <i32 7, i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6>\n"
+   "%next = add i32 %i, 1\nbr label %header\n"
+   "exit:\n"
+   "%pair = bitcast <8 x i8> %acc to <2 x i32>\n"
+   "%lo = extractelement <2 x i32> %pair, i32 0\n"
+   "store i32 %lo, ptr addrspace(1) %out, align 4\n"
+   "%p1 = getelementptr i32, ptr addrspace(1) %out, i32 1\n"
+   "%hi = extractelement <2 x i32> %pair, i32 1\n"
+   "store i32 %hi, ptr addrspace(1) %p1, align 4\n"
+   "%q = bitcast <8 x i8> %acc to i64\n"
+   "%p2 = getelementptr i8, ptr addrspace(1) %out, i32 8\n"
+   "store i64 %q, ptr addrspace(1) %p2, align 8\n"
+   "%wide = sext <8 x i8> %acc to <8 x i16>\n"
+   "%p3 = getelementptr i8, ptr addrspace(1) %out, i32 16\n"
+   "store <8 x i16> %wide, ptr addrspace(1) %p3, align 16\n"
+   "%p4 = getelementptr i8, ptr addrspace(1) %out, i32 35\n"
+   "store <8 x i8> %acc, ptr addrspace(1) %p4, align 1\n"
+   "%p5 = getelementptr i8, ptr addrspace(1) %out, i32 48\n"
+   "store <8 x half> %hacc, ptr addrspace(1) %p5, align 16\n"
+   "ret void\n";
+
+/* Loads of 8 and 16 lanes at aligned and unaligned offsets, the same bytes
+ * as other lanes, and stores of what lane-wise arithmetic, comparisons,
+ * selects and shuffles make of them. */
+static const char *wide_memory_body =
+   "%a = getelementptr i8, ptr addrspace(1) %out, i64 3\n"
+   "%u = load <8 x i8>, ptr addrspace(1) %a, align 1\n"
+   "%b = getelementptr i8, ptr addrspace(1) %out, i64 16\n"
+   "%w = load <16 x i8>, ptr addrspace(1) %b, align 16\n"
+   "%h = load <8 x i16>, ptr addrspace(1) %b, align 16\n"
+   "%c = getelementptr i8, ptr addrspace(1) %out, i64 34\n"
+   "%f = load <8 x float>, ptr addrspace(1) %c, align 2\n"
+   "%odd = shufflevector <16 x i8> %w, <16 x i8> poison,"
+   " <8 x i32> <i32 15, i32 13, i32 11, i32 9, i32 7, i32 5, i32 3, i32 1>\n"
+   "%less = icmp slt <8 x i8> %u, %odd\n"
+   "%low = select <8 x i1> %less, <8 x i8> %u, <8 x i8> %odd\n"
+   "%above = icmp ugt <8 x i8> %u, %odd\n"
+   "%high = select <8 x i1> %above, <8 x i8> %u, <8 x i8> %odd\n"
+   "%mix = xor <8 x i8> %low, %high\n"
+   "%wide = zext <8 x i8> %mix to <8 x i16>\n"
+   "%diff = sub <8 x i16> %h, %wide\n"
+   "%o0 = getelementptr i8, ptr addrspace(1) %out, i64 72\n"
+   "store <8 x i16> %diff, ptr addrspace(1) %o0, align 8\n"
+   "%zip = shufflevector <8 x i8> %low, <8 x i8> %high, <16 x i32> <i32 0, i32 8, i32 1, i32 9,"
+   " i32 2, i32 10, i32 3, i32 11, i32 4, i32 12, i32 5, i32 13, i32 6, i32 14, i32 7, i32 15>\n"
+   "%o1 = getelementptr i8, ptr addrspace(1) %out, i64 89\n"
+   "store <16 x i8> %zip, ptr addrspace(1) %o1, align 1\n"
+   "%fi = bitcast <8 x float> %f to <8 x i32>\n"
+   "%fr = shufflevector <8 x i32> %fi, <8 x i32> poison,"
+   " <8 x i32> <i32 7, i32 6, i32 5, i32 4, i32 3, i32 2, i32 1, i32 0>\n"
+   "%ff = bitcast <8 x i32> %fr to <8 x float>\n"
+   "%o2 = getelementptr i8, ptr addrspace(1) %out, i64 108\n"
+   "store <8 x float> %ff, ptr addrspace(1) %o2, align 4\n"
+   "%pairs = bitcast <16 x i8> %zip to <2 x i64>\n"
+   "%top = extractelement <2 x i64> %pairs, i32 1\n"
+   "%o3 = getelementptr i8, ptr addrspace(1) %out, i64 144\n"
+   "store i64 %top, ptr addrspace(1) %o3, align 8\n"
+   "%hw = bitcast <8 x i16> %h to <16 x i8>\n"
+   "%twice = add <16 x i8> %hw, %w\n"
+   "%o4 = getelementptr i8, ptr addrspace(1) %out, i64 153\n"
+   "store <16 x i8> %twice, ptr addrspace(1) %o4, align 1\n"
+   "ret void\n";
+
+/* Arithmetic on wide floats, which NAK compiles. */
+static const char *wide_floating_body =
+   "%h = load <8 x half>, ptr addrspace(1) %out, align 16\n"
+   "%p = getelementptr i8, ptr addrspace(1) %out, i64 16\n"
+   "%f = load <8 x float>, ptr addrspace(1) %p, align 16\n"
+   "%x = fpext <8 x half> %h to <8 x float>\n"
+   "%s = fadd <8 x float> %x, %f\n"
+   "%m = fmul <8 x float> %s, %f\n"
+   "%t = fptrunc <8 x float> %m to <8 x half>\n"
+   "%b = load <16 x i8>, ptr addrspace(1) %p, align 16\n"
+   "%c = sitofp <16 x i8> %b to <16 x half>\n"
+   "%d = shufflevector <16 x half> %c, <16 x half> poison, <8 x i32> <i32 0, i32 2, i32 4, i32 6,"
+   " i32 8, i32 10, i32 12, i32 14>\n"
+   "%e = fsub <8 x half> %t, %d\n"
+   "store <8 x half> %e, ptr addrspace(1) %out, align 16\n"
+   "%q = fptosi <8 x float> %m to <8 x i32>\n"
+   "store <8 x i32> %q, ptr addrspace(1) %p, align 16\n"
+   "ret void\n";
+
+/* Store `index` of an execution: `components` lanes of `bits` at `address`. */
+static void
+check_wide_store(const struct air_effect_store *trace, unsigned index, uint64_t address,
+                 unsigned components, unsigned bits, const uint64_t *lanes)
+{
+   const struct air_effect_store *store = &trace[index];
+   if (store->address != address || store->components != components || store->bits != bits)
+      fprintf(stderr, "store %u: %u x %u bits at 0x%llx\n", index, store->components, store->bits,
+              (unsigned long long)store->address);
+   CHECK(!store->ssbo && !store->shared && store->address == address &&
+         store->components == components && store->bits == bits);
+   for (unsigned i = 0; i < components; i++) {
+      uint64_t value = nir_const_value_as_uint(store->values[i], bits);
+      if (value != lanes[i])
+         fprintf(stderr, "store %u lane %u: 0x%llx, wanted 0x%llx\n", index, i,
+                 (unsigned long long)value, (unsigned long long)lanes[i]);
+      CHECK(value == lanes[i]);
+   }
+}
+
+static uint64_t
+little_endian(const uint8_t *bytes, unsigned count)
+{
+   uint64_t value = 0;
+   for (unsigned i = 0; i < count; i++)
+      value |= (uint64_t)bytes[i] << (8 * i);
+   return value;
+}
+
+/* A loop carries <8 x i8> and <8 x half> accumulators: each trip turns the
+ * bytes a lane, adds them to themselves, flips them through an i64 and
+ * raises the trip's lane by 100, and negates and turns the halves. */
+static void
+wide_vector_loop_semantics(void)
+{
+   uint8_t acc[8] = {1, 2, 3, 4, 5, 6, 7, 0x80};
+   uint16_t halves[8] = {0x3c00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600, 0x4700, 0x4800};
+   for (unsigned trip = 0; trip < 5; trip++) {
+      uint8_t sum[8];
+      for (unsigned l = 0; l < 8; l++)
+         sum[l] = (uint8_t)((l < 7 ? acc[l + 1] : 9) + acc[l]);
+      uint64_t word = little_endian(sum, 8) ^ UINT64_C(0x0123456789abcdef);
+      for (unsigned l = 0; l < 8; l++)
+         acc[l] = (uint8_t)(word >> (8 * l));
+      acc[trip & 7] = (uint8_t)(acc[trip & 7] + 100);
+      uint16_t negated[8];
+      for (unsigned l = 0; l < 8; l++)
+         negated[l] = halves[l] ^ 0x8000;
+      for (unsigned l = 0; l < 8; l++)
+         halves[l] = negated[(l + 7) % 8];
+   }
+   uint64_t lo = little_endian(acc, 4), hi = little_endian(acc + 4, 4), whole = little_endian(acc, 8);
+   uint64_t widened[8], bytes[8], half_lanes[8];
+   for (unsigned l = 0; l < 8; l++) {
+      widened[l] = (uint16_t)(int16_t)(int8_t)acc[l];
+      bytes[l] = acc[l];
+      half_lanes[l] = halves[l];
+   }
+   nir_shader *nir = translate_body(wide_loop_body);
+   specialize_invocation(nir, 0);
+   struct air_effect_store trace[8];
+   struct air_effect_run run = air_effect_execute(nir, 100000, trace, ARRAY_SIZE(trace));
+   if (run.status != AIR_EFFECT_COMPLETE) {
+      fprintf(stderr, "wide loop: status %u: %s\n", run.status, run.detail);
+      nir_print_shader(nir, stderr);
+   }
+   CHECK(run.status == AIR_EFFECT_COMPLETE && run.stores == 6);
+   check_wide_store(trace, 0, 0x100000, 1, 32, &lo);
+   check_wide_store(trace, 1, 0x100004, 1, 32, &hi);
+   check_wide_store(trace, 2, 0x100008, 1, 64, &whole);
+   check_wide_store(trace, 3, 0x100010, 8, 16, widened);
+   check_wide_store(trace, 4, 0x100023, 8, 8, bytes);
+   check_wide_store(trace, 5, 0x100030, 8, 16, half_lanes);
+   /* The accumulators stay whole vectors in their PHIs. */
+   unsigned wide_phis = 0;
+   nir_foreach_function_impl(impl, nir) nir_foreach_block(block, impl) nir_foreach_phi(phi, block)
+      wide_phis += phi->def.num_components == 8;
+   CHECK(wide_phis == 2);
+   ralloc_free(nir);
+}
+
+static void
+wide_vector_memory_semantics(void)
+{
+   uint8_t memory[256], initial[256];
+   for (unsigned i = 0; i < sizeof(memory); i++)
+      memory[i] = initial[i] = (uint8_t)(i * 37 + 11);
+   uint8_t u[8], w[16], odd[8], low[8], high[8], zip[16];
+   uint64_t diff[8], zipped[16], reversed[8], twice[16], top;
+   memcpy(u, initial + 3, 8);
+   memcpy(w, initial + 16, 16);
+   for (unsigned l = 0; l < 8; l++) {
+      odd[l] = w[15 - 2 * l];
+      low[l] = (int8_t)u[l] < (int8_t)odd[l] ? u[l] : odd[l];
+      high[l] = u[l] > odd[l] ? u[l] : odd[l];
+      diff[l] = (uint16_t)(little_endian(initial + 16 + 2 * l, 2) - (uint8_t)(low[l] ^ high[l]));
+      zip[2 * l] = low[l];
+      zip[2 * l + 1] = high[l];
+      reversed[l] = little_endian(initial + 34 + 4 * (7 - l), 4);
+   }
+   for (unsigned k = 0; k < 16; k++) {
+      zipped[k] = zip[k];
+      twice[k] = (uint8_t)(2 * w[k]);
+   }
+   top = little_endian(zip + 8, 8);
+   nir_shader *nir = translate_body(wide_memory_body);
+   specialize_invocation(nir, 0);
+   const struct air_effect_environment environment = {.base = 0x100000, .bytes = memory,
+                                                      .size = sizeof(memory)};
+   struct air_effect_store trace[8];
+   struct air_effect_run run = air_effect_execute_in(nir, 100000, trace, ARRAY_SIZE(trace), &environment);
+   if (run.status != AIR_EFFECT_COMPLETE) {
+      fprintf(stderr, "wide memory: status %u: %s\n", run.status, run.detail);
+      nir_print_shader(nir, stderr);
+   }
+   CHECK(run.status == AIR_EFFECT_COMPLETE && run.stores == 5);
+   check_wide_store(trace, 0, 0x100048, 8, 16, diff);
+   check_wide_store(trace, 1, 0x100059, 16, 8, zipped);
+   check_wide_store(trace, 2, 0x10006c, 8, 32, reversed);
+   check_wide_store(trace, 3, 0x100090, 1, 64, &top);
+   check_wide_store(trace, 4, 0x100099, 16, 8, twice);
+   /* Each wide access is one NIR load or store of its lanes. */
+   unsigned loads = 0;
+   nir_foreach_function_impl(impl, nir) nir_foreach_block(block, impl) nir_foreach_instr(instr, block) {
+      if (instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_global)
+         loads += nir_instr_as_intrinsic(instr)->def.num_components >= 8;
+   }
+   CHECK(loads == 4);
+   ralloc_free(nir);
+}
+
+/* Wide float arithmetic, conversions and math intrinsics, folded to the
+ * exact bits of one lane; wide integer intrinsics, folded too. */
+static void
+wide_vector_floating_semantics(void)
+{
+   const char *eight = "<i8 -3, i8 1, i8 2, i8 3, i8 4, i8 5, i8 100, i8 7>";
+   char body[1024];
+   /* -3 + 0.5 ... 100 + 0.5: lane 6 is 100.5. */
+   snprintf(body, sizeof(body),
+      "%%v = sitofp <8 x i8> %s to <8 x float>\n"
+      "%%s = fadd <8 x float> %%v, <float 0.5, float 0.5, float 0.5, float 0.5,"
+      " float 0.5, float 0.5, float 0.5, float 0.5>\n"
+      "%%e = extractelement <8 x float> %%s, i32 6\n%%bits = bitcast float %%e to i32\n"
+      "store i32 %%bits, ptr addrspace(1) %%out, align 4\nret void\n", eight);
+   ieee_store(body, 0x42c90000);
+   /* Lane 1, 1.5 as a half, squared: 2.25. */
+   snprintf(body, sizeof(body),
+      "%%v = sitofp <8 x i8> %s to <8 x float>\n"
+      "%%s = fadd <8 x float> %%v, <float 0.5, float 0.5, float 0.5, float 0.5,"
+      " float 0.5, float 0.5, float 0.5, float 0.5>\n"
+      "%%h = fptrunc <8 x float> %%s to <8 x half>\n%%m = fmul <8 x half> %%h, %%h\n"
+      "%%e = extractelement <8 x half> %%m, i32 1\n%%bits = bitcast half %%e to i16\n"
+      "%%z = zext i16 %%bits to i32\nstore i32 %%z, ptr addrspace(1) %%out, align 4\nret void\n", eight);
+   ieee_store(body, 0x4080);
+   /* |-2.5| through llvm.fabs.v8f32. */
+   snprintf(body, sizeof(body),
+      "%%v = sitofp <8 x i8> %s to <8 x float>\n"
+      "%%s = fadd <8 x float> %%v, <float 0.5, float 0.5, float 0.5, float 0.5,"
+      " float 0.5, float 0.5, float 0.5, float 0.5>\n"
+      "%%a = call <8 x float> @llvm.fabs.v8f32(<8 x float> %%s)\n"
+      "%%e = extractelement <8 x float> %%a, i32 0\n%%bits = bitcast float %%e to i32\n"
+      "store i32 %%bits, ptr addrspace(1) %%out, align 4\nret void\n", eight);
+   constant_store_input(ieee_bitcode_extra(stela_air_test_prefix, body,
+                                           "declare <8 x float> @llvm.fabs.v8f32(<8 x float>)\n"),
+                        0x40200000, 0x100000);
+   /* 255 as a half from 16 unsigned bytes: lane 15. */
+   ieee_store("%c = uitofp <16 x i8> <i8 0, i8 1, i8 2, i8 3, i8 4, i8 5, i8 6, i8 7, i8 8, i8 9,"
+              " i8 10, i8 11, i8 12, i8 13, i8 14, i8 -1> to <16 x half>\n"
+              "%e = extractelement <16 x half> %c, i32 15\n%bits = bitcast half %e to i16\n"
+              "%z = zext i16 %bits to i32\nstore i32 %z, ptr addrspace(1) %out, align 4\nret void\n",
+              0x5bf8);
+   /* llvm.umax.v16i8 and llvm.smin.v8i16, lane by lane. */
+   constant_store_input(stela_air_test_bitcode(
+      "%m = call <16 x i8> @llvm.umax.v16i8(<16 x i8> <i8 1, i8 -1, i8 3, i8 4, i8 5, i8 6, i8 7,"
+      " i8 8, i8 9, i8 10, i8 11, i8 12, i8 13, i8 14, i8 15, i8 16>, <16 x i8> <i8 2, i8 1, i8 1,"
+      " i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1, i8 1>)\n"
+      "%n = call <8 x i16> @llvm.smin.v8i16(<8 x i16> <i16 -5, i16 0, i16 0, i16 0, i16 0, i16 0,"
+      " i16 0, i16 9>, <8 x i16> <i16 3, i16 0, i16 0, i16 0, i16 0, i16 0, i16 0, i16 -9>)\n"
+      "%a = extractelement <16 x i8> %m, i32 1\n%b = extractelement <8 x i16> %n, i32 7\n"
+      "%za = zext i8 %a to i32\n%zb = zext i16 %b to i32\n%sh = shl i32 %zb, 8\n"
+      "%r = or i32 %za, %sh\nstore i32 %r, ptr addrspace(1) %out, align 4\nret void\n",
+      "declare <16 x i8> @llvm.umax.v16i8(<16 x i8>, <16 x i8>)\n"
+      "declare <8 x i16> @llvm.smin.v8i16(<8 x i16>, <8 x i16>)\n"),
+      0xfff7ff, 0x100000);
+   /* A vector of lanes no NIR vector has stays refused. */
+   expect_refusal("%v = add <6 x i16> zeroinitializer, zeroinitializer\nret void\n", "", 100,
+                  STELA_AIR_TYPE);
+   expect_refusal("%v = add <32 x i8> zeroinitializer, zeroinitializer\nret void\n", "", 100,
+                  STELA_AIR_TYPE);
+}
+
+/* Integer reductions of vectors, and the masks of bool vectors as
+ * integers and back. */
+static const char *reduction_declarations =
+   "declare i8 @llvm.vector.reduce.add.v8i8(<8 x i8>)\n"
+   "declare i8 @llvm.vector.reduce.umax.v8i8(<8 x i8>)\n"
+   "declare i8 @llvm.vector.reduce.smin.v16i8(<16 x i8>)\n"
+   "declare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>)\n"
+   "declare i1 @llvm.vector.reduce.or.v16i1(<16 x i1>)\n"
+   "declare i1 @llvm.vector.reduce.and.v16i1(<16 x i1>)\n";
+
+static const char *reduction_body =
+   "%p = getelementptr i8, ptr addrspace(1) %out, i64 8\n"
+   "%v = load <8 x i8>, ptr addrspace(1) %p, align 8\n"
+   "%q = getelementptr i8, ptr addrspace(1) %out, i64 16\n"
+   "%x = load <16 x i8>, ptr addrspace(1) %q, align 16\n"
+   "%s = call i8 @llvm.vector.reduce.add.v8i8(<8 x i8> %v)\n"
+   "%m = call i8 @llvm.vector.reduce.umax.v8i8(<8 x i8> %v)\n"
+   "%n = call i8 @llvm.vector.reduce.smin.v16i8(<16 x i8> %x)\n"
+   "%w = sext <8 x i8> %v to <8 x i32>\n"
+   "%t = call i32 @llvm.vector.reduce.add.v8i32(<8 x i32> %w)\n"
+   "%negative = icmp slt <16 x i8> %x, zeroinitializer\n"
+   "%mask = bitcast <16 x i1> %negative to i16\n"
+   "%any = call i1 @llvm.vector.reduce.or.v16i1(<16 x i1> %negative)\n"
+   "%all = call i1 @llvm.vector.reduce.and.v16i1(<16 x i1> %negative)\n"
+   "%chosen = bitcast i8 %s to <8 x i1>\n"
+   "%kept = select <8 x i1> %chosen, <8 x i8> %v, <8 x i8> zeroinitializer\n"
+   "%o0 = getelementptr i8, ptr addrspace(1) %out, i64 64\n"
+   "store i8 %s, ptr addrspace(1) %o0, align 1\n"
+   "%o1 = getelementptr i8, ptr addrspace(1) %out, i64 65\n"
+   "store i8 %m, ptr addrspace(1) %o1, align 1\n"
+   "%o2 = getelementptr i8, ptr addrspace(1) %out, i64 66\n"
+   "store i8 %n, ptr addrspace(1) %o2, align 1\n"
+   "%o3 = getelementptr i8, ptr addrspace(1) %out, i64 68\n"
+   "store i32 %t, ptr addrspace(1) %o3, align 4\n"
+   "%o4 = getelementptr i8, ptr addrspace(1) %out, i64 72\n"
+   "store i16 %mask, ptr addrspace(1) %o4, align 2\n"
+   "%a = zext i1 %any to i8\n%b = zext i1 %all to i8\n%b2 = shl i8 %b, 1\n%flags = or i8 %a, %b2\n"
+   "%o5 = getelementptr i8, ptr addrspace(1) %out, i64 74\n"
+   "store i8 %flags, ptr addrspace(1) %o5, align 1\n"
+   "%o6 = getelementptr i8, ptr addrspace(1) %out, i64 80\n"
+   "store <8 x i8> %kept, ptr addrspace(1) %o6, align 8\n"
+   "ret void\n";
+
+static void
+vector_reductions_and_masks(void)
+{
+   uint8_t memory[128];
+   for (unsigned i = 0; i < sizeof(memory); i++)
+      memory[i] = (uint8_t)(i * 37 + 11);
+   const uint8_t *v = memory + 8, *x = memory + 16;
+   uint64_t sum = 0, umax = 0, smin, total = 0, mask = 0, flags, kept[8];
+   int8_t least = 127;
+   for (unsigned l = 0; l < 8; l++) {
+      sum = (uint8_t)(sum + v[l]);
+      umax = v[l] > umax ? v[l] : umax;
+      total = (uint32_t)(total + (uint32_t)(int32_t)(int8_t)v[l]);
+   }
+   for (unsigned k = 0; k < 16; k++) {
+      least = (int8_t)x[k] < least ? (int8_t)x[k] : least;
+      mask |= (uint64_t)(x[k] >> 7) << k;
+   }
+   smin = (uint8_t)least;
+   flags = (mask != 0) | (uint64_t)(mask == 0xffff) << 1;
+   for (unsigned l = 0; l < 8; l++)
+      kept[l] = (sum >> l) & 1 ? v[l] : 0;
+   LLVMMemoryBufferRef input = stela_air_test_bitcode(reduction_body, reduction_declarations);
+   struct stela_air_error error;
+   nir_shader *nir = translate(input, &test_nir_options, 1000, &error);
+   if (!nir)
+      fprintf(stderr, "reductions: %s\n", error.detail);
+   CHECK(nir);
+   LLVMDisposeMemoryBuffer(input);
+   specialize_invocation(nir, 0);
+   const struct air_effect_environment environment = {.base = 0x100000, .bytes = memory,
+                                                      .size = sizeof(memory)};
+   struct air_effect_store trace[8];
+   struct air_effect_run run = air_effect_execute_in(nir, 100000, trace, ARRAY_SIZE(trace), &environment);
+   if (run.status != AIR_EFFECT_COMPLETE) {
+      fprintf(stderr, "reductions: status %u: %s\n", run.status, run.detail);
+      nir_print_shader(nir, stderr);
+   }
+   CHECK(run.status == AIR_EFFECT_COMPLETE && run.stores == 7);
+   check_wide_store(trace, 0, 0x100040, 1, 8, &sum);
+   check_wide_store(trace, 1, 0x100041, 1, 8, &umax);
+   check_wide_store(trace, 2, 0x100042, 1, 8, &smin);
+   check_wide_store(trace, 3, 0x100044, 1, 32, &total);
+   check_wide_store(trace, 4, 0x100048, 1, 16, &mask);
+   check_wide_store(trace, 5, 0x10004a, 1, 8, &flags);
+   check_wide_store(trace, 6, 0x100050, 8, 8, kept);
+   ralloc_free(nir);
+   /* A bool vector bitcasts only to an integer of its lanes. */
+   expect_refusal("%b = bitcast <16 x i1> zeroinitializer to <2 x i8>\nret void\n", "", 100,
+                  STELA_AIR_TYPE);
+}
+
 static void
 tests(void)
 {
@@ -2862,6 +3256,10 @@ tests(void)
    integer_minmax_tests();
    integer_funnel_tests();
    vector_semantics();
+   wide_vector_loop_semantics();
+   wide_vector_memory_semantics();
+   wide_vector_floating_semantics();
+   vector_reductions_and_masks();
    undefined_phi_values();
    conditional_semantics();
    loop_semantics();
@@ -2996,16 +3394,17 @@ nak_target_name(char name[32], unsigned sm, const char *label)
       snprintf(name, 32, "sm%u.%s", sm, label);
 }
 
+/* body, with extra declarations, compiled for every NVIDIA target. */
 static void
-nak_codegen(const char *body, const char *label, bool ieee)
+nak_codegen_extra(const char *body, const char *extra, const char *label, bool ieee)
 {
    char target[32];
    for (unsigned i = 0; i < ARRAY_SIZE(stela_nvidia_sms); i++) {
       nak_target_name(target, stela_nvidia_sms[i], label);
       record_expect(target, NULL);
    }
-   LLVMMemoryBufferRef input = ieee ? ieee_bitcode(stela_air_test_prefix, body) :
-                                    stela_air_test_bitcode(body, "");
+   LLVMMemoryBufferRef input = ieee ? ieee_bitcode_extra(stela_air_test_prefix, body, extra) :
+                                    stela_air_test_bitcode(body, extra);
    for (unsigned i = 0; i < ARRAY_SIZE(stela_nvidia_sms); i++) {
       const unsigned sm = stela_nvidia_sms[i];
       const struct nv_device_info dev = {.sm = sm, .max_warps_per_mp = 32};
@@ -3041,6 +3440,12 @@ nak_codegen(const char *body, const char *label, bool ieee)
       nak_compiler_destroy(compiler);
    }
    LLVMDisposeMemoryBuffer(input);
+}
+
+static void
+nak_codegen(const char *body, const char *label, bool ieee)
+{
+   nak_codegen_extra(body, "", label, ieee);
 }
 #endif
 
@@ -3303,6 +3708,10 @@ main(void)
    char *comparisons = floating_comparison_body();
    nak_codegen(comparisons, "ieee-fp32-comparisons", true);
    free(comparisons);
+   nak_codegen(wide_loop_body, "wide-vector-loop", false);
+   nak_codegen(wide_memory_body, "wide-vector-memory", false);
+   nak_codegen(wide_floating_body, "wide-vector-floating", true);
+   nak_codegen_extra(reduction_body, reduction_declarations, "vector-reductions", false);
    nak_shared_codegen(false);
    nak_shared_codegen(true);
 #endif

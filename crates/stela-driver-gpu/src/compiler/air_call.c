@@ -55,14 +55,14 @@ stela_air_call_element(LLVMTypeRef type, unsigned *lanes)
    return type;
 }
 
-/* A scalar's type or a 2- to 4-lane vector's element type; otherwise NULL. */
+/* A scalar's type or a NIR-sized vector's element type; otherwise NULL. */
 static LLVMTypeRef
 shaped(LLVMTypeRef type)
 {
    unsigned lanes;
    LLVMTypeRef element = stela_air_call_element(type, &lanes);
    bool vector = LLVMGetTypeKind(type) == LLVMVectorTypeKind;
-   return lanes <= 4 && (!vector || lanes >= 2) ? element : NULL;
+   return !vector || stela_air_vector_lanes(lanes) ? element : NULL;
 }
 
 bool
