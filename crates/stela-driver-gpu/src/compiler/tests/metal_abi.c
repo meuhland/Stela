@@ -428,6 +428,8 @@ static void texel_kernels_convert_each_encoding(void)
    assert(intrinsic_count(load, nir_intrinsic_image_deref_load) == 1 + planes + 1 + 2 * planes);
    assert(intrinsic_count(load, nir_intrinsic_image_deref_store) == 2 * planes + planes);
    assert(intrinsic_count(load, nir_intrinsic_store_global) == encodings + 2 * planes + 2 * planes);
+   /* Each thread converts one texel, dirty tiles' too: no loop. */
+   assert(count(load).loops == 0);
    ralloc_free(load);
 }
 

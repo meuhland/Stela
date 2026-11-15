@@ -597,8 +597,9 @@ pub struct TexelArguments {
     pub bytes_per_image: u32,
     pub origin: [u32; 3],
     /// A load's pass stamp ([`PassDirty`]): nonzero, the region is the
-    /// whole image from the origin and thread `n` converts column `n % 64`
-    /// of tile `n / 64` where the dirty layer holds the stamp.
+    /// whole image from the origin and thread `n` converts texel `n % 64`
+    /// of row `n / 64 % 64` of tile `n / 4096` where the dirty layer holds
+    /// the stamp.
     pub stamp: u32,
     /// For the two-plane extended-range encodings, the address of the
     /// alpha plane's byte of the region's first texel, or zero for none,

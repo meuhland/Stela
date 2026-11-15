@@ -703,7 +703,8 @@ impl CommandBuffer {
                     counts.copied_texels += u64::from(count);
                 } else if stamp != 0 {
                     counts.stamped += 1;
-                    counts.stamped_tiles += u64::from(count / TexelArguments::WORKGROUP_SIZE);
+                    let tile = TexelArguments::DIRTY_TILE;
+                    counts.stamped_tiles += u64::from(count / (tile * tile));
                 } else {
                     counts.direct += 1;
                     counts.direct_texels += u64::from(count);
@@ -1261,9 +1262,9 @@ fn narrows(planes: &ExtendedPlanes) -> bool {
 
 /// The texel kernels' arguments converting `planes` over `area`
 /// (`[x, y, width, height]`, all of the extent for `None`), and the threads;
-/// `None` for none. With a pass's `stamp` the area is the whole extent and
-/// a workgroup converts each tile its fragments marked
-/// ([`TexelArguments::stamp`]).
+/// `None` for none. With a pass's `stamp` the area is the whole extent,
+/// rounded up to whole tiles, and a thread converts each texel of the tiles
+/// its fragments marked ([`TexelArguments::stamp`]).
 fn plane_conversion(
     planes: &ExtendedPlanes,
     area: Option<[u32; 4]>,
@@ -1272,7 +1273,7 @@ fn plane_conversion(
     let [x, y, width, height] = area.unwrap_or([0, 0, planes.extent[0], planes.extent[1]]);
     let tile = TexelArguments::DIRTY_TILE;
     let count = if stamp != 0 {
-        width.div_ceil(tile) * height.div_ceil(tile) * TexelArguments::WORKGROUP_SIZE
+        width.div_ceil(tile) * height.div_ceil(tile) * tile * tile
     } else {
         width
             .checked_mul(height)

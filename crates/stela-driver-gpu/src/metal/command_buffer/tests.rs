@@ -2405,10 +2405,10 @@ fn marked_passes_encode_their_dirty_tiles() {
         width: 200,
         height: 70,
     };
-    // 4 x 2 tiles of 64, a workgroup of 64 threads each.
+    // 4 x 2 tiles of 64, a thread for each of their texels.
     assert_eq!(
         record(whole, ResourceId(0x55)),
-        [(4 * 2 * 64, 7, [200, 70])]
+        [(4 * 2 * 64 * 64, 7, [200, 70])]
     );
     let part = ScissorRect {
         x: 8,
