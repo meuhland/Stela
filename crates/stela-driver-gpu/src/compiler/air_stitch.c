@@ -10,7 +10,10 @@
  * metadata of the parameter it feeds, a kernel's builtin or bound resource a
  * call of the Stela function that the kernel's translation answers, an early
  * return a branch to a return, and a stitched function returns what its
- * output node's function returns.
+ * output node's function returns. A graph names an argument only by an
+ * input node a call reads, so an argument nothing reads is no parameter;
+ * a caller that passes one anyway calls the function with the arguments it
+ * takes once linked (STELA_AIR_STITCHED_FUNCTION).
  *
  * A graph's call passes one value for each of the function's stitching
  * arguments (air.stitching_info), which may differ from its parameters: a
@@ -678,6 +681,12 @@ stitch_graph(struct stela_air_metadata *m, LLVMContextRef context, LLVMModuleRef
    unsigned sret_kind = LLVMGetEnumAttributeKindForName("sret", 4);
    if (output_sret)
       LLVMAddAttributeAtIndex(function, 1, LLVMCreateTypeAttribute(context, sret_kind, output_sret));
+   /* Its parameters are the inputs its calls read, which callers may follow
+    * with arguments it never reads. */
+   if (!graph->kernel)
+      LLVMAddAttributeAtIndex(function, LLVMAttributeFunctionIndex,
+                              LLVMCreateStringAttribute(context, STELA_AIR_STITCHED_FUNCTION,
+                                                        strlen(STELA_AIR_STITCHED_FUNCTION), "", 0));
 
    /* The entry block starts with the thread memory of calls. */
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(context, function, "entry");
