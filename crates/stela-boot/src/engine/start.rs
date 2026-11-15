@@ -1027,12 +1027,19 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 placement.physical,
                 network.mac(),
                 irq,
-                options.guest_network_stelanet_csum,
+                options.guest_network_stelanet_offloads.features(),
             )
             .unwrap_or_else(|error| output::fatal(&error));
+        use stela_boot_core::options::StelaNetOffloads;
+        let offloads = options.guest_network_stelanet_offloads;
         output::arguments(format_args!(
-            "GUEST NETWORK StelaNet /arm-io/stela-net0 at {:#x} aic input {:#x} checksums={}\n",
-            placement.physical, placement.irq, options.guest_network_stelanet_csum
+            "GUEST NETWORK StelaNet /arm-io/stela-net0 at {:#x} aic input {:#x} checksums={} \
+             lro={} offloads={}\n",
+            placement.physical,
+            placement.irq,
+            offloads >= StelaNetOffloads::Checksums,
+            offloads == StelaNetOffloads::Coalescing,
+            offloads.name()
         ));
     }
     // Device placement has copied the carried firmware. This function

@@ -644,6 +644,8 @@ pub struct GuestNetwork {
     /// The host adapter's carrier as last read for StelaNet, and when (TSC).
     carrier: Option<bool>,
     carrier_read: Option<u64>,
+    /// What the StelaNet adapter did for the guest at the last status.
+    stela_net: Option<stela_soc::stela_net::Stats>,
 }
 
 /// The APIC ID of the core the guest network's receive signal goes to once
@@ -692,6 +694,7 @@ impl GuestNetwork {
             address: None,
             carrier: None,
             carrier_read: None,
+            stela_net: None,
         })
     }
 
@@ -729,6 +732,11 @@ impl GuestNetwork {
                 if up { "up" } else { "down" }
             ));
         }
+    }
+
+    /// Keep the StelaNet adapter's counters for [`Self::report`].
+    pub fn stela_net_stats(&mut self, stats: Option<stela_soc::stela_net::Stats>) {
+        self.stela_net = stats;
     }
 
     /// Report why the StelaNet adapter stopped itself, once per new reason.
@@ -799,6 +807,27 @@ impl GuestNetwork {
             counters.overflowed,
             counters.malformed
         ));
+        if let Some(stats) = self.stela_net {
+            // Tenths, as integers: host frames per guest interrupt and per
+            // frame the guest's stack took.
+            let tenths = |count: u64, per: u64| {
+                let tenths = (count * 10).checked_div(per).unwrap_or(0);
+                (tenths / 10, tenths % 10)
+            };
+            let (irq_whole, irq_tenth) = tenths(counters.to_guest, stats.interrupts);
+            let (frame_whole, frame_tenth) = tenths(counters.to_guest, stats.rx_frames);
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet interrupts={} rx_signals={} tx_signals={} kicks={}                  rx_frames={} coalesced={} coalesced_segments={}                  frames_per_interrupt={irq_whole}.{irq_tenth}                  frames_per_rx_frame={frame_whole}.{frame_tenth}
+",
+                stats.interrupts,
+                stats.rx_signals,
+                stats.tx_signals,
+                stats.kicks,
+                stats.rx_frames,
+                stats.coalesced,
+                stats.coalesced_segments,
+            ));
+        }
     }
 
     /// Read frames from the host adapter while the guest's receive queue
