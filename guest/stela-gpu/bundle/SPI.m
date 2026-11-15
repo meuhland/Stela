@@ -55,6 +55,15 @@
 	return _surface;
 }
 
+/* The IOSurface the Neural Engine would read the buffer through, which
+ * MPSGraph asks of each buffer it might hand to one. The board claims no
+ * Neural Engine (`ane-type` is withheld, as in Apple's virtual machines), so
+ * no buffer has one: NULL, and MPSGraph keeps the work on the GPU. */
+- (IOSurfaceRef)_aneIOSurface
+{
+	return NULL;
+}
+
 @end
 
 @implementation StelaGPUQueue (SPI)
