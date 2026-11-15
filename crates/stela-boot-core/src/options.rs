@@ -406,6 +406,10 @@ pub struct System {
     /// Give the guest a USB Audio Class 2 speaker on the native hub
     /// (`--guest-audio`), whose frames the host consumes at 48 kHz.
     pub guest_audio: bool,
+    /// Play the speaker's frames on the HDMI monitor of the started GPU,
+    /// through its claimed HD Audio function, instead of the sink
+    /// (`--guest-audio-hdmi`, which also gives the guest the speaker).
+    pub guest_audio_hdmi: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -505,6 +509,7 @@ impl Default for System {
             guest_network_stelanet: false,
             guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
             guest_audio: false,
+            guest_audio_hdmi: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -939,7 +944,11 @@ impl fmt::Display for System {
                 stelanet && self.guest_network_stelanet_offloads == offloads,
             )?;
         }
-        line.flag("--guest-audio", self.guest_audio)?;
+        line.flag("--guest-audio", self.guest_audio && !self.guest_audio_hdmi)?;
+        line.flag(
+            "--guest-audio-hdmi",
+            self.guest_audio && self.guest_audio_hdmi,
+        )?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

@@ -435,6 +435,7 @@ impl Service {
             // The sink's clock is the corrected count, as the turn may run
             // on any core.
             devices.with(|devices| audio.serve(devices, host::fresh_counter()));
+            audio.play(host::fresh_counter());
             audio.transitions();
             lap.part(Part::Audio);
         }
