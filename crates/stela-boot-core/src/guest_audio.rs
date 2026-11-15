@@ -151,6 +151,55 @@ impl fmt::Display for Report {
     }
 }
 
+/// The speakers an ELD's allocation byte names (CEA-861 Speaker
+/// Allocation Data Block): `FL/FR LFE FC`, or `none`.
+pub fn speakers(allocation: u8) -> alloc::string::String {
+    const NAMES: [&str; 7] = ["FL/FR", "LFE", "FC", "RL/RR", "RC", "FLC/FRC", "RLC/RRC"];
+    let names: alloc::vec::Vec<&str> = NAMES
+        .iter()
+        .enumerate()
+        .filter(|(bit, _)| allocation & (1 << bit) != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if names.is_empty() {
+        alloc::string::String::from("none")
+    } else {
+        names.join(" ")
+    }
+}
+
+/// One CEA-861 Short Audio Descriptor as the ELD's parse gives it:
+/// `LPCM 2ch 32/44.1/48kHz 16/20/24-bit`, or the coding type's number for
+/// a compressed format.
+pub fn audio_descriptor(
+    coding: u8,
+    channels: u8,
+    rates: u8,
+    sample_bits: u8,
+) -> alloc::string::String {
+    use core::fmt::Write;
+    const RATES: [&str; 7] = ["32", "44.1", "48", "88.2", "96", "176.4", "192"];
+    const BITS: [&str; 3] = ["16", "20", "24"];
+    let pick = |mask: u8, names: &[&'static str]| -> alloc::vec::Vec<&'static str> {
+        names
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .map(|(_, name)| *name)
+            .collect()
+    };
+    let mut text = alloc::string::String::new();
+    let _ = match coding {
+        1 => write!(text, "LPCM"),
+        coding => write!(text, "coding{coding}"),
+    };
+    let _ = write!(text, " {channels}ch {}kHz", pick(rates, &RATES).join("/"));
+    if coding == 1 {
+        let _ = write!(text, " {}-bit", pick(sample_bits, &BITS).join("/"));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +310,22 @@ mod tests {
                 .to_string()
                 .ends_with("bits=0 muted=true volume=0.0dB")
         );
+    }
+
+    #[test]
+    fn speakers_and_descriptors_read_as_cea_861_names_them() {
+        assert_eq!(speakers(0x01), "FL/FR");
+        assert_eq!(speakers(0x0b), "FL/FR LFE RL/RR");
+        assert_eq!(speakers(0x7f), "FL/FR LFE FC RL/RR RC FLC/FRC RLC/RRC");
+        assert_eq!(speakers(0), "none");
+        assert_eq!(
+            audio_descriptor(1, 2, 0x07, 0x07),
+            "LPCM 2ch 32/44.1/48kHz 16/20/24-bit"
+        );
+        assert_eq!(
+            audio_descriptor(1, 8, 0x7f, 0x01),
+            "LPCM 8ch 32/44.1/48/88.2/96/176.4/192kHz 16-bit"
+        );
+        assert_eq!(audio_descriptor(2, 6, 0x04, 0), "coding2 6ch 48kHz");
     }
 }

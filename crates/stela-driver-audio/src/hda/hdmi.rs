@@ -93,6 +93,32 @@ pub unsafe trait DisplayAudioPort {
     fn enable_audio(&self, format: PcmFormat, deadline_us: u64) -> Result<(), Error>;
     fn disable_audio(&self, deadline_us: u64) -> Result<(), Error>;
 }
+/// One device entry of an HDMI/DP pin as the codec reports it before any
+/// route: what Linux hdmi_present_sense reads, for the owner's log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HdmiEntry {
+    pub pin: u8,
+    pub device: u8,
+    /// The pin's device entries: one unless the codec is DP-MST capable.
+    pub devices: u8,
+    pub pin_default: u32,
+    pub pin_capabilities: u32,
+    /// The entry's pin sense: presence detect in bit 31, ELD valid in 30.
+    pub sense: u32,
+    /// With presence and a valid ELD: the ELD's bytes and their parse, or
+    /// the error that stopped the read.
+    pub eld: Option<EldRead>,
+}
+/// An ELD's bytes and their parse, or why they could not be read.
+pub type EldRead = Result<(Vec<u8>, Result<Eld, Error>), Error>;
+impl HdmiEntry {
+    pub fn present(&self) -> bool {
+        self.sense != u32::MAX && self.sense & PRESENT != 0
+    }
+    pub fn eld_valid(&self) -> bool {
+        self.sense != u32::MAX && self.sense & ELD_VALID != 0
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdmiPortId {
     token: ControllerToken,
@@ -288,10 +314,104 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .widget(pin)
             .and_then(|w| w.pin_capabilities)
             .unwrap_or(0);
+        self.pin_sense(codec, pin, device, capabilities)
+    }
+    fn pin_sense(
+        &mut self,
+        codec: u8,
+        pin: u8,
+        device: u8,
+        capabilities: u32,
+    ) -> Result<u32, Error> {
+        self.minimum_guard()?;
         if capabilities & PIN_TRIGGER_REQUIRED != 0 {
             self.verb(Verb::short(codec, pin, SET_PIN_SENSE, 0)?)?;
         }
         self.verb(Verb::short(codec, pin, PIN_SENSE, device)?)
+    }
+    /// The selected device entry's ELD bytes, as Linux snd_hdmi_get_eld
+    /// reads them through the codec's command transport.
+    fn read_eld_bytes(&mut self, codec: u8, pin: u8) -> Result<Vec<u8>, Error> {
+        self.minimum_guard()?;
+        let size = self.verb(Verb::short(codec, pin, 0xf2e, 8)?)?;
+        // Same donor compatibility fallback: a zero length means 128,
+        // never a missing service or invented monitor/ELD-valid bit.
+        let size = if size == 0 {
+            128
+        } else {
+            usize::try_from(size).map_err(|_| Error::InvalidEld)?
+        };
+        if !(20..=256).contains(&size) {
+            return Err(Error::InvalidEld);
+        }
+        let mut raw = Vec::with_capacity(size);
+        for byte in 0..size {
+            let value = self.verb(Verb::short(codec, pin, 0xf2f, byte as u8)?)?;
+            if value == u32::MAX || value & (1 << 31) == 0 || (byte == 0 && value & 255 == 0) {
+                return Err(Error::InvalidEld);
+            }
+            raw.push(value as u8);
+        }
+        Ok(raw)
+    }
+    /// Every HDMI/DP pin of NVIDIA HDMI codec `graph` and each of its device
+    /// entries: its pin sense and, with a sink present and a valid ELD, the
+    /// ELD. Nothing but device selection changes, which it leaves on entry
+    /// 0; refused while a stream runs, whose pin state that selection moves.
+    /// No port is attached and no route is granted.
+    pub fn survey_hdmi(&mut self, graph: &CodecGraph) -> Result<Vec<HdmiEntry>, Error> {
+        self.minimum_guard()?;
+        if graph.token != self.token {
+            return Err(Error::InvalidCodecGraph);
+        }
+        if !LEGACY_IDS.contains(&graph.vendor_id) && !GENERIC_IDS.contains(&graph.vendor_id) {
+            return Err(Error::UnsupportedTopology);
+        }
+        self.require_routing_stopped()?;
+        let pins: Vec<(u8, u32, u32)> = graph
+            .groups
+            .iter()
+            .filter(|g| g.function_type & 255 == 1)
+            .flat_map(|g| &g.widgets)
+            .filter(|w| w.kind == WidgetKind::Pin && w.capabilities & DIGITAL != 0)
+            .filter_map(|w| {
+                let capabilities = w
+                    .pin_capabilities
+                    .filter(|&p| p != u32::MAX && p & (PIN_HDMI | PIN_DP) != 0)?;
+                Some((w.node, capabilities, w.pin_default.unwrap_or(0)))
+            })
+            .collect();
+        let (codec, vendor) = (graph.address, graph.vendor_id);
+        let mut entries = Vec::new();
+        for (pin, pin_capabilities, pin_default) in pins {
+            let devices = self.hdmi_devices(codec, vendor, pin)?;
+            for device in 0..devices {
+                self.hdmi_select(codec, vendor, pin, device)?;
+                let sense = self.pin_sense(codec, pin, device, pin_capabilities)?;
+                let eld =
+                    if sense != u32::MAX && sense & (PRESENT | ELD_VALID) == PRESENT | ELD_VALID {
+                        Some(self.read_eld_bytes(codec, pin).map(|raw| {
+                            let parsed = Eld::parse(&raw);
+                            (raw, parsed)
+                        }))
+                    } else {
+                        None
+                    };
+                entries.push(HdmiEntry {
+                    pin,
+                    device,
+                    devices,
+                    pin_default,
+                    pin_capabilities,
+                    sense,
+                    eld,
+                });
+            }
+            if devices > 1 {
+                self.hdmi_select(codec, vendor, pin, 0)?;
+            }
+        }
+        Ok(entries)
     }
     /// Attach a platform-owned GPU/HDA display-audio route. ELD is read through
     /// the codec command transport. Intel/AMD vendor profiles are refused.
@@ -398,25 +518,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if sense & ELD_VALID == 0 {
             return Ok(HdmiSink { state, eld: None });
         }
-        let size = self.verb(Verb::short(codec, pin, 0xf2e, 8)?)?;
-        // Same donor compatibility fallback: a zero length means 128,
-        // never a missing service or invented monitor/ELD-valid bit.
-        let size = if size == 0 {
-            128
-        } else {
-            usize::try_from(size).map_err(|_| Error::InvalidEld)?
-        };
-        if !(20..=256).contains(&size) {
-            return Err(Error::InvalidEld);
-        }
-        let mut raw = Vec::with_capacity(size);
-        for byte in 0..size {
-            let value = self.verb(Verb::short(codec, pin, 0xf2f, byte as u8)?)?;
-            if value == u32::MAX || value & (1 << 31) == 0 || (byte == 0 && value & 255 == 0) {
-                return Err(Error::InvalidEld);
-            }
-            raw.push(value as u8);
-        }
+        let raw = self.read_eld_bytes(codec, pin)?;
         let after = self.hdmi_pin_sense(index)?;
         if after != sense || self.hdmi_observe(index)? != state {
             return Err(Error::SinkChanged);

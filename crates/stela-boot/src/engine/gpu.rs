@@ -1181,9 +1181,12 @@ fn claim(
         None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
         )),
-        Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
-            "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
-        )),
+        Some(gpu::cold::Reset::SecondaryBus) => {
+            note_bus_reset(address);
+            output::arguments(format_args!(
+                "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
+            ));
+        }
         Some(gpu::cold::Reset::Function(method)) => {
             let name = match method {
                 stela_drivers::bus::pci::ResetMethod::FunctionLevel => "Function Level Reset",
@@ -1460,6 +1463,37 @@ pub(super) struct Refused {
     pub(super) reason: stela_boot_core::gpu_status::Reason,
     /// The refusal's own words, for the screen as for the log.
     pub(super) why: String,
+}
+
+/// The GPUs whose cold start reset their own bus in this boot, each as
+/// one plus its segment, bus and device; 0 is a free slot. The reset reset
+/// their other functions too, which probe left parked for it.
+static BUS_RESET: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn note_bus_reset(address: stela_drivers::bus::pci::Address) {
+    let word = 1 << 32
+        | u64::from(address.segment) << 16
+        | u64::from(address.bus) << 8
+        | u64::from(address.device);
+    let _ = BUS_RESET.iter().find(|slot| {
+        slot.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    });
+}
+
+/// Function 0 of each GPU whose cold start reset its bus in this boot.
+pub(super) fn reset_their_bus() -> Vec<stela_drivers::bus::pci::Address> {
+    BUS_RESET
+        .iter()
+        .map(|slot| slot.load(Ordering::Acquire))
+        .filter(|&word| word != 0)
+        .map(|word| stela_drivers::bus::pci::Address {
+            segment: (word >> 16) as u16,
+            bus: (word >> 8) as u8,
+            device: word as u8,
+            function: 0,
+        })
+        .collect()
 }
 
 /// Claim every adapter Stela has a driver stack for ([`GpuStack::select`]),

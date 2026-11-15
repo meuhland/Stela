@@ -63,6 +63,8 @@ struct Hardware {
     device_list: u32,
     selected: u8,
     device: u8,
+    /// The other device entries sense nothing, for a survey of them all.
+    other_entries_empty: bool,
 }
 impl Hardware {
     fn new(clock: Clock, dp: bool) -> Self {
@@ -109,6 +111,7 @@ impl Hardware {
             device_list: 0,
             selected: 0,
             device: 0,
+            other_entries_empty: false,
         };
         h.set(0, 0x1001, 2);
         h.set(2, 0, 1);
@@ -248,6 +251,7 @@ impl Hardware {
             0xf02 => 0x0302,
             0x705 => 0,
             0xf05 => 0,
+            0xf09 if self.other_entries_empty && byte != self.device => 0,
             0xf09 => {
                 assert_eq!(byte, self.device);
                 self.sense
@@ -631,6 +635,8 @@ impl Fixture {
 }
 
 mod transport;
+
+mod survey;
 
 mod lifecycle;
 

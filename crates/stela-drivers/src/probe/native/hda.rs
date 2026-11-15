@@ -15,7 +15,7 @@ use crate::{
 use alloc::{boxed::Box, string::String, vec::Vec};
 mod lifetime;
 pub use lifetime::Error as RetirementError;
-use lifetime::{Inputs, Native};
+use lifetime::{Inputs, Native, OriginalUsers};
 
 /// HD Audio BAR0 through its actual owned uncached mapping/native widths.
 pub struct Bar0 {
@@ -65,6 +65,36 @@ impl Host {
     pub fn shutdown(&mut self) -> Result<(), RetirementError> {
         self.owner.close()
     }
+
+    /// The controller's capabilities and the codecs its link found.
+    pub fn capabilities(&mut self) -> Result<(hda::Capabilities, u16), RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        Ok((controller.capabilities(), controller.codec_mask()))
+    }
+
+    /// Each NVIDIA HDMI codec's pins and device entries, with their sense
+    /// and ELD (`hda::Controller::survey_hdmi`), by codec address; other
+    /// codecs are left out.
+    pub fn survey_hdmi(&mut self) -> Result<Vec<HdmiSurvey>, RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        Ok(self
+            .codecs
+            .iter()
+            .filter(|codec| codec.graph.vendor_id >> 16 == 0x10de)
+            .map(|codec| (codec.graph.address, controller.survey_hdmi(&codec.graph)))
+            .collect())
+    }
+}
+
+/// One codec's HDMI/DP entries by its address, or why it has none.
+pub type HdmiSurvey = (u8, Result<Vec<hda::hdmi::HdmiEntry>, audio::Error>);
+
+/// What vouches for the original users of the function an attach takes.
+enum Users {
+    /// Nothing: the conventional controller is retained and refused.
+    Unavailable,
+    /// The function's GPU reset its bus in this boot ([`OriginalUsers::after_bus_reset`]).
+    AfterBusReset,
 }
 struct ColdOwner {
     requester: Option<crate::bus::pci::requester::preparation::PreparingRequester>,
@@ -93,6 +123,55 @@ pub(in crate::probe) unsafe fn attach(
     address: Address,
     clock: Clock,
     minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
+) -> Result<Host, Failure> {
+    // SAFETY: forwarded.
+    unsafe { attach_with(services, address, clock, minimum, Users::Unavailable) }
+}
+
+/// The HD Audio function of a GPU whose cold start reset their bus: the
+/// HDMI/DP audio controller probe left parked for that reset
+/// (`probe::display_audio`), claimed once the GPU started. Its original
+/// users are those the reset retired, so the controller binds a private
+/// domain and its codecs are discovered, all polled.
+///
+/// A function that is not an HD Audio controller is refused, and every
+/// failure keeps the original owners in the returned graph, which the
+/// caller keeps for the boot.
+///
+/// # Safety
+/// As for probe's HD Audio attach, and: `address` is a function of the
+/// device whose function 0 is a display controller that, in this boot,
+/// completed its cold start with a Secondary Bus Reset of its own bus
+/// (`gpu::cold::Reset::SecondaryBus`). Until that reset the function stayed
+/// parked in the contained fabric, and nothing claimed or enabled it since.
+/// No later reset of that bus runs while the returned host is live.
+#[expect(
+    clippy::result_large_err,
+    reason = "A failed HDA attach keeps its typed cause and all original resource owners"
+)]
+pub unsafe fn attach_display_audio(
+    services: &dyn NativeServices,
+    address: Address,
+    clock: Clock,
+    minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
+) -> Result<Host, (Error, Option<Box<dyn core::any::Any>>)> {
+    // SAFETY: forwarded, with the bus reset that retired the original users.
+    unsafe { attach_with(services, address, clock, minimum, Users::AfterBusReset) }
+}
+
+/// # Safety
+/// As for [`attach`]; [`Users::AfterBusReset`] as for
+/// [`attach_display_audio`].
+#[expect(
+    clippy::result_large_err,
+    reason = "A failed HDA attach keeps its typed cause and all original resource owners"
+)]
+unsafe fn attach_with(
+    services: &dyn NativeServices,
+    address: Address,
+    clock: Clock,
+    minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
+    users: Users,
 ) -> Result<Host, Failure> {
     minimum.check().map_err(|error| {
         (
@@ -124,6 +203,29 @@ pub(in crate::probe) unsafe fn attach(
         Err(e) => return Err((Error::Native(e), Some(Box::new(cold)))),
     };
     cold.mapping = Some(mapping);
+    let original_users = match users {
+        Users::Unavailable => None,
+        Users::AfterBusReset => {
+            let function = cold.requester.as_mut().unwrap().function_mut();
+            if function.class[..2] != [0x04, 0x03] {
+                return Err((
+                    Error::Native(ServiceError::Refused("not an HD Audio controller")),
+                    Some(Box::new(cold)),
+                ));
+            }
+            match function.config().retain_epoch() {
+                // SAFETY: this function's own epoch; the caller vouches for
+                // the bus reset that retired its original users.
+                Ok(retained) => Some(unsafe { OriginalUsers::after_bus_reset(retained) }),
+                Err(error) => {
+                    return Err((
+                        Error::Native(ServiceError::Mapping(error)),
+                        Some(Box::new(cold)),
+                    ));
+                }
+            }
+        }
+    };
     let bar = bars[0].expect("map checked BAR0");
     let window = (|| {
         let mapping = cold.mapping.as_ref().unwrap();
@@ -152,10 +254,11 @@ pub(in crate::probe) unsafe fn attach(
         clock: audio::Timing::new(clock, cold.minimum.take().unwrap()),
         pages: services.pages(),
         bar,
-        // No native original-owner IRQ/CPU/EOI/service/work completion producer
-        // exists. Post-EBS serialization, source masks or polled operation do
-        // not construct one; Native retains/refuses before root drain/bind.
-        original_users: None,
+        // Only a bus reset in this boot produces the original-owner
+        // IRQ/CPU/EOI/service/work retirement. Post-EBS serialization, source
+        // masks or polled operation do not construct one; without it Native
+        // retains/refuses before root drain/bind.
+        original_users,
     };
     let mut owner = match Native::new(inputs) {
         Ok(owner) => owner,

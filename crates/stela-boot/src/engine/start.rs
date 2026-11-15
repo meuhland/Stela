@@ -956,6 +956,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 guest_network,
                 host_disks,
                 fdr: mut fdr_device,
+                display_audio,
                 ..
             },
         ram: worker_ram,
@@ -1218,7 +1219,9 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
-                guest_audio: options.guest_audio.then(guest_audio::GuestAudio::new),
+                guest_audio: options
+                    .guest_audio
+                    .then(|| guest_audio::GuestAudio::new(display_audio)),
                 guest_network,
                 host_nor,
                 host_disks,
@@ -2955,6 +2958,8 @@ struct HostDevices {
     guest_network: Option<network::GuestNetwork>,
     host_disks: storage::HostDisks,
     fdr: Option<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
+    /// The started GPU's audio functions, for the guest's speaker.
+    display_audio: Option<guest_audio::DisplayAudio>,
 }
 
 /// Probe the host's devices once, with the native services when the
@@ -2978,6 +2983,7 @@ fn start_devices(
     } = wanted;
     let mut fdr_device = None;
     let mut host_usb = None;
+    let mut display_audio = None;
     let host_bluetooth: Option<bluetooth::HostBluetooth> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
@@ -3183,6 +3189,15 @@ fn start_devices(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
                 );
+                // The GPU's audio function, only now that its start ended:
+                // its bus reset needed the function parked.
+                if options.guest_audio
+                    && let Some(mmio) = mmio
+                {
+                    display_audio = guest_audio::claim_display_audio(
+                        work, mmio, remappers, handoff, host_clock,
+                    );
+                }
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
@@ -3299,5 +3314,6 @@ fn start_devices(
         guest_network,
         host_disks,
         fdr: fdr_device,
+        display_audio,
     }
 }
