@@ -24,7 +24,7 @@ struct air_effect_store {
    bool ssbo, shared;
    uint64_t slot, address;
    unsigned components, bits;
-   nir_const_value values[4];
+   nir_const_value values[NIR_MAX_VEC_COMPONENTS];
 };
 
 struct air_effect_run {
@@ -36,7 +36,7 @@ struct air_effect_run {
 struct air_effect_value {
    bool known;
    unsigned components, bits;
-   nir_const_value lanes[4];
+   nir_const_value lanes[NIR_MAX_VEC_COMPONENTS];
 };
 
 /* A storage image of one layer and sample: four 32-bit words a texel, in
@@ -102,7 +102,7 @@ air_effect_write(uint8_t *bytes, const struct air_effect_value *value)
 static bool
 air_effect_shape(const nir_def *def)
 {
-   return def && def->num_components && def->num_components <= 4 &&
+   return def && def->num_components && def->num_components <= NIR_MAX_VEC_COMPONENTS &&
           (def->bit_size == 1 || def->bit_size == 8 || def->bit_size == 16 ||
            def->bit_size == 32 || def->bit_size == 64);
 }

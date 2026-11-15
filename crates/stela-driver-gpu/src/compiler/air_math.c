@@ -781,7 +781,7 @@ boolean(LLVMTypeRef type)
 {
    unsigned lanes;
    LLVMTypeRef element = stela_air_call_element(type, &lanes);
-   return lanes <= 4 && LLVMGetTypeKind(element) == LLVMIntegerTypeKind &&
+   return (lanes == 1 || stela_air_vector_lanes(lanes)) && LLVMGetTypeKind(element) == LLVMIntegerTypeKind &&
           LLVMGetIntTypeWidth(element) == 1;
 }
 
