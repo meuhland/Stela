@@ -27,6 +27,7 @@
 #include "llvm-c/Transforms/PassBuilder.h"
 #include "util/hash_table.h"
 #include "util/set.h"
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -154,6 +155,150 @@ inline_always(LLVMValueRef fn)
                                                    attribute("alwaysinline"), 0));
 }
 
+/* Lets the inliner inline each call of fn: a call site's own noinline holds
+ * it as the function's would, and NIR takes no calls. */
+static void
+release_calls(LLVMValueRef fn)
+{
+   for (LLVMUseRef use = LLVMGetFirstUse(fn); use; use = LLVMGetNextUse(use)) {
+      LLVMValueRef user = LLVMGetUser(use);
+      if (LLVMIsACallInst(user) && LLVMGetCalledValue(user) == fn)
+         LLVMRemoveCallSiteEnumAttribute(user, LLVMAttributeFunctionIndex, attribute("noinline"));
+   }
+}
+
+/* The attributes the inliner requires a caller and its callee to share,
+ * even to inline what must be ("conflicting target features"). */
+static const char *const target_attributes[] = {"target-cpu", "target-features"};
+
+/* Drops fn's target CPU and features. Translation compiles no function with
+ * LLVM's code generator, so they say nothing to it, but they would keep a
+ * function from inlining into one whose differ: a stitched function or a
+ * dispatcher, which has none, or a function of another linked module. */
+static void
+drop_target_attributes(LLVMValueRef fn)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(target_attributes); i++)
+      LLVMRemoveStringAttributeAtIndex(fn, LLVMAttributeFunctionIndex, target_attributes[i],
+                                       strlen(target_attributes[i]));
+}
+
+static void
+text_append(char *text, size_t size, size_t *used, const char *fmt, ...)
+{
+   va_list args;
+   va_start(args, fmt);
+   int n = *used < size ? vsnprintf(text + *used, size - *used, fmt, args) : 0;
+   va_end(args);
+   if (n > 0)
+      *used = MIN2(*used + (size_t)n, size - 1);
+}
+
+static void
+type_append(char *text, size_t size, size_t *used, LLVMTypeRef type)
+{
+   char *printed = LLVMPrintTypeToString(type);
+   text_append(text, size, used, "%s", printed);
+   LLVMDisposeMessage(printed);
+}
+
+/* Whether a string attribute of fn's differs from the caller's. */
+static bool
+attribute_differs(LLVMValueRef caller, LLVMValueRef fn, const char *name)
+{
+   LLVMAttributeRef a = LLVMGetStringAttributeAtIndex(caller, LLVMAttributeFunctionIndex, name,
+                                                      strlen(name));
+   LLVMAttributeRef b = LLVMGetStringAttributeAtIndex(fn, LLVMAttributeFunctionIndex, name, strlen(name));
+   if (!a || !b)
+      return a != b;
+   unsigned a_length, b_length;
+   const char *a_value = LLVMGetStringAttributeValue(a, &a_length);
+   const char *b_value = LLVMGetStringAttributeValue(b, &b_length);
+   return a_length != b_length || memcmp(a_value, b_value, a_length);
+}
+
+/* Why LLVM's inliner keeps fn's body out of line (isInlineViable), or NULL. */
+static const char *
+not_viable(LLVMValueRef fn)
+{
+   unsigned vastart = LLVMLookupIntrinsicID("llvm.va_start", strlen("llvm.va_start"));
+   for (LLVMBasicBlockRef block = LLVMGetFirstBasicBlock(fn); block;
+        block = LLVMGetNextBasicBlock(block)) {
+      LLVMValueRef term = LLVMGetBasicBlockTerminator(block);
+      if (term && LLVMGetInstructionOpcode(term) == LLVMIndirectBr)
+         return "it branches indirectly";
+      for (LLVMValueRef inst = LLVMGetFirstInstruction(block); inst; inst = LLVMGetNextInstruction(inst)) {
+         if (!LLVMIsACallInst(inst))
+            continue;
+         LLVMValueRef callee = LLVMGetCalledValue(inst);
+         if (callee == fn)
+            return "it calls itself";
+         if (vastart && LLVMIsAFunction(callee) && LLVMGetIntrinsicID(callee) == vastart)
+            return "it reads variable arguments";
+         if (LLVMGetCallSiteEnumAttribute(inst, LLVMAttributeFunctionIndex, attribute("returns_twice")) ||
+             (LLVMIsAFunction(callee) &&
+              LLVMGetEnumAttributeAtIndex(callee, LLVMAttributeFunctionIndex, attribute("returns_twice"))))
+            return "it calls a function that returns twice";
+      }
+   }
+   for (LLVMUseRef use = LLVMGetFirstUse(fn); use; use = LLVMGetNextUse(use)) {
+      if (LLVMIsABlockAddress(LLVMGetUser(use)))
+         return "a block's address is taken";
+   }
+   return NULL;
+}
+
+void
+stela_air_uninlined_call(LLVMValueRef call, char *text, size_t size)
+{
+   static const char *const flags[] = {"noinline", "alwaysinline", "optnone", "convergent",
+                                       "noduplicate"};
+   size_t used = 0, bytes;
+   text[0] = '\0';
+   LLVMValueRef fn = LLVMGetCalledValue(call);
+   const char *name = LLVMGetValueName2(fn, &bytes);
+   /* Room for the reason after a long mangled name. */
+   const unsigned shown = 96;
+   text_append(text, size, &used, "%s @%.*s%s", LLVMIsDeclaration(fn) ? "declaration" : "definition",
+               (int)MIN2(bytes, shown), name, bytes > shown ? "..." : "");
+   bool listed = false;
+   for (unsigned i = 0; i < ARRAY_SIZE(flags); i++) {
+      if (LLVMGetEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, attribute(flags[i]))) {
+         text_append(text, size, &used, "%s%s", listed ? " " : " (", flags[i]);
+         listed = true;
+      }
+   }
+   for (unsigned i = 0; i < ARRAY_SIZE(target_attributes); i++) {
+      if (LLVMGetStringAttributeAtIndex(fn, LLVMAttributeFunctionIndex, target_attributes[i],
+                                        strlen(target_attributes[i]))) {
+         text_append(text, size, &used, "%s%s", listed ? " " : " (", target_attributes[i]);
+         listed = true;
+      }
+   }
+   text_append(text, size, &used, listed ? ")" : "");
+   LLVMValueRef caller = LLVMGetBasicBlockParent(LLVMGetInstructionParent(call));
+   LLVMTypeRef have = LLVMGetCalledFunctionType(call), want = LLVMGlobalGetValueType(fn);
+   const char *reason = NULL;
+   if (have != want) {
+      text_append(text, size, &used, ": called as ");
+      type_append(text, size, &used, have);
+      text_append(text, size, &used, ", defined as ");
+      type_append(text, size, &used, want);
+      return;
+   }
+   if (LLVMGetCallSiteEnumAttribute(call, LLVMAttributeFunctionIndex, attribute("noinline")))
+      reason = "the call is noinline";
+   for (unsigned i = 0; !reason && i < ARRAY_SIZE(target_attributes); i++) {
+      if (attribute_differs(caller, fn, target_attributes[i]))
+         reason = "the caller's target differs";
+   }
+   if (!reason && LLVMGetNumOperandBundles(call))
+      reason = "the call has operand bundles";
+   if (!reason)
+      reason = not_viable(fn);
+   text_append(text, size, &used, ": %s", reason ? reason : "LLVM's inliner gave no reason");
+}
+
 static bool
 run_inliner(struct stela_air_metadata *m)
 {
@@ -190,6 +335,7 @@ hold(LLVMValueRef call)
  * held or released. */
 struct entry_calls {
    unsigned dispatches, others, released, instructions;
+   LLVMValueRef first_released;
 };
 
 static struct entry_calls
@@ -208,7 +354,8 @@ entry_calls(LLVMValueRef entry, unsigned limit)
             calls.dispatches++;
          else
             calls.others++;
-         calls.released += !held(inst);
+         if (!held(inst) && !calls.released++)
+            calls.first_released = inst;
       }
    }
    return calls;
@@ -285,8 +432,12 @@ unroll(struct stela_air_metadata *m, LLVMValueRef entry, unsigned depth, unsigne
       struct entry_calls calls = entry_calls(entry, max_instructions);
       if (calls.instructions > max_instructions)
          return fail(m, STELA_AIR_LIMIT, "unrolled recursion exceeds the instruction budget");
-      if (calls.released)
-         return fail(m, STELA_AIR_INSTRUCTION, "LLVM refused to inline the module's calls");
+      if (calls.released) {
+         char detail[sizeof(m->error->detail)];
+         int prefix = snprintf(detail, sizeof(detail), "LLVM refused to inline the module's calls: ");
+         stela_air_uninlined_call(calls.first_released, detail + prefix, sizeof(detail) - prefix);
+         return fail(m, STELA_AIR_INSTRUCTION, detail);
+      }
       if (!calls.others && !calls.dispatches)
          return true;
       if (!calls.others && level == depth) {
@@ -318,13 +469,50 @@ can_prune_calls(LLVMValueRef entry)
    return false;
 }
 
+/* The bits of a number or a vector of numbers; zero for any other type. */
+static unsigned
+number_bits(LLVMTypeRef type)
+{
+   switch (LLVMGetTypeKind(type)) {
+   case LLVMIntegerTypeKind:
+      return LLVMGetIntTypeWidth(type);
+   case LLVMHalfTypeKind:
+   case LLVMBFloatTypeKind:
+      return 16;
+   case LLVMFloatTypeKind:
+      return 32;
+   case LLVMDoubleTypeKind:
+      return 64;
+   case LLVMVectorTypeKind:
+      return LLVMGetVectorSize(type) * number_bits(LLVMGetElementType(type));
+   default:
+      return 0;
+   }
+}
+
+/* Whether a value of `have` passes as `want`: an isomorphic aggregate, or
+ * numbers of as many bits, as an ABI coerces a `half2` to an i32. */
+static bool
+passes_as(LLVMContextRef context, LLVMTypeRef want, LLVMTypeRef have)
+{
+   unsigned bits = number_bits(want);
+   return stela_air_isomorphic(context, want, have) || (bits && bits == number_bits(have));
+}
+
+static LLVMValueRef
+pass_as(LLVMBuilderRef builder, LLVMValueRef value, LLVMTypeRef to)
+{
+   return LLVMTypeOf(value) != to && number_bits(to) ? LLVMBuildBitCast(builder, value, to, "") :
+                                                       stela_air_convert_layout(builder, value, to);
+}
+
 /* Makes each call of a defined function whose call type differs from the
- * definition's only in structs of the same layout call it with the
- * definition's type, converting its arguments and result. Linking keeps two
- * modules' copies of one struct distinct types (`T.3` and `T.127`), and a
- * call whose type is not its callee's never inlines: Core Image's stitched
- * graphs call one library's filter with the struct values another library's
- * functions build. */
+ * definition's only in structs of the same layout, or in numbers of the same
+ * bits, call it with the definition's type, converting its arguments and
+ * result. Linking keeps two modules' copies of one struct distinct types
+ * (`T.3` and `T.127`), and a call whose type is not its callee's never
+ * inlines: Core Image's stitched graphs call one library's filter with the
+ * struct values another library's functions build. */
 static void
 match_call_types(LLVMModuleRef module)
 {
@@ -344,25 +532,24 @@ match_call_types(LLVMModuleRef module)
             if (want == have || count != LLVMCountParamTypes(have) || count > 64 ||
                 LLVMIsFunctionVarArg(want) != LLVMIsFunctionVarArg(have) ||
                 LLVMGetNumArgOperands(inst) != count ||
-                !stela_air_isomorphic(context, LLVMGetReturnType(want), LLVMGetReturnType(have)))
+                !passes_as(context, LLVMGetReturnType(have), LLVMGetReturnType(want)))
                continue;
             LLVMTypeRef wanted[64], had[64];
             LLVMGetParamTypes(want, wanted);
             LLVMGetParamTypes(have, had);
             bool same = true;
             for (unsigned i = 0; i < count && same; i++)
-               same = stela_air_isomorphic(context, wanted[i], had[i]);
+               same = passes_as(context, wanted[i], had[i]);
             if (!same)
                continue;
             LLVMPositionBuilderBefore(builder, inst);
             LLVMValueRef arguments[64];
             for (unsigned i = 0; i < count; i++)
-               arguments[i] = stela_air_convert_layout(builder, LLVMGetOperand(inst, i), wanted[i]);
+               arguments[i] = pass_as(builder, LLVMGetOperand(inst, i), wanted[i]);
             LLVMValueRef call = LLVMBuildCall2(builder, want, callee, arguments, count, "");
             LLVMSetInstructionCallConv(call, LLVMGetInstructionCallConv(inst));
             if (LLVMGetTypeKind(LLVMGetReturnType(have)) != LLVMVoidTypeKind)
-               LLVMReplaceAllUsesWith(inst, stela_air_convert_layout(builder, call,
-                                                                     LLVMGetReturnType(have)));
+               LLVMReplaceAllUsesWith(inst, pass_as(builder, call, LLVMGetReturnType(have)));
             LLVMInstructionEraseFromParent(inst);
          }
       }
@@ -895,7 +1082,12 @@ inline_calls(struct stela_air_metadata *m, LLVMValueRef entry, unsigned max_call
          _mesa_hash_table_insert(shareable, fn, (void *)(uintptr_t)(noinline ? SHARED_CALL_MIN_OUT_OF_LINE :
                                                                      SHARED_CALL_MIN_INSTRUCTIONS));
       inline_always(fn);
+      release_calls(fn);
       inlined = true;
+   }
+   for (LLVMValueRef fn = LLVMGetFirstFunction(m->module); fn && walked; fn = LLVMGetNextFunction(fn)) {
+      if (!LLVMIsDeclaration(fn))
+         drop_target_attributes(fn);
    }
    /* Keep the original graph's depth and cycle checks before pruning calls. */
    struct hash_entry *state = walked && inlined && specialized && !m->unoptimized ?
