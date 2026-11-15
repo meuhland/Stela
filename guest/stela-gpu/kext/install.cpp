@@ -118,6 +118,7 @@ StelaGPU::installPlugin(void *parameter, wait_result_t)
 		gpu->setProperty(STELA_APP_PROPERTY, stelaDeliverApp(context, buffer));
 		stelaTellNoCompression(context, buffer);
 		stelaDeliverSandboxPatch(context, buffer);
+		stelaDeliverStelaNetJob(context, buffer);
 	}
 	if (buffer) {
 		IOFreeData(buffer, kStelaChunk);
