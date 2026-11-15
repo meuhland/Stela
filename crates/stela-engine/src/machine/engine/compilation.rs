@@ -16,6 +16,36 @@ fn shared_part(code: &board::Code, at: NativeCode) -> u8 {
 /// more than a few mean the ring is broken.
 const REDONE_INSTALLS: u32 = 64;
 
+/// Bits of a [`Machine::remembered`] slot: 16 Ki tags, 128 KiB a PE.
+const REMEMBERED_BITS: u32 = 14;
+pub(super) const REMEMBERED: usize = 1 << REMEMBERED_BITS;
+
+/// What a fetch that found its block did about the block's block table
+/// entry ([`Machine::remember_or_link`]), counted per PE in
+/// [`Statistics::remembers`] (`PES REMEMBER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remember {
+    /// A direct exit waited for the block and linked to it instead.
+    Linked,
+    /// The table holds the entry already.
+    Held,
+    /// The block takes no entry (one instruction, a trace point).
+    Excluded,
+    /// The index no longer holds the block.
+    Unindexed,
+    /// The block's throttle refused it.
+    Throttled,
+    /// The index changed before the lock was taken.
+    Raced,
+    /// Put in as this PE's first insert of the entry.
+    First,
+    /// Put in again: this PE put it in before, and it left its set since.
+    Again,
+}
+
+/// How many [`Remember`]s there are.
+pub const REMEMBERS: usize = Remember::Again as usize + 1;
+
 /// Put `target`, block `index`'s entry for a fetch at `pc`, in slot `slot`
 /// of the block table, under the board's lock (`cache`), if the block is
 /// still the indexed one: a retirement or an IC IVAU takes a block out of
@@ -354,9 +384,36 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// exits enter needs no lookup entry: the link is the page's, and
     /// enters it in every address space.
     fn remember_or_link(&mut self, pc: u64, index: usize) {
-        if !self.link_direct_exit(pc) {
+        if self.link_direct_exit(pc) {
+            self.statistics.remembers[Remember::Linked as usize] += 1;
+        } else {
             self.remember_target(pc, index);
         }
+    }
+
+    /// Where [`Self::remembered`] tags the entry of `pc` with `key`, and
+    /// its tag for block `index` in its current incarnation (never 0).
+    fn remembered_at(&self, pc: u64, key: u64, index: usize) -> (usize, u64) {
+        const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+        let at = ((pc ^ key.rotate_left(32)).wrapping_mul(MIX) >> (64 - REMEMBERED_BITS)) as usize;
+        let incarnation = u64::from(self.code.blocks.record(index).incarnation());
+        let block = (index as u64) << 32 | incarnation;
+        let tag = (pc.rotate_left(17) ^ key ^ block.wrapping_mul(MIX)) | 1;
+        (at, tag)
+    }
+
+    /// Note that this PE put the entry of `pc` with `key` for block `index`
+    /// in the block table ([`Self::remembered`]).
+    fn note_remembered(&mut self, pc: u64, key: u64, index: usize) {
+        let (at, tag) = self.remembered_at(pc, key, index);
+        self.remembered[at] = tag;
+    }
+
+    /// Throttle every block table insert by its block's count, as before
+    /// an entry's first insert on a PE went in regardless
+    /// (`--table-insert-throttled`, [`Self::remembered`]).
+    pub fn set_table_insert_throttled(&mut self, throttled: bool) {
+        self.table_insert_throttled = throttled;
     }
 
     /// Record that a fetch at `pc` runs block `index` while the page of
@@ -367,12 +424,30 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// points, which the engine records. Whether the table took a new
     /// entry: one it holds already, in either place of its set, stays where
     /// it is, and keeps its neighbour.
+    ///
+    /// The block's throttle ([`board::Record::remember`]) bounds the lock
+    /// an entry that other inserts keep putting out of its set costs. It
+    /// counts the block's tries on every PE, though, not this PE's of the
+    /// entry: once they spent its free inserts, each fetch here of an
+    /// entry the table lost came to the engine some 32 times before one put
+    /// it back. So the first insert of an entry on this PE goes in
+    /// regardless ([`Self::remembered`]); after that the throttle decides,
+    /// unless `--table-insert-throttled` makes it decide every one.
     pub(super) fn remember_target(&mut self, pc: u64, index: usize) -> bool {
+        let outcome = self.remember_entry(pc, index);
+        self.statistics.remembers[outcome as usize] += 1;
+        matches!(outcome, Remember::First | Remember::Again)
+    }
+
+    fn remember_entry(&mut self, pc: u64, index: usize) -> Remember {
         let Some((slot, target)) = self.target_entry(pc, index) else {
-            return false;
+            return self.unremembered(pc, index);
         };
         let block = &self.code.blocks[index];
         let (physical, variant_id) = (block.physical, block.variant);
+        let (at, tag) = self.remembered_at(pc, target.key, index);
+        let first = self.remembered[at] != tag;
+        let free = first && !self.table_insert_throttled;
         // Only an indexed block takes an entry: one an IC IVAU forgot (that
         // a PE's jump cache still names until it reads the post) or one
         // retired since it was found would be reachable again, and links
@@ -384,16 +459,41 @@ impl<H: Host, D: Devices> Machine<H, D> {
             Some(Some(found)) if found == index => {}
             Some(_) => {
                 board::Events::count(&code.events.targets_unindexed);
-                return false;
+                return Remember::Unindexed;
             }
             None => {}
         }
-        if !code.blocks.record(index).remember() {
+        // A first insert counts in the block's throttle too, so that the
+        // entries it keeps putting back stay as bounded as before.
+        if !code.blocks.record(index).remember() && !free {
             board::Events::count(&code.events.targets_deferred);
-            return false;
+            return Remember::Throttled;
         }
         let mut cache = code.cache_at(board::LockSite::Target);
-        insert_target(code, &mut cache, pc, index, slot, target)
+        let inserted = insert_target(code, &mut cache, pc, index, slot, target);
+        drop(cache);
+        if !inserted {
+            return Remember::Raced;
+        }
+        self.remembered[at] = tag;
+        if first {
+            Remember::First
+        } else {
+            Remember::Again
+        }
+    }
+
+    /// Why [`Self::target_entry`] gave no entry for a fetch at `pc` of
+    /// block `index`: the table holds it already, or the block takes none.
+    fn unremembered(&self, pc: u64, index: usize) -> Remember {
+        let block = &self.code.blocks[index];
+        let key = self.block_key(block.physical, block.variant);
+        let held = self.code.table.find(self.code.table.slot(pc, key), pc, key);
+        if held.pc == pc && held.key == key && held.block == index as u32 {
+            Remember::Held
+        } else {
+            Remember::Excluded
+        }
     }
 
     /// The block table slot and entry a fetch at `pc` of block `index`
@@ -1193,10 +1293,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .is_some_and(|(_, _, target, _)| target == pc)
             && let Some((at, target)) = self.target_entry(pc, slot)
             && shared.blocks.record(slot).remember()
+            && insert_target(&shared, &mut cache, pc, slot, at, target)
         {
-            insert_target(&shared, &mut cache, pc, slot, at, target);
+            drop(cache);
+            self.note_remembered(pc, target.key, slot);
+        } else {
+            drop(cache);
         }
-        drop(cache);
         self.mirrors.close_code_page();
         Ok(Some(Fetched::Block(slot)))
     }

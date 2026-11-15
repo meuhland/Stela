@@ -971,6 +971,17 @@ pub struct Machine<H: Host, D: Devices> {
     /// keep it while nothing its entries rest on changed
     /// (`--jump-serial-always`, [`chain_control::JumpBasis`]).
     jump_serial_always: bool,
+    /// The block table entries this PE added, by a hash of their PC and
+    /// key: a tag of the PC, key and block each ([`Self::remember_target`]).
+    /// An entry with no tag here is this PE's first of it and goes in
+    /// whatever the block's tries elsewhere spent of its throttle; one
+    /// tagged went in before and has since left its set, so its block's
+    /// throttle decides.
+    remembered: Box<[u64]>,
+    /// Every block table insert takes its block's throttle, as before an
+    /// entry's first insert on a PE went in regardless
+    /// (`--table-insert-throttled`).
+    table_insert_throttled: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1421,6 +1432,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self_loops: true,
             loop_counts_off: false,
             jump_serial_always: false,
+            remembered: vec![0; compilation::REMEMBERED].into_boxed_slice(),
+            table_insert_throttled: false,
             event_sample: None,
             debug: None,
             device_lines: None,

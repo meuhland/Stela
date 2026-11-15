@@ -108,6 +108,9 @@ pub(crate) struct Settings {
     /// `--jump-serial-always`, as the home machine starts its jump cache
     /// over at every native entry.
     pub jump_serial_always: bool,
+    /// `--table-insert-throttled`, as the home machine throttles block
+    /// table inserts.
+    pub table_insert_throttled: bool,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -141,6 +144,7 @@ pub(crate) fn spawn<H: Host>(
             step_timing: settings.step_timing,
             loop_counts_off: settings.loop_counts_off,
             jump_serial_always: settings.jump_serial_always,
+            table_insert_throttled: settings.table_insert_throttled,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -165,6 +169,7 @@ struct Pe {
     step_timing: bool,
     loop_counts_off: bool,
     jump_serial_always: bool,
+    table_insert_throttled: bool,
 }
 
 impl Pe {
@@ -179,6 +184,7 @@ impl Pe {
             step_timing,
             loop_counts_off,
             jump_serial_always,
+            table_insert_throttled,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -203,6 +209,7 @@ impl Pe {
         machine.set_step_timing(step_timing);
         machine.set_loop_counts_off(loop_counts_off);
         machine.set_jump_serial_always(jump_serial_always);
+        machine.set_table_insert_throttled(table_insert_throttled);
         if step_timing {
             host::pmu::start(pe);
         }
