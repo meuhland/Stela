@@ -40,6 +40,7 @@ impl ParseState<'_> {
                 options.profile = true;
                 options.profile_keep_pack = true;
             }
+            "--jump-serial-always" => options.jump_serial_always = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,

@@ -574,6 +574,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         cache.targets.forget_frames(frame..=frame, |_| true);
         let forgot = cache.index.forget_page(physical & !(FETCH_PAGE - 1));
         drop(cache);
+        // Every PE's native jump cache may name the page's blocks.
+        code.note_unpublished();
         // Every PE's jump cache on a shared board still names its blocks.
         if forgot || self.code_hub.is_some() {
             self.forget_code_page_here(physical);
@@ -1292,6 +1294,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         self.unlink_points(unlinks);
+        // Their table entries went: every PE's native jump cache may name
+        // them.
+        code.note_unpublished();
         visits
     }
 
@@ -1379,6 +1384,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .retain(|&(held, _)| held != part);
         }
         let slots: Vec<u32> = job.slots.iter().map(|&(_, slot)| slot).collect();
+        // Before the grace the slots and the part wait for: a PE that
+        // passes it starts its native jump cache over at its next entry.
+        code.note_unpublished();
         let (grace, _) = self.grace();
         code.blocks.release(slots, grace.snapshot());
         if let (Some(arena), Some(part)) = (arena, job.part) {
@@ -1443,6 +1451,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         cache.targets.clear();
         drop(cache);
         self.code.epoch.fetch_add(1, Ordering::AcqRel);
+        self.code.note_unpublished();
     }
 
     /// What jump cache entries are valid in: this machine's code
@@ -1547,6 +1556,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     detached(entry.block as usize)
                 });
         }
+        // And from every PE's native jump cache, at its next entry.
+        self.code.note_unpublished();
         // A jump cache entry sits in its PC's slot alone.
         for &(_, pc) in &gone {
             let entry = &mut self.jump[(pc / INSTRUCTION) as usize % JUMP_CACHE];
@@ -1593,6 +1604,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         drop(code);
         self.host.discard_code();
+        // The host's code went: no native jump cache keeps naming it.
+        self.code.note_unpublished();
         self.lookup_dispatchers = Default::default();
         self.direct_exit = None;
         // A worker built on the hub's code holds it before it joins.

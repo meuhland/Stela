@@ -105,6 +105,9 @@ pub(crate) struct Settings {
     /// `--profile-keep-pack`, as the home machine leaves self-loop counts
     /// out of timed code so its pack serves it.
     pub loop_counts_off: bool,
+    /// `--jump-serial-always`, as the home machine starts its jump cache
+    /// over at every native entry.
+    pub jump_serial_always: bool,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -137,6 +140,7 @@ pub(crate) fn spawn<H: Host>(
             watches: settings.watches.clone(),
             step_timing: settings.step_timing,
             loop_counts_off: settings.loop_counts_off,
+            jump_serial_always: settings.jump_serial_always,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -160,6 +164,7 @@ struct Pe {
     watches: Vec<(u64, u64)>,
     step_timing: bool,
     loop_counts_off: bool,
+    jump_serial_always: bool,
 }
 
 impl Pe {
@@ -173,6 +178,7 @@ impl Pe {
             watches,
             step_timing,
             loop_counts_off,
+            jump_serial_always,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -196,6 +202,7 @@ impl Pe {
             .unwrap_or_else(|error| output::fatal(error));
         machine.set_step_timing(step_timing);
         machine.set_loop_counts_off(loop_counts_off);
+        machine.set_jump_serial_always(jump_serial_always);
         if step_timing {
             host::pmu::start(pe);
         }

@@ -967,6 +967,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// is on (`--profile-keep-pack`), so the translation context, and with
     /// it the pack, stays that of an untimed boot.
     loop_counts_off: bool,
+    /// Every native entry starts the jump cache over, as before it could
+    /// keep it while nothing its entries rest on changed
+    /// (`--jump-serial-always`, [`chain_control::JumpBasis`]).
+    jump_serial_always: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1416,6 +1420,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             native_system: None,
             self_loops: true,
             loop_counts_off: false,
+            jump_serial_always: false,
             event_sample: None,
             debug: None,
             device_lines: None,

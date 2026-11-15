@@ -147,7 +147,7 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
     let weak = Arc::downgrade(&hub.inboxes[0].chain);
     let (attached, mut control) = Attached::new(&hub, 0, false).unwrap();
     control.initialize(11, 14, [12, 13], [0xffff, 0xfff]);
-    control.begin(9, 99);
+    control.begin(9, 99, None);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let foreign = Arc::clone(&hub);
@@ -172,7 +172,7 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
     );
     let (next, mut control) = Attached::new(&hub, 0, false).unwrap();
     control.initialize(21, 24, [22, 23], [0xffff, 0xfff]);
-    control.begin(2, 77);
+    control.begin(2, 77, None);
     resume_tx.send(()).unwrap();
     reader.join().unwrap();
     let snapshot = control.snapshot();
@@ -257,7 +257,7 @@ fn repeated_owner_reuse_keeps_remote_epoch_writes_disjoint() {
         assert!(attached.epoch > last);
         last = attached.epoch;
         control.initialize(index, index + 3, [index + 1, index + 2], [0xffff, 0xfff]);
-        control.begin(index as usize, 31);
+        control.begin(index as usize, 31, None);
         let state = control.snapshot();
         assert_eq!(
             (state.block, state.table, state.itlb, state.contexts),
@@ -1005,7 +1005,7 @@ fn notification_after_drain_survives_native_budget_reset() {
     // This is the old lost-notification window: the owner has drained,
     // then a peer posts before the owner initializes its next budget.
     hub.post(0, |mail| mail.event = true);
-    machine.chain.begin(0, 4096);
+    machine.chain.begin(0, 4096, None);
     let entered = machine.chain.snapshot();
     assert_eq!(entered.budget, 4096);
     assert_ne!(entered.interrupt_epoch, entered.observed_interrupt_epoch);
@@ -1035,7 +1035,7 @@ fn epoch_exhaustion_is_sticky_across_drain_detach_and_reuse() {
     let (_, mut next) = Attached::new(&hub, 0, false).unwrap();
     next.initialize(11, 14, [12, 13], [0xffff, 0xfff]);
     next.acknowledge_interrupt(u64::MAX);
-    next.begin(0, 4096);
+    next.begin(0, 4096, None);
     let reused = next.snapshot();
     assert_eq!(reused.interrupt_epoch, u64::MAX);
     assert_eq!(reused.observed_interrupt_epoch, u64::MAX - 1);
@@ -2872,24 +2872,146 @@ fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
     assert_eq!(machine.chain.stamp_counts(), [0; chain::STAMP_COUNTS]);
 }
 
-/// Every native entry starts the PE's jump cache over (`chain::lookup_tail`):
-/// what its table probes found under the last run's ITLB, contexts and
-/// blocks holds in no later run.
-#[test]
-fn each_native_entry_moves_the_jump_cache_serial() {
-    let mut machine = super::super::tests::machine(&[0xd65f_03c0]);
+/// The jump cache serial of `machine`'s PE (`chain::JUMP_SERIAL`).
+fn jump_serial<H: Host, D: Devices>(machine: &Machine<H, D>) -> u64 {
     let stamps = machine.chain.stamps().0;
     assert_ne!(stamps, 0, "every PE's control has stamps before it runs");
     let at = (stamps as i64 + i64::from(chain::JUMP_SERIAL)) as *const u64;
     // SAFETY: the serial in front of the PE's live stamps; no native code
     // runs meanwhile.
-    let serial = || unsafe { at.read() };
-    let before = serial();
+    unsafe { at.read() }
+}
+
+/// A native entry as `execute` begins one: whether the jump cache's serial
+/// moved, which the statistics count.
+fn enter<H: Host, D: Devices>(machine: &mut Machine<H, D>) -> bool {
+    let basis = (!machine.jump_serial_always).then(|| machine.jump_basis());
+    let before = jump_serial(machine);
+    let moved = machine.chain.begin(0, 16, basis);
+    assert_eq!(jump_serial(machine) != before, moved);
+    moved
+}
+
+/// With `--jump-serial-always` every native entry starts the PE's jump
+/// cache over (`chain::lookup_tail`), as all did before entries could keep
+/// it.
+#[test]
+fn each_native_entry_moves_the_jump_cache_serial_when_asked() {
+    let mut machine = super::super::tests::machine(&[0xd65f_03c0]);
+    machine.set_jump_serial_always(true);
+    let before = jump_serial(&machine);
     assert_ne!(before, 0);
-    machine.chain.begin(0, 16);
-    assert_eq!(serial(), before + 1);
-    machine.chain.begin(0, 16);
-    assert_eq!(serial(), before + 2);
+    assert!(enter(&mut machine));
+    assert_eq!(jump_serial(&machine), before + 1);
+    assert!(enter(&mut machine));
+    assert_eq!(jump_serial(&machine), before + 2);
+}
+
+/// Entries with nothing between them that the jump cache's entries rest
+/// on keep its serial: the first moves it, as the control is new.
+#[test]
+fn a_native_entry_keeps_the_jump_cache_while_nothing_changed() {
+    let mut machine = super::super::tests::machine(&[0xd65f_03c0]);
+    machine.chain.set_contexts([0x51, 0x52]);
+    assert!(enter(&mut machine), "a new control's first entry moves it");
+    let serial = jump_serial(&machine);
+    for _ in 0..3 {
+        assert!(!enter(&mut machine));
+    }
+    assert_eq!(jump_serial(&machine), serial);
+    // The same contexts written again, and a page the ITLB lacked taken:
+    // no translation an entry rests on changed.
+    let contexts = machine.chain.contexts();
+    machine.chain.set_contexts(contexts);
+    let context = contexts[0];
+    let slot = machine.itlb.page_slot(0x4000_0000, context);
+    machine.itlb.insert(
+        slot,
+        chain::LookupEntry::page(0x4000_0000, context, chain::block_key(0x8000_0000, 2)),
+    );
+    assert!(!enter(&mut machine));
+    // And the always-move option set back.
+    machine.set_jump_serial_always(true);
+    assert!(enter(&mut machine));
+    machine.set_jump_serial_always(false);
+    assert!(enter(&mut machine), "after an always-move entry");
+    assert!(!enter(&mut machine));
+}
+
+/// Each change of what the jump cache's entries rest on moves its serial
+/// at the next native entry, and only that one.
+#[test]
+fn what_jump_cache_entries_rest_on_moves_the_serial() {
+    let mut machine = super::super::tests::machine(&[0xd65f_03c0]);
+    machine.chain.set_contexts([0x51, 0x52]);
+    enter(&mut machine);
+    let changed = |machine: &mut Machine<_, _>, what: &str| {
+        assert!(enter(machine), "{what} moves the serial");
+        assert!(!enter(machine), "once, after {what}");
+    };
+    // Other contexts: the cache's entries were found in the old ones.
+    let contexts = machine.chain.contexts();
+    machine.chain.set_contexts([contexts[0] + 1, contexts[1]]);
+    changed(&mut machine, "a context change");
+    machine.chain.set_contexts(contexts);
+    changed(&mut machine, "a context change back");
+    // The tables, or the stamps holding the cache.
+    let (table, itlb) = (machine.code.table.address(), machine.itlb.address());
+    let masks = [machine.code.table.mask(), machine.itlb.mask()];
+    machine.chain.set_table(table, itlb, masks);
+    changed(&mut machine, "the tables written");
+    let (stamps, cells) = machine.chain.stamps();
+    machine.chain.set_stamps(stamps, cells);
+    changed(&mut machine, "the stamps written");
+    // The ITLB: a page's key changed, a TLBI's span, a page put out. A
+    // page it lacked, taken, changes no translation an entry rests on.
+    let context = machine.chain.contexts()[0];
+    let page =
+        |pc: u64, frame: u64| chain::LookupEntry::page(pc, context, chain::block_key(frame, 2));
+    let slot = machine.itlb.page_slot(0x4000_0000, context);
+    machine.itlb.insert(slot, page(0x4000_0000, 0x8000_0000));
+    assert!(!enter(&mut machine), "a page the ITLB lacked");
+    machine.itlb.insert(slot, page(0x4000_0000, 0x9000_0000));
+    changed(&mut machine, "a page's key changed");
+    machine
+        .itlb
+        .forget_range(0x4000_0000..=0x4000_3fff, u64::MAX);
+    changed(&mut machine, "a TLBI's span");
+    for at in 0..3 {
+        machine
+            .itlb
+            .insert(slot, page(0x5000_0000 + at * 0x4000, 0x8000_0000));
+    }
+    changed(&mut machine, "a page put out of a full set");
+    // The board's blocks: an IC IVAU's page, a retirement's release, every
+    // block forgotten.
+    machine.invalidate_code_page(0x8000_0000);
+    changed(&mut machine, "an IC IVAU");
+    let before = machine.code.unpublished();
+    machine.evict_code(0..1);
+    assert_ne!(machine.code.unpublished(), before, "a retirement");
+    changed(&mut machine, "a retirement");
+    machine.discard_blocks();
+    changed(&mut machine, "discarding every block");
+    // Another PE's change of the board: the count is the board's.
+    machine.code.note_unpublished();
+    changed(&mut machine, "another PE's unpublished block");
+}
+
+/// The statistics count the entries that moved the serial and those that
+/// kept it (`PES STAMPED`'s serial_moved/serial_kept).
+#[test]
+fn native_entries_count_whether_they_moved_the_jump_cache_serial() {
+    let mut machine = super::super::tests::machine(&[0xd65f_03c0]);
+    let basis = machine.jump_basis();
+    for _ in 0..3 {
+        let moved = machine.chain.begin(0, 16, Some(basis));
+        machine.statistics.jump_serials[usize::from(!moved)] += 1;
+    }
+    assert_eq!(machine.statistics.jump_serials, [1, 2]);
+    let mut total = machine.statistics;
+    total += machine.statistics;
+    assert_eq!(total.jump_serials, [2, 4]);
 }
 
 /// A PE that joins a board other than the one it was made on takes stamps

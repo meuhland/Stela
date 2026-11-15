@@ -55,12 +55,42 @@ impl Storage {
     }
 }
 
+/// What a PE's native jump cache entries rest on besides what its control
+/// holds ([`chain::lookup_tail`]): the table probe that filled each found
+/// the target through the PE's ITLB, then the board's block table. An
+/// entry enters the block that probe found, so it may outlive a native
+/// entry only while neither changed in a way a probe would see:
+///
+/// - `board`: the board's count of unpublished blocks and released code
+///   ([`super::board::Code::note_unpublished`]), which moves after every
+///   change of the block table that takes an entry away or makes it name
+///   another block, after a page's blocks leave the index, and before the
+///   grace of any release of code or block slots;
+/// - `itlb`: the PE's ITLB's drop epochs of both halves (an entry left or
+///   changed, a TLBI's span) plus the entries its inserts put out of a full
+///   set ([`chain::LookupTable::evicted`]): with no change of either, every
+///   page it held at the fill it holds with the same key.
+///
+/// The contexts the probe translated in, the tables' addresses and masks
+/// are the control's own: the native transitions that change contexts move
+/// the serial themselves, and the owner's writes of them make the next
+/// entry move it ([`Owner::begin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct JumpBasis {
+    pub(super) board: u64,
+    pub(super) itlb: u64,
+}
+
 /// The sole local-control writer. It can move between threads with its Machine,
 /// but cannot be shared; a hub keeps Storage without granting this role.
 pub(super) struct Owner {
     storage: Arc<Storage>,
     /// The budget the last native call began with ([`Self::begin`]).
     entered: u64,
+    /// The basis the jump cache's serial last moved at ([`Self::begin`]),
+    /// or none once the owner wrote what the cache's entries rest on
+    /// (the contexts, the tables, the stamps): the next entry moves it.
+    jump_basis: Option<JumpBasis>,
     _single_writer: PhantomData<Cell<()>>,
     _attachment: Option<Arc<super::parallel::Attached>>,
 }
@@ -69,6 +99,7 @@ impl Default for Owner {
         Self {
             storage: Storage::new(),
             entered: 0,
+            jump_basis: None,
             _single_writer: PhantomData,
             _attachment: None,
         }
@@ -86,6 +117,7 @@ impl Owner {
         Self {
             storage,
             entered: 0,
+            jump_basis: None,
             _single_writer: PhantomData,
             _attachment: Some(attachment),
         }
@@ -121,6 +153,7 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).observed_interrupt_epoch).write(0);
         }
         self.budget().store(0, Ordering::Relaxed);
+        self.jump_basis = None;
     }
     /// Acknowledge only the Acquire snapshot taken before a successful drain.
     /// MAX is never acknowledged, so exhausted notification state stays sticky.
@@ -156,6 +189,7 @@ impl Owner {
             let contexts = core::ptr::addr_of!((*control).contexts).read();
             core::ptr::addr_of_mut!((*control).salts).write(salts(contexts, masks));
         }
+        self.jump_basis = None;
     }
     /// This PE's stamps and the board's stamped cells, which stamped tails
     /// and the cell probe use ([`stela_compiler::x86_64::chain::stamped_tail`]).
@@ -166,6 +200,7 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).stamps).write(stamps);
             core::ptr::addr_of_mut!((*control).cells).write(cells);
         }
+        self.jump_basis = None;
     }
     /// The stamps and stamped cells [`Self::set_stamps`] gave, or zeros.
     pub(super) fn stamps(&self) -> (u64, u64) {
@@ -205,6 +240,12 @@ impl Owner {
         salts(contexts, self.masks())
     }
     pub(super) fn set_contexts(&mut self, contexts: [u64; 2]) {
+        // Jump cache entries were found in the contexts the control holds,
+        // which native transitions may have changed since: other contexts
+        // hold none of them.
+        if contexts != self.contexts() {
+            self.jump_basis = None;
+        }
         // SAFETY: the sole owner writes this non-budget field outside native execution.
         unsafe {
             let control = self.storage.control.get();
@@ -217,7 +258,12 @@ impl Owner {
                 .write(salts(contexts, masks));
         }
     }
-    pub(super) fn begin(&mut self, block: usize, budget: u64) {
+    /// Prepare a native call of `block` with `budget`. The jump cache's
+    /// serial moves, so that every entry goes, unless `basis` is the one it
+    /// last moved at and the owner wrote nothing its entries rest on since
+    /// ([`JumpBasis`]); `None` moves it always (`--jump-serial-always`).
+    /// Whether it moved.
+    pub(super) fn begin(&mut self, block: usize, budget: u64, basis: Option<JumpBasis>) -> bool {
         let control = self.storage.control.get();
         // SAFETY: the sole owner prepares these disjoint fields before its
         // synchronous native call; remote writers touch only the epoch.
@@ -227,11 +273,16 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).hits).write(0);
             core::ptr::addr_of_mut!((*control).linked).write(0);
         }
-        // SAFETY: `set_stamps` stored 0 or the board's table's stamps for
-        // this PE, and its native code does not run.
-        unsafe { chain::next_jump_serial(self.stamps().0) };
+        let moved = basis.is_none() || basis != self.jump_basis;
+        if moved {
+            // SAFETY: `set_stamps` stored 0 or the board's table's stamps
+            // for this PE, and its native code does not run.
+            unsafe { chain::next_jump_serial(self.stamps().0) };
+            self.jump_basis = basis;
+        }
         self.budget().store(budget, Ordering::Relaxed);
         self.entered = budget;
+        moved
     }
     /// The block that ended the last native call, the instructions of the
     /// blocks it chained out of, the transfers lookup probes made and the

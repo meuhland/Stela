@@ -296,6 +296,10 @@ pub struct System {
     /// (`--profile-keep-pack`), so the boot still reads its pack and the
     /// shares are those of a normal boot.
     pub profile_keep_pack: bool,
+    /// Start every PE's native jump cache over at each native entry
+    /// (`--jump-serial-always`), as before entries could keep it while no
+    /// block went and the PE's ITLB and contexts stayed: for A/B runs.
+    pub jump_serial_always: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -402,6 +406,7 @@ impl Default for System {
             parallel: true,
             profile: false,
             profile_keep_pack: false,
+            jump_serial_always: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -854,6 +859,7 @@ impl fmt::Display for System {
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile && !self.profile_keep_pack)?;
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
+        line.flag("--jump-serial-always", self.jump_serial_always)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
