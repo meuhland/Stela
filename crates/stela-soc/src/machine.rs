@@ -22,6 +22,7 @@ use crate::Result;
 pub use crate::pmu::{RtcAnchor, RtcEpoch};
 use crate::usb::{
     Function, Speed,
+    audio::Audio,
     ecm::Ecm,
     hci::Hci,
     hid::Peripheral,
@@ -30,6 +31,7 @@ use crate::usb::{
     storage::MassStorage,
 };
 pub use crate::usb::{
+    audio::{CHANNELS as USB_AUDIO_CHANNELS, Status as UsbAudioStatus},
     ecm::Counters as UsbNetworkCounters,
     hci::{Counters as UsbBluetoothCounters, Outbound},
     host::{Descriptor as UsbDescriptor, MuxEndpoints},
@@ -394,24 +396,28 @@ pub struct UsbCables {
     /// A USB Bluetooth controller: bridged to one of the host's, or the
     /// model the owner selects with [`AppleDevices::bluetooth_model`].
     pub bluetooth: bool,
+    /// A USB Audio Class 2 speaker (`crate::usb::audio`), whose frames the
+    /// owner takes with [`AppleDevices::guest_audio_take`].
+    pub audio: bool,
 }
 
 impl UsbCables {
     /// The disks the hub has ports for beside the keyboard and pointer and,
-    /// with `network` and `bluetooth`, the Ethernet adapter and Bluetooth
-    /// controller.
-    pub const fn disk_ports(network: bool, bluetooth: bool) -> usize {
-        hub::MAX_PORTS - 1 - network as usize - bluetooth as usize
+    /// with `network`, `bluetooth` and `audio`, the Ethernet adapter,
+    /// Bluetooth controller and speaker.
+    pub const fn disk_ports(network: bool, bluetooth: bool, audio: bool) -> usize {
+        hub::MAX_PORTS - 1 - network as usize - bluetooth as usize - audio as usize
     }
 }
 
 /// The functions on the native hub's ports: the keyboard and pointer on
-/// port 1, then the Ethernet adapter and Bluetooth controller when there are
-/// any, then one mass storage device per host disk.
+/// port 1, then the Ethernet adapter, Bluetooth controller and speaker when
+/// there are any, then one mass storage device per host disk.
 struct Attachments {
     input: Peripheral,
     network: Option<Ecm>,
     bluetooth: Option<Hci>,
+    audio: Option<Audio>,
     disks: Vec<MassStorage>,
 }
 
@@ -419,6 +425,7 @@ impl hub::Ports for Attachments {
     fn count(&self) -> usize {
         1 + usize::from(self.network.is_some())
             + usize::from(self.bluetooth.is_some())
+            + usize::from(self.audio.is_some())
             + self.disks.len()
     }
     fn speed(&self, port: usize) -> Speed {
@@ -428,16 +435,26 @@ impl hub::Ports for Attachments {
         let input = core::iter::once(&mut self.input as &mut dyn Function);
         let network = self.network.iter_mut().map(|f| f as &mut dyn Function);
         let bluetooth = self.bluetooth.iter_mut().map(|f| f as &mut dyn Function);
+        let audio = self.audio.iter_mut().map(|f| f as &mut dyn Function);
         let disks = self.disks.iter_mut().map(|f| f as &mut dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(disks);
+        let mut functions = input
+            .chain(network)
+            .chain(bluetooth)
+            .chain(audio)
+            .chain(disks);
         functions.nth(port).expect("a port of the hub's count")
     }
     fn function_ref(&self, port: usize) -> &dyn Function {
         let input = core::iter::once(&self.input as &dyn Function);
         let network = self.network.iter().map(|f| f as &dyn Function);
         let bluetooth = self.bluetooth.iter().map(|f| f as &dyn Function);
+        let audio = self.audio.iter().map(|f| f as &dyn Function);
         let disks = self.disks.iter().map(|f| f as &dyn Function);
-        let mut functions = input.chain(network).chain(bluetooth).chain(disks);
+        let mut functions = input
+            .chain(network)
+            .chain(bluetooth)
+            .chain(audio)
+            .chain(disks);
         functions.nth(port).expect("a port of the hub's count")
     }
 }
@@ -1372,12 +1389,18 @@ impl Devices for AppleDevices {
 
     fn take_host_service(&mut self) -> bool {
         let net = self.stela_net_take_service_due();
-        self.usb_masters
-            .iter_mut()
-            .fold(core::mem::take(&mut self.frame_presented), |due, master| {
-                master.session.take_due() | due
-            })
-            | net
+        self.usb_masters.iter_mut().fold(
+            core::mem::take(&mut self.frame_presented),
+            |due, master| {
+                // The speaker's 5 ms of fresh frames waits for the owner.
+                let audio = master
+                    .peripheral
+                    .as_mut()
+                    .and_then(|hub| hub.ports.audio.as_mut())
+                    .is_some_and(Audio::take_due);
+                master.session.take_due() | audio | due
+            },
+        ) | net
     }
 
     fn device_name(&self, physical: u64) -> Option<&'static str> {

@@ -152,14 +152,15 @@ impl AppleDevices {
     /// HPM reports the attach and the controller's host personality finds
     /// the hub on its USB2 port. The keyboard and pointer sit on the hub's
     /// first port, and `cables` names the USB Ethernet adapter, Bluetooth
-    /// controller and mass storage devices on the next ones.
+    /// controller, speaker and mass storage devices on the next ones.
     pub fn attach_input(&mut self, connector: u32, cables: UsbCables) -> Result<()> {
         let UsbCables {
             disks,
             network,
             bluetooth,
+            audio,
         } = cables;
-        let extras = usize::from(network.is_some()) + usize::from(bluetooth);
+        let extras = usize::from(network.is_some()) + usize::from(bluetooth) + usize::from(audio);
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
@@ -179,6 +180,7 @@ impl AppleDevices {
             input: Peripheral::new(),
             network,
             bluetooth: bluetooth.then(Hci::new),
+            audio: audio.then(Audio::new),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
@@ -190,6 +192,26 @@ impl AppleDevices {
             speed: typec::Usb2Speed::High,
         }))?;
         Ok(())
+    }
+
+    fn usb_audio(&mut self) -> Option<&mut Audio> {
+        self.usb_masters
+            .iter_mut()
+            .find_map(|master| master.peripheral.as_mut()?.ports.audio.as_mut())
+    }
+
+    /// The guest speaker's stream status and the frames waiting for the
+    /// owner; `None` without a speaker.
+    pub fn guest_audio_status(&mut self) -> Option<(UsbAudioStatus, usize)> {
+        let audio = self.usb_audio()?;
+        Some((audio.status(), audio.queued()))
+    }
+
+    /// Moves up to `out.len()` of the guest speaker's frames to `out`, its
+    /// mute and volume applied (`Audio::take`); the number moved, 0 without
+    /// a speaker.
+    pub fn guest_audio_take(&mut self, out: &mut [[i32; USB_AUDIO_CHANNELS]]) -> usize {
+        self.usb_audio().map_or(0, |audio| audio.take(out))
     }
 
     pub(super) fn usb_network(&mut self) -> Result<&mut Ecm> {

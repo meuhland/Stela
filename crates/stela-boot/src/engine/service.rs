@@ -30,7 +30,9 @@
 //! [`LATE_MILLIS`] is named in the `HOST SERVICE SLOW` line with what
 //! waited; a wait that began before the part is the turn's, in one
 //! `HOST SERVICE LATE` line.
-use super::{bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
+use super::{
+    bluetooth, guest_audio, host, input, network, nor, output, parallel, power, restore, usb,
+};
 use alloc::{format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
@@ -100,9 +102,10 @@ const INPUTS: usize = 0;
 const LOGS: usize = 1;
 const NETWORK: usize = 2;
 const BLUETOOTH: usize = 3;
-const NOR: usize = 4;
-const RESTORE: usize = 5;
-const TURN_PARTS: usize = 6;
+const AUDIO: usize = 4;
+const NOR: usize = 5;
+const RESTORE: usize = 6;
+const TURN_PARTS: usize = 7;
 
 /// The host interfaces the service owns for the whole run.
 pub(super) struct Service {
@@ -111,6 +114,7 @@ pub(super) struct Service {
     input: Option<input::HostInput>,
     usb: Option<usb::HostUsb>,
     bluetooth: Option<bluetooth::HostBluetooth>,
+    audio: Option<guest_audio::GuestAudio>,
     network: Option<network::GuestNetwork>,
     nor: Option<nor::HostNor>,
     power: power::HostPowerControl,
@@ -129,11 +133,13 @@ pub(super) struct Service {
 }
 
 /// The host's keyboards and pointers, the USB controllers new ones arrive
-/// on, and the Bluetooth controller behind the guest's.
+/// on, the Bluetooth controller behind the guest's, and the output behind
+/// the guest's speaker.
 pub(super) struct Peripherals {
     pub input: Option<input::HostInput>,
     pub usb: Option<usb::HostUsb>,
     pub bluetooth: Option<bluetooth::HostBluetooth>,
+    pub audio: Option<guest_audio::GuestAudio>,
 }
 
 impl Service {
@@ -144,6 +150,7 @@ impl Service {
             input,
             usb,
             bluetooth,
+            audio,
         }: Peripherals,
         network: Option<network::GuestNetwork>,
         nor: Option<nor::HostNor>,
@@ -159,6 +166,7 @@ impl Service {
             input,
             usb,
             bluetooth,
+            audio,
             network,
             nor,
             power,
@@ -233,6 +241,7 @@ impl Service {
             input,
             usb,
             bluetooth,
+            audio,
             network,
             nor,
             power,
@@ -422,6 +431,13 @@ impl Service {
             }
             lap.part(Part::Bluetooth);
         }
+        if let Some(audio) = audio.as_mut().filter(|_| due(AUDIO, false, &mut turn)) {
+            // The sink's clock is the corrected count, as the turn may run
+            // on any core.
+            devices.with(|devices| audio.serve(devices, host::fresh_counter()));
+            audio.transitions();
+            lap.part(Part::Audio);
+        }
         if due(NOR, true, &mut turn) {
             let mut drivers = String::new();
             if let Some(nor) = nor {
@@ -487,6 +503,9 @@ impl Service {
             if let Some(network) = network.as_ref() {
                 network.report();
             }
+            if let Some(audio) = audio.as_mut() {
+                audio.report();
+            }
             power.disks().report(*tsc_hz);
             *reported = stamp;
         }
@@ -515,9 +534,11 @@ enum Part {
     /// The NOR's stores and the power button.
     Nor,
     Log,
+    /// The guest speaker's frames and the host output behind it.
+    Audio,
 }
 
-const PARTS: usize = 8;
+const PARTS: usize = 9;
 const NAMES: [&str; PARTS] = [
     "read",
     "restore",
@@ -527,6 +548,7 @@ const NAMES: [&str; PARTS] = [
     "bluetooth",
     "nor",
     "log",
+    "audio",
 ];
 
 /// The longest each part took since the last [`report`], in counter ticks.

@@ -1217,6 +1217,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
+                guest_audio: options.guest_audio.then(guest_audio::GuestAudio::new),
                 guest_network,
                 host_nor,
                 host_disks,
@@ -1764,6 +1765,7 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
+                audio: options.guest_audio,
             },
             scanout,
             firmware: &firmware,
@@ -3000,8 +3002,12 @@ fn start_devices(
             let owned_wifi = wifi_network(handoff, options);
             let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
-                stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
-                    .saturating_sub(owned_usb.len())
+                stela_soc::machine::UsbCables::disk_ports(
+                    options.guest_network,
+                    options.input,
+                    options.guest_audio,
+                )
+                .saturating_sub(owned_usb.len())
             });
             let root = handoff.root;
             let heap = handoff.heap.physical..handoff.heap.physical + handoff.heap.bytes;

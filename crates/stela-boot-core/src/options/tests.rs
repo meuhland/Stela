@@ -527,3 +527,26 @@ fn table_insert_throttled_is_off_by_default_and_round_trips() {
     assert_eq!(options.to_string(), line);
     assert!(!round_trip("--system").table_insert_throttled);
 }
+
+/// The guest speaker is off unless asked for, and rides choices.cfg's line
+/// beside the network and the input.
+#[test]
+fn guest_audio_is_off_by_default_and_round_trips() {
+    assert!(!System::parse("--system").unwrap().guest_audio);
+    assert!(!System::default().guest_audio);
+    let line = "--system --guest-audio";
+    let options = round_trip(line);
+    assert!(options.guest_audio);
+    assert_eq!(options.to_string(), line);
+    let line = "--system --guest-network --guest-audio --input";
+    let options = round_trip(line);
+    assert!(options.guest_audio && options.guest_network && options.input);
+    assert_eq!(options.to_string(), line);
+    // A repeated flag is the same choice.
+    assert_eq!(
+        System::parse("--system --guest-audio --guest-audio")
+            .unwrap()
+            .to_string(),
+        "--system --guest-audio"
+    );
+}
