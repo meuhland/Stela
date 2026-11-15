@@ -5,7 +5,7 @@
  * Prototype: a plain ifnet (the BSD network KPI, no IONetworkingFamily
  * vtables) named stn0. It reports its link (KEV_DL_LINK_ON/OFF, SIOCGIFMEDIA)
  * as an Ethernet driver does, so IPConfiguration configures it once asked
- * (`ipconfig set stn0 DHCP`, which the sandbox patcher's job does); not being
+ * (`ipconfig set stn0 DHCP`, which the org.stela.StelaNet job does); not being
  * an IONetworkInterface, it is no hardware port in System Settings. Frames move
  * through two virtio split virtqueues the kext allocates: receive buffers of
  * 2 KiB each posted once and reposted as they are harvested, and transmit
