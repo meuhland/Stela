@@ -671,9 +671,9 @@ pub const STAMP_COUNTS_BYTES: usize = 64;
 
 /// Entries of a PE's jump cache, in front of its stamp counts: the
 /// targets its table probe found since the cache's serial last moved, by
-/// guest PC, which a [`lookup_tail`] takes without a probe. Bits 2-9 of
+/// guest PC, which a [`lookup_tail`] takes without a probe. Bits 2-13 of
 /// the PC pick the entry.
-pub const JUMP_CACHE_ENTRIES: usize = 256;
+pub const JUMP_CACHE_ENTRIES: usize = 4096;
 /// Bytes of one jump cache entry: the PC, the block's code, its index and
 /// the BTYPEs it accepts (as [`LookupEntry`]), and the serial it holds in.
 const JUMP_ENTRY_BYTES: usize = 32;
