@@ -239,9 +239,15 @@ typed(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef ca
          return STELA_AIR_CALL_FAILED;
    }
    struct group g = group(c->b, quad);
+   /* bfloats move as their bits, and combine in single precision, rounded
+    * once at the end. */
+   bool bfloat = floating && operation >= SUM && stela_air_call_bfloat(type);
    *result = filled ? fill(c->b, operation, v[0], v[1], v[2], v[3], &g) :
              operation < SUM ? move(c->b, operation, v[0], lane ? v[1] : NULL, &g) :
-                               reduce(c->b, operation, v[0], floating, sign, &g);
+             bfloat ? stela_air_float_to_bfloat(c->b, reduce(c->b, operation,
+                                                             stela_air_bfloat_to_float(c->b, v[0]),
+                                                             floating, sign, &g)) :
+                      reduce(c->b, operation, v[0], floating, sign, &g);
    return STELA_AIR_CALL_LOWERED;
 }
 
@@ -328,7 +334,7 @@ stela_air_simd_call(const struct stela_air_call_context *c, LLVMValueRef call, L
    if (!LLVMGetNumArgOperands(call))
       return STELA_AIR_CALL_OTHER;
    LLVMTypeRef type = LLVMTypeOf(LLVMGetOperand(call, 0));
-   bool floating = stela_air_call_floating(type);
+   bool floating = stela_air_call_floating(type) || stela_air_call_bfloat(type);
    if (!floating && !stela_air_call_integer(type))
       return STELA_AIR_CALL_OTHER;
    char overload[16];

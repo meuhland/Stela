@@ -563,6 +563,86 @@ bfloats_round_to_nearest_even(void)
                     1) == 0xc000);
 }
 
+/* A bfloat's arithmetic, conversions from integers and functions round
+ * once from exact or single-precision results; its comparisons are single
+ * precision's. */
+static void
+bfloats_compute_in_single_precision(void)
+{
+   /* Halfway sums round to the even neighbor: 1 + 2^-8 down to 1,
+    * (1 + 2^-7) + 2^-8 up to 1 + 2^-6. */
+   CHECK_FOLD("", "bfloat", "fadd bfloat 0xR3F80, 0xR3B80", 0x3f80);
+   CHECK_FOLD("", "bfloat", "fadd bfloat 0xR3F81, 0xR3B80", 0x3f82);
+   CHECK_FOLD("", "bfloat", "fsub bfloat 0xR4040, 0xR3F80", 0x4000);
+   CHECK_FOLD("", "bfloat", "fmul bfloat 0xR3FC0, 0xR4040", 0x4090);
+   /* 1/3 is 0x3EAAAAAB in single precision, which rounds up. */
+   CHECK_FOLD("", "bfloat", "fdiv fast bfloat 0xR3F80, 0xR4040", 0x3eab);
+   CHECK_FOLD("", "bfloat", "frem fast bfloat 0xRC0E0, 0xR4040", 0xbf80);
+   assert(fold_lane("", "<2 x bfloat>", "bfloat",
+                    "fadd <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, <bfloat 0xR3F80, bfloat 0xR3F80>",
+                    1) == 0x4040);
+   CHECK_FOLD("", "bfloat", "fneg bfloat 0xR3F80", 0xbf80);
+   assert(fold_body("", "%c = fcmp olt bfloat 0xR3F80, 0xR4000\n%r = zext i1 %c to i32\n", "i32") == 1);
+   assert(fold_body("", "%c = fcmp ogt bfloat 0xR3F80, 0xR4000\n%r = zext i1 %c to i32\n", "i32") == 0);
+   assert(fold_body("", "%c = fcmp uno bfloat 0xR7FC0, 0xR3F80\n%r = zext i1 %c to i32\n", "i32") == 1);
+   /* Precise quotients and remainders evaluate in single precision. */
+   ralloc_free(translated("", "%r = fdiv bfloat 0xR3F80, 0xR4040\n"
+                              "store bfloat %r, ptr addrspace(1) %out, align 2\nret void\n"));
+   ralloc_free(translated("", "%r = frem bfloat 0xR3F80, 0xR4040\n"
+                              "store bfloat %r, ptr addrspace(1) %out, align 2\nret void\n"));
+
+   /* Integers round once. 2^24 + 2^16 + 1 is just past the halfway point
+    * 2^24 + 2^16 between two bfloats, which a float's own rounding would
+    * land on and a second rounding take to the even 2^24. */
+   CHECK_FOLD("", "bfloat", "sitofp i32 3 to bfloat", 0x4040);
+   CHECK_FOLD("", "bfloat", "sitofp i32 16842753 to bfloat", 0x4b81);
+   CHECK_FOLD("", "bfloat", "sitofp i32 -16842753 to bfloat", 0xcb81);
+   CHECK_FOLD("", "bfloat", "uitofp i32 16842752 to bfloat", 0x4b80);
+   CHECK_FOLD("", "bfloat", "sitofp i32 -2147483648 to bfloat", 0xcf00);
+   CHECK_FOLD("", "bfloat", "uitofp i32 4294967295 to bfloat", 0x4f80);
+   CHECK_FOLD("", "bfloat", "sitofp i32 0 to bfloat", 0);
+   /* 2^40 + 2^32 + 1, past the halfway point 2^40 + 2^32. */
+   CHECK_FOLD("", "bfloat", "uitofp i64 1103806595073 to bfloat", 0x5381);
+   CHECK_FOLD("", "bfloat", "uitofp i64 18446744073709551615 to bfloat", 0x5f80);
+   CHECK_FOLD("", "bfloat", "sitofp i64 -1 to bfloat", 0xbf80);
+   CHECK_FOLD("", "bfloat", "uitofp i8 255 to bfloat", 0x437f);
+   CHECK_FOLD("", "bfloat", "sitofp i8 -128 to bfloat", 0xc300);
+   CHECK_FOLD("", "bfloat", "sitofp i16 -32768 to bfloat", 0xc700);
+   CHECK_FOLD("", "bfloat", "sitofp i1 true to bfloat", 0xbf80);
+   CHECK_FOLD("", "bfloat", "uitofp i1 true to bfloat", 0x3f80);
+   assert(fold_lane("", "<2 x bfloat>", "bfloat",
+                    "sitofp <2 x i32> <i32 1, i32 -3> to <2 x bfloat>", 1) == 0xc040);
+   CHECK_FOLD("declare bfloat @air.convert.f.bf16.s.i32(i32)\n", "bfloat",
+              "call bfloat @air.convert.f.bf16.s.i32(i32 16842753)", 0x4b81);
+   CHECK_FOLD("declare bfloat @air.convert.f.bf16.u.i8(i8)\n", "bfloat",
+              "call bfloat @air.convert.f.bf16.u.i8(i8 255)", 0x437f);
+   CHECK_FOLD("declare bfloat @air.convert.f.bf16.u.i64(i64)\n", "bfloat",
+              "call bfloat @air.convert.f.bf16.u.i64(i64 1103806595073)", 0x5381);
+   assert(fold_lane("declare <2 x bfloat> @air.convert.f.v2bf16.s.v2i32(<2 x i32>)\n",
+                    "<2 x bfloat>", "bfloat",
+                    "call <2 x bfloat> @air.convert.f.v2bf16.s.v2i32(<2 x i32> <i32 1, i32 -3>)",
+                    1) == 0xc040);
+
+   /* Functions: 1.5 * 2 + 0.5, |-3|, max(1, 2), 2^3. */
+   CHECK_FOLD("declare bfloat @llvm.fma.bf16(bfloat, bfloat, bfloat)\n", "bfloat",
+              "call bfloat @llvm.fma.bf16(bfloat 0xR3FC0, bfloat 0xR4000, bfloat 0xR3F00)", 0x4060);
+   CHECK_FOLD("declare bfloat @llvm.fabs.bf16(bfloat)\n", "bfloat",
+              "call bfloat @llvm.fabs.bf16(bfloat 0xRC040)", 0x4040);
+   CHECK_FOLD("declare bfloat @air.fmax.bf16(bfloat, bfloat)\n", "bfloat",
+              "call bfloat @air.fmax.bf16(bfloat 0xR3F80, bfloat 0xR4000)", 0x4000);
+   CHECK_FOLD("declare bfloat @air.fast_exp2.bf16(bfloat)\n", "bfloat",
+              "call bfloat @air.fast_exp2.bf16(bfloat 0xR4040)", 0x4100);
+   assert(fold_lane("declare <2 x bfloat> @air.fabs.v2bf16(<2 x bfloat>)\n", "<2 x bfloat>", "bfloat",
+                    "call <2 x bfloat> @air.fabs.v2bf16(<2 x bfloat> <bfloat 0xR3F80, bfloat 0xRC000>)",
+                    1) == 0x4000);
+   /* Their results of other types stay those types. */
+   CHECK_FOLD("declare i32 @air.ilogb.bf16(bfloat)\n", "i32",
+              "call i32 @air.ilogb.bf16(bfloat 0xR4100)", 3);
+   ralloc_free(translated("declare bfloat @air.sqrt.bf16(bfloat)\n",
+                          "%r = call bfloat @air.sqrt.bf16(bfloat 0xR4080)\n"
+                          "store bfloat %r, ptr addrspace(1) %out, align 2\nret void\n"));
+}
+
 static void
 refuses_misnamed_and_misplaced_functions(void)
 {
@@ -578,12 +658,8 @@ refuses_misnamed_and_misplaced_functions(void)
        "call i16 @air.convert.s.i32.f.f32(float 1.0)", STELA_AIR_INSTRUCTION},
       {"declare float @air.convert.s.f32.f.f32(float)\n", "float",
        "call float @air.convert.s.f32.f.f32(float 1.0)", STELA_AIR_INSTRUCTION},
-      /* An integer would round twice on its way to a bfloat. */
-      {"declare bfloat @air.convert.f.bf16.s.i32(i32)\n", "bfloat",
-       "call bfloat @air.convert.f.bf16.s.i32(i32 3)", STELA_AIR_TYPE},
-      {"", "bfloat", "sitofp i32 3 to bfloat", STELA_AIR_TYPE},
-      /* A bfloat's arithmetic is not a half's. */
-      {"", "bfloat", "fadd bfloat 0xR3F80, 0xR3F80", STELA_AIR_TYPE},
+      /* A bfloat vector has at most 4 lanes, as a half or float one does. */
+      {"", "<8 x bfloat>", "fadd <8 x bfloat> zeroinitializer, zeroinitializer", STELA_AIR_TYPE},
       /* A function's name spells its overload. */
       {"declare float @air.sqrt.f16(float)\n", "float", "call float @air.sqrt.f16(float 1.0)",
        STELA_AIR_INSTRUCTION},
@@ -1199,6 +1275,7 @@ main(void)
    bools_reduce();
    conversions_follow_their_names();
    bfloats_round_to_nearest_even();
+   bfloats_compute_in_single_precision();
    fast_functions_meet_their_bounds();
    fast_inverse_trigonometry_stays_single();
    half_functions_stay_single();
