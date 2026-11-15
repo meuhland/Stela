@@ -490,3 +490,17 @@ fn table_insert_throttled_is_off_by_default_and_round_trips() {
     assert_eq!(options.to_string(), line);
     assert!(!round_trip("--system").table_insert_throttled);
 }
+
+/// `--probe-nvenc` checks the started GPUs' video encoders before macOS; it
+/// is off unless asked for, and round-trips beside the boot's usual flags.
+#[test]
+fn probe_nvenc_is_off_by_default_and_round_trips() {
+    assert!(!System::default().probe_nvenc);
+    assert!(!round_trip("--system").probe_nvenc);
+    let options = round_trip(&format!("--system --input --parallel {PROBE_NVENC}"));
+    assert!(options.probe_nvenc && options.input && options.parallel);
+    assert!(options.to_string().contains(" --probe-nvenc"));
+    let alone = round_trip(&format!("--system {PROBE_NVENC}"));
+    assert_eq!(alone.to_string(), "--system --probe-nvenc");
+}
+

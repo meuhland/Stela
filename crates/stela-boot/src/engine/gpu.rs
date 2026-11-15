@@ -31,6 +31,8 @@ mod kext {
     ));
 }
 #[cfg(feature = "nvk")]
+pub(super) mod nvenc;
+#[cfg(feature = "nvk")]
 mod slice;
 #[cfg(feature = "nvk")]
 mod stack;
