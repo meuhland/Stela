@@ -403,6 +403,9 @@ pub struct System {
     /// compare (`--guest-network-stelanet-no-lro`,
     /// `--guest-network-stelanet-no-offload`, each implying the adapter).
     pub guest_network_stelanet_offloads: StelaNetOffloads,
+    /// Give the guest a USB Audio Class 2 speaker on the native hub
+    /// (`--guest-audio`), whose frames the host consumes at 48 kHz.
+    pub guest_audio: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -501,6 +504,7 @@ impl Default for System {
             guest_network: false,
             guest_network_stelanet: false,
             guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
+            guest_audio: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -935,6 +939,7 @@ impl fmt::Display for System {
                 stelanet && self.guest_network_stelanet_offloads == offloads,
             )?;
         }
+        line.flag("--guest-audio", self.guest_audio)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

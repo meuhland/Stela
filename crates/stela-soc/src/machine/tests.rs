@@ -4415,3 +4415,45 @@ fn nor_access_cost() {
         "NOR access ns: alone={alone:.1} beside_board_writes={contended:.1} (other PE wrote {writes})"
     );
 }
+
+/// The guest speaker takes a high-speed hub port of its own, after the
+/// Ethernet adapter and Bluetooth controller and before the disks, and
+/// costs the disks one port.
+#[test]
+fn the_guest_speaker_takes_a_high_speed_hub_port_before_the_disks() {
+    use crate::usb::{
+        control::{
+            DEVICE, GET_DESCRIPTOR,
+            tests::{setup, transfer},
+        },
+        hub::Ports,
+    };
+    assert_eq!(UsbCables::disk_ports(false, false, false), 6);
+    assert_eq!(UsbCables::disk_ports(false, false, true), 5);
+    assert_eq!(UsbCables::disk_ports(true, true, true), 3);
+    let mut ports = Attachments {
+        input: Peripheral::new(),
+        network: None,
+        bluetooth: Some(Hci::new()),
+        audio: Some(Audio::new()),
+        disks: Vec::new(),
+    };
+    assert_eq!(ports.count(), 3);
+    assert_eq!(ports.speed(0), Speed::Full);
+    assert_eq!(ports.speed(2), Speed::High);
+    // Port 3 is the speaker: a function described by interface
+    // associations, pid.codes' test vendor.
+    let device = transfer(
+        ports.function(2),
+        setup(0x80, GET_DESCRIPTOR, u16::from(DEVICE) << 8, 0, 18),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(device[4], 0xef);
+    assert_eq!(u16::from_le_bytes([device[8], device[9]]), 0x1209);
+    // Its frames wait for the owner, who has none yet.
+    let mut audio = Audio::new();
+    let mut out = [[0; USB_AUDIO_CHANNELS]; 4];
+    assert_eq!(audio.take(&mut out), 0);
+    assert_eq!(audio.status().bits, 0);
+}

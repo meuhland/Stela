@@ -1,0 +1,265 @@
+//! The host's side of the guest's USB speaker (`stela_soc::usb::audio`):
+//! how many of its frames a service turn takes, and the line that reports
+//! them.
+//!
+//! The guest's frames come at 48 kHz of guest time; the host consumes them
+//! at 48 kHz of its own clock, the counter for a sink or the HDA link for
+//! an HDMI stream. Nothing resamples. A turn that owes more frames than wait
+//! plays silence for the rest, and frames beyond [`BACKLOG_FRAMES`] after a
+//! turn are dropped, oldest first, so the guest's sound never trails the
+//! host's clock by more than that.
+use core::fmt;
+
+/// The only sample rate.
+pub const RATE: u64 = 48_000;
+/// The guest's frames a turn leaves waiting at most: 20 ms.
+pub const BACKLOG_FRAMES: usize = RATE as usize / 50;
+/// The most one turn owes a sink: 200 ms, the guest ring's size. A longer
+/// gap in the service is not paid back with that much silence.
+pub const MAX_STEP_FRAMES: u64 = RATE / 5;
+
+/// Paces a consumer at [`RATE`] frames a second of a counter that ticks
+/// `hz` times a second.
+#[derive(Clone, Copy, Debug)]
+pub struct Pacer {
+    hz: u64,
+    last: Option<u64>,
+    /// Ticks times [`RATE`] not yet a whole frame.
+    remainder: u64,
+}
+
+impl Pacer {
+    pub const fn new(hz: u64) -> Self {
+        Self {
+            hz,
+            last: None,
+            remainder: 0,
+        }
+    }
+
+    /// The stream stopped: the next [`Self::due`] starts over.
+    pub fn stop(&mut self) {
+        self.last = None;
+        self.remainder = 0;
+    }
+
+    /// Frames due since the last call, at counter `now`: none at the first
+    /// call after [`Self::new`] or [`Self::stop`], and at most
+    /// [`MAX_STEP_FRAMES`]. A counter that went back owes nothing.
+    pub fn due(&mut self, now: u64) -> u64 {
+        let Some(last) = self.last.replace(now) else {
+            self.remainder = 0;
+            return 0;
+        };
+        let hz = u128::from(self.hz.max(1));
+        let scaled =
+            u128::from(now.saturating_sub(last)) * u128::from(RATE) + u128::from(self.remainder);
+        let frames = scaled / hz;
+        if frames >= u128::from(MAX_STEP_FRAMES) {
+            self.remainder = 0;
+            return MAX_STEP_FRAMES;
+        }
+        self.remainder = (scaled % hz) as u64;
+        frames as u64
+    }
+}
+
+/// What one turn does with the guest's frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Step {
+    /// The oldest frames dropped first, past the backlog.
+    pub dropped: usize,
+    /// Frames played, after the dropped ones.
+    pub take: usize,
+    /// Frames owed that the guest had not sent: silence.
+    pub silent: u64,
+}
+
+/// A turn that owes `due` frames with `queued` waiting: it plays what is
+/// there up to `due`, silence for the rest, and first drops the oldest
+/// frames that would leave more than [`BACKLOG_FRAMES`] waiting after it.
+pub fn step(due: u64, queued: usize) -> Step {
+    let take = usize::try_from(due).unwrap_or(usize::MAX).min(queued);
+    Step {
+        dropped: (queued - take).saturating_sub(BACKLOG_FRAMES),
+        take,
+        silent: due - take as u64,
+    }
+}
+
+/// The host side's counts since the stream was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub consumed: u64,
+    pub silent: u64,
+    /// Frames the host dropped past the backlog.
+    pub trimmed: u64,
+}
+
+impl Counters {
+    pub fn add(&mut self, step: Step) {
+        self.consumed += step.take as u64;
+        self.silent += step.silent;
+        self.trimmed += step.dropped as u64;
+    }
+}
+
+/// The `GUEST AUDIO` line: the function's counts and controls beside the
+/// host's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Report {
+    /// The streaming setting's bit resolution, 0 while the guest is idle.
+    pub bits: u8,
+    /// Frames the guest sent.
+    pub received: u64,
+    /// Frames the function dropped at its full ring.
+    pub overflowed: u64,
+    /// Bytes of packets that split a frame.
+    pub split: u64,
+    pub queued: usize,
+    pub muted: bool,
+    /// 1/256 dB.
+    pub volume: i16,
+    pub host: Counters,
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let volume = i32::from(self.volume);
+        let (sign, magnitude) = if volume < 0 {
+            ("-", -volume)
+        } else {
+            ("", volume)
+        };
+        // Tenths of a dB, rounded toward zero: the steps are 0.5 dB.
+        let tenths = magnitude * 10 / 256;
+        write!(
+            f,
+            "GUEST AUDIO frames={} consumed={} silent={} dropped={} split={} queued={} \
+             bits={} muted={} volume={sign}{}.{}dB",
+            self.received,
+            self.host.consumed,
+            self.host.silent,
+            self.overflowed + self.host.trimmed,
+            self.split,
+            self.queued,
+            self.bits,
+            self.muted,
+            tenths / 10,
+            tenths % 10,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    #[test]
+    fn a_pacer_owes_48_frames_a_millisecond_and_keeps_the_remainder() {
+        // A 3 MHz counter: one frame is 62.5 ticks.
+        let mut pacer = Pacer::new(3_000_000);
+        assert_eq!(pacer.due(1_000), 0, "the first call starts the clock");
+        assert_eq!(pacer.due(4_000), 48);
+        // 125 ticks are two frames; 63 then 62 ticks are one each, as the
+        // half frame carries over.
+        assert_eq!(pacer.due(4_063), 1);
+        assert_eq!(pacer.due(4_125), 1);
+        // A second in many small steps is exactly 48000 frames.
+        let mut pacer = Pacer::new(3_000_000);
+        pacer.due(0);
+        let owed: u64 = (1..=3_000).map(|n| pacer.due(n * 1_000)).sum();
+        assert_eq!(owed, RATE);
+    }
+
+    #[test]
+    fn a_pacer_caps_a_long_gap_and_restarts_after_a_stop() {
+        let mut pacer = Pacer::new(1_000_000);
+        pacer.due(0);
+        assert_eq!(pacer.due(5_000_000), MAX_STEP_FRAMES);
+        assert_eq!(pacer.due(5_001_000), 48);
+        // A counter that went back owes nothing.
+        assert_eq!(pacer.due(5_000_500), 0);
+        pacer.stop();
+        assert_eq!(pacer.due(9_000_000), 0);
+        assert_eq!(pacer.due(9_010_000), 480);
+    }
+
+    #[test]
+    fn a_step_plays_what_waits_pads_silence_and_trims_the_backlog() {
+        // Enough waiting: play what is owed, keep the rest.
+        assert_eq!(
+            step(480, 600),
+            Step {
+                dropped: 0,
+                take: 480,
+                silent: 0
+            }
+        );
+        // Too little: silence for the rest.
+        assert_eq!(
+            step(480, 100),
+            Step {
+                dropped: 0,
+                take: 100,
+                silent: 380
+            }
+        );
+        // More than the backlog would remain: the oldest go first.
+        assert_eq!(
+            step(480, 480 + BACKLOG_FRAMES + 7),
+            Step {
+                dropped: 7,
+                take: 480,
+                silent: 0
+            }
+        );
+        assert_eq!(step(0, 0), Step::default());
+        let mut counters = Counters::default();
+        counters.add(step(480, 100));
+        counters.add(step(480, 480 + BACKLOG_FRAMES + 7));
+        assert_eq!(
+            counters,
+            Counters {
+                consumed: 580,
+                silent: 380,
+                trimmed: 7
+            }
+        );
+    }
+
+    #[test]
+    fn the_report_line_names_every_count_and_the_volume_in_db() {
+        let report = Report {
+            bits: 16,
+            received: 96_000,
+            overflowed: 3,
+            split: 0,
+            queued: 240,
+            muted: false,
+            volume: -12 * 256 - 128,
+            host: Counters {
+                consumed: 95_000,
+                silent: 10,
+                trimmed: 4,
+            },
+        };
+        assert_eq!(
+            report.to_string(),
+            "GUEST AUDIO frames=96000 consumed=95000 silent=10 dropped=7 split=0 queued=240 \
+             bits=16 muted=false volume=-12.5dB"
+        );
+        let unity = Report {
+            volume: 0,
+            muted: true,
+            bits: 0,
+            ..report
+        };
+        assert!(
+            unity
+                .to_string()
+                .ends_with("bits=0 muted=true volume=0.0dB")
+        );
+    }
+}

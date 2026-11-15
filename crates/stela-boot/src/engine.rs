@@ -25,6 +25,7 @@ mod display;
 pub(crate) mod fdr;
 mod firmware_requests;
 mod gpu;
+mod guest_audio;
 pub(crate) mod host;
 mod input;
 pub(crate) mod install;
@@ -1193,6 +1194,7 @@ struct RunIo {
     host_input: Option<input::HostInput>,
     host_usb: Option<usb::HostUsb>,
     host_bluetooth: Option<bluetooth::HostBluetooth>,
+    guest_audio: Option<guest_audio::GuestAudio>,
     guest_network: Option<network::GuestNetwork>,
     host_nor: Option<nor::HostNor>,
     host_disks: storage::HostDisks,
@@ -1310,6 +1312,7 @@ fn run_machine<H: Host>(
         host_input,
         host_usb,
         host_bluetooth,
+        guest_audio,
         guest_network,
         host_nor,
         host_disks,
@@ -1327,6 +1330,7 @@ fn run_machine<H: Host>(
             input: host_input,
             usb: host_usb,
             bluetooth: host_bluetooth,
+            audio: guest_audio,
         },
         guest_network,
         host_nor,

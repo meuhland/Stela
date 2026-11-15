@@ -168,6 +168,7 @@ impl ParseState<'_> {
                 options.guest_network_stelanet = true;
                 options.guest_network_stelanet_offloads = StelaNetOffloads::None;
             }
+            "--guest-audio" => options.guest_audio = true,
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {
