@@ -689,6 +689,42 @@ simd_functions_lower_to_subgroup_operations(void)
            "%a = call i32 @air.simd_shuffle.i32(i32 1, i16 3)\nret void\n", STELA_AIR_INSTRUCTION);
 }
 
+/* bfloats move as their bits and combine in single precision. */
+static void
+simd_functions_take_bfloats(void)
+{
+   nir_shader *shader = lowered(
+      "declare bfloat @air.simd_shuffle.bf16(bfloat, i16)\n"
+      "declare bfloat @air.simd_sum.bf16(bfloat)\n"
+      "declare <2 x bfloat> @air.quad_max.v2bf16(<2 x bfloat>)\n"
+      "declare bfloat @air.simd_prefix_exclusive_sum.bf16(bfloat)\n",
+      "%a = call bfloat @air.simd_shuffle.bf16(bfloat 0xR3F80, i16 3)\n"
+      "%s = call bfloat @air.simd_sum.bf16(bfloat %a)\n"
+      "%m = call <2 x bfloat> @air.quad_max.v2bf16(<2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>)\n"
+      "%e = extractelement <2 x bfloat> %m, i32 1\n"
+      "%p = call bfloat @air.simd_prefix_exclusive_sum.bf16(bfloat %e)\n"
+      "%x = fadd bfloat %s, %p\n"
+      "store bfloat %x, ptr addrspace(1) %out, align 2\nret void\n");
+   assert(count(shader, nir_intrinsic_shuffle) >= 1);
+   assert(count(shader, nir_intrinsic_reduce) == 2);
+   assert(count(shader, nir_intrinsic_exclusive_scan) == 1);
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_reduce || intr->intrinsic == nir_intrinsic_exclusive_scan)
+               assert(intr->def.bit_size == 32);
+         }
+      }
+   }
+   ralloc_free(shader);
+   /* Bitwise functions still take integers. */
+   refused("declare bfloat @air.simd_and.bf16(bfloat)\n",
+           "%a = call bfloat @air.simd_and.bf16(bfloat 0xR3F80)\nret void\n", STELA_AIR_TYPE);
+}
+
 enum { SIMD_LANES = 32, MAX_SHUFFLES = 128 };
 
 /* Rewrites a lane's uses of `def` with the `bits` constant `value`; whether
@@ -999,6 +1035,37 @@ matrix_constants_name_thread_elements(void)
       assert(float_at(memory, i) == (i % 2 ? 3.0f : 2.0f));
 }
 
+/* A bfloat matrix's arithmetic is its thread elements', each in single
+ * precision rounded once: (2a + a) / 3 is a again. */
+static void
+bfloat_matrix_arithmetic_is_elementwise(void)
+{
+   uint8_t memory[512] = {0};
+   for (unsigned i = 0; i < 64; i++) {
+      float value = (float)(i % 11) - 3.0f;
+      uint32_t bits;
+      memcpy(&bits, &value, sizeof(bits));
+      uint16_t bfloat = bits >> 16;
+      memcpy(memory + 2 * i, &bfloat, 2);
+   }
+   run_simdgroup(
+      "declare <64 x bfloat> @air.simdgroup_matrix_8x8_load.v64bf16.p1bf16(ptr addrspace(1), i64,"
+      " <2 x i64>, i1)\n"
+      "declare void @air.simdgroup_matrix_8x8_store.v64bf16.p1bf16(<64 x bfloat>, ptr addrspace(1),"
+      " i64, <2 x i64>, i1)\n",
+      "%a = call <64 x bfloat> @air.simdgroup_matrix_8x8_load.v64bf16.p1bf16(ptr addrspace(1)"
+      " %out, i64 8, <2 x i64> zeroinitializer, i1 false)\n"
+      "%twice = fmul <64 x bfloat> %a, splat (bfloat 0xR4000)\n"
+      "%thrice = fadd <64 x bfloat> %twice, %a\n"
+      "%once = fdiv <64 x bfloat> %thrice, splat (bfloat 0xR4040)\n"
+      "%pd = getelementptr bfloat, ptr addrspace(1) %out, i64 64\n"
+      "call void @air.simdgroup_matrix_8x8_store.v64bf16.p1bf16(<64 x bfloat> %once,"
+      " ptr addrspace(1) %pd, i64 8, <2 x i64> zeroinitializer, i1 false)\n"
+      "ret void\n",
+      memory, sizeof(memory));
+   assert(!memcmp(memory, memory + 128, 128));
+}
+
 /* Half and bfloat products accumulate in single precision; a half result
  * rounds once; a thread's elements 0 and 1 are its storage's. */
 static void
@@ -1154,6 +1221,7 @@ main(void)
    barriers_and_fences_follow_their_flags();
    ordered_atomics_and_fences_are_barriers();
    simd_functions_lower_to_subgroup_operations();
+   simd_functions_take_bfloats();
    simdgroup_copies_complete_where_they_are_made();
    matrix_products_follow_rows_and_columns();
    matrix_memory_takes_origins_strides_and_transposes();
@@ -1161,6 +1229,7 @@ main(void)
    matrix_elements_and_narrow_types();
    matrix_constants_name_thread_elements();
    matrix_arithmetic_is_elementwise();
+   bfloat_matrix_arithmetic_is_elementwise();
    refuses_misused_matrices();
    glsl_type_singleton_decref();
    puts("air sync: ok");
