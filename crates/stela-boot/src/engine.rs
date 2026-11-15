@@ -1057,6 +1057,12 @@ fn run_machine<H: Host>(
         ));
     }
     machine.set_step_timing(options.profile);
+    machine.set_loop_counts_off(options.profile_keep_pack);
+    if options.profile_keep_pack {
+        output::arguments(format_args!(
+            "ENGINE profile without self-loop counts: the pack serves this boot\n"
+        ));
+    }
     if options.profile {
         host::pmu::start(machine.processor());
     }

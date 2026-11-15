@@ -292,6 +292,18 @@ fn static_ipv4_and_dns_round_trip_and_stay_in_their_subnet() {
     }
 }
 
+/// `--profile-keep-pack` profiles without self-loop counts and round-trips
+/// alone, without a separate `--profile`.
+#[test]
+fn profile_keep_pack_implies_profile_and_round_trips() {
+    let line = "--system --profile-keep-pack";
+    let options = round_trip(line);
+    assert!(options.profile && options.profile_keep_pack);
+    assert_eq!(options.to_string(), line);
+    let plain = round_trip("--system --profile");
+    assert!(plain.profile && !plain.profile_keep_pack);
+}
+
 #[test]
 fn native_checks_imply_serialized_execution_without_writing_it() {
     let options = round_trip("--system --native-cores 2 --native-rounds");
