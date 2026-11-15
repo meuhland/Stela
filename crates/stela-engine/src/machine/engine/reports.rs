@@ -647,6 +647,10 @@ pub struct Statistics {
     /// exit instead, found it held, took none, found the block unindexed,
     /// throttled, found the lock busy, raced, put it in first, again.
     pub remembers: [u64; super::compilation::REMEMBERS],
+    /// Block table inserts by this PE that put back an entry an insert
+    /// had put out (with `--profile`): first, again; then its tags of
+    /// entries it put in that took the place of another entry's tag.
+    pub remembered: [u64; 3],
     /// Native runs that ended in an exit to the engine, by `ExitKind`
     /// (Fallthrough, Direct, Indirect, Call, Return, Trap, PAC, Clock,
     /// ThreadRegister, FloatingPoint, ScalableNumerical, System, AMX).
@@ -872,6 +876,7 @@ impl core::ops::AddAssign for Statistics {
             lookup_hits,
             jump_serials,
             remembers,
+            remembered,
             exit_kinds,
             lookup_misses,
             lookup_forgets,
@@ -952,6 +957,9 @@ impl core::ops::AddAssign for Statistics {
             *total += count;
         }
         for (total, count) in self.jump_serials.iter_mut().zip(jump_serials) {
+            *total += count;
+        }
+        for (total, count) in self.remembered.iter_mut().zip(remembered) {
             *total += count;
         }
         for (total, count) in self.remembers.iter_mut().zip(remembers) {

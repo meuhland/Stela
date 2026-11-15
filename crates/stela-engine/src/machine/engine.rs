@@ -1039,6 +1039,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// entry's first insert on a PE went in regardless
     /// (`--table-insert-throttled`).
     table_insert_throttled: bool,
+    /// Whether an insert asks the locked block index if its block is still
+    /// the indexed one, rather than the finder (`--table-index-locked`).
+    table_index_locked: bool,
     /// Whether a page-relative block serves every guest page that maps its
     /// frame (`--shared-aliases`, [`Block::shared`]): off unless asked for,
     /// and only with [`Self::page_relative`].
@@ -1383,9 +1386,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
             host.code_partitions()
                 .map(|parts| parts.bytes_per_part * parts.parts)
         });
-        let (table_entries, itlb_entries) = code_bytes
-            .map_or((chain::LOOKUP_ENTRIES, chain::ITLB_ENTRIES), |bytes| {
-                (chain::lookup_entries(bytes), chain::itlb_entries(bytes))
+        let (table_entries, itlb_entries) =
+            code_bytes.map_or((chain::LOOKUP_ENTRIES, chain::ITLB_ENTRIES), |bytes| {
+                let table_bytes = match TABLE_WINDOW_256.load(Ordering::Relaxed) {
+                    true => bytes,
+                    false => bytes.saturating_mul(TABLE_WINDOW_FACTOR),
+                };
+                (
+                    chain::lookup_entries(table_bytes),
+                    chain::itlb_entries(bytes),
+                )
             });
         // The hub's code when this host gives its window, else a board of
         // one PE until the machine joins a hub's.
@@ -1509,6 +1519,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             jump_serial_always: false,
             remembered: vec![0; compilation::REMEMBERED].into_boxed_slice(),
             table_insert_throttled: false,
+            table_index_locked: false,
             shared_aliases: false,
             shared_limits: SharedLimits::default(),
             shared_verified: BTreeMap::new(),
@@ -1639,6 +1650,27 @@ mod tests;
 /// Whether `bytes` are a block's direct exit to `pc` of `kind`: its target
 /// whole, or, in a page-relative block (`NativeSystem::page_relative`), its
 /// offset from the page, which the exit's base slot adds the page to.
+/// A board's block table takes an entry for every 256 / this many bytes
+/// of its code window (`chain::lookup_entries`), within the table's
+/// bounds: 4 Mi entries (128 MiB) for 8 PEs' 768 MiB. With one per 256
+/// bytes, 2 Mi entries in two-entry sets held about as many live blocks
+/// as the window, and each PE's fetches put some 300 thousand entries a
+/// beat back in; a compile workload of short processes, each with its own
+/// slide of the compiler, wants an entry per block per process. In a model
+/// of one (`table_insert_bench`), twice the entries took 39% fewer inserts.
+const TABLE_WINDOW_FACTOR: usize = 2;
+
+/// [`set_table_window_256`].
+static TABLE_WINDOW_256: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Size the block tables of boards made from now on at one entry per 256
+/// bytes of code window, as before [`TABLE_WINDOW_FACTOR`]
+/// (`--table-window-256`).
+pub fn set_table_window_256(on: bool) {
+    TABLE_WINDOW_256.store(on, Ordering::Relaxed);
+}
+
 pub(crate) fn exits_to(
     bytes: &[u8],
     pc: u64,

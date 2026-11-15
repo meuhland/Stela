@@ -1139,4 +1139,78 @@ mod tests {
             );
         }
     }
+
+    /// What the check of a block table insert under the board's lock costs
+    /// on a board of some 60 thousand code pages: the index's walk of its
+    /// ordered pages, or the finder's bucket (`insert_target`). Ignored; run
+    /// with `cargo test --release -p stela-engine --lib
+    /// index_check_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn index_check_cost() {
+        const PAGES: u64 = 60_000;
+        const PER_PAGE: u64 = 16;
+        let count = (PAGES * PER_PAGE) as u32;
+        let blocks = super::super::board::Blocks::new(count + 64);
+        let grace = super::super::board::Grace::new(1);
+        let mut index = BlockIndex::with_finder(Arc::new(Finder::new(count + 64)));
+        let finder = Arc::clone(&index.finder);
+        let mut found = Vec::new();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for page in 0..PAGES {
+            // Frames scattered over 64 GiB, as a board's code pages are.
+            let frame = 0x8_0000_0000 + (page.wrapping_mul(0x9e37_79b9) % (1 << 24)) * FETCH_PAGE;
+            for block_number in 0..PER_PAGE {
+                let offset = block_number * 0x40;
+                let pc = 0x1_0000_0000 + page * FETCH_PAGE + offset;
+                let slot = blocks.take(&grace, Some(0)).unwrap();
+                blocks.fill(slot, block(pc, frame + offset, 0));
+                if index.insert(&blocks, slot).is_none() {
+                    found.push((pc, frame + offset, slot));
+                }
+            }
+        }
+        let lookups: Vec<_> = (0..2_000_000)
+            .map(|_| found[(next() % found.len() as u64) as usize])
+            .collect();
+        // The lock-free walk a fetch makes first (`remember_entry`), then
+        // the check under the lock: the index's, or the finder's again.
+        let cold = |pc, physical| finder.find(&blocks, pc, physical, VariantId(0), true);
+        let mut run = |locked: Option<bool>| {
+            let start = std::time::Instant::now();
+            let mut hits = 0usize;
+            for &(pc, physical, slot) in &lookups {
+                let first = cold(pc, physical);
+                let found = match locked {
+                    None => first.flatten(),
+                    Some(true) => index.get(&blocks, pc, physical, VariantId(0), true),
+                    Some(false) => match cold(pc, physical) {
+                        Some(found) => found,
+                        None => index.get(&blocks, pc, physical, VariantId(0), true),
+                    },
+                };
+                hits += usize::from(found == Some(slot));
+            }
+            (
+                start.elapsed().as_nanos() as f64 / lookups.len() as f64,
+                hits,
+            )
+        };
+        let (walk, _) = run(None);
+        let (index_after, hits) = run(Some(true));
+        assert_eq!(hits, lookups.len());
+        let (finder_after, hits) = run(Some(false));
+        assert_eq!(hits, lookups.len());
+        std::println!(
+            "walk {walk:.0} ns; the check after it: index {:.0} ns, finder {:.0} ns",
+            index_after - walk,
+            finder_after - walk,
+        );
+    }
 }

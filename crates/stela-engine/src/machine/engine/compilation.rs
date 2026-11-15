@@ -53,7 +53,18 @@ pub const REMEMBERS: usize = Remember::Again as usize + 1;
 /// of the block table, under the board's lock (`cache`), if the block is
 /// still the indexed one: a retirement or an IC IVAU takes a block out of
 /// the index and its entries out of the table in one hold, so an entry put
-/// in after would outlive its block. Whether the table took it.
+/// in after would outlive its block. Whether the table took it, and if so
+/// whether it put back an entry an insert had put out
+/// ([`board::Cache::table_ghosts`], counted only while `ghosts`).
+///
+/// The finder answers whether the block is the indexed one: under the lock
+/// it changes with the index, and its answer is a bucket the fetch walked a
+/// moment before, where the index's walked its ordered map of pages (some
+/// 60 thousand on a busy board, which its front of 4 Ki pages mostly
+/// missed) at each of some 3 million inserts a beat under the lock. A
+/// finder that cannot answer, and `locked_index` (`--table-index-locked`),
+/// ask the index as before.
+#[allow(clippy::too_many_arguments)]
 fn insert_target(
     code: &board::Code,
     cache: &mut board::Cache,
@@ -61,30 +72,68 @@ fn insert_target(
     index: usize,
     slot: usize,
     target: chain::LookupEntry,
-) -> bool {
+    locked_index: bool,
+    ghosts: bool,
+) -> Option<bool> {
     let block = &code.blocks[index];
-    if cache.index.get(
-        &code.blocks,
-        pc,
-        block.physical,
-        block.variant,
-        block.shared,
-    ) != Some(index)
+    let (physical, variant, shared) = (block.physical, block.variant, block.shared);
+    let found = match (!locked_index)
+        .then(|| {
+            code.finder
+                .find(&code.blocks, pc, physical, variant, shared)
+        })
+        .flatten()
     {
+        Some(found) => found,
+        None => cache.index.get(&code.blocks, pc, physical, variant, shared),
+    };
+    if found != Some(index) {
         cache.targets_raced += 1;
-        return false;
+        return None;
     }
     // An entry of the same PC and key that names another block (or other
     // BTYPEs) changes what a probe of them finds: a native jump cache
     // filled from the old one goes too.
     let held = cache.targets.find(slot, pc, target.key);
     let replaced = held.pc == pc && held.key == target.key && held != target;
+    let (resident, beside) = (cache.targets.entry(slot), cache.targets.entry(slot ^ 1));
+    let own = |entry: &chain::LookupEntry| entry.pc == pc && entry.key == target.key;
+    let outcome = if resident == target || beside == target {
+        board::TableInsert::Present
+    } else if own(&resident) || own(&beside) {
+        board::TableInsert::Rekeyed
+    } else if resident.key == 0 {
+        board::TableInsert::Filled
+    } else if beside.key == 0 {
+        board::TableInsert::Moved
+    } else {
+        board::TableInsert::Evicted
+    };
+    let returned = ghosts
+        && matches!(
+            outcome,
+            board::TableInsert::Filled | board::TableInsert::Moved | board::TableInsert::Evicted
+        )
+        && cache.take_ghost(&target);
     cache.targets.insert(slot, target);
     cache.targets_inserted += 1;
+    cache.table_inserts[outcome as usize] += 1;
+    if returned {
+        cache.table_inserts[board::TableInsert::Returned as usize] += 1;
+    }
+    if outcome == board::TableInsert::Evicted && ghosts {
+        // The resident moved beside the new entry, or left itself.
+        let out = if cache.targets.entry(slot ^ 1) == resident {
+            beside
+        } else {
+            resident
+        };
+        cache.note_ghost(&out);
+    }
     if replaced {
         code.note_unpublished();
     }
-    true
+    Some(returned)
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
@@ -436,7 +485,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// in the block table ([`Self::remembered`]).
     fn note_remembered(&mut self, pc: u64, key: u64, index: usize) {
         let (at, tag) = self.remembered_at(pc, key, index);
-        self.remembered[at] = tag;
+        self.note_tag(at, tag);
+    }
+
+    /// Ask the board's locked block index, as before, whether a block
+    /// whose entry goes in the block table is still the indexed one,
+    /// rather than the finder (`--table-index-locked`).
+    pub fn set_table_index_locked(&mut self, locked: bool) {
+        self.table_index_locked = locked;
     }
 
     /// Throttle every block table insert by its block's count, as before
@@ -517,16 +573,38 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.statistics.target_skips += 1;
             return Remember::Busy;
         };
-        let inserted = insert_target(code, &mut cache, pc, index, slot, target);
+        let ghosts = self.step_timing.is_some();
+        let inserted = insert_target(
+            code,
+            &mut cache,
+            pc,
+            index,
+            slot,
+            target,
+            self.table_index_locked,
+            ghosts,
+        );
         drop(cache);
-        if !inserted {
+        let Some(returned) = inserted else {
             return Remember::Raced;
+        };
+        if returned {
+            self.statistics.remembered[usize::from(!first)] += 1;
         }
-        self.remembered[at] = tag;
+        self.note_tag(at, tag);
         if first {
             Remember::First
         } else {
             Remember::Again
+        }
+    }
+
+    /// Tag `at` of [`Self::remembered`] with `tag`, counting a tag of
+    /// another entry it takes the place of ([`Statistics::remembered`]).
+    fn note_tag(&mut self, at: usize, tag: u64) {
+        let held = core::mem::replace(&mut self.remembered[at], tag);
+        if held != 0 && held != tag {
+            self.statistics.remembered[2] += 1;
         }
     }
 
@@ -1372,7 +1450,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .is_some_and(|(_, _, target, _)| target == pc)
             && let Some((at, target)) = self.target_entry(pc, slot)
             && shared.blocks.record(slot).remember()
-            && insert_target(&shared, &mut cache, pc, slot, at, target)
+            && insert_target(
+                &shared,
+                &mut cache,
+                pc,
+                slot,
+                at,
+                target,
+                self.table_index_locked,
+                self.step_timing.is_some(),
+            )
+            .is_some()
         {
             drop(cache);
             self.note_remembered(pc, target.key, slot);

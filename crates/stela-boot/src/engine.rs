@@ -1063,6 +1063,17 @@ fn run_machine<H: Host>(
 "
         ));
     }
+    machine.set_table_index_locked(options.table_index_locked);
+    if options.table_index_locked {
+        output::arguments(format_args!(
+            "ENGINE block table inserts checked against the locked index\n"
+        ));
+    }
+    if options.table_window_256 {
+        output::arguments(format_args!(
+            "ENGINE block table sized at one entry per 256 window bytes\n"
+        ));
+    }
     machine.set_table_insert_throttled(options.table_insert_throttled);
     if options.table_insert_throttled {
         output::arguments(format_args!(

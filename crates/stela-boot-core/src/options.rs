@@ -321,6 +321,14 @@ pub struct System {
     /// (`--table-insert-throttled`), as before an entry's first insert on a
     /// PE went in regardless: for A/B runs.
     pub table_insert_throttled: bool,
+    /// Check that a block whose entry goes in the block table is still
+    /// indexed in the locked index (`--table-index-locked`), as before the
+    /// finder answered it: for A/B runs.
+    pub table_index_locked: bool,
+    /// Size the board's block table at one entry per 256 bytes of code
+    /// window (`--table-window-256`), as before it took one per 128: for
+    /// A/B runs.
+    pub table_window_256: bool,
     /// Compile guest code page-relative (`--page-relative`): a block's code
     /// serves every page that maps the same bytes, each entry setting the
     /// page it runs at.
@@ -443,6 +451,8 @@ impl Default for System {
             profile_keep_pack: false,
             jump_serial_always: false,
             table_insert_throttled: false,
+            table_index_locked: false,
+            table_window_256: false,
             page_relative: false,
             shared_aliases: false,
             shared_limits: 0,
@@ -871,6 +881,8 @@ impl fmt::Display for System {
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
         line.flag("--jump-serial-always", self.jump_serial_always)?;
         line.flag("--table-insert-throttled", self.table_insert_throttled)?;
+        line.flag("--table-index-locked", self.table_index_locked)?;
+        line.flag("--table-window-256", self.table_window_256)?;
         line.flag("--page-relative", self.page_relative)?;
         line.flag("--shared-aliases", self.shared_aliases)?;
         for (bit, name) in SHARED_LIMITS.iter().enumerate() {

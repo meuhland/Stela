@@ -447,3 +447,18 @@ fn table_insert_throttled_is_off_by_default_and_round_trips() {
     assert_eq!(options.to_string(), line);
     assert!(!round_trip("--system").table_insert_throttled);
 }
+
+/// The block table's insert check and size keep their new defaults unless
+/// `--table-index-locked` and `--table-window-256` ask for the old ones,
+/// which round-trip.
+#[test]
+fn table_index_locked_and_window_256_are_off_by_default_and_round_trip() {
+    let options = System::default();
+    assert!(!options.table_index_locked && !options.table_window_256);
+    let line = "--system --table-insert-throttled --table-index-locked --table-window-256";
+    let options = round_trip(line);
+    assert!(options.table_index_locked && options.table_window_256);
+    assert_eq!(options.to_string(), line);
+    let options = round_trip("--system");
+    assert!(!options.table_index_locked && !options.table_window_256);
+}

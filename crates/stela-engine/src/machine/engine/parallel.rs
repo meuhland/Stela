@@ -456,6 +456,8 @@ pub struct Counts {
     /// Its fetches that found their block, by what they did about its
     /// block table entry ([`super::Statistics::remembers`]).
     pub remembers: [u64; super::compilation::REMEMBERS],
+    /// [`super::Statistics::remembered`].
+    pub remembered: [u64; 3],
     pub itlb_misses: [u64; 4],
     pub itlb_drops: [u64; 5],
     pub lookup_forgets: [u64; 4],
@@ -2288,6 +2290,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             itlb: statistics.itlb,
             fetch_paths: statistics.fetch_paths,
             remembers: statistics.remembers,
+            remembered: statistics.remembered,
             itlb_misses: statistics.itlb_misses,
             itlb_drops: statistics.itlb_drops,
             lookup_forgets: statistics.lookup_forgets,

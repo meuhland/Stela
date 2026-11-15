@@ -138,8 +138,8 @@ pub const PRIVATE_PARTS: u32 = 4;
 /// The board's code window holds the guest's working set of code once for
 /// every PE: free RAM / 16, at most [`WINDOW_PER_RUNNER`] per runner, 64 MiB
 /// to 2 GiB, in 16 MiB steps. The block table grows with it (one entry per
-/// 256 bytes, 128 MiB at 1 GiB and above), and each PE's ITLB to 16,384
-/// entries from 64 MiB.
+/// 128 bytes, 128 MiB from 512 MiB; one per 256 with `--table-window-256`),
+/// and each PE's ITLB to 16,384 entries from 64 MiB.
 const WINDOW_SHARE: u64 = 16;
 /// The window per runner where the host's memory allows it. A sign-in on 8
 /// PEs with 512 MiB (64 MiB per runner) compiled 45% of its installs again

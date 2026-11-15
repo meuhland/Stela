@@ -1257,8 +1257,11 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         shared_limits: options.shared_limits,
         jump_serial_always: options.jump_serial_always,
         table_insert_throttled: options.table_insert_throttled,
+        table_index_locked: options.table_index_locked,
         loop_counts_off: options.profile_keep_pack,
     };
+    // Before the machine makes the board's code and its block table.
+    stela_engine::machine::engine::set_table_window_256(options.table_window_256);
     // The loader handle's last RAM copy preceded canonical registration; its
     // borrow has ended. It never executes a guest instruction.
     // SAFETY: started executors, kept source Plan/profile and exact

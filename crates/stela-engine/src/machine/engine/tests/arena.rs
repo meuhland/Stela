@@ -847,6 +847,64 @@ fn a_fetch_whose_entry_the_table_holds_counts_it_held() {
     );
 }
 
+/// A block's entry that another insert put out of a full set, put back by
+/// the next fetch: the board counts the install's insert into an empty
+/// slot, then one into a set two other entries held, which (under
+/// `--profile`) put back an entry an insert had put out, and the PE counts
+/// it among its again inserts that did. `locked_index`
+/// (`--table-index-locked`) asks the locked index instead of the finder,
+/// to the same effect.
+fn an_entry_put_out_and_back(locked_index: bool) {
+    let mut memory = vec![0u8; WINDOW];
+    let mut machine = arena_machine(&mut memory);
+    machine.set_step_timing(true);
+    machine.set_table_index_locked(locked_index);
+    let pc = machine.cpu.pc;
+    let Ok(Fetched::Block(slot)) = machine.fetch_block(pc, false) else {
+        panic!("a block")
+    };
+    let table = machine.code.report().targets.table;
+    assert_eq!(table[board::TableInsert::Filled as usize], 1, "{table:?}");
+    let key = target_key(&machine, pc);
+    let at = target_slot(&machine, pc);
+    {
+        let mut cache = machine.code.cache();
+        let held = cache.targets.find(at, pc, key);
+        assert_eq!((held.pc, held.block), (pc, slot as u32));
+        // Two other blocks' entries fill the set; the block's own goes,
+        // as an insert into a full set would have put it out.
+        for (place, other) in [(at, 0x40), (at ^ 1, 0x80)] {
+            let foreign = chain::LookupEntry {
+                pc: pc + 0x10_0000 + other,
+                key,
+                entry: held.entry,
+                block: held.block,
+                targets: held.targets,
+            };
+            cache.targets.set(place, foreign);
+        }
+        cache.note_ghost(&held);
+    }
+    assert!(matches!(machine.fetch_block(pc, false), Ok(Fetched::Block(found)) if found == slot));
+    let held = machine.code.table.find(at, pc, key);
+    assert_eq!((held.pc, held.block), (pc, slot as u32));
+    let table = machine.code.report().targets.table;
+    assert_eq!(table[board::TableInsert::Evicted as usize], 1, "{table:?}");
+    assert_eq!(table[board::TableInsert::Returned as usize], 1, "{table:?}");
+    assert_eq!(machine.statistics.remembers[Remember::Again as usize], 1);
+    assert_eq!(machine.statistics.remembered, [0, 1, 0]);
+}
+
+#[test]
+fn an_entry_put_out_and_back_counts_as_returned() {
+    an_entry_put_out_and_back(false);
+}
+
+#[test]
+fn table_index_locked_counts_an_entry_put_out_and_back_alike() {
+    an_entry_put_out_and_back(true);
+}
+
 /// Pages of two-block groups, each group's first block ending in a direct
 /// branch to its second (`b .+8` over a hole): words for `pages` pages.
 fn linked_groups(pages: usize) -> Vec<u32> {

@@ -29,12 +29,12 @@ use super::{
     recovery::CodeRecovery,
 };
 use crate::platform::sync::{Mutex, MutexGuard};
-use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
 };
-use stela_compiler::x86_64::chain::{self, LookupTable, TableReader};
+use stela_compiler::x86_64::chain::{self, LookupEntry, LookupTable, TableReader};
 
 mod ring;
 #[cfg(test)]
@@ -375,6 +375,12 @@ pub(super) struct Cache {
     /// ([`TargetCounts`]).
     pub(super) targets_inserted: u64,
     pub(super) targets_raced: u64,
+    /// Block table inserts by what their set held ([`TableInsert`]).
+    pub(super) table_inserts: [u64; TABLE_INSERTS],
+    /// With `--profile`: a fingerprint of each entry an insert put out of
+    /// a full set, by a hash of its PC and key, so that an insert that puts
+    /// it back counts as [`TableInsert::Returned`]. Made at the first.
+    pub(super) table_ghosts: Option<Box<[u32]>>,
     /// Why blocks were installed on a shared board, with `--profile`:
     /// one census for the board, as its blocks are.
     pub(super) census: Option<Box<super::install_census::Census>>,
@@ -545,6 +551,66 @@ pub struct TargetCounts {
     pub raced: u64,
     pub unindexed: u64,
     pub deferred: u64,
+    /// Inserts by [`TableInsert`].
+    pub table: [u64; TABLE_INSERTS],
+    /// The table's entries, held cells, and index bytes.
+    pub entries: usize,
+    pub cells: usize,
+    pub index_bytes: usize,
+}
+
+/// What a block table insert found in its set ([`Cache::table_inserts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableInsert {
+    /// Its slot was empty.
+    Filled,
+    /// Its slot's entry moved to the empty slot beside it.
+    Moved,
+    /// The set was full of other entries: one of them left.
+    Evicted,
+    /// The set held its PC and key for another block or BTYPEs.
+    Rekeyed,
+    /// The set held the very entry (another PE put it in first).
+    Present,
+    /// Of the first three, one that put back an entry an insert put out
+    /// before (with `--profile`, [`Cache::table_ghosts`]).
+    Returned,
+}
+
+/// How many [`TableInsert`]s there are.
+pub const TABLE_INSERTS: usize = TableInsert::Returned as usize + 1;
+
+/// Bits of [`Cache::table_ghosts`]' index: 1 Mi fingerprints, 4 MiB, the
+/// entries some seconds of inserts put out.
+const TABLE_GHOST_BITS: u32 = 20;
+
+/// The ghost slot and fingerprint (never 0) of the entry of `pc` and `key`.
+fn table_ghost(pc: u64, key: u64) -> (usize, u32) {
+    let hash = (pc ^ key.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    ((hash >> (64 - TABLE_GHOST_BITS)) as usize, hash as u32 | 1)
+}
+
+impl Cache {
+    /// Whether an insert put out the entry of `entry`'s PC and key before
+    /// ([`Self::table_ghosts`]), which it now forgets.
+    pub(super) fn take_ghost(&mut self, entry: &LookupEntry) -> bool {
+        let (at, print) = table_ghost(entry.pc, entry.key);
+        let Some(ghosts) = self.table_ghosts.as_mut() else {
+            return false;
+        };
+        let held = ghosts[at] == print;
+        if held {
+            ghosts[at] = 0;
+        }
+        held
+    }
+
+    /// Note that an insert put `entry` out of its set.
+    pub(super) fn note_ghost(&mut self, entry: &LookupEntry) {
+        let (at, print) = table_ghost(entry.pc, entry.key);
+        self.table_ghosts
+            .get_or_insert_with(|| vec![0; 1 << TABLE_GHOST_BITS].into_boxed_slice())[at] = print;
+    }
 }
 
 /// Board events counted outside the lock: rare, so a shared atomic each,
@@ -675,6 +741,8 @@ impl Cache {
             lock: LockCounts::default(),
             targets_inserted: 0,
             targets_raced: 0,
+            table_inserts: [0; TABLE_INSERTS],
+            table_ghosts: None,
             census: None,
             churn: super::ChurnCounts::default(),
         }
@@ -809,7 +877,7 @@ impl Code {
 
     /// What the board's code came to; the lock's longest wait starts over.
     pub(super) fn report(&self) -> CodeReport {
-        let (lock, inserted, raced, churn) = {
+        let (lock, inserted, raced, churn, table) = {
             let mut cache = self.cache_at(LockSite::Report);
             let lock = cache.lock;
             let counts = (cache.targets_inserted, cache.targets_raced);
@@ -818,7 +886,13 @@ impl Code {
             for site in &mut cache.lock.sites {
                 site.longest_held = 0;
             }
-            (lock, counts.0, counts.1, churn)
+            let table = (
+                cache.table_inserts,
+                cache.targets.entries(),
+                cache.targets.cells(),
+                cache.targets.index_bytes(),
+            );
+            (lock, counts.0, counts.1, churn, table)
         };
         let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CodeReport {
@@ -845,6 +919,10 @@ impl Code {
                 raced,
                 unindexed: count(&self.events.targets_unindexed),
                 deferred: count(&self.events.targets_deferred),
+                table: table.0,
+                entries: table.1,
+                cells: table.2,
+                index_bytes: table.3,
             },
             lock,
             churn,

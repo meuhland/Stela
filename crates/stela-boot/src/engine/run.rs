@@ -1596,6 +1596,12 @@ impl Heartbeat {
             let mut remembers = String::from(
                 "PES REMEMBER linked/held/excluded/unindexed/throttled/busy/raced/first/again",
             );
+            // Per PE: its inserts that put back an entry an insert put out
+            // (with --profile), of its first and again ones; and its tags
+            // of entries it put in that took another entry's tag (a first
+            // insert of an entry whose tag went counts as first again).
+            let mut remembered =
+                String::from("PES REMEMBERED returned_first/returned_again/displaced");
             // Per PE: its ITLB fills by why the page was missing (a fill
             // took its entry's place, a TLBI by VA dropped it, its context
             // was forgotten, no trace of it); the live entries fills took
@@ -1768,6 +1774,7 @@ impl Heartbeat {
                 }
                 deltas(&mut paths, pe, &now.fetch_paths, &before.fetch_paths);
                 deltas(&mut remembers, pe, &now.remembers, &before.remembers);
+                deltas(&mut remembered, pe, &now.remembered, &before.remembered);
                 let concat = |counts: &parallel::Counts| {
                     let mut all = [0u64; 13];
                     all[..4].copy_from_slice(&counts.itlb_misses);
@@ -1978,6 +1985,7 @@ impl Heartbeat {
             output::arguments(format_args!("{lookups}\n"));
             output::arguments(format_args!("{paths}\n"));
             output::arguments(format_args!("{remembers}\n"));
+            output::arguments(format_args!("{remembered}\n"));
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
             output::arguments(format_args!("{transitions}\n"));
@@ -2131,6 +2139,28 @@ fn board_code(
         targets.unindexed.saturating_sub(was_targets.unindexed),
         targets.deferred.saturating_sub(was_targets.deferred),
     );
+    // Inserts by what their set held: an empty slot, a resident that moved
+    // beside, a full set (one entry left), the same PC and key of another
+    // block, the very entry; of the first three, those that put back an
+    // entry an insert put out (with --profile). Then the table's entries,
+    // its held cells and its index's KiB.
+    let table = {
+        let now_targets = now.targets;
+        let (now, was) = (now_targets.table, was_targets.table);
+        format!(
+            " table=filled/moved/evicted/rekeyed/present/returned/entries/cells/index_kib:{}/{}/{}/{}/{}/{}/{}/{}/{}",
+            now[0].saturating_sub(was[0]),
+            now[1].saturating_sub(was[1]),
+            now[2].saturating_sub(was[2]),
+            now[3].saturating_sub(was[3]),
+            now[4].saturating_sub(was[4]),
+            now[5].saturating_sub(was[5]),
+            now_targets.entries,
+            now_targets.cells,
+            now_targets.index_bytes / 1024,
+        )
+    };
+    let targets = targets + &table;
     // Installs: never on the board before; again after their block went
     // with its ring part, an IC IVAU, a part taken for want of a slot or
     // anything else; IC IVAU ones of unchanged bytes; again within one
