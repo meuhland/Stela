@@ -2764,6 +2764,153 @@ uninlined_calls_name_their_callee(void)
    }
 }
 
+/* Keeps a stitched module's bitcode without the wrapper LLVM's writer puts
+ * around a Darwin target's, as the driver's library reader takes it. */
+static void
+keep_stitched_module(void *data, const void *bytes, size_t size)
+{
+   uint32_t wrapper[5];
+   CHECK(size >= sizeof(wrapper));
+   memcpy(wrapper, bytes, sizeof(wrapper));
+   size_t offset = 0, length = size;
+   if (wrapper[0] == 0x0b17c0de) {
+      CHECK(wrapper[2] <= size && wrapper[3] <= size - wrapper[2]);
+      offset = wrapper[2];
+      length = wrapper[3];
+   }
+   *(LLVMMemoryBufferRef *)data =
+      LLVMCreateMemoryBufferWithMemoryRangeCopy((const char *)bytes + offset, length, "stitched");
+}
+
+/* The visible function MPSGraph's reductionStitched::write_fn graph calls,
+ * of a [8 x i8] parameter struct as its ABI coerces it and a value:
+ * value * params[0] + params[1]. */
+static const char *stitched_write_prefix =
+   "target datalayout = \"e-p:64:64-i64:64-n8:16:32\"\n"
+   "target triple = \"air64_v28-apple-macosx26.7.0\"\n";
+static const char *stitched_write_function =
+   "define float @reduction_write([8 x i8] %params, float %value) {\n"
+   "%scale = extractvalue [8 x i8] %params, 0\n%s = uitofp i8 %scale to float\n"
+   "%bias = extractvalue [8 x i8] %params, 1\n%b = uitofp i8 %bias to float\n"
+   "%m = fmul float %value, %s\n%r = fadd float %m, %b\nret float %r\n}\n";
+static const char *stitched_write_metadata =
+   "!air.version = !{!0}\n!air.language_version = !{!1}\n"
+   "!air.compile_options = !{!8, !9, !10}\n!air.visible = !{!2}\n"
+   "!0 = !{i32 2, i32 8, i32 0}\n!1 = !{!\"Metal\", i32 4, i32 0, i32 0}\n"
+   "!2 = !{ptr @reduction_write, !3, !4}\n!3 = !{!30}\n"
+   "!30 = !{!\"air.visible_output\", !\"air.arg_type_name\", !\"float\"}\n!4 = !{!40, !41}\n"
+   "!40 = !{i32 0, !\"air.visible_input\", !\"air.arg_type_name\", !\"ReduceParams\","
+   " !\"air.arg_name\", !\"params\"}\n"
+   "!41 = !{i32 1, !\"air.visible_input\", !\"air.arg_type_name\", !\"float\", !\"air.arg_name\","
+   " !\"value\"}\n"
+   "!8 = !{!\"air.compile.denorms_disable\"}\n!9 = !{!\"air.compile.fast_math_enable\"}\n"
+   "!10 = !{!\"air.compile.framebuffer_fetch_enable\"}\n";
+
+/* MPSGraph's reduce_stitched calls its stitched reductionStitched::write_fn
+ * with three arguments, a [8 x i8] parameter struct and two floats, and a
+ * graph of it reads only the first two: Metal's graph names an argument only
+ * by an input node a call reads, so the stitched function takes two. Linked,
+ * the call was refused as "a function call was not inlined: definition
+ * @reductionStitched::write_fn (alwaysinline): called as float ([8 x i8],
+ * float, float), defined as float ([8 x i8], float)". It now calls the
+ * stitched function with the arguments it takes, and every thread stores
+ * tid * 3 + 5. A function that is not stitched called so stays refused. */
+static void
+stitched_calls_pass_unread_arguments(void)
+{
+   LLVMMemoryBufferRef source = stela_air_test_custom_bitcode(
+      stitched_write_prefix, stitched_write_function, stitched_write_metadata, "");
+   const struct stela_air_stitch_source sources[] = {
+      {LLVMGetBufferStart(source), LLVMGetBufferSize(source), "reduction_write"},
+   };
+   const uint32_t inputs[] = {0, 1};
+   const struct stela_air_stitch_node nodes[] = {
+      {.function = STELA_AIR_STITCH_INPUT, .input = 0},
+      {.function = STELA_AIR_STITCH_INPUT, .input = 1},
+      {.function = 0, .arguments = inputs, .argument_count = 2},
+   };
+   const struct stela_air_stitch_graph graph = {"reductionStitched::write_fn", nodes, 3, 2};
+   struct stela_air_error error;
+   LLVMMemoryBufferRef stitched = NULL;
+   if (!stela_air_stitch(sources, 1, &graph, 1, keep_stitched_module, &stitched, &error))
+      fprintf(stderr, "stitch: %u %s\n", error.kind, error.detail);
+   CHECK(stitched);
+
+   /* The stitched function takes the two arguments its graph reads. */
+   LLVMContextRef context = LLVMContextCreate();
+   LLVMModuleRef module;
+   LLVMMemoryBufferRef parsed =
+      LLVMCreateMemoryBufferWithMemoryRangeCopy(LLVMGetBufferStart(stitched),
+                                                LLVMGetBufferSize(stitched), "parsed");
+   CHECK(!LLVMParseBitcodeInContext2(context, parsed, &module));
+   LLVMDisposeMemoryBuffer(parsed);
+   LLVMValueRef write = LLVMGetNamedFunction(module, "reductionStitched::write_fn");
+   CHECK(write && LLVMCountParams(write) == 2);
+   CHECK(LLVMGetStringAttributeAtIndex(write, LLVMAttributeFunctionIndex, "stela.stitched",
+                                       strlen("stela.stitched")));
+   LLVMDisposeModule(module);
+   LLVMContextDispose(context);
+
+   const struct stela_air_module modules[] = {
+      {LLVMGetBufferStart(stitched), LLVMGetBufferSize(stitched)},
+      {LLVMGetBufferStart(source), LLVMGetBufferSize(source)},
+   };
+   static const struct {
+      const char *callee, *refusal;
+   } cases[] = {
+      {"reductionStitched::write_fn", NULL},
+      {"reduction_write",
+       "a function call was not inlined: definition @reduction_write (alwaysinline): called as "
+       "float ([8 x i8], float, float), defined as float ([8 x i8], float)"},
+   };
+   for (unsigned c = 0; c < ARRAY_SIZE(cases); c++) {
+      char body[512], extra[512];
+      snprintf(body, sizeof(body),
+               "%%f = uitofp i32 %%tid to float\n"
+               "%%r = call float @\"%s.MTL_VISIBLE_FN_REF\"([8 x i8] c\"\\03\\05\\00\\00\\00\\00\\00\\00\","
+               " float %%f, float 1.0e+02)\n"
+               "%%i = fptoui float %%r to i32\nstore i32 %%i, ptr addrspace(1) %%out, align 4\nret void\n",
+               cases[c].callee);
+      snprintf(extra, sizeof(extra),
+               "declare float @\"%s.MTL_VISIBLE_FN_REF\"([8 x i8], float, float)"
+               " section \"air.externally_defined\"\n"
+               "!air.visible_function_references = !{!60}\n"
+               "!60 = !{!\"air.visible_function_reference\", ptr @\"%s.MTL_VISIBLE_FN_REF\", !\"%s\"}\n",
+               cases[c].callee, cases[c].callee, cases[c].callee);
+      for (uint32_t tid = 0; tid < 3; tid++) {
+         LLVMMemoryBufferRef input = stela_air_test_bitcode(body, extra);
+         unsigned bindings = 0;
+         const struct stela_air_options options = {
+            .workgroup_size = {32, 1, 1}, .max_instructions = 1000,
+            .bind_buffer = bind_buffer, .binding_data = &bindings,
+            .fp_profile = STELA_AIR_FP_METAL,
+            .modules = modules, .module_count = ARRAY_SIZE(modules),
+         };
+         nir_shader *nir = stela_air_to_nir(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                            "kernel", &test_nir_options, &options, &error);
+         LLVMDisposeMemoryBuffer(input);
+         if (cases[c].refusal) {
+            if (nir || error.kind != STELA_AIR_INSTRUCTION || strcmp(error.detail, cases[c].refusal))
+               fprintf(stderr, "unread argument of %s: %u %s\n", cases[c].callee, error.kind,
+                       error.detail);
+            CHECK(!nir && error.kind == STELA_AIR_INSTRUCTION &&
+                  !strcmp(error.detail, cases[c].refusal));
+            break;
+         }
+         if (!nir)
+            fprintf(stderr, "stitched call of an unread argument: %u %s\n", error.kind, error.detail);
+         CHECK(nir && bindings == 1);
+         specialize_invocation(nir, tid);
+         const uint64_t address = 0x100000;
+         const uint32_t value = tid * 3 + 5;
+         check_executed_stores(nir, &address, &value, 1);
+         ralloc_free(nir);
+      }
+   }
+   LLVMDisposeMemoryBuffer(stitched);
+   LLVMDisposeMemoryBuffer(source);
+}
+
 /* Thread memory holds only what the function accesses: a dynamically
  * indexed array, and none of the variables structurizing a loop and its
  * branches needs. */
@@ -3323,6 +3470,7 @@ tests(void)
    inlined_thread_reference_takes_no_thread_memory();
    kept_calls_are_inlined();
    uninlined_calls_name_their_callee();
+   stitched_calls_pass_unread_arguments();
    thread_memory_holds_only_accessed_variables();
    struct stela_air_error error;
    LLVMMemoryBufferRef input = stela_air_test_bitcode(stela_air_test_store_body, "");

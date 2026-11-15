@@ -626,6 +626,15 @@ bool stela_air_isomorphic(LLVMContextRef context, LLVMTypeRef a, LLVMTypeRef b);
 /* `value` as `to`, a type of the same layout: itself, or for structs and
  * arrays of the same shape, its elements each converted; NULL otherwise. */
 LLVMValueRef stela_air_convert_layout(LLVMBuilderRef builder, LLVMValueRef value, LLVMTypeRef to);
+/* The string attribute of each visible function air_stitch.c stitches,
+ * whose parameters are only the arguments its graph's input nodes read. A
+ * graph names an argument only by an input node a call reads, so one that
+ * nothing reads has no node, no type and no parameter, yet its callers pass
+ * it: MPSGraph's reduce_stitched calls reductionStitched::write_fn with an
+ * argument some of its graphs ignore. Linking calls such a function with the
+ * leading arguments it takes (air_calls.c), as Apple's calling convention
+ * leaves a callee's undeclared trailing arguments unread. */
+#define STELA_AIR_STITCHED_FUNCTION "stela.stitched"
 bool stela_air_md_string(LLVMValueRef value, const char *expected);
 bool stela_air_md_uint(LLVMValueRef value, unsigned *number);
 /* Whether only os_log's calls read a value: its object or a string, which
