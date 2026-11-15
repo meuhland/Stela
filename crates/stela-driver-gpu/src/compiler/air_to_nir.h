@@ -731,7 +731,7 @@ nir_shader *stela_air_metal_stage_to_nir(const void *, size_t, const char *entry
  * remain static and every incoming edge must agree. Pointer eq/ne require the
  * same resource authority, ignoring only AS2 root-reflection typing state;
  * relational and cross-resource comparisons remain explicit refusals.
- * Integer division/remainder admit i8/i16/i32/i64 scalar or fixed2-4 lanes
+ * Integer division/remainder admit i8/i16/i32/i64 scalar or 2-4, 8 or 16 lanes
  * through original NIR udiv/idiv/umod/irem. Only LLVM-defined inputs constrain
  * their values: zero divisors and signed MIN/-1 division/remainder are UB;
  * inexact exact-div results are poison. No result/trap behavior is promised

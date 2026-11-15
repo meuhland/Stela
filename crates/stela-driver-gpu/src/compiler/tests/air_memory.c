@@ -808,6 +808,35 @@ nested_aggregate_phis_carry_each_leaf(void)
    ralloc_free(shader);
 }
 
+/* Thread memory holds 8-lane vectors whole: one scratch access of 8 lanes
+ * each, at a dynamic, a constant and an unaligned offset. */
+static void
+wide_vectors_in_thread_memory(void)
+{
+   nir_shader *shader = compiled("",
+      "%a = alloca [2 x <8 x i8>], align 8\n"
+      "%i = load i32, ptr addrspace(1) %out, align 4\n"
+      "%p = getelementptr [2 x <8 x i8>], ptr %a, i32 0, i32 %i\n"
+      "store <8 x i8> <i8 1, i8 2, i8 3, i8 4, i8 5, i8 6, i8 7, i8 8>, ptr %p, align 8\n"
+      "%q = getelementptr [2 x <8 x i8>], ptr %a, i32 0, i32 1\n"
+      "%v = load <8 x i8>, ptr %q, align 8\n"
+      "%r = getelementptr i8, ptr addrspace(1) %out, i64 5\n"
+      "store <8 x i8> %v, ptr addrspace(1) %r, align 1\n"
+      "%s = getelementptr i8, ptr %a, i64 3\n"
+      "%w = load <8 x i8>, ptr %s, align 1\n"
+      "%x = bitcast <8 x i8> %w to <4 x i16>\n"
+      "%t = getelementptr i8, ptr addrspace(1) %out, i64 16\n"
+      "store <4 x i16> %x, ptr addrspace(1) %t, align 4\nret void\n");
+   assert(shader->scratch_size == 16);
+   nir_intrinsic_instr *stores[1], *loads[2];
+   assert(intrinsics_of(shader, nir_intrinsic_store_scratch, stores, 1) == 1);
+   assert(stores[0]->src[0].ssa->num_components == 8 && stores[0]->src[0].ssa->bit_size == 8);
+   assert(intrinsics_of(shader, nir_intrinsic_load_scratch, loads, 2) == 2);
+   for (unsigned i = 0; i < 2; i++)
+      assert(loads[i]->def.num_components == 8 && loads[i]->def.bit_size == 8);
+   ralloc_free(shader);
+}
+
 /* A pointer left in a stack slot keeps its provenance through promotion. */
 static void
 stack_pointers_keep_their_origin(void)
@@ -840,6 +869,7 @@ main(void)
    rate_map_decoders_read_their_parameters();
    aggregates_load_and_store_by_leaf();
    nested_aggregate_phis_carry_each_leaf();
+   wide_vectors_in_thread_memory();
    stack_pointers_keep_their_origin();
    unaliased_read_buffers_load_read_only();
    glsl_type_singleton_decref();
