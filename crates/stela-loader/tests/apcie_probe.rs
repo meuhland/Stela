@@ -231,6 +231,9 @@ fn board_tree() -> Vec<u8> {
                 "ranges",
                 &cells(&[0x4200_0000, 0x8000_0000, 0, 0x8000_0000, 0, 0x4000_0000, 0]),
             ),
+            ("msi-address", &pairs(&[0xffff_f000])),
+            ("#msi-vectors", &cells(&[32])),
+            ("msi-vector-offset", &cells(&[0x380])),
         ],
         &[port, second],
     );
@@ -387,6 +390,18 @@ fn the_model_unmaps_only_the_modeled_ports_endpoint_and_admission_accepts_it() {
     assert_eq!(apcie.memory[0].pci, 0x8000_0000);
     assert_eq!(apcie.memory[0].bytes, 0x4000_0000);
     assert!(apcie.memory[0].prefetchable);
+    // The modeled port's DART is the one its `function-dart_self` names,
+    // and the complex's MSI doorbell and vectors are the board's.
+    assert_eq!(apcie.dart, Some(0));
+    assert_eq!(found.darts[0].phandle, Some(DART));
+    assert_eq!(
+        apcie.msi,
+        Some(apcie_probe::ApcieMsi {
+            address: 0xffff_f000,
+            vectors: 32,
+            offset: 0x380,
+        })
+    );
 
     // Off, a model port alone changes nothing.
     apcie_probe::set_model_port(Some(0));

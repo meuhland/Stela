@@ -584,6 +584,9 @@ pub struct DartInstance {
 /// the DART. Per-instance DMA selection remains the bus master's contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Iommu {
+    /// The DART node's own `AAPL,phandle`, which platform functions name
+    /// (a PCIe port's `function-dart_self`).
+    pub phandle: Option<u32>,
     pub profile: crate::dart::Profile,
     pub instances: Vec<DartInstance>,
     pub streams: u16,
@@ -940,7 +943,7 @@ pub fn board(tree: &[u8]) -> Result<Board> {
     let spmis = spmi_controllers(&io, &extent, phandle)?;
     let dcp = dcp_device(&io, &translate, &darts)?;
     Ok(Board {
-        apcie: apcie_probe::root_complexes(&io),
+        apcie: apcie_probe::root_complexes(&io, &darts),
         spmis,
         dcp,
         gpio,

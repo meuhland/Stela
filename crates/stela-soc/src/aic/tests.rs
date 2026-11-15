@@ -972,3 +972,54 @@ fn the_event_register_is_plain_while_nothing_is_deliverable() {
         ],
     );
 }
+
+#[test]
+fn an_edge_input_latches_each_rise_until_an_event_claims_it() {
+    // The PCIe MSI vectors: a rise and a fall in one access is one event.
+    let mut aic = aic(1);
+    let mut latch = InterruptLatch::new();
+    write(&mut aic, &mut latch, CONFIG, CONFIG_ENABLE);
+    let msi = AicInput::new(0, 0x300);
+    let (word, bit) = position(usize::from(msi.irq));
+    write(&mut aic, &mut latch, MASK_CLR + 4 * word as u64, bit);
+    aic.set_edge_inputs(msi, 8).unwrap();
+    let pulse = |aic: &mut Aic2, latch: &mut InterruptLatch| {
+        for level in [true, false] {
+            aic.set_input(msi, level, &mut Access::new(0, 0, latch))
+                .unwrap();
+        }
+    };
+    pulse(&mut aic, &mut latch);
+    assert_eq!(
+        read(&mut aic, &mut latch, 0, EVENT),
+        EVENT_TYPE_IRQ | u32::from(msi.irq)
+    );
+    // Claimed and masked; unmasked again nothing is left, the line is low.
+    write(&mut aic, &mut latch, MASK_CLR + 4 * word as u64, bit);
+    assert_eq!(read(&mut aic, &mut latch, 0, EVENT), 0);
+    // A held level raises nothing more than its rise.
+    aic.set_input(msi, true, &mut Access::new(0, 0, &mut latch))
+        .unwrap();
+    assert_eq!(
+        read(&mut aic, &mut latch, 0, EVENT),
+        EVENT_TYPE_IRQ | u32::from(msi.irq)
+    );
+    write(&mut aic, &mut latch, MASK_CLR + 4 * word as u64, bit);
+    assert_eq!(read(&mut aic, &mut latch, 0, EVENT), 0);
+    aic.set_input(msi, false, &mut Access::new(0, 0, &mut latch))
+        .unwrap();
+    // A level input next to the range keeps its level behavior.
+    let level = AicInput::new(0, 0x308);
+    let (word, bit) = position(usize::from(level.irq));
+    write(&mut aic, &mut latch, MASK_CLR + 4 * word as u64, bit);
+    for asserted in [true, false] {
+        aic.set_input(level, asserted, &mut Access::new(0, 0, &mut latch))
+            .unwrap();
+    }
+    assert_eq!(read(&mut aic, &mut latch, 0, EVENT), 0);
+    // Out of range: refused.
+    assert!(
+        aic.set_edge_inputs(AicInput::new(0, NR_IRQ - 4), 8)
+            .is_err()
+    );
+}

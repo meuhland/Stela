@@ -301,6 +301,7 @@ pub(super) fn iommu(node: &Node<'_>, translate: &dyn Fn(u64, u64) -> Option<u64>
         ));
     }
     Ok(Iommu {
+        phandle: node.first_u32("AAPL,phandle"),
         profile,
         instances,
         sids,

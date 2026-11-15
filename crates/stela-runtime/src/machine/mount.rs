@@ -251,7 +251,9 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     // resources are bound, since it owns the complex's. A probe that cannot
     // be placed is reported, never a reason to stop.
     for apcie in &board.apcie {
-        match devices.add_apcie_probe(apcie) {
+        // The modeled port's DART, through which its endpoint's DMA goes.
+        let dart = apcie.dart.and_then(|group| darts.native(group, 0).ok());
+        match devices.add_apcie_probe(apcie, dart) {
             Ok(line) => log(format_args!("{line}")),
             Err(error) => log(format_args!(
                 "APCIE PROBE /arm-io/{} not placed: {error:?}

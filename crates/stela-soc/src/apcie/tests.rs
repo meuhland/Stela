@@ -1,4 +1,5 @@
 use super::*;
+use stela_contracts::dma::test_support::Ram;
 use stela_contracts::interrupt::InterruptLatch;
 
 /// Each window's guest PA in these tests: apart, and ECAM above the rest.
@@ -433,11 +434,14 @@ fn the_endpoint_answers_on_the_secondary_bus_with_a_header_macos_enumerates() {
     // Type 0, single function, no interrupt pin.
     assert_eq!(read(stub, endpoint + 0x0e, Width::Byte), 0);
     assert_eq!(read(stub, endpoint + 0x3d, Width::Byte), 0);
-    // A PCIe v2 endpoint capability, x1 at 2.5 GT/s, then no more.
+    // A PCIe v2 endpoint capability, x1 at 2.5 GT/s, then MSI (64-bit,
+    // one vector, off), then no more.
     assert_eq!(read(stub, endpoint + 6, Width::Half) & 0x10, 0x10);
     let cap = read(stub, endpoint + 0x34, Width::Byte);
-    assert_eq!(read(stub, endpoint + cap, Width::Word), 0x0002_0010);
+    assert_eq!(read(stub, endpoint + cap, Width::Word), 0x0002_8010);
     assert_eq!(read(stub, endpoint + cap + 0x12, Width::Half) & 0x3ff, 0x11);
+    let msi = read(stub, endpoint + cap + 1, Width::Byte);
+    assert_eq!(read(stub, endpoint + msi, Width::Word), 0x0080_0005);
     assert_eq!(read(stub, endpoint + 0x100, Width::Word), 0);
     // Only device 0, function 0, only on the secondary bus.
     for address in [config(1, 1, 0, 0), config(1, 0, 1, 0), config(2, 0, 0, 0)] {
@@ -513,4 +517,299 @@ fn without_the_model_no_link_comes_up_and_the_memory_window_is_unknown() {
     );
     // A port with no root port header cannot be modeled.
     assert_eq!(probe().with_model(7, None, &[]).modeled_port(), None);
+}
+
+#[test]
+fn msi_ranges_decode_as_config_msi_range_programs_them() {
+    // probe3's port 2: MSICFG 0x31 (eight vectors), MSIBASE 0x00100010
+    // (base 16, and 16 mod 32 in [20:16]), MSIADDR msi-address & ~0xf.
+    let window = dma::MsiWindow::of(0x31, 0x0010_0010, 0xffff_f000).unwrap();
+    assert_eq!(
+        window,
+        dma::MsiWindow {
+            base: 16,
+            count: 8,
+            doorbell: 0xffff_f000,
+        }
+    );
+    // The data is the complex's vector: 16..23 are port 2's, 8 is port 1's.
+    assert_eq!(window.vector(16), Some(16));
+    assert_eq!(window.vector(23), Some(23));
+    assert_eq!(window.vector(24), None);
+    assert_eq!(window.vector(8), None);
+    assert!(window.is_doorbell(0xffff_f000));
+    assert!(window.is_doorbell(0xffff_f004));
+    assert!(!window.is_doorbell(0xffff_e000));
+    // Disabled (the reset burst's 0) or no doorbell: no window.
+    assert_eq!(dma::MsiWindow::of(0, 0x0010_0010, 0xffff_f000), None);
+    assert_eq!(dma::MsiWindow::of(0x31, 0, 0), None);
+    // Port 0: base 0.
+    assert_eq!(
+        dma::MsiWindow::of(0x31, 0, 0xffff_f000).unwrap().vector(0),
+        Some(0)
+    );
+}
+
+#[test]
+fn rid2sid_entries_name_a_requesters_stream_only_when_valid() {
+    // _updateRIDToSIDMappings: RID [15:0], SID [19:16], VALID 31.
+    let entries = [0, 0x8001_0100, 0x0002_0200, 0x8003_0300];
+    assert_eq!(dma::sid_for(&entries, 0x0100), Some(1));
+    assert_eq!(dma::sid_for(&entries, 0x0300), Some(3));
+    // Written but not valid, or no entry at all.
+    assert_eq!(dma::sid_for(&entries, 0x0200), None);
+    assert_eq!(dma::sid_for(&entries, 0x0400), None);
+}
+
+const ROOT: u64 = 0x1_0000_0000;
+const DART_PAGE: u64 = 0x4000;
+const LEAVES: u64 = ROOT + DART_PAGE;
+const FRAME: u64 = ROOT + 4 * DART_PAGE;
+/// IOVA 0x200_4000: first-level entry 1, page entry 1 (16 KiB pages).
+const IOVA: u64 = 0x200_4000;
+const MSI_OFFSET: u32 = 0x380;
+const SID: u64 = 1;
+
+fn table_entry(address: u64) -> u64 {
+    (address >> 4) & 0x3f_ffff_fc00 | 1
+}
+
+/// A t8110 DART as SPTM programs a stream for `NewIODARTMapper`'s mapper:
+/// the stream enabled, translating, its TTBR at a two-level table that maps
+/// `IOVA` to `FRAME`; then a TLB flush of the stream.
+fn dart_with_stream(sid: u64) -> (crate::dart::Dart, Ram) {
+    let mut dart = crate::dart::Dart::new(3, None);
+    let mut ram = Ram::new(ROOT, 8 * DART_PAGE as usize);
+    ram.put_u64(ROOT + 8, table_entry(LEAVES));
+    ram.put_u64(LEAVES + 8, table_entry(FRAME) | 0xfff << 40);
+    let mut latch = InterruptLatch::new();
+    let access = &mut Access::new(0, 0, &mut latch);
+    for (offset, value) in [
+        (0xc00, 1 << sid),
+        (0x1000 + 4 * sid, 1),
+        (0x1400 + 4 * sid, (ROOT >> 14) << 2 | 1),
+        (0x80, 1 << 8 | sid),
+    ] {
+        dart.write(offset, Width::Word, value, access).unwrap();
+    }
+    (dart, ram)
+}
+
+/// The linked model with MSI, its endpoint enumerated as IOPCIFamily would
+/// leave it: BAR0 assigned and decoding, bus mastering on both sides, MSI
+/// programmed with vector 9 (port 1's MSIBASE 8), and the port's MSI and
+/// RID2SID registers as the driver writes them.
+fn enumerated(latch: &mut InterruptLatch) -> ApcieProbe {
+    let mut stub = linked(latch).with_msi(MSI_OFFSET);
+    let access = &mut Access::new(0, link::TRAINING_TICKS, latch);
+    let endpoint = config(1, 0, 0, 0);
+    let port = config(0, 1, 0, 0);
+    let mut put = |address, width, value| stub.write(address, width, value, access).unwrap();
+    put(endpoint + 0x10, Width::Word, PCI);
+    put(endpoint + 4, Width::Half, 0x6);
+    put(port + 0x20, Width::Word, 0x8000_8000);
+    put(port + 4, Width::Half, 0x6);
+    put(endpoint + 0x84, Width::Word, 0xffff_f000);
+    put(endpoint + 0x88, Width::Word, 0);
+    put(endpoint + 0x8c, Width::Half, 9);
+    put(endpoint + 0x82, Width::Half, 1);
+    put(at(Window::Port(1), 0x124), Width::Word, 0x31);
+    put(at(Window::Port(1), 0x128), Width::Word, 0x0008_0008);
+    put(at(Window::Port(1), 0x168), Width::Word, 0xffff_f000);
+    put(
+        at(Window::Port(1), 0x828 + 4 * SID),
+        Width::Word,
+        0x8000_0100 | SID << 16,
+    );
+    stub
+}
+
+fn start_selftest(stub: &mut ApcieProbe, latch: &mut InterruptLatch, command: u64, iova: u64) {
+    let access = &mut Access::new(0, link::TRAINING_TICKS, latch);
+    for (offset, value) in [
+        (0xf00, iova & 0xffff_ffff),
+        (0xf04, iova >> 32),
+        (0xf08, 64),
+        (0xf0c, command),
+    ] {
+        stub.write(MEMORY + offset, Width::Word, value, access)
+            .unwrap();
+    }
+}
+
+fn bar(stub: &mut ApcieProbe, latch: &mut InterruptLatch, offset: u64) -> u64 {
+    stub.read(
+        MEMORY + offset,
+        Width::Word,
+        &mut Access::new(0, link::TRAINING_TICKS, latch),
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_endpoints_dma_goes_by_rid2sid_through_the_dart_and_raises_its_msi() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut enumerated(&mut latch);
+    let (mut dart, mut ram) = dart_with_stream(SID);
+    latch.take_aic_inputs();
+    // The MSI capability as IOPCIFamily programmed it.
+    assert!(!stub.dma_pending());
+    // Self-test: write the pattern at IOVA, through stream 1, then MSI.
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), IOVA);
+    assert!(stub.dma_pending());
+    assert_eq!(
+        bar(stub, &mut latch, 0xf10) & 0xffff,
+        u64::from(dma::STATUS_BUSY)
+    );
+    stub.run_dma(
+        Some(&mut dart),
+        &mut ram,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    );
+    assert!(!stub.dma_pending());
+    let mut written = [0u8; 64];
+    assert!(ram.read(FRAME, &mut written));
+    assert!(
+        written
+            .iter()
+            .enumerate()
+            .all(|(index, &byte)| byte == dma::pattern(0xa5, index))
+    );
+    assert_eq!(
+        bar(stub, &mut latch, 0xf10),
+        1 << 16 | u64::from(dma::STATUS_DONE | dma::STATUS_MSI)
+    );
+    assert_eq!(bar(stub, &mut latch, 0xf1c), 64);
+    // The MSI: vector 9 is AIC input msi-vector-offset + 9, one rise and
+    // fall (the AIC latches the rise: an edge input).
+    let msi = AicInput::new(0, (MSI_OFFSET + 9) as u16);
+    assert_eq!(latch.take_aic_inputs(), [(msi, true), (msi, false)]);
+
+    // Read back through the DART into BAR0.
+    ram.write(FRAME + 0x10, &[0xde, 0xad, 0xbe, 0xef]);
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_READ), IOVA + 0x10);
+    stub.run_dma(
+        Some(&mut dart),
+        &mut ram,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    );
+    assert_eq!(bar(stub, &mut latch, 0), 0xefbe_adde);
+    assert_eq!(bar(stub, &mut latch, 0xf10) >> 16, 2);
+
+    // An address the stream does not map: the DART faults (latched in its
+    // ERROR register) and the endpoint reports it; no MSI.
+    latch.take_aic_inputs();
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), 0x400_0000);
+    stub.run_dma(
+        Some(&mut dart),
+        &mut ram,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    );
+    let status = bar(stub, &mut latch, 0xf10);
+    assert_eq!(
+        status & 0xf,
+        u64::from(dma::STATUS_DONE | dma::STATUS_REFUSED)
+    );
+    assert_eq!(bar(stub, &mut latch, 0xf18), 4);
+    let error = dart
+        .read(0x100, Width::Word, &mut Access::new(0, 0, &mut latch))
+        .unwrap();
+    assert_eq!(error >> 31, 1);
+    assert_eq!(error >> 20 & 0xff, SID);
+    assert!(latch.take_aic_inputs().is_empty());
+}
+
+#[test]
+fn a_requester_without_a_valid_rid2sid_entry_or_bus_mastering_moves_nothing() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut enumerated(&mut latch);
+    let (mut dart, mut ram) = dart_with_stream(SID);
+    let run = |stub: &mut ApcieProbe,
+               dart: &mut crate::dart::Dart,
+               ram: &mut Ram,
+               latch: &mut InterruptLatch| {
+        stub.run_dma(
+            Some(dart),
+            ram,
+            &mut Access::new(0, link::TRAINING_TICKS, latch),
+        );
+    };
+    // The entry names another requester: no SID.
+    stub.write(
+        at(Window::Port(1), 0x828 + 4 * SID),
+        Width::Word,
+        0x8000_0200 | SID << 16,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    )
+    .unwrap();
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), IOVA);
+    run(stub, &mut dart, &mut ram, &mut latch);
+    assert_eq!(bar(stub, &mut latch, 0xf18), 2);
+    assert_eq!(bar(stub, &mut latch, 0xf1c), 0);
+    let mut written = [0u8; 4];
+    assert!(ram.read(FRAME, &mut written));
+    assert_eq!(written, [0; 4]);
+    // No DART at all.
+    stub.write(
+        at(Window::Port(1), 0x828 + 4 * SID),
+        Width::Word,
+        0x8000_0100 | SID << 16,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    )
+    .unwrap();
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), IOVA);
+    stub.run_dma(
+        None,
+        &mut ram,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    );
+    assert_eq!(bar(stub, &mut latch, 0xf18), 3);
+    // Bus mastering off on the endpoint.
+    stub.write(
+        config(1, 0, 0, 4),
+        Width::Half,
+        0x2,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    )
+    .unwrap();
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), IOVA);
+    run(stub, &mut dart, &mut ram, &mut latch);
+    assert_eq!(bar(stub, &mut latch, 0xf18), 1);
+}
+
+#[test]
+fn a_doorbell_write_outside_the_ports_vectors_is_no_msi() {
+    let mut latch = InterruptLatch::new();
+    let stub = &mut enumerated(&mut latch);
+    let (mut dart, mut ram) = dart_with_stream(SID);
+    // The endpoint's MSI data is port 2's vector 16, not one of port 1's.
+    stub.write(
+        config(1, 0, 0, 0x8c),
+        Width::Half,
+        16,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    )
+    .unwrap();
+    latch.take_aic_inputs();
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), IOVA);
+    stub.run_dma(
+        Some(&mut dart),
+        &mut ram,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    );
+    // The DMA went; the MSI did not.
+    assert_eq!(bar(stub, &mut latch, 0xf1c), 64);
+    assert_eq!(bar(stub, &mut latch, 0xf18), 5);
+    assert_eq!(bar(stub, &mut latch, 0xf10) & u64::from(dma::STATUS_MSI), 0);
+    assert!(latch.take_aic_inputs().is_empty());
+    // Nothing is pending once the link is down.
+    start_selftest(stub, &mut latch, u64::from(dma::COMMAND_WRITE), IOVA);
+    stub.write(
+        at(Window::Port(1), 0x80),
+        Width::Word,
+        0,
+        &mut Access::new(0, link::TRAINING_TICKS, &mut latch),
+    )
+    .unwrap();
+    assert!(!stub.dma_pending());
 }
