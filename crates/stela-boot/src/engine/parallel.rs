@@ -307,6 +307,12 @@ impl Pe {
                 stop if machine.yielded_for_interrupt(&stop) => {
                     super::run::host_work(&mut machine, "idle service", |machine| {
                         let watch = machine.guest_watch();
+                        // The GPUs' Linux work first, which a frame waits
+                        // on, in the boot CPU's place, until this PE's
+                        // guest has work.
+                        super::gpu::pump_waiting_pe(&|| {
+                            watch.pending(host::fresh_counter()).is_some()
+                        });
                         super::service::serve(false, false, &watch);
                         super::display::flush(super::display::Turn::Idle);
                         if super::storage::serve_staged(true) {

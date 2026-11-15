@@ -1,11 +1,14 @@
 //! The host's Linux environment and the NVIDIA GPUs nouveau drives in it,
 //! which back the guest's Metal device.
 //!
-//! It lives on the boot CPU and takes time from the boot PE as Linux steals it
-//! from an interrupted thread. A GPU's MSI targets that CPU, which takes it
-//! between slices or when the PE waits, and only records its line ([`Fired`]);
-//! the run loop then runs what is ready ([`pump`]) and the guest goes on.
-//! Like the host's service, it waits for a boot PE that holds no guest lock,
+//! It lives on the boot CPU, and any processor may run it in that CPU's
+//! place, one at a time (`KernelWork::dispatch_linux_moved`). A GPU's MSI
+//! targets the boot CPU, which takes it between slices or when the PE waits,
+//! and only records its line ([`Fired`]). An event wakes a PE whose guest
+//! waits for an interrupt, which holds no guest lock: its idle core runs
+//! what is ready ([`pump_waiting_pe`]). A PE waiting for a call it posted
+//! runs Linux for it itself. The boot PE pumps when no other did ([`pump`]):
+//! like the host's service, it waits for a moment it holds no guest lock,
 //! waiting for an interrupt or at EL0, but only for a bounded time
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
@@ -56,6 +59,8 @@ use core::{
     ptr::{self, addr_of},
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
+pub(super) use stela_boot_core::linux_pump::Calm;
+use stela_boot_core::linux_pump::{BootPump, Limits, Taker, Turn, Wakes, boot_decision};
 use stela_boot_core::page_window::{self, Cache};
 #[cfg(feature = "nvk")]
 use stela_drivers::gpu::metal::nvidia::PcieLink;
@@ -130,6 +135,26 @@ const WAIT_REPORT_SECONDS: u64 = 2;
 /// still runnable stays pending for the next, so a busy driver shares the
 /// boot CPU with the guest and the host's devices instead of holding it.
 const PUMP_NS: u64 = 2_000_000;
+/// The longest a pump on a PE whose guest waits runs Linux, ending sooner
+/// once its guest has work: a guest interrupt waits at most this and the
+/// step running then.
+const WAITING_PUMP_NS: u64 = 1_000_000;
+/// The longest a PE waiting for its own posted call runs Linux at a time
+/// before it lets another processor in.
+#[cfg(feature = "nvk")]
+const POSTER_PUMP_NS: u64 = 1_000_000;
+/// The longest the GPUs' stop waits for a processor in the boot CPU's place
+/// to leave Linux.
+#[cfg(feature = "nvk")]
+const MOVES_CLOSE_NS: u64 = 200_000_000;
+
+/// How long a pump on a waiting PE waits for the host drivers' lock.
+const MOVED_LOCK_WAIT_MICROS: u64 = 50;
+
+/// The processor that pumps now ([`pump_as`]).
+static TURN: Turn = Turn::new();
+/// One wake of a sleeping PE for each episode of held-back work.
+static WAKES: Wakes = Wakes::new();
 
 /// Who runs PE work on the boot CPU, once the PEs run.
 static HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
@@ -145,16 +170,25 @@ pub(super) fn set_hub(hub: Arc<Hub>, pe: usize) {
 }
 
 /// Calls a PE whose guest sleeps waiting for an interrupt, never the boot
-/// PE, to run a deferred job a guest call waits for at once
-/// (`gate::run_job` with `Taker::Waiting` in its idle service). A sleeping
-/// PE wakes only for its guest or the host's service, so a job otherwise
-/// waits for the next PE that stops to wait, or for a busy one 20 ms on.
-/// Whether one was called.
-#[cfg(feature = "nvk")]
-pub(super) fn call_job_taker() -> bool {
+/// PE, for the GPUs' host work its idle service does at once: Linux's ready
+/// work ([`pump_waiting_pe`]) and a deferred job a guest call waits for
+/// (`gate::run_job` with `Taker::Waiting`). A sleeping PE wakes only for its
+/// guest or the host's service, so the work otherwise waits for the boot
+/// PE's pump or the next PE that stops to wait. Whether one was called;
+/// with none asleep, the caller leaves the work to those. Safe with
+/// interrupts on: the kick writes this processor's ICR with them off.
+fn call_idle_core() -> bool {
     // SAFETY: a published hub is leaked, so it lives for the boot.
-    unsafe { HUB.load(Ordering::Acquire).as_ref() }
-        .is_some_and(|hub| hub.call_sleeping_server(BOOT_PE.load(Ordering::Relaxed)))
+    let Some(hub) = (unsafe { HUB.load(Ordering::Acquire).as_ref() }) else {
+        return false;
+    };
+    let flags: u64;
+    // SAFETY: CPL0 IF save, restored below on this processor.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    let called = hub.call_sleeping_server(BOOT_PE.load(Ordering::Relaxed));
+    // SAFETY: the save above, on this processor.
+    unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
+    called
 }
 
 /// What wakes the service: a raised line or a call.
@@ -177,11 +211,28 @@ unsafe impl Idle for Events {
             PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
         }
         self.clock.notify_dispatch();
-        // Only the first event since the last pump ends the boot PE's slice:
-        // later ones find it already called, and the pump takes them all.
+        // Only the first event since the last pump wakes a core: later ones
+        // find one already called, and the pump takes them all. A PE whose
+        // guest waits for an interrupt takes it; with none asleep, the boot
+        // PE's slice ends, and it pumps by `pump_due`. A woken PE that found
+        // guest work first leaves it to the boot PE's same limits.
+        if !raised {
+            return Ok(());
+        }
+        if may_move() && call_idle_core() {
+            PUMPS.woken.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         // SAFETY: a published hub is leaked, so it lives for the boot.
-        if raised && let Some(hub) = unsafe { HUB.load(Ordering::Acquire).as_ref() } {
+        if let Some(hub) = unsafe { HUB.load(Ordering::Acquire).as_ref() } {
+            // A kick writes this processor's ICR, which needs interrupts
+            // off: Linux, which raises events too, runs with them on.
+            let flags: u64;
+            // SAFETY: CPL0 IF save, restored below on this processor.
+            unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
             hub.call_host(BOOT_PE.load(Ordering::Relaxed));
+            // SAFETY: the save above, on this processor.
+            unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
         }
         Ok(())
     }
@@ -204,7 +255,10 @@ unsafe fn allocate_zeroed(layout: Layout) -> *mut u8 {
 }
 
 /// A function's configuration space, which its MSI source shares with Linux.
-/// The two take turns on the boot CPU, and neither calls out while it holds it.
+/// The two take turns under the host drivers' lock, which every Linux entry
+/// holds on whichever processor it runs, and the source's route changes run
+/// only in Linux on the boot CPU (`Host::refused_moved`); neither calls out
+/// while it holds it.
 #[derive(Clone)]
 struct SharedConfig(Rc<RefCell<Function<OwnedConfig>>>);
 
@@ -432,6 +486,26 @@ impl Host {
     fn report(&self, line: core::fmt::Arguments<'_>) {
         output::arguments(format_args!("LINUX {line}\n"));
     }
+
+    /// Whether Linux runs on a processor in the boot CPU's place, which
+    /// refuses `operation`: interrupt routes are the boot CPU's, and the
+    /// GPUs' stop, which changes them, closes moves first (`close_moves`).
+    /// Reported once.
+    fn refused_moved(&self, operation: &str) -> bool {
+        if !host::moved_here() {
+            return false;
+        }
+        if self
+            .reported
+            .borrow_mut()
+            .insert(format!("moved {operation}"))
+        {
+            self.report(format_args!(
+                "unsupported: {operation} on a processor in the boot CPU's place; refused"
+            ));
+        }
+        true
+    }
 }
 
 // SAFETY: work owns the original queue, code and root. Its live dispatcher
@@ -604,6 +678,10 @@ impl Platform for Host {
 
     fn irq_enable(&self, irq: u32) -> Result<(), stela_linux::owner::IrqEnableError> {
         use stela_linux::owner::IrqEnableError;
+        if self.refused_moved("irq_enable") {
+            // SAFETY: refused before any route, event or source.
+            return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) });
+        }
         // Refuse a foreign native execution context before classifying any
         // owner return; no errno itself proves a clean unpublished attempt.
         let controller = native_irq::service().map_err(|_| IrqEnableError::retained(ENODEV))?;
@@ -720,6 +798,9 @@ impl Platform for Host {
     }
 
     fn irq_disable(&self, irq: u32) -> Result<(), Errno> {
+        if self.refused_moved("irq_disable") {
+            return Err(EOPNOTSUPP);
+        }
         let mut lines = self.lines.borrow_mut();
         let line = lines.get_mut(irq as usize).ok_or(EINVAL)?;
         match &mut line.registration {
@@ -728,6 +809,9 @@ impl Platform for Host {
         }
     }
     fn irq_retire(&self, irq: u32) -> Result<(), Errno> {
+        if self.refused_moved("irq_retire") {
+            return Err(EOPNOTSUPP);
+        }
         let mut lines = self.lines.borrow_mut();
         let line = lines.get_mut(irq as usize).ok_or(EINVAL)?;
         if line.retired.is_some() {
@@ -1673,7 +1757,8 @@ struct Installed {
     /// Clients' mappings with their sizes in pages, by address. For tasks.
     #[cfg(feature = "nvk")]
     mappings: RefCell<BTreeMap<u64, (stela_linux::client::Mapping, usize)>>,
-    /// Mesa's running threads, by the bottom of their stacks. On the boot CPU.
+    /// Mesa's running threads, by the bottom of their stacks. Only Linux
+    /// entries, under the host drivers' lock, read and change it.
     #[cfg(feature = "nvk")]
     mesa_threads: RefCell<BTreeMap<u64, client::Running>>,
     #[cfg(feature = "nvk")]
@@ -2137,18 +2222,6 @@ const DEFER_LONGEST_NS: u64 = 4_000_000;
 /// How often a slice of a boot PE that holds work back ends to look again.
 const RECHECK_NS: u64 = 250_000;
 
-/// What the boot PE runs at a slice's end, which decides how long the
-/// environment's ready work waits for it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Calm {
-    /// Waiting for an interrupt or at EL0: it holds no guest lock.
-    Quiet,
-    /// EL1 or EL2 with IRQs unmasked.
-    Unmasked,
-    /// IRQs masked, or a guarded level: likely inside a spinlock.
-    Masked,
-}
-
 /// Why pumps ran, and what they took, since the last [`pump_report`].
 struct PumpCounts {
     /// Pumps that ran the environment, by the boot PE's [`Calm`].
@@ -2159,6 +2232,17 @@ struct PumpCounts {
     relaxed: AtomicU64,
     /// Pumps for a posted call from the host service ([`pump_posted`]).
     posted: AtomicU64,
+    /// Pumps by who ran them ([`Taker`]): the boot PE, a PE whose guest
+    /// waits, and Linux runs of a PE waiting for its own posted call.
+    by_taker: [AtomicU64; 3],
+    /// Ticks from work being ready until a pump took it, by taker, and the
+    /// longest, for the boot PE and a waiting PE.
+    taker_delay: [AtomicU64; 2],
+    taker_delay_longest: [AtomicU64; 2],
+    /// Sleeping PEs woken for ready work, and pumps a processor did not run
+    /// because another held the turn or the host drivers' lock.
+    woken: AtomicU64,
+    turn_busy: AtomicU64,
     /// Pumps for raised events, and for Linux's deadline alone.
     by_event: AtomicU64,
     by_deadline: AtomicU64,
@@ -2241,6 +2325,11 @@ static PUMPS: PumpCounts = PumpCounts {
     forced: AtomicU64::new(0),
     relaxed: AtomicU64::new(0),
     posted: AtomicU64::new(0),
+    by_taker: [const { AtomicU64::new(0) }; 3],
+    taker_delay: [const { AtomicU64::new(0) }; 2],
+    taker_delay_longest: [const { AtomicU64::new(0) }; 2],
+    woken: AtomicU64::new(0),
+    turn_busy: AtomicU64::new(0),
     by_event: AtomicU64::new(0),
     by_deadline: AtomicU64::new(0),
     idle: AtomicU64::new(0),
@@ -2320,7 +2409,10 @@ pub(super) fn interrupt_window() {
 /// Whether the run loop pumps now, the boot PE being `calm`: at once when it
 /// holds no guest lock, and otherwise only once the ready work has waited
 /// [`DEFER_UNMASKED_NS`] with interrupts unmasked or [`DEFER_LONGEST_NS`]
-/// whatever it runs, so completions and posted calls are never starved.
+/// whatever it runs, so completions and posted calls are never starved
+/// ([`boot_decision`]). Work it holds back first wakes a PE whose guest
+/// waits, once for each episode, which pumps it at once: the boot PE pumps
+/// only what no such PE took.
 pub(super) fn pump_due(calm: Calm) -> bool {
     let Some(gpu) = installed() else {
         return false;
@@ -2330,59 +2422,144 @@ pub(super) fn pump_due(calm: Calm) -> bool {
         return false;
     };
     let waited = now.saturating_sub(since);
-    let due = match calm {
-        Calm::Quiet => true,
-        Calm::Unmasked => waited >= gpu.tsc_after(DEFER_UNMASKED_NS),
-        Calm::Masked => false,
-    } || waited >= gpu.tsc_after(DEFER_LONGEST_NS);
-    if !due {
+    let limits = Limits {
+        unmasked: gpu.tsc_after(DEFER_UNMASKED_NS),
+        longest: gpu.tsc_after(DEFER_LONGEST_NS),
+    };
+    let Some(why) = boot_decision(calm, waited, limits) else {
         PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
+        // A Linux timer that came due raised no event, so nothing woke a
+        // sleeper for it yet.
+        if may_move() && WAKES.first_for(since) && call_idle_core() {
+            PUMPS.woken.fetch_add(1, Ordering::Relaxed);
+        }
         return false;
-    }
-    let counter = match calm {
-        _ if waited >= gpu.tsc_after(DEFER_LONGEST_NS) => &PUMPS.forced,
-        Calm::Quiet => &PUMPS.quiet,
-        Calm::Unmasked | Calm::Masked => &PUMPS.unmasked,
+    };
+    let counter = match why {
+        BootPump::Forced => &PUMPS.forced,
+        BootPump::Quiet => &PUMPS.quiet,
+        BootPump::Unmasked => &PUMPS.unmasked,
     };
     counter.fetch_add(1, Ordering::Relaxed);
     true
 }
 
-/// Run what is ready in the environment, on the boot CPU: between the boot
-/// PE's slices once [`pump_due`], or while it waits for the service's turn.
-pub(super) fn pump() {
+/// Whether a processor other than the boot CPU may run Linux in its place:
+/// with the GPUs' Metal service, until the GPUs' stop closes it
+/// ([`close_moves`]).
+fn may_move() -> bool {
+    cfg!(feature = "nvk") && !host::moves_closed()
+}
+
+/// Whether this is the boot CPU, which Linux lives on.
+fn on_boot_cpu() -> bool {
+    #[cfg(feature = "nvk")]
+    return host::processor() == BOOT_CPU.load(Ordering::Relaxed);
+    #[cfg(not(feature = "nvk"))]
+    true
+}
+
+/// This processor's index: the boot CPU's, without the Metal service.
+fn this_processor() -> u32 {
+    #[cfg(feature = "nvk")]
+    return host::processor();
+    #[cfg(not(feature = "nvk"))]
+    0
+}
+
+/// Has every later Linux entry run on the boot CPU, and waits for one in
+/// its place to leave, for the GPUs' stop: its work changes interrupt
+/// routes and unloads firmware, which the boot CPU owns.
+#[cfg(feature = "nvk")]
+pub(super) fn close_moves() {
     let Some(gpu) = installed() else {
         return;
     };
-    native_irq::interrupt_window();
-    let now = host::rdtsc();
-    let Some(since) = ready_since(gpu, now) else {
+    if !host::close_moves(gpu.tsc_after(MOVES_CLOSE_NS)) {
+        output::arguments(format_args!(
+            "GPU stop: Linux still runs on another processor after {} ms\n",
+            MOVES_CLOSE_NS / 1_000_000
+        ));
+    }
+}
+
+/// Run what is ready in the environment from the boot PE's run loop:
+/// between its slices once [`pump_due`], or while it waits for the
+/// service's turn.
+pub(super) fn pump() {
+    pump_as(Taker::Boot, &|| false);
+}
+
+/// Run what is ready from the idle service of a PE whose guest waits for an
+/// interrupt, on its own core, within [`WAITING_PUMP_NS`] and only until its
+/// guest has work (`guest_work`). Nothing with no work ready, or while the
+/// GPUs stop.
+pub(super) fn pump_waiting_pe(guest_work: &dyn Fn() -> bool) {
+    if on_boot_cpu() || !may_move() {
+        return;
+    }
+    if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
+        pump_as(Taker::Waiting, guest_work);
+    }
+}
+
+/// One pump by `taker` on this processor, under the [`TURN`]: what was
+/// raised and Linux's due timers, its steps until nothing runs, the budget
+/// ends, another core wants the host drivers or, off the boot CPU,
+/// `guest_work` says this PE's guest has work. A processor that finds the
+/// turn or the host drivers' lock taken leaves the work pending for the one
+/// that has it, or for the boot PE's fallback.
+fn pump_as(taker: Taker, guest_work: &dyn Fn() -> bool) {
+    let Some(gpu) = installed() else {
         return;
     };
-    // Cleared before the flag: an event raised between the two stores its
-    // own time once the flag is clear.
-    PENDING_SINCE.store(0, Ordering::Release);
-    let raised = gpu.events.pending.swap(false, Ordering::AcqRel);
-    let started = host::rdtsc();
-    let delay = started.saturating_sub(since);
-    PUMPS.delay.fetch_add(delay, Ordering::Relaxed);
-    PUMPS.delay_longest.fetch_max(delay, Ordering::Relaxed);
-    let cause = if raised {
-        &PUMPS.by_event
-    } else {
-        &PUMPS.by_deadline
+    let boot = on_boot_cpu();
+    if boot {
+        native_irq::interrupt_window();
+    }
+    let Some(since) = ready_since(gpu, host::rdtsc()) else {
+        return;
     };
-    cause.fetch_add(1, Ordering::Relaxed);
-    let budget = gpu.tsc_after(PUMP_NS);
+    let Some(turn) = TURN.try_take(this_processor()) else {
+        PUMPS.turn_busy.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let entered = host::rdtsc();
+    let budget = gpu.tsc_after(if boot { PUMP_NS } else { WAITING_PUMP_NS });
     let mut steps = 0u32;
-    let mut part_at = started;
+    let mut started = entered;
+    let mut part_at = entered;
     let mut lap = |part: PumpPart| {
         let now = host::rdtsc();
         part.add(now.wrapping_sub(part_at));
         part_at = now;
     };
-    let ran = gpu.work.dispatch_linux(|runtime| {
+    let body = |runtime: Pin<&'static stela_drivers::platform::work::Runtime<SLOTS>>| {
         lap(PumpPart::Enter);
+        // Taken here, inside: a pump that could not enter leaves the work
+        // pending with its age. Cleared before the flag: an event raised
+        // between the two stores its own time once the flag is clear.
+        started = host::rdtsc();
+        PENDING_SINCE.store(0, Ordering::Release);
+        let raised = gpu.events.pending.swap(false, Ordering::AcqRel);
+        let delay = started.saturating_sub(since);
+        PUMPS.delay.fetch_add(delay, Ordering::Relaxed);
+        PUMPS.delay_longest.fetch_max(delay, Ordering::Relaxed);
+        PUMPS.by_taker[taker as usize].fetch_add(1, Ordering::Relaxed);
+        if let Some(index) = match taker {
+            Taker::Boot => Some(0),
+            Taker::Waiting => Some(1),
+            Taker::Poster => None,
+        } {
+            PUMPS.taker_delay[index].fetch_add(delay, Ordering::Relaxed);
+            PUMPS.taker_delay_longest[index].fetch_max(delay, Ordering::Relaxed);
+        }
+        let cause = if raised {
+            &PUMPS.by_event
+        } else {
+            &PUMPS.by_deadline
+        };
+        cause.fetch_add(1, Ordering::Relaxed);
         let mut first = true;
         loop {
             // What is raised from here on this pass takes: the step runs
@@ -2423,10 +2600,12 @@ pub(super) fn pump() {
             steps += 1;
             // A core spinning for the host drivers' lock this pump holds
             // (a disk or input call) takes it after this step; the rest
-            // stays pending for the next pump.
+            // stays pending for the next pump. So does it once this PE's
+            // guest has work, off the boot CPU.
             if super::service::shutdown_pending()
                 || host::rdtsc().wrapping_sub(started) >= budget
                 || super::storage::host_drivers_wanted()
+                || (!boot && guest_work())
             {
                 if !gpu.events.pending.swap(true, Ordering::AcqRel) {
                     PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
@@ -2443,15 +2622,36 @@ pub(super) fn pump() {
         };
         gpu.next.store(next, Ordering::Relaxed);
         Ok(())
-    });
-    if let Err(error) = ran {
-        output::fatal(format_args!("the host's Linux environment failed: {error}"));
+    };
+    // A waiting PE waits briefly for the lock: a poster running Linux for
+    // its own call lets go at its next step once a core waits.
+    let ran = if boot {
+        Some(gpu.work.dispatch_linux(body))
+    } else {
+        gpu.work.dispatch_linux_moved(MOVED_LOCK_WAIT_MICROS, body)
+    };
+    match ran {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            output::fatal(format_args!("the host's Linux environment failed: {error}"))
+        }
+        None => {
+            // The host drivers' lock was taken: whoever holds it runs Linux
+            // or a driver, and the work stays pending for the next pump.
+            PUMPS.turn_busy.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     }
     lap(PumpPart::Leave);
     if steps == 0 {
         PUMPS.idle.fetch_add(1, Ordering::Relaxed);
     }
     PUMPS.steps.fetch_add(u64::from(steps), Ordering::Relaxed);
+    // Off the boot CPU the turn goes first: the look may post calls, which
+    // this processor then runs Linux for itself (`serve_posted`).
+    if !boot {
+        drop(turn);
+    }
     #[cfg(feature = "nvk")]
     match look_due(gpu) {
         Look::Device => {
@@ -2463,12 +2663,84 @@ pub(super) fn pump() {
     }
     lap(PumpPart::Look);
     // The pipelines the device added go to the store's file, queued a
-    // piece at a time.
+    // piece at a time, from the boot CPU.
     #[cfg(feature = "nvk")]
-    super::pipelines::step();
-    let took = host::rdtsc().wrapping_sub(started);
+    if boot {
+        super::pipelines::step();
+    }
+    let took = host::rdtsc().wrapping_sub(entered);
     PUMPS.ticks.fetch_add(took, Ordering::Relaxed);
     PUMPS.longest.fetch_max(took, Ordering::Relaxed);
+}
+
+/// Run Linux on this processor, not the boot CPU, for a call it posted and
+/// waits for (`client::spin`), while `waiting`: in the boot CPU's place, as
+/// the boot CPU would in its run loop, for [`POSTER_PUMP_NS`] at most or
+/// until nothing runs. `None` when it did not enter: with the host drivers'
+/// lock taken, or where it does not serve its own calls
+/// ([`serves_own_posts`]), the caller spins. Otherwise whether a step ran:
+/// with none, the caller waits for an event or a due timer
+/// ([`posted_work_ready`]) before it enters again.
+#[cfg(feature = "nvk")]
+fn serve_posted(gpu: &Installed, waiting: &dyn Fn() -> bool) -> Option<bool> {
+    if !serves_own_posts() {
+        return None;
+    }
+    let started = host::rdtsc();
+    let budget = gpu.tsc_after(POSTER_PUMP_NS);
+    let mut stepped = false;
+    let ran = gpu.work.dispatch_linux_moved(0, |runtime| {
+        PUMPS.by_taker[Taker::Poster as usize].fetch_add(1, Ordering::Relaxed);
+        while waiting() {
+            gpu.advance_children();
+            client::start(gpu)?;
+            if !waiting() || !runtime.step()? {
+                break;
+            }
+            stepped = true;
+            client::children_stale();
+            if host::rdtsc().wrapping_sub(started) >= budget
+                || super::storage::host_drivers_wanted()
+            {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    if let Err(error) = ran {
+        output::fatal(format_args!("the host's Linux environment failed: {error}"));
+    }
+    Some(stepped)
+}
+
+/// How long a poster that found nothing to run ([`serve_posted`]) spins
+/// before it enters again: with work raised or due, which the processor it
+/// woke may be taking, and without, for a call no other processor took.
+#[cfg(feature = "nvk")]
+const POSTER_READY_NS: u64 = 20_000;
+#[cfg(feature = "nvk")]
+const POSTER_RECHECK_NS: u64 = 100_000;
+
+/// Whether a poster that found nothing to run when it left at `since`
+/// enters again ([`POSTER_READY_NS`], [`POSTER_RECHECK_NS`]).
+#[cfg(feature = "nvk")]
+fn posted_work_ready(gpu: &Installed, since: u64) -> bool {
+    let now = host::rdtsc();
+    let idle = now.wrapping_sub(since);
+    idle >= gpu.tsc_after(POSTER_RECHECK_NS)
+        || (idle >= gpu.tsc_after(POSTER_READY_NS) && ready_since(gpu, now).is_some())
+}
+
+/// Whether this processor runs Linux itself for the calls it posts
+/// ([`serve_posted`]), so that none needs waking for them: a processor
+/// other than the boot CPU, outside a job's slice and an interrupt handler,
+/// while the GPUs do not stop.
+#[cfg(feature = "nvk")]
+fn serves_own_posts() -> bool {
+    host::processor() != BOOT_CPU.load(Ordering::Relaxed)
+        && may_move()
+        && !slice::in_job()
+        && !host::in_interrupt()
 }
 
 /// A pump for a posted call, from host work on the boot CPU that can run
@@ -2504,7 +2776,14 @@ fn pump_waiting() {
 /// `step_longest_us=… step_shootdowns=… step_serving=…`: the longest single
 /// Linux step, the shootdowns during it and the posted calls being performed
 /// as it began (`-` for none), and `unmaps=device/pages/files/stacks`
-/// ([`UNMAPS`]), and `total_us=enter/children/steps/leave/look:…` the
+/// ([`UNMAPS`]). Then `by_boot=… by_waiting=… by_poster=… woken=…
+/// turn_busy=… boot_delay_mean_us=… boot_delay_longest_us=…
+/// waiting_delay_mean_us=… waiting_delay_longest_us=…`: who ran Linux
+/// ([`Taker`]: the boot PE's pumps, pumps on PEs whose guest waits, and runs
+/// of PEs for their own posted calls), the sleeping PEs woken for work, the
+/// pumps not run as another processor held the turn or the host drivers'
+/// lock, and how long ready work waited for the boot PE's pumps and the
+/// waiting PEs'. And `total_us=enter/children/steps/leave/look:…` the
 /// pumps' time by [`PumpPart`], then `part_longest_us=…` the longest each
 /// part took in one pump. Then `\nGPU LINUX timers=… works=… sleepers=… timeouts=…
 /// steps=…` ([`linux_report`]).
@@ -2534,6 +2813,8 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         serving.push('-');
     }
     let [device, pages, files, stacks] = UNMAPS.each_ref().map(take);
+    let boot = take(&PUMPS.by_taker[Taker::Boot as usize]);
+    let waiting = take(&PUMPS.by_taker[Taker::Waiting as usize]);
     #[cfg(feature = "nvk")]
     let nvkm = nvkm_report() + &perf_report();
     #[cfg(not(feature = "nvk"))]
@@ -2543,7 +2824,9 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
          by_deadline={by_deadline} idle={} deferred={} mean_us={} longest_us={} \
          delay_mean_us={} delay_longest_us={} next_us={next_us} next_timer={} \
          step_longest_us={} step_shootdowns={} step_serving={serving} \
-         unmaps={device}/{pages}/{files}/{stacks}",
+         unmaps={device}/{pages}/{files}/{stacks} by_boot={boot} by_waiting={waiting} \
+         by_poster={} woken={} turn_busy={} boot_delay_mean_us={} boot_delay_longest_us={} \
+         waiting_delay_mean_us={} waiting_delay_longest_us={}",
         take(&PUMPS.quiet),
         take(&PUMPS.unmasked),
         take(&PUMPS.forced),
@@ -2558,6 +2841,17 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         next_timer(),
         micros(take(&PUMPS.step_longest)),
         take(&PUMPS.step_shootdowns),
+        take(&PUMPS.by_taker[Taker::Poster as usize]),
+        take(&PUMPS.woken),
+        take(&PUMPS.turn_busy),
+        micros(take(&PUMPS.taker_delay[0]).checked_div(boot).unwrap_or(0)),
+        micros(take(&PUMPS.taker_delay_longest[0])),
+        micros(
+            take(&PUMPS.taker_delay[1])
+                .checked_div(waiting)
+                .unwrap_or(0)
+        ),
+        micros(take(&PUMPS.taker_delay_longest[1])),
     );
     // Each part's total over the pumps since the last report.
     let parts: Vec<String> = PUMPS

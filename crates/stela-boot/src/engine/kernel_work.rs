@@ -340,6 +340,9 @@ unsafe impl Cpu for NativeCpu {
 }
 /// !Send/!Sync executor: producers may eventually receive owned mailbox views,
 /// never an Arc wrapping this Runtime or a foreign-CPU task-switch permission.
+/// The one exception is [`Self::dispatch_linux_moved`]: another processor
+/// runs its Linux work in the boot processor's place, under the same host
+/// drivers' lock every entry takes.
 pub(super) struct KernelWork {
     executor: Executor<SLOTS>,
     reservation: Arc<Reservation>,
@@ -358,6 +361,25 @@ struct ClearLinuxExecution<'a>(&'a Cell<Option<NonNull<DriverExecution<'static>>
 impl Drop for ClearLinuxExecution<'_> {
     fn drop(&mut self) {
         self.0.set(None);
+    }
+}
+
+/// Says once for each kind that a processor's entry in the boot
+/// processor's place was refused (`KernelWork::dispatch_linux_moved`).
+fn refused_move(error: WorkError) {
+    static SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let kind = match error {
+        WorkError::WrongCpu => 1,
+        WorkError::InterruptContext => 2,
+        WorkError::Busy => 4,
+        _ => 8,
+    };
+    if SHOWN.fetch_or(kind, Ordering::Relaxed) & kind == 0 {
+        crate::output::arguments(format_args!(
+            "LINUX entry in the boot processor's place refused on processor {}: {error:?}; it \
+             waits for another processor instead\n",
+            super::host::local::processor(),
+        ));
     }
 }
 
@@ -652,14 +674,21 @@ impl KernelWork {
             .check_dispatch()
             .map_err(Error::Work)?;
         let runtime = self.executor.runtime();
+        // A continuation of this processor's own holds the lock below. The
+        // runtime's current one is looked at only under it: another
+        // processor may run Linux work in the boot processor's place
+        // (`dispatch_linux_moved`).
+        if super::storage::host_drivers_held_here() {
+            return Err(Error::Work(WorkError::WouldDeadlock));
+        }
+        // SAFETY: loader root on this physical BSP, no native
+        // or IRQ frame; every continuation was checked in this same domain.
+        let _root = unsafe { RestoreRoot::enter(self.root) };
         match runtime.current_id() {
             Ok(_) => return Err(Error::Work(WorkError::WouldDeadlock)),
             Err(WorkError::Unavailable) => {}
             Err(error) => return Err(Error::Work(error)),
         }
-        // SAFETY: loader root on this physical BSP, no native
-        // or IRQ frame; every continuation was checked in this same domain.
-        let _root = unsafe { RestoreRoot::enter(self.root) };
         // This checks the original allocation/entered root link only;
         // it supplies no rate, timer, firmware-service or task admission grant.
         self.reservation
@@ -746,11 +775,13 @@ impl KernelWork {
         if identity.in_interrupt() {
             return Err(Error::Work(WorkError::InterruptContext));
         }
-        if self.linux_execution.get().is_some() {
-            return Err(Error::Work(WorkError::Busy));
-        }
         let _watched = Watched::enter();
         self.dispatch(|_| {
+            // Under the host drivers' lock, which a processor running Linux
+            // work in this one's place holds too (`dispatch_linux_moved`).
+            if self.linux_execution.get().is_some() {
+                return Err(WorkError::Busy);
+            }
             // SAFETY: dispatch entered the kept loader root on the owning
             // BSP. This scope ends after every active frame returns or parks.
             let execution = unsafe { clock.enter_driver_execution()? };
@@ -759,6 +790,79 @@ impl KernelWork {
             body(self.executor.runtime())
         })?
         .map_err(Error::Work)
+    }
+
+    /// [`Self::dispatch_linux`] from a processor other than the boot
+    /// processor, in its place: for the GPUs' pump on a PE whose guest
+    /// waits, or one waiting for its own posted call. Linux is `!SMP` and
+    /// runs on one processor at a time, under the host drivers' lock, so it
+    /// runs the same here; the boot processor's identity accepts this
+    /// processor only while it holds that lock
+    /// (`host::RootIdentity::move_here`). `None` without entering when the
+    /// lock is taken (another processor runs Linux or a host driver), when
+    /// moves were closed for the GPUs' stop, or before the clock is
+    /// installed; on the boot processor itself, the ordinary entry. A taken
+    /// lock is waited for `wait_micros` at most, as a waiter a holder that
+    /// works in steps lets in (`storage::host_drivers_wanted`).
+    pub(super) fn dispatch_linux_moved<T>(
+        &'static self,
+        wait_micros: u64,
+        body: impl FnOnce(Pin<&'static work::Runtime<SLOTS>>) -> Result<T, WorkError>,
+    ) -> Option<Result<T, Error>> {
+        let clock = self.installed_clock?;
+        let identity = &self.reservation.identity;
+        if identity.owner_here() {
+            return Some(self.dispatch_linux(body));
+        }
+        // SAFETY: the live loader root, which keeps the engine window; this
+        // processor's record is active.
+        let root = unsafe {
+            if wait_micros == 0 {
+                RestoreRoot::try_enter(self.root)
+            } else {
+                RestoreRoot::enter_within(self.root, wait_micros)
+            }
+        }?;
+        // SAFETY: the lock is held until after `moved` drops, below, and
+        // only this Linux entry runs meanwhile.
+        let Some(moved) = (unsafe { identity.move_here() }) else {
+            drop(root);
+            return None;
+        };
+        // A context the boot processor's entry would refuse is not entered:
+        // the caller goes on as without the lock, and the refusal is shown
+        // once by kind.
+        let admitted = (|| {
+            identity.check_irq_cpu()?;
+            if identity.in_interrupt() {
+                return Err(WorkError::InterruptContext);
+            }
+            identity.check_clock_root()?;
+            identity.check_dispatch()?;
+            if self.linux_execution.get().is_some() {
+                return Err(WorkError::Busy);
+            }
+            Ok(())
+        })();
+        if let Err(error) = admitted {
+            drop(moved);
+            drop(root);
+            refused_move(error);
+            return None;
+        }
+        let result = (|| {
+            let _watched = super::step_watchdog::Moved::enter();
+            // SAFETY: the kept loader root, entered on the processor in
+            // the boot processor's place under the host drivers' lock. This
+            // scope ends after every active frame returns or parks.
+            let execution = unsafe { clock.enter_driver_execution()? };
+            self.linux_execution.set(Some(NonNull::from(&execution)));
+            let _clear = ClearLinuxExecution(&self.linux_execution);
+            body(self.executor.runtime())
+        })();
+        drop(moved);
+        drop(root);
+        Some(result.map_err(Error::Work))
     }
 
     /// Lend the actual dispatch segment for one synchronous Linux metadata leaf.

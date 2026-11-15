@@ -192,9 +192,12 @@ fn run_thread(gpu: &Installed, thread: &Thread, stack: &Stack) {
     gpu.mesa_threads.borrow_mut().remove(&stack.bottom());
 }
 
-/// The Mesa thread running here, by its stack.
+/// The Mesa thread running here, by its stack. Mesa's threads are Linux
+/// tasks, which run only under the host drivers' lock, on the boot CPU or a
+/// processor in its place, so a processor without it runs none and must not
+/// read the threads Linux changes.
 fn current_thread(gpu: &Installed) -> Option<Running> {
-    if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
+    if !crate::engine::storage::holds_host_drivers() {
         return None;
     }
     let pointer = stack::pointer();
@@ -298,6 +301,8 @@ fn unload(request: &Request, seconds: u64) -> bool {
     let Some(gpu) = installed() else {
         return true;
     };
+    // The unload frees interrupt routes the boot CPU owns: it runs there.
+    super::close_moves();
     // The GPUs unload one after another, each bounded by nouveau in time:
     // each has its own `seconds`, so one that does not answer leaves the
     // next its whole share.
@@ -1004,7 +1009,7 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
                         "which fails the guest call"
                     }
                 ));
-                // The pool's state is the boot CPU's to read.
+                // One processor's report: the boot CPU's.
                 if host::processor() == BOOT_CPU.load(Ordering::Relaxed)
                     && let Some(line) = pool_report(gpu.tsc_hz)
                 {
@@ -1254,6 +1259,11 @@ pub(super) fn posted_waiting() -> bool {
 /// entry other than the pump's ([`wait`], startup) leaves them unlooked.
 static CHILDREN_STALE: AtomicBool = AtomicBool::new(true);
 
+/// Linux ran steps outside a pump, which may have ended a child.
+pub(super) fn children_stale() {
+    CHILDREN_STALE.store(true, Ordering::Relaxed);
+}
+
 /// Whether a pump's first pass retires tasks and runs [`start`]: a call is
 /// posted, a PE asked for a wake, a task waits for a wake, calls wait for workers, or steps ran
 /// since the last look, which may have ended a child. Without any, both
@@ -1296,8 +1306,15 @@ pub(super) fn pool_report(tsc_hz: u64) -> Option<alloc::string::String> {
 /// idle and starting ones, queued calls with the oldest one's wait, and each
 /// call still running with how long it has.
 fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
-    use core::fmt::Write;
     let gpu = installed()?;
+    // Only Linux entries change the pool, on any processor; a report while
+    // one runs is left out.
+    crate::engine::storage::with_drivers_held(|| workers_held(gpu, tsc_hz))?
+}
+
+/// [`workers_line`] with no Linux entry running.
+fn workers_held(gpu: &Installed, tsc_hz: u64) -> Option<alloc::string::String> {
+    use core::fmt::Write;
     let service = &gpu.service;
     let now = host::rdtsc();
     let ms = |since: u64| now.wrapping_sub(since) / (tsc_hz / 1000).max(1);
@@ -1336,7 +1353,12 @@ fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
 /// reaches `deadline`.
 fn wait(gpu: &Installed, request: &Request, deadline: u64) {
     post(request);
-    if let Err(error) = gpu.events.notify() {
+    // A poster that runs Linux for its call itself wakes nobody: a
+    // processor holding the host drivers' lock meanwhile takes the call at
+    // its next pass, and the poster when it lets go.
+    if !super::serves_own_posts()
+        && let Err(error) = gpu.events.notify()
+    {
         output::fatal(format_args!(
             "the host's Linux environment failed: {error:?}"
         ));
@@ -1345,11 +1367,25 @@ fn wait(gpu: &Installed, request: &Request, deadline: u64) {
 }
 
 /// Waits for the posted `request`, until the host counter reaches
-/// `deadline`: a PE spins, the boot CPU runs the environment.
+/// `deadline`: the boot CPU runs the environment; another processor runs it
+/// in the boot CPU's place whenever no other processor does, and spins
+/// meanwhile (`super::serve_posted`).
 fn spin(gpu: &Installed, request: &Request, deadline: u64) {
     let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
     if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
+        // When it last ran Linux and found nothing to run.
+        let mut idle_since = None;
         while waiting() {
+            if idle_since.is_none_or(|since| super::posted_work_ready(gpu, since)) {
+                match super::serve_posted(gpu, &waiting) {
+                    Some(true) => {
+                        idle_since = None;
+                        continue;
+                    }
+                    Some(false) => idle_since = Some(host::rdtsc()),
+                    None => {}
+                }
+            }
             // The boot CPU's work may be retiring a mapping, which waits for this.
             crate::native_mmio::shootdown::service();
             hint::spin_loop();
@@ -1653,6 +1689,7 @@ extern "C" fn stela_libc_wake(word: *const c_uint) {
     // slept yet finds its word changed and does not.
     if let Some(gpu) = installed()
         && host::processor() != BOOT_CPU.load(Ordering::Relaxed)
+        && !crate::engine::storage::holds_host_drivers()
     {
         WAKE_ASKED.store(true, Ordering::Release);
         if let Err(error) = gpu.events.notify() {

@@ -1,7 +1,151 @@
-//! Rules for the host's Linux environment when more than one processor runs
-//! it: one at a time, under the host drivers' lock. A clock that more than
-//! one processor samples uses [`advance`], which stays monotonic across
-//! their counters' small skew.
+//! Who runs the host's Linux environment, and when.
+//!
+//! The ported driver's tasks, timers and interrupt work run only when a
+//! processor pumps them. `stela-boot` lets any processor do it, one at a time.
+//! A PE whose guest waits for an interrupt holds no guest lock, so its core
+//! pumps as soon as work is ready: an event wakes one that sleeps, and a PE
+//! that waits for its own posted call runs Linux for it. The boot PE, whose
+//! core also serves the host, pumps as a fallback when no PE took the work.
+//! It then defers as it always did, so that it does not stop guest code that
+//! may hold an XNU spinlock ([`boot_decision`]).
+//!
+//! Linux runs on one processor at a time: the host drivers' lock covers every
+//! Linux entry, and [`Turn`] decides which processor pumps, so a second one
+//! does not spin on that lock for work the first is already doing. A clock
+//! that more than one processor samples uses [`advance`], which stays
+//! monotonic across their counters' small skew.
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// What the boot PE runs at a slice's end, which decides how long the
+/// environment's ready work waits for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Calm {
+    /// Waiting for an interrupt or at EL0: it holds no guest lock.
+    Quiet,
+    /// EL1 or EL2 with IRQs unmasked.
+    Unmasked,
+    /// IRQs masked, or a guarded level: likely inside a spinlock.
+    Masked,
+}
+
+/// How long ready work may wait for the boot PE, in counter ticks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Limits {
+    /// With guest interrupts unmasked at EL1 or EL2.
+    pub unmasked: u64,
+    /// Whatever the boot PE runs.
+    pub longest: u64,
+}
+
+/// Why the boot PE pumps now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootPump {
+    /// It holds no guest lock.
+    Quiet,
+    /// The work waited past [`Limits::unmasked`] with interrupts unmasked.
+    Unmasked,
+    /// The work waited past [`Limits::longest`].
+    Forced,
+}
+
+/// Whether the boot PE, `calm`, pumps work that has waited `waited` ticks:
+/// at once when it holds no guest lock, and otherwise only after the
+/// limits, so completions and posted calls are never starved. `None` holds
+/// the work back.
+pub fn boot_decision(calm: Calm, waited: u64, limits: Limits) -> Option<BootPump> {
+    if waited >= limits.longest {
+        return Some(BootPump::Forced);
+    }
+    match calm {
+        Calm::Quiet => Some(BootPump::Quiet),
+        Calm::Unmasked if waited >= limits.unmasked => Some(BootPump::Unmasked),
+        Calm::Unmasked | Calm::Masked => None,
+    }
+}
+
+/// Who takes the pump.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Taker {
+    /// The boot PE between its slices, or while it waits in a guest call.
+    Boot,
+    /// A PE whose guest waits for an interrupt.
+    Waiting,
+    /// A PE that waits for a call it posted.
+    Poster,
+}
+
+/// The processor that pumps now: one at a time.
+pub struct Turn {
+    /// The holder's processor index plus one, zero while free.
+    holder: AtomicU32,
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Turn {
+    pub const fn new() -> Self {
+        Self {
+            holder: AtomicU32::new(0),
+        }
+    }
+
+    /// The turn for `processor`, unless another processor holds it.
+    pub fn try_take(&self, processor: u32) -> Option<Held<'_>> {
+        let mine = processor.checked_add(1)?;
+        self.holder
+            .compare_exchange(0, mine, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Held { turn: self })
+    }
+
+    /// The processor holding the turn.
+    pub fn holder(&self) -> Option<u32> {
+        self.holder.load(Ordering::Relaxed).checked_sub(1)
+    }
+}
+
+/// A held [`Turn`], given back when dropped.
+pub struct Held<'a> {
+    turn: &'a Turn,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.turn.holder.store(0, Ordering::Release);
+    }
+}
+
+/// One wake of a sleeping PE for each episode of ready work: the boot PE,
+/// finding work ready at a slice's end that it holds back, wakes a sleeper
+/// for it once, not at every recheck.
+pub struct Wakes {
+    /// The start of the ready episode a sleeper was last woken for.
+    woken_for: AtomicU64,
+}
+
+impl Default for Wakes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Wakes {
+    pub const fn new() -> Self {
+        Self {
+            woken_for: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether to wake a sleeper for the work ready since `since`, which no
+    /// wake was for yet.
+    pub fn first_for(&self, since: u64) -> bool {
+        since != 0 && self.woken_for.swap(since, Ordering::AcqRel) != since
+    }
+}
 
 /// The next state of a counter clock sampled by more than one processor:
 /// `previous`, the last raw value taken, and `elapsed`, the ticks counted so

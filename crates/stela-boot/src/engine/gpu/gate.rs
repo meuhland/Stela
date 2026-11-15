@@ -506,7 +506,7 @@ fn report_peaks() {
 /// for the next PE that stopped to wait, or 20 ms for a busy one
 /// (`Taker::Busy`), while the guest's call slept and asked again.
 fn job_waiting() {
-    super::call_job_taker();
+    super::call_idle_core();
 }
 
 /// What the kext found of the Metal plugin, the bundle whose code this boot's
@@ -1388,6 +1388,9 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
     let Some(gpu) = installed() else {
         return;
     };
+    // From here Linux runs on the boot CPU only, which owns what the stop
+    // releases.
+    super::close_moves();
     let services = shared();
     let ms = |since: u64| host::rdtsc().wrapping_sub(since) / (gpu.tsc_hz / 1000).max(1);
     let began = host::rdtsc();
@@ -1453,7 +1456,9 @@ pub(in crate::engine) fn stop_for_fatal() {
     if installed().is_none() || STOPPING.swap(true, Ordering::AcqRel) {
         return;
     }
-    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
+    // A stop on a processor running Linux in the boot CPU's place holds
+    // the host drivers' lock the unload would wait for.
+    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) || host::moved_here() {
         output::arguments(format_args!(
             "GPU firmware left running: the stop is on the CPU that unloads it\n"
         ));
