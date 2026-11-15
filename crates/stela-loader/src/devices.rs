@@ -109,6 +109,7 @@ const PHANDLE: &str = "AAPL,phandle";
 const SECURE_ROOT_PREFIX: &str = "secure-root-prefix";
 const DEVICE_TYPE: &str = "device_type";
 const IOMMU_PARENT: &str = "iommu-parent";
+const MANUAL_ENABLE: &str = "manual-enable";
 const ACIO_PARENT: &str = "acio-parent";
 const NO_PMU: &str = "no-pmu";
 const IGNORE: &str = "AAPL,ignore";
@@ -563,8 +564,48 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
     retire_hidden_capabilities(tree, &mut hidden);
     if let Some(port) = board::apcie_probe::model_port() {
         unmap_modeled_endpoints(tree, port, &mut hidden);
+        manually_enable_other_ports(tree, port, &mut hidden);
     }
     hidden
+}
+
+/// The root-complex model (`--apcie`): every port but the modeled one gets
+/// `manual-enable`, the driver's own optional-port handling. Their
+/// endpoints are not modeled, and a port the driver auto-enables must train
+/// its link: `AppleEmbeddedPCIE::_waitForLinkUp` (0xfffffe000944337c) logs
+/// "link training timeout" through `logLinkState` with panic set by the
+/// port's `+0x1be`, which `initWithAPCIeAndRegistryEntry` sets for every
+/// port without `manual-enable` (unless `_portDebugFlags` bit 16), and for a
+/// `manual-enable` port only when `PE_i_can_has_debugger` (apcie2 panicked
+/// so: "apcie[1:pcie-xhci]::_waitForLinkUp: link training timeout").
+/// `autoEnable` (0xfffffe0009456214) enables a `manual-enable` port with
+/// flag 2, for which `enableGated` skips `enableLinkTraining` and the
+/// link-training timer and which leaves the port out of `_waitForLinkUp`'s
+/// mask: the port is powered and clocked, its LTSSM never starts, and it
+/// waits for a client's `pcie_port_control` (none is visible). Each port is
+/// a ledger note `PATH +manual-enable` and an `APCIE PREPARE` line.
+fn manually_enable_other_ports(tree: &mut DeviceTree, port: u32, hidden: &mut Vec<String>) {
+    fn walk(node: &mut Node, path: &str, port: u32, inside: bool, hidden: &mut Vec<String>) {
+        let complex = compatibles(node).any(board::apcie_probe::is_root_complex);
+        if inside && let Some(index) = node.property("apcie-port").and_then(|p| p.as_u32()) {
+            if index != port && node.property(MANUAL_ENABLE).is_none() {
+                node.set_property(MANUAL_ENABLE, Vec::new())
+                    .expect("empty property");
+                board::apcie_probe::note(format_args!(
+                    "APCIE PREPARE {path} +manual-enable: port {index} has no modeled endpoint, \
+                     so the driver enables it without link training\n"
+                ));
+                hidden.push(format!("{path} +{MANUAL_ENABLE}"));
+            }
+            return;
+        }
+        for child in &mut node.children {
+            let name = child.name().unwrap_or("?");
+            let path = format!("{path}/{name}");
+            walk(child, &path, port, inside || complex, hidden);
+        }
+    }
+    walk(&mut tree.root, "", port, false, hidden);
 }
 
 /// The root-complex model (`--apcie`): drop `iommu-parent` from every node

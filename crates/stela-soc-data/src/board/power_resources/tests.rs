@@ -1224,3 +1224,33 @@ fn the_pcie_models_unmapped_endpoint_is_a_valid_note_on_a_kept_node() {
             .contains("names missing resource")
     );
 }
+
+#[test]
+fn the_pcie_models_manual_enable_note_holds_only_while_the_property_is_there() {
+    // `--apcie`: the ports without a modeled endpoint get `manual-enable`
+    // (apcie2 panicked on port 1's link-training timeout).
+    let port = |manual: bool| {
+        let mut properties: Vec<(&str, &[u8])> = vec![("name", b"pci-bridge1")];
+        if manual {
+            properties.push(("manual-enable", &[]));
+        }
+        let bridge = encode(&properties, &[]);
+        let apcie = encode(
+            &[("name", b"apcie"), ("clock-gates", &words(&[1]))],
+            &[bridge],
+        );
+        tree(&[(1, Some(0), [0, 0])], &[apcie])
+    };
+    let ledger: Vec<String> = vec!["/arm-io/apcie/pci-bridge1 +manual-enable".into()];
+    for (manual, admitted) in [(true, true), (false, false)] {
+        let bytes = port(manual);
+        let mut states = power_states(
+            &Node::root(&bytes).unwrap(),
+            &flat_fixture_extent(&Some),
+            0x8112,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(states.apply_admission(&bytes, &ledger).is_ok(), admitted);
+    }
+}

@@ -231,6 +231,8 @@ impl PowerStates {
                     // The PCIe model (`--apcie`) unmaps its endpoint node.
                     (_, "iommu-parent") => node.property("iommu-parent").is_none(),
                     (_, "+no-pmu") => node.property("no-pmu").is_some(),
+                    // The PCIe model's other ports (`--apcie`).
+                    (_, "+manual-enable") => node.property("manual-enable").is_some(),
                     (_, "+gptbat-ready") => node.property("gptbat-ready").is_some(),
                     (_, note) if super::CAPABILITY_PROPERTIES.contains(&note) => {
                         node.property(note).is_none()
