@@ -892,3 +892,44 @@ fn a_method_in_a_slot_the_kernel_reserves_is_refused() {
         "{error:#}"
     );
 }
+
+/// Links a built kext against a real boot kernel collection, as every boot
+/// does, so a kext that names a symbol the kernel does not export is found
+/// before it stops a boot. Run with
+/// `STELA_BOOT_KC=<kernelcache> STELA_KEXT=<target/guest/StelaGPU.kext>
+/// cargo test -p stela-loader --lib -- --ignored a_built_kext`.
+#[test]
+#[ignore = "oracle: STELA_BOOT_KC, STELA_KEXT"]
+fn a_built_kext_links_against_a_real_boot_collection() {
+    extern crate std;
+    let (Ok(collection), Ok(kext)) = (std::env::var("STELA_BOOT_KC"), std::env::var("STELA_KEXT"))
+    else {
+        std::eprintln!("STELA_BOOT_KC or STELA_KEXT unset: nothing linked");
+        return;
+    };
+    let boot = std::fs::read(&collection).unwrap();
+    let directory = std::path::Path::new(&kext);
+    let info = std::fs::read(directory.join("Info.plist")).unwrap();
+    let mut objects: Vec<Vec<u8>> = Vec::new();
+    let mut names: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "o"))
+        .collect();
+    names.sort();
+    for name in &names {
+        objects.push(std::fs::read(name).unwrap());
+    }
+    let kext = Kext {
+        info: &info,
+        objects: objects.iter().map(Vec::as_slice).collect(),
+        bundle_path: "/Library/Extensions/StelaGPU.kext".into(),
+        trusted_code: Vec::new(),
+    };
+    let linked = link(&boot, &[kext]).unwrap_or_else(|error| panic!("{error:#}"));
+    std::eprintln!(
+        "linked {} objects into {} bytes",
+        names.len(),
+        linked.collection.len()
+    );
+}

@@ -18,6 +18,7 @@ use stela_loader::{aux_kc::TRUSTED_CODE_FILE, trust_cache::CodeHash};
 
 pub mod app;
 pub mod sdk;
+pub mod stelanet;
 pub mod wire;
 
 /// The macOS the guest components target, as clang's `-target` names it.
@@ -50,6 +51,7 @@ pub fn run() -> Result<()> {
         include.join("stela/sandbox_patch.h"),
         sandbox_patch_header(&patcher, &component.join("sandbox").join(SANDBOX_PATCH_JOB))?,
     )?;
+    fs::write(include.join("stela/stelanet_job.h"), stelanet::header()?)?;
     fs::write(
         include.join("stela/stelavt.h"),
         stelavt_header(&component.join("stelavt"))?,

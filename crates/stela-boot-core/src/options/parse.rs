@@ -156,6 +156,22 @@ impl ParseState<'_> {
                 options.guest_network = true;
                 options.guest_network_ecm = true;
             }
+            "--guest-network-stelanet" => {
+                options.guest_network = true;
+                options.guest_network_stelanet = true;
+            }
+            "--guest-network-stelanet-no-lro" | "--guest-network-stelanet-csum" => {
+                options.guest_network = true;
+                options.guest_network_stelanet = true;
+                options.guest_network_stelanet_offloads = options
+                    .guest_network_stelanet_offloads
+                    .min(StelaNetOffloads::Checksums);
+            }
+            "--guest-network-stelanet-no-offload" => {
+                options.guest_network = true;
+                options.guest_network_stelanet = true;
+                options.guest_network_stelanet_offloads = StelaNetOffloads::None;
+            }
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {

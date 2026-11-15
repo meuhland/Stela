@@ -132,6 +132,59 @@ fn setup_lines_parse_and_serialize_identically() {
     let ecm = round_trip(&format!("{preboot}-ecm"));
     assert!(ecm.guest_network && ecm.guest_network_ecm);
     assert_eq!(ecm.to_string(), format!("{preboot} --guest-network-ecm"));
+    assert!(!options.guest_network_stelanet && !ecm.guest_network_stelanet);
+    // StelaNet instead of a USB adapter: the flag alone gives the network.
+    let stelanet = round_trip(&format!("{preboot}-stelanet"));
+    assert!(stelanet.guest_network && stelanet.guest_network_stelanet);
+    assert!(!stelanet.guest_network_ecm);
+    assert_eq!(
+        stelanet.to_string(),
+        format!("{preboot} --guest-network-stelanet")
+    );
+    // Every offload by default; fewer to compare, each flag alone giving
+    // the adapter. The first name of -no-lro still parses.
+    assert_eq!(
+        stelanet.guest_network_stelanet_offloads,
+        StelaNetOffloads::Coalescing
+    );
+    for (suffix, offloads, written) in [
+        (
+            "-stelanet-no-lro",
+            StelaNetOffloads::Checksums,
+            "-stelanet-no-lro",
+        ),
+        (
+            "-stelanet-csum",
+            StelaNetOffloads::Checksums,
+            "-stelanet-no-lro",
+        ),
+        (
+            "-stelanet-no-offload",
+            StelaNetOffloads::None,
+            "-stelanet-no-offload",
+        ),
+        (
+            "-stelanet-no-offload --guest-network-stelanet-no-lro",
+            StelaNetOffloads::None,
+            "-stelanet-no-offload",
+        ),
+    ] {
+        let fewer = round_trip(&format!("{preboot}{suffix}"));
+        assert!(
+            fewer.guest_network && fewer.guest_network_stelanet,
+            "{suffix}"
+        );
+        assert_eq!(fewer.guest_network_stelanet_offloads, offloads, "{suffix}");
+        assert_eq!(
+            fewer.to_string(),
+            format!("{preboot} --guest-network{written}")
+        );
+    }
+    assert_eq!(StelaNetOffloads::None.features(), 0);
+    assert_eq!(
+        StelaNetOffloads::Coalescing.features(),
+        stela_contracts::net::features::CHECKSUMS | stela_contracts::net::features::COALESCING
+    );
     let bundle = format!("--system --storage {DISK} --nor {DISK} --bundle \\EFI\\stela\\r");
     assert_eq!(round_trip(&bundle).to_string(), bundle);
 }

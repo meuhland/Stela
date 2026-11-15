@@ -116,6 +116,7 @@ StelaGPU::installPlugin(void *parameter, wait_result_t)
 	if (!stopping && context && buffer) {
 		gpu->setProperty(STELA_APP_PROPERTY, stelaDeliverApp(context, buffer));
 		stelaDeliverSandboxPatch(context, buffer);
+		stelaDeliverStelaNetJob(context, buffer);
 	}
 	if (buffer) {
 		IOFreeData(buffer, kStelaChunk);

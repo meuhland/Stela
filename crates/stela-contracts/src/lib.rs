@@ -15,6 +15,7 @@ pub mod dma;
 pub mod gate;
 pub mod identity;
 pub mod interrupt;
+pub mod net;
 pub mod pauth;
 pub mod processor;
 pub mod refusal;

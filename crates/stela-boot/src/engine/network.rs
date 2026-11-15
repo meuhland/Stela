@@ -130,6 +130,13 @@ impl RootLink {
         Some(self.send(frame))
     }
 
+    /// [`Link::carrier`] for a service turn, as [`Self::transmit_now`].
+    fn carrier_now(&mut self) -> Option<bool> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.device.carrier())
+    }
+
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
     fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
         // SAFETY: as in `carrier`.
@@ -630,6 +637,15 @@ pub struct GuestNetwork {
     /// Whether the adapter's receive signal was pointed at
     /// [`set_receive_core`]'s core, which the first link up does.
     retargeted: bool,
+    /// Why the StelaNet adapter last stopped itself, as last reported.
+    fault: Option<&'static str>,
+    /// The guest's IPv4 address as StelaNet last reported it.
+    address: Option<[u8; 4]>,
+    /// The host adapter's carrier as last read for StelaNet, and when (TSC).
+    carrier: Option<bool>,
+    carrier_read: Option<u64>,
+    /// What the StelaNet adapter did for the guest at the last status.
+    stela_net: Option<stela_soc::stela_net::Stats>,
 }
 
 /// The APIC ID of the core the guest network's receive signal goes to once
@@ -674,6 +690,11 @@ impl GuestNetwork {
             received: alloc::collections::VecDeque::new(),
             unsent: alloc::collections::VecDeque::new(),
             retargeted: false,
+            fault: None,
+            address: None,
+            carrier: None,
+            carrier_read: None,
+            stela_net: None,
         })
     }
 
@@ -713,6 +734,57 @@ impl GuestNetwork {
         }
     }
 
+    /// Keep the StelaNet adapter's counters for [`Self::report`].
+    pub fn stela_net_stats(&mut self, stats: Option<stela_soc::stela_net::Stats>) {
+        self.stela_net = stats;
+    }
+
+    /// Report why the StelaNet adapter stopped itself, once per new reason.
+    pub fn fault(&mut self, fault: Option<&'static str>) {
+        if fault.is_some() && self.fault != fault {
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet stopped: {}\n",
+                fault.unwrap_or_default()
+            ));
+        }
+        self.fault = fault;
+    }
+
+    /// Report the IPv4 address the guest claimed through StelaNet, once per
+    /// new address: how a run finds a guest whose address DHCP chose.
+    pub fn address(&mut self, address: Option<[u8; 4]>) {
+        if let Some([a, b, c, d]) = address
+            && self.address != address
+        {
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet guest address {a}.{b}.{c}.{d}\n"
+            ));
+            self.address = address;
+        }
+    }
+
+    /// The host adapter's carrier for StelaNet's link, read at most once a
+    /// second (`now` and `tsc_hz` in TSC ticks) and never waiting for the
+    /// host drivers' lock; `None` when not read this turn.
+    pub fn carrier_now(&mut self, now: u64, tsc_hz: u64) -> Option<bool> {
+        if self
+            .carrier_read
+            .is_some_and(|at| now.wrapping_sub(at) < tsc_hz)
+        {
+            return None;
+        }
+        let up = self.link.carrier_now()?;
+        self.carrier_read = Some(now);
+        if self.carrier.is_some_and(|was| was != up) || self.carrier.is_none() && !up {
+            output::arguments(format_args!(
+                "GUEST NETWORK host carrier {}\n",
+                if up { "up" } else { "down" }
+            ));
+        }
+        self.carrier = Some(up);
+        Some(up)
+    }
+
     /// The beat report's line: the frames the guest adapter moved each way
     /// and dropped (oversized, filtered and overflowed), and the NCM blocks
     /// from the guest that did not decode, so a run shows whether traffic
@@ -735,6 +807,27 @@ impl GuestNetwork {
             counters.overflowed,
             counters.malformed
         ));
+        if let Some(stats) = self.stela_net {
+            // Tenths, as integers: host frames per guest interrupt and per
+            // frame the guest's stack took.
+            let tenths = |count: u64, per: u64| {
+                let tenths = (count * 10).checked_div(per).unwrap_or(0);
+                (tenths / 10, tenths % 10)
+            };
+            let (irq_whole, irq_tenth) = tenths(counters.to_guest, stats.interrupts);
+            let (frame_whole, frame_tenth) = tenths(counters.to_guest, stats.rx_frames);
+            output::arguments(format_args!(
+                "GUEST NETWORK StelaNet interrupts={} rx_signals={} tx_signals={} kicks={}                  rx_frames={} coalesced={} coalesced_segments={}                  frames_per_interrupt={irq_whole}.{irq_tenth}                  frames_per_rx_frame={frame_whole}.{frame_tenth}
+",
+                stats.interrupts,
+                stats.rx_signals,
+                stats.tx_signals,
+                stats.kicks,
+                stats.rx_frames,
+                stats.coalesced,
+                stats.coalesced_segments,
+            ));
+        }
     }
 
     /// Read frames from the host adapter while the guest's receive queue
