@@ -322,32 +322,65 @@ fn the_probes_prepared_tree_passes_the_board_model() {
 }
 
 #[test]
-fn the_model_removes_the_modeled_ports_endpoint_nodes_only() {
+fn the_model_unmaps_only_the_modeled_ports_endpoint_and_admission_accepts_it() {
     let _one = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let wlan = "/arm-io/apcie/pci-bridge0/wlan";
     apcie_probe::set_apcie(true);
     apcie_probe::set_model_port(Some(0));
     let mut on = tree();
+    on.node_mut(wlan)
+        .unwrap()
+        .set_property("iommu-parent", cells(&[MAPPER]))
+        .unwrap();
     let hidden = hide_unmodeled(&mut on);
+    // The J473AP shape: the Ethernet endpoint below the modeled port.
     let bytes = board_tree();
     let mut modeled = DeviceTree::parse(&bytes).unwrap();
-    hide_unmodeled(&mut modeled);
-    let found = board::board(&modeled.serialize());
+    let lan = node("lan-1gb", &[("iommu-parent", cells(&[MAPPER]))], vec![]);
+    modeled
+        .node_mut("/arm-io/apcie/pci-bridge0")
+        .unwrap()
+        .children
+        .push(lan);
+    let ledger = hide_unmodeled(&mut modeled);
+    let prepared = modeled.serialize();
+    let found = board::board(&prepared);
     apcie_probe::set_model_port(None);
     apcie_probe::set_apcie(false);
-    // The port keeps its node and properties; its endpoint node is gone.
-    assert!(on.node("/arm-io/apcie/pci-bridge0").is_some());
+    // The port and its endpoint node stay; only `iommu-parent` goes, noted.
     assert!(
         on.property("/arm-io/apcie/pci-bridge0", "apcie-port")
             .is_some()
     );
-    assert!(on.node("/arm-io/apcie/pci-bridge0/wlan").is_none());
+    assert!(on.node(wlan).is_some());
+    assert!(on.property(wlan, "iommu-parent").is_none());
     assert!(
         hidden
             .iter()
-            .any(|entry| entry == "/arm-io/apcie/pci-bridge0/wlan removed")
+            .any(|entry| *entry == format!("{wlan} iommu-parent"))
     );
+    assert!(hidden.iter().any(|entry| entry == wlan));
+    let lan = "/arm-io/apcie/pci-bridge0/lan-1gb";
+    assert!(modeled.node(lan).is_some());
+    assert!(modeled.property(lan, "iommu-parent").is_none());
+    assert!(
+        ledger
+            .iter()
+            .any(|entry| *entry == format!("{lan} iommu-parent"))
+    );
+    // apcie1 stopped here: the PMGR admission takes the ledger against
+    // the prepared tree, so every path it names must still be there.
+    let mut found = found.unwrap();
+    if let Some(states) = found.power_states.as_mut() {
+        states.apply_admission(&prepared, &ledger).unwrap();
+    }
+    for entry in &ledger {
+        let path = entry
+            .split_once(' ')
+            .map_or(entry.as_str(), |(path, _)| path);
+        assert!(path == "/" || modeled.node(path).is_some(), "{entry}");
+    }
     // The board names the modeled port and the complex's memory window.
-    let found = found.unwrap();
     let apcie = &found.apcie[0];
     assert_eq!(apcie.model, Some(0));
     assert_eq!(apcie.memory.len(), 1);
@@ -358,7 +391,11 @@ fn the_model_removes_the_modeled_ports_endpoint_nodes_only() {
     // Off, a model port alone changes nothing.
     apcie_probe::set_model_port(Some(0));
     let mut off = tree();
+    off.node_mut(wlan)
+        .unwrap()
+        .set_property("iommu-parent", cells(&[MAPPER]))
+        .unwrap();
     hide_unmodeled(&mut off);
     apcie_probe::set_model_port(None);
-    assert!(off.node("/arm-io/apcie/pci-bridge0/wlan").is_some());
+    assert!(off.property(wlan, "iommu-parent").is_some());
 }

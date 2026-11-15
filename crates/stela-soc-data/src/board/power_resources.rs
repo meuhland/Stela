@@ -229,6 +229,8 @@ impl PowerStates {
                     ("/defaults", "entangle-nonce") => node.property("entangle-nonce").is_none(),
                     ("/", "secure-root-prefix") => node.property("secure-root-prefix").is_none(),
                     (_, "acio-parent") => node.property("acio-parent").is_none(),
+                    // The PCIe model (`--apcie`) unmaps its endpoint node.
+                    (_, "iommu-parent") => node.property("iommu-parent").is_none(),
                     (_, "+no-pmu") => node.property("no-pmu").is_some(),
                     (_, "+gptbat-ready") => node.property("gptbat-ready").is_some(),
                     (_, note) if super::CAPABILITY_PROPERTIES.contains(&note) => {
