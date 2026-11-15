@@ -27,11 +27,16 @@
 //! The endpoint, at the root port's secondary bus, device 0, function 0, is
 //! a type-0 function no macOS driver matches: QEMU's PCI test device ID
 //! ([`VENDOR`]:[`DEVICE`]), class 0xff0000 (unassigned), a PCIe v2 endpoint
-//! capability (x1, 2.5 GT/s), no MSI and no INTx, and one 4 KiB 32-bit
-//! memory BAR backed by RAM, which answers once IOPCIFamily has assigned it
-//! from the port's window and enabled memory decoding on the root port and
-//! the endpoint.
+//! capability (x1, 2.5 GT/s), an MSI capability (one vector, 64-bit
+//! address), no INTx, and one 4 KiB 32-bit memory BAR, which answers once
+//! IOPCIFamily has assigned it from the port's window and enabled memory
+//! decoding on the root port and the endpoint. The BAR is RAM up to 0xf00,
+//! then the DMA self-test's registers ([`super::dma::SELFTEST`]).
 use super::EXPRESS;
+use super::dma::{
+    COMMAND_READ, COMMAND_WRITE, SELFTEST, SELFTEST_MAX, STATUS_BUSY, STATUS_DONE, STATUS_MSI,
+    STATUS_REFUSED,
+};
 use alloc::boxed::Box;
 
 /// Guest time from LTSSM start to link-up: 5 ms of 24 MHz ticks, well inside
@@ -51,9 +56,32 @@ const DLL_ACTIVE: u16 = 1 << 13;
 const SLOT_CLOCK: u16 = 1 << 12;
 /// DesignWare `PL_DEBUG0` (port logic `0x728`) LTSSM state L0.
 pub const LTSSM_L0: u32 = 0x11;
-/// The endpoint's PCIe capability.
+/// The endpoint's PCIe capability, then its MSI capability.
 const CAPABILITY: usize = 0x40;
+/// After the PCIe capability's 0x3c bytes.
+pub const MSI_CAPABILITY: usize = 0x80;
+/// MSI control: 64-bit addresses, one vector (MMC 0).
+const MSI_64BIT: u16 = 1 << 7;
 const CONFIG_BYTES: usize = 0x1000;
+/// The self-test's registers, by offset from [`SELFTEST`].
+const TEST_IOVA_LOW: usize = 0x00;
+const TEST_IOVA_HIGH: usize = 0x04;
+const TEST_LENGTH: usize = 0x08;
+const TEST_COMMAND: usize = 0x0c;
+const TEST_STATUS: usize = 0x10;
+const TEST_SEED: usize = 0x14;
+const TEST_REFUSAL: usize = 0x18;
+const TEST_MOVED: usize = 0x1c;
+const TEST_REGISTERS: usize = 8;
+
+/// A self-test run the guest started ([`super::dma::run_selftest`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfTest {
+    pub command: u32,
+    pub iova: u64,
+    pub length: u32,
+    pub seed: u32,
+}
 
 /// Where a port's link is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +108,8 @@ pub fn link_status(lnkcap: u32, lnkctl2: u16) -> u16 {
 pub struct Endpoint {
     config: Box<[u8; CONFIG_BYTES]>,
     bar: Box<[u8; BAR_BYTES]>,
+    /// The self-test registers, as words.
+    test: [u32; TEST_REGISTERS],
 }
 
 impl Default for Endpoint {
@@ -100,17 +130,84 @@ impl Endpoint {
         put(0x0c, 0); // type-0 header, single function
         put(0x2c, u32::from(DEVICE) << 16 | u32::from(VENDOR)); // subsystem
         put(0x34, CAPABILITY as u32);
-        // PCIe capability v2, endpoint, no next capability.
-        put(CAPABILITY, 0x0002_0010);
+        // PCIe capability v2, endpoint; next the MSI capability.
+        put(CAPABILITY, 0x0002_0010 | (MSI_CAPABILITY as u32) << 8);
         put(CAPABILITY + 0x04, 0x0000_8000); // DEVCAP: role-based errors, 128 B
         put(CAPABILITY + 0x08, 0x0000_2810); // DEVCTL: 512 B reads, RO, NS
         put(CAPABILITY + 0x0c, 0x0000_0011); // LNKCAP: x1, 2.5 GT/s
         put(CAPABILITY + 0x10, u32::from(SLOT_CLOCK | 1 << 4 | 1) << 16); // LNKSTA
         put(CAPABILITY + 0x2c, 0x0000_0002); // LNKCAP2: 2.5 GT/s
         put(CAPABILITY + 0x30, 0x0000_0001); // LNKCTL2: 2.5 GT/s
+        // MSI, 64-bit, one vector, disabled; no next capability.
+        put(MSI_CAPABILITY, u32::from(MSI_64BIT) << 16 | 0x05);
+        let mut test = [0; TEST_REGISTERS];
+        test[TEST_SEED / 4] = 0xa5;
         Self {
             config,
             bar: Box::new([0u8; BAR_BYTES]),
+            test,
+        }
+    }
+
+    /// Whether the endpoint may master the bus (command bit 2).
+    pub fn bus_master(&self) -> bool {
+        self.command() & 4 != 0
+    }
+
+    /// The MSI the endpoint sends, when its MSI is enabled: the address and
+    /// data software programmed.
+    pub fn msi_message(&self) -> Option<(u64, u32)> {
+        let control = self.word(MSI_CAPABILITY) >> 16;
+        (control & 1 != 0).then(|| {
+            let address = u64::from(self.word(MSI_CAPABILITY + 4))
+                | u64::from(self.word(MSI_CAPABILITY + 8)) << 32;
+            (address, self.word(MSI_CAPABILITY + 0xc) & 0xffff)
+        })
+    }
+
+    /// Whether a self-test run is waiting for the upstream path.
+    pub fn selftest_pending(&self) -> bool {
+        self.test[TEST_STATUS / 4] & STATUS_BUSY != 0
+    }
+
+    /// The waiting self-test run, if any; it stays busy until finished.
+    pub fn take_selftest(&mut self) -> Option<SelfTest> {
+        self.selftest_pending().then(|| {
+            let length = match self.test[TEST_LENGTH / 4] {
+                0 => 64,
+                length => length.min(SELFTEST_MAX),
+            };
+            SelfTest {
+                command: self.test[TEST_COMMAND / 4],
+                iova: u64::from(self.test[TEST_IOVA_LOW / 4])
+                    | u64::from(self.test[TEST_IOVA_HIGH / 4]) << 32,
+                length,
+                seed: self.test[TEST_SEED / 4],
+            }
+        })
+    }
+
+    /// The run is over: `moved` bytes, refused with `refusal` (0 if not),
+    /// and whether the MSI went out.
+    pub fn finish_selftest(&mut self, moved: u32, refusal: u32, msi: bool) {
+        let runs = (self.test[TEST_STATUS / 4] >> 16).wrapping_add(1) & 0xffff;
+        self.test[TEST_STATUS / 4] = runs << 16
+            | STATUS_DONE
+            | if refusal != 0 { STATUS_REFUSED } else { 0 }
+            | if msi { STATUS_MSI } else { 0 };
+        self.test[TEST_REFUSAL / 4] = refusal;
+        self.test[TEST_MOVED / 4] = moved;
+    }
+
+    fn write_test(&mut self, register: usize, value: u32) {
+        match register {
+            TEST_COMMAND if value == COMMAND_WRITE || value == COMMAND_READ => {
+                self.test[TEST_COMMAND / 4] = value;
+                let runs = self.test[TEST_STATUS / 4] & 0xffff_0000;
+                self.test[TEST_STATUS / 4] = runs | STATUS_BUSY;
+            }
+            TEST_STATUS | TEST_REFUSAL | TEST_MOVED | TEST_COMMAND => {}
+            _ => self.test[register / 4] = value,
         }
     }
 
@@ -159,12 +256,31 @@ impl Endpoint {
 
     pub fn read_bar(&self, offset: usize, bytes: usize) -> u64 {
         (0..bytes).fold(0, |value, at| {
-            let byte = self.bar.get(offset + at).copied().unwrap_or(0xff);
+            let here = offset + at;
+            let byte = match here.checked_sub(SELFTEST) {
+                Some(register) if register < 4 * TEST_REGISTERS => {
+                    (self.test[register / 4] >> (8 * (register % 4))) as u8
+                }
+                _ => self.bar.get(here).copied().unwrap_or(0xff),
+            };
             value | u64::from(byte) << (8 * at)
         })
     }
 
     pub fn write_bar(&mut self, offset: usize, bytes: usize, value: u64) {
+        if let Some(register) = offset.checked_sub(SELFTEST)
+            && register < 4 * TEST_REGISTERS
+        {
+            // Registers take aligned 32-bit (or 64-bit, as two) writes.
+            if register % 4 == 0 && (bytes == 4 || bytes == 8) {
+                for word in 0..bytes / 4 {
+                    if register + 4 * word < 4 * TEST_REGISTERS {
+                        self.write_test(register + 4 * word, (value >> (32 * word)) as u32);
+                    }
+                }
+            }
+            return;
+        }
         for at in 0..bytes {
             if let Some(byte) = self.bar.get_mut(offset + at) {
                 *byte = (value >> (8 * at)) as u8;
@@ -191,6 +307,11 @@ fn writable(offset: usize) -> u8 {
         o if o == CAPABILITY + 0x09 || o == CAPABILITY + 0x11 => 0xff,
         o if o == CAPABILITY + 0x28 || o == CAPABILITY + 0x29 => 0xff,
         o if o == CAPABILITY + 0x30 || o == CAPABILITY + 0x31 => 0xff,
+        // MSI control: enable and multiple message enable; the address
+        // (dword aligned, 64-bit) and the data.
+        o if o == MSI_CAPABILITY + 2 => 0x71,
+        o if o == MSI_CAPABILITY + 4 => 0xfc,
+        o if (MSI_CAPABILITY + 5..MSI_CAPABILITY + 0xe).contains(&o) => 0xff,
         _ => 0,
     }
 }

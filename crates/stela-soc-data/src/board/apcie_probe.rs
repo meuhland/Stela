@@ -148,6 +148,25 @@ pub struct Apcie {
     /// The port the root-complex model makes real (`--apcie`), when the
     /// complex has it.
     pub model: Option<u32>,
+    /// The modeled port's DART: the index in [`super::Board::darts`] of the
+    /// DART its `function-dart_self` names (the port's DMA translates through
+    /// it, by the stream its RID2SID table gives a requester).
+    pub dart: Option<usize>,
+    /// The complex's MSI doorbell and AIC vectors, when the node has them.
+    pub msi: Option<ApcieMsi>,
+}
+
+/// The complex's MSI properties (`AppleEmbeddedPCIE::start` reads them):
+/// `msi-address` (the doorbell an endpoint writes; J473AP 0xfffff000),
+/// `#msi-vectors` (the complex's vectors, which the ports' `msi-vector-base`
+/// and `#msi-vectors` divide) and `msi-vector-offset` (the AIC input of
+/// vector 0: `ApplePCIEMSIController::addDeviceInterruptProperties` adds it
+/// to every vector it gives a device).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApcieMsi {
+    pub address: u64,
+    pub vectors: u32,
+    pub offset: u32,
 }
 
 /// One PCI memory window of a root complex's `ranges`: its PCI address,
@@ -197,8 +216,9 @@ pub fn memory_ranges(io: &Node<'_>, raw: &[u8]) -> Vec<ApcieMemory> {
         .collect()
 }
 
-/// The visible root complexes under `/arm-io`, when the probe is on.
-pub(super) fn root_complexes(io: &Node<'_>) -> Vec<Apcie> {
+/// The visible root complexes under `/arm-io`, when the probe is on, with
+/// the board's DARTs `darts` to find the modeled port's.
+pub(super) fn root_complexes(io: &Node<'_>, darts: &[super::Iommu]) -> Vec<Apcie> {
     if !apcie() {
         return Vec::new();
     }
@@ -214,8 +234,24 @@ pub(super) fn root_complexes(io: &Node<'_>) -> Vec<Apcie> {
                     .any(is_root_complex)
             })
         })
-        .map(|node| root_complex(io, node))
+        .map(|node| root_complex(io, node, darts))
         .collect()
+}
+
+/// The complex's MSI properties, when it has all three.
+fn msi(node: &Node<'_>) -> Option<ApcieMsi> {
+    let address = node
+        .property("msi-address")
+        .and_then(|bytes| match bytes.len() {
+            4 => Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?))),
+            8 => Some(u64::from_le_bytes(bytes.try_into().ok()?)),
+            _ => None,
+        })?;
+    Some(ApcieMsi {
+        address,
+        vectors: node.first_u32("#msi-vectors")?,
+        offset: node.first_u32("msi-vector-offset")?,
+    })
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -225,7 +261,7 @@ fn text(bytes: &[u8]) -> String {
     )
 }
 
-fn root_complex(io: &Node<'_>, node: &Node<'_>) -> Apcie {
+fn root_complex(io: &Node<'_>, node: &Node<'_>, darts: &[super::Iommu]) -> Apcie {
     let windows = apertures::registers(node)
         .unwrap_or_default()
         .into_iter()
@@ -248,6 +284,15 @@ fn root_complex(io: &Node<'_>, node: &Node<'_>) -> Apcie {
         })
         .collect::<Vec<ApciePort>>();
     let model = model_port().filter(|&port| ports.iter().any(|child| child.index == port));
+    // The modeled port's DART: the provider its `function-dart_self` names.
+    let dart = model.and_then(|port| {
+        let child = node
+            .children()?
+            .into_iter()
+            .find(|child| child.first_u32("apcie-port") == Some(port))?;
+        let phandle = child.first_u32("function-dart_self")?;
+        darts.iter().position(|dart| dart.phandle == Some(phandle))
+    });
     Apcie {
         name: text(node.property("name").unwrap_or(b"?")),
         windows,
@@ -262,6 +307,8 @@ fn root_complex(io: &Node<'_>, node: &Node<'_>) -> Apcie {
             .map(|raw| memory_ranges(io, raw))
             .unwrap_or_default(),
         model,
+        dart,
+        msi: msi(node),
     }
 }
 

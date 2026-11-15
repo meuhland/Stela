@@ -241,6 +241,8 @@ pub struct AppleDevices {
     /// One wired-OR owner per physical DART input, across logical groups.
     dart_irqs: Vec<(AicInput, dart::SharedIrq)>,
     usb_masters: Vec<UsbMaster>,
+    /// The PCIe root-complex model's ports (`--apcie`) and their DARTs.
+    apcie_masters: Vec<(DeviceId, Option<DeviceId>)>,
     cpu_start: Option<CpuStarter>,
     reset_vectors: Vec<Option<DeviceId>>,
     /// Each PE's CLPC sampler counters (`platform::apple::core_counters`),
@@ -687,6 +689,7 @@ impl AppleDevices {
             frame_presented: false,
             dart_irqs: Vec::new(),
             usb_masters: Vec::new(),
+            apcie_masters: Vec::new(),
             cpu_start: None,
             reset_vectors: Vec::new(),
             core_counters: Vec::new(),
@@ -1526,11 +1529,13 @@ impl Devices for AppleDevices {
                 3 => self.transfer_gfx(cpu, memory, now),
                 4 => self.transfer_sep(cpu, memory, now),
                 5 => self.transfer_dcp(cpu, memory, now),
-                // StelaNet moves the guest network's frames beside USB.
+                // StelaNet moves the guest network's frames beside USB, and
+                // the PCIe root-complex model's upstream step (`--apcie`)
+                // shares the same part's time.
                 _ => {
                     let usb = self.transfer_usb(cpu, memory, now);
                     self.transfer_stela_net(cpu, memory, now);
-                    usb
+                    usb.and(self.transfer_apcie(cpu, memory, now))
                 }
             };
             lap.end(&mut self.transfer_times, index + 1);

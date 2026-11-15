@@ -117,6 +117,16 @@
 //! supplied independently; the legacy constructor keeps the single-die
 //! contiguous layout. Unknown banks or hardware capacity are not inferred.
 //!
+//! Edge inputs ([`Aic2::set_edge_inputs`]): the PCIe root complex's MSI
+//! vectors (`msi-vector-offset` .. + `#msi-vectors`; Linux names them
+//! `IRQ_TYPE_EDGE_RISING` in `msi-ranges`) are posted writes, not levels. The
+//! machine's wires are levels, so an MSI is a rise and a fall in one access,
+//! which a level input would lose unless a CPU read the event in between.
+//! Inferred, not documented: the AIC latches each rise of such an input
+//! until the event register returns it (which masks it, as for any IRQ), so
+//! one MSI is one event, and a later rise after the claim is a new one.
+//! `HW_STATE` still reads the line's level. No other input is edge.
+//!
 //! Physical lifecycle is checked independently of CONFIG.ENABLE. Retained
 //! clock/quiesce pauses require delivery disabled and all timestamp slots
 //! disarmed: capture/wake behavior while the physical clock is stopped is
@@ -244,6 +254,10 @@ pub struct Aic2 {
     irq_cfg: Vec<u32>,
     software: Vec<u32>,
     hardware: Vec<u32>,
+    /// Inputs latched on a rise ([`Self::set_edge_inputs`]), and the rises
+    /// latched and not yet claimed by an event read.
+    edge: Vec<u32>,
+    latched: Vec<u32>,
     mask: Vec<u32>,
     irq_level: u64,
     /// The CPUs whose SIQ_CFG_EL1 refuses IRQs ([`Aic2::steer`]).
@@ -351,6 +365,8 @@ impl Aic2 {
             irq_cfg: vec![0; interrupts],
             software: vec![0; words],
             hardware: vec![0; words],
+            edge: vec![0; words],
+            latched: vec![0; words],
             mask: vec![u32::MAX; words],
             irq_level: 0,
             refusing: 0,
@@ -405,12 +421,34 @@ impl Aic2 {
                 }
             }
         }
+        if asserted && self.edge[word] & bit != 0 && self.hardware[word] & bit == 0 {
+            self.latched[word] |= bit;
+        }
         if asserted {
             self.hardware[word] |= bit;
         } else {
             self.hardware[word] &= !bit;
         }
         self.update(access);
+        Ok(())
+    }
+
+    /// Make `count` inputs from `first` edge inputs: each rise is latched
+    /// until an event read claims it, and the level itself raises nothing
+    /// (the PCIe root complex's MSI vectors; module documentation). Refused,
+    /// changing nothing, when an input is outside the controller.
+    pub fn set_edge_inputs(&mut self, first: AicInput, count: u16) -> Result<(), Aic2Error> {
+        let first = AicInput::from_vector(first.vector(self.config.max_irq), self.config.max_irq)
+            .ok_or(Aic2Error::UnknownInput(first))?;
+        let last = u32::from(first.irq) + u32::from(count);
+        if usize::from(first.die) >= self.layout.dies.len() || last > u32::from(self.config.nr_irq)
+        {
+            return Err(Aic2Error::UnknownInput(first));
+        }
+        for irq in first.irq..first.irq + count {
+            let (word, bit) = position(self.input_index(AicInput::new(first.die, irq)));
+            self.edge[word] |= bit;
+        }
         Ok(())
     }
     /// Applies the ADT `aic-ext-intr-cfg` property as iBoot does: triples of
@@ -507,7 +545,8 @@ impl Aic2 {
             .zip(&self.mask)
             .enumerate()
             .find_map(|(word, ((software, hardware), mask))| {
-                let pending = (software | hardware) & !mask;
+                let level = hardware & !self.edge[word] | self.latched[word];
+                let pending = (software | level) & !mask;
                 (pending != 0).then(|| word * 32 + pending.trailing_zeros() as usize)
             })
     }
@@ -655,6 +694,7 @@ impl Aic2 {
                         }
                         let (word, bit) = position(irq);
                         self.mask[word] |= bit;
+                        self.latched[word] &= !bit;
                         let die = irq / usize::from(self.config.max_irq);
                         let local = irq % usize::from(self.config.max_irq);
                         EVENT_TYPE_IRQ | (die as u32) << INFO_DIE_SHIFT | local as u32

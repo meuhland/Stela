@@ -105,6 +105,7 @@ mod tests {
 
     fn dart(mapper: u32) -> Iommu {
         Iommu {
+            phandle: None,
             profile: crate::dart::Profile::T8110,
             instances: alloc::vec![DartInstance {
                 physical: 0x20000,

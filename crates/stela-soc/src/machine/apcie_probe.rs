@@ -17,8 +17,11 @@ impl AppleDevices {
     /// smallest window holding it. A run another model already owns (the
     /// PMGR eFuses, `reg[5]`, are the always-on fuse block's) falls back to
     /// its free windows one by one; an untranslated window stays as it is.
+    /// With the root-complex model, `dart` is the modeled port's DART (its
+    /// `function-dart_self`), through which its endpoint's DMA translates,
+    /// and the complex's MSI vectors become edge inputs of the AIC.
     /// Returns the `APCIE PROBE` description of what the guest is shown.
-    pub fn add_apcie_probe(&mut self, apcie: &Apcie) -> Result<String> {
+    pub fn add_apcie_probe(&mut self, apcie: &Apcie, dart: Option<DartId>) -> Result<String> {
         let mut ports: Vec<u8> = apcie
             .ports
             .iter()
@@ -67,11 +70,35 @@ impl AppleDevices {
                 .and_then(|&irq| u16::try_from(irq).ok())
                 .map(|irq| AicInput::new(0, irq));
             probe = probe.with_model(port as usize, irq, &memory);
+            let mut msi = String::from("none");
+            if let Some(vectors) = apcie.msi
+                && probe.modeled_port().is_some()
+            {
+                probe = probe.with_msi(vectors.offset);
+                let edge = u16::try_from(vectors.offset)
+                    .ok()
+                    .zip(u16::try_from(vectors.vectors).ok())
+                    .ok_or_else(|| String::from("vectors outside the AIC"))
+                    .and_then(|(first, count)| {
+                        self.set_edge_inputs(AicInput::new(0, first), count)
+                    });
+                msi = format!(
+                    "aic {}+{} doorbell {:#x}{}",
+                    vectors.offset,
+                    vectors.vectors,
+                    vectors.address,
+                    match edge {
+                        Ok(()) => String::new(),
+                        Err(why) => format!(" (not edge: {why})"),
+                    }
+                );
+            }
             let _ = write!(
                 model,
-                " model=port{port}(aic {}, memory windows {}{})",
+                " model=port{port}(aic {}, memory windows {}, dart {}, msi {msi}{})",
                 irq.map_or(-1, |irq| i64::from(irq.irq)),
                 memory.len(),
+                dart.map_or_else(|| String::from("none"), |dart| format!("{:?}", dart.0)),
                 if probe.modeled_port().is_some() {
                     ""
                 } else {
@@ -81,6 +108,9 @@ impl AppleDevices {
         }
         let modeled = probe.modeled_port().is_some();
         let device = self.bus.add(Box::new(probe));
+        if modeled {
+            self.apcie_masters.push((device, dart.map(|dart| dart.0)));
+        }
         // Runs of overlapping windows, by start.
         let mut sorted = windows.clone();
         sorted.sort_by_key(|&(_, physical, _)| physical);
@@ -192,12 +222,65 @@ impl AppleDevices {
     }
 }
 
+impl AppleDevices {
+    /// Make `count` AIC inputs from `first` edge inputs (the complex's MSI
+    /// vectors, `crate::aic`); why not, when it cannot.
+    fn set_edge_inputs(&mut self, first: AicInput, count: u16) -> core::result::Result<(), String> {
+        match self.aic {
+            Some(Controller::V2(id)) => self
+                .bus
+                .device_mut::<Aic2>(id)
+                .ok_or_else(|| String::from("the AIC id names no AICv2"))?
+                .set_edge_inputs(first, count)
+                .map_err(|error| format!("{error:?}")),
+            Some(Controller::V1(_)) => Err(String::from("AICv1 edge inputs are not modeled")),
+            None => Err(String::from("no AIC is mapped")),
+        }
+    }
+
+    /// Each modeled root port's upstream step: its endpoint's DMA through
+    /// the port's DART and its MSIs, when the endpoint has work. A refused
+    /// transfer is the endpoint's status, never the machine's error.
+    pub(super) fn transfer_apcie(
+        &mut self,
+        cpu: usize,
+        memory: &mut dyn Memory,
+        now: u64,
+    ) -> core::result::Result<(), DeviceError> {
+        for index in 0..self.apcie_masters.len() {
+            let (probe, dart) = self.apcie_masters[index];
+            if !self
+                .bus
+                .device::<ApcieProbe>(probe)
+                .is_some_and(ApcieProbe::dma_pending)
+            {
+                continue;
+            }
+            let mut access = Access::new(cpu, now, &mut self.latch);
+            match dart {
+                Some(dart) => {
+                    if let Some((probe, dart)) = self.bus.pair_mut::<ApcieProbe, Dart>(probe, dart)
+                    {
+                        probe.run_dma(Some(dart), memory, &mut access);
+                    }
+                }
+                None => {
+                    if let Some(probe) = self.bus.device_mut::<ApcieProbe>(probe) {
+                        probe.run_dma(None, memory, &mut access);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::apcie::link;
     use stela_engine::machine::engine::Devices as _;
-    use stela_soc_data::board::apcie_probe::{ApcieMemory, ApciePort, ApcieWindow};
+    use stela_soc_data::board::apcie_probe::{ApcieMemory, ApcieMsi, ApciePort, ApcieWindow};
 
     const FUSES: u64 = 0x2_3d2b_c000;
 
@@ -235,8 +318,10 @@ mod tests {
             first_bus: 0,
             memory: vec![],
             model: None,
+            dart: None,
+            msi: None,
         };
-        let line = devices.add_apcie_probe(&apcie).unwrap();
+        let line = devices.add_apcie_probe(&apcie, None).unwrap();
         assert!(line.starts_with("APCIE PROBE nodes=/arm-io/apcie windows=7"));
         assert!(line.contains("rc=0x680000000+0x4000"), "{line}");
         assert!(line.contains("axi2af(untranslated)"), "{line}");
@@ -269,8 +354,10 @@ mod tests {
             first_bus: 0,
             memory: vec![],
             model: None,
+            dart: None,
+            msi: None,
         };
-        let line = devices.add_apcie_probe(&apcie).unwrap();
+        let line = devices.add_apcie_probe(&apcie, None).unwrap();
         assert!(
             line.contains("phy/phy-glue0/phy-ip=0x680084000+0x60000"),
             "{line}"
@@ -305,10 +392,19 @@ mod tests {
                 prefetchable: false,
             }],
             model: Some(0),
+            dart: None,
+            msi: Some(ApcieMsi {
+                address: 0xffff_f000,
+                vectors: 32,
+                offset: 896,
+            }),
         };
-        let line = devices.add_apcie_probe(&apcie).unwrap();
+        let line = devices.add_apcie_probe(&apcie, None).unwrap();
         assert!(
-            line.contains("model=port0(aic 781, memory windows 1)"),
+            line.contains(
+                "model=port0(aic 781, memory windows 1, dart none, msi aic 896+32 \
+                 doorbell 0xfffff000 (not edge: no AIC is mapped))"
+            ),
             "{line}"
         );
         assert!(

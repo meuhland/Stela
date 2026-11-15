@@ -717,6 +717,7 @@ fn a_board_places_its_darts_and_the_aes_engine_behind_one() {
     assert_eq!(
         found.darts,
         [Iommu {
+            phandle: None,
             profile: crate::dart::Profile::T8110,
             instances: vec![DartInstance {
                 physical: 0x2_3500_4000,

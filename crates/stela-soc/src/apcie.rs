@@ -45,7 +45,11 @@
 //! With the root-complex model (`--apcie`, [`ApcieProbe::with_model`]) one
 //! port is a real one ([`link`]): its link trains, its interrupt reaches the
 //! AIC, and an endpoint answers on its secondary bus, with a RAM-backed BAR
-//! in the complex's memory window. The other ports stay as above.
+//! in the complex's memory window. The other ports stay as above. The
+//! endpoint's DMA goes upstream by its requester ID through the port's
+//! RID2SID table to the port's DART stream, and its MSIs to the port's
+//! doorbell become AIC inputs ([`dma`]); the machine runs that step when the
+//! endpoint has work ([`ApcieProbe::dma_pending`], [`ApcieProbe::run_dma`]).
 //!
 //! No access is ever refused: a probe must not stop the machine. Each access
 //! is logged as one `APCIE` line (the guest PC is not known at the device
@@ -55,15 +59,17 @@
 //! log stops at [`LINE_CAP`] lines; a per-register table (`APCIE SUMMARY`)
 //! follows every [`BEAT_SECONDS`] while anything changed, when a port is
 //! disabled and when the cap is reached.
-use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::String, vec::Vec};
 use core::fmt;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use stela_contracts::Refusal;
 use stela_contracts::bus::{Access, Lifecycle, LifecycleState, MmioDevice, MmioError, Width};
 use stela_contracts::interrupt::{AicInput, Wire};
 
+pub mod dma;
 pub mod link;
 use link::{Endpoint, Training};
+use stela_contracts::dma::{Iommu, Memory};
 
 const NAME: &str = "apcie-probe";
 /// Most `APCIE LINK`/`ENUM` model events a boot prints; they are never
@@ -369,6 +375,8 @@ struct Model {
     endpoint: Endpoint,
     /// Each PCI memory window: guest PA, bytes, PCI address.
     memory: Vec<(u64, u64, u64)>,
+    /// The AIC input of the complex's MSI vector 0 (`msi-vector-offset`).
+    msi_offset: Option<u32>,
     events: u32,
 }
 
@@ -436,9 +444,113 @@ impl ApcieProbe {
             training: Training::Down,
             endpoint: Endpoint::new(),
             memory: memory.to_vec(),
+            msi_offset: None,
             events: 0,
         });
         self
+    }
+
+    /// The complex's MSI vector 0 is AIC input `offset` (`msi-vector-offset`):
+    /// the modeled port's MSIs reach the AIC from there.
+    pub fn with_msi(mut self, offset: u32) -> Self {
+        if let Some(model) = &mut self.model {
+            model.msi_offset = Some(offset);
+        }
+        self
+    }
+
+    /// Whether the modeled port's endpoint has upstream work (DMA, MSI) for
+    /// [`Self::run_dma`]: only while its link is up.
+    pub fn dma_pending(&self) -> bool {
+        self.model.as_ref().is_some_and(|model| {
+            model.training == Training::Up && model.endpoint.selftest_pending()
+        })
+    }
+
+    /// The modeled port's requester ID for its endpoint: the secondary bus,
+    /// device 0, function 0.
+    fn requester(&self, port: usize) -> u16 {
+        self.ports
+            .iter()
+            .find(|root| usize::from(root.device) == port)
+            .map_or(0, |root| u16::from(root.secondary()) << 8)
+    }
+
+    /// Run the endpoint's upstream work through `iommu`, the port's DART
+    /// (or none), into `memory`. Never refuses: what the path refused is the
+    /// endpoint's status and an `APCIE DMA` line.
+    pub fn run_dma<'a, 'b>(
+        &mut self,
+        iommu: Option<&'a mut dyn Iommu>,
+        memory: &'a mut dyn Memory,
+        access: &'a mut Access<'b>,
+    ) {
+        if !self.dma_pending() {
+            return;
+        }
+        let Some(port) = self.modeled_port() else {
+            return;
+        };
+        let window = Window::Port(port);
+        let rid2sid: Vec<u32> = (0..dma::RID2SID_ENTRIES)
+            .map(|index| self.stored(window, dma::RID2SID + 4 * index as u64))
+            .collect();
+        let msi = dma::MsiWindow::of(
+            self.stored(window, dma::MSICFG),
+            self.stored(window, dma::MSIBASE),
+            self.stored(window, dma::MSIADDR),
+        );
+        let rid = self.requester(port);
+        let forwarding = self
+            .ports
+            .iter()
+            .find(|root| usize::from(root.device) == port)
+            .is_some_and(|root| root.stored(0x04, 2) & 4 != 0);
+        let Some(model) = self.model.as_mut() else {
+            return;
+        };
+        let test = model.endpoint.take_selftest();
+        let mut upstream = dma::Upstream {
+            rid2sid,
+            msi,
+            msi_offset: model.msi_offset,
+            forwarding: forwarding && model.endpoint.bus_master(),
+            iommu,
+            memory,
+            access,
+            signalled: Vec::new(),
+        };
+        let result = dma::run_selftest(&mut model.endpoint, rid, &mut upstream);
+        let sid = dma::sid_for(&upstream.rid2sid, rid);
+        let signalled = core::mem::take(&mut upstream.signalled);
+        drop(upstream);
+        let name = self.name.clone();
+        if let Some(test) = test {
+            self.event(format_args!(
+                "APCIE DMA {name} port{port} rid {rid:#06x} sid {} selftest {} iova={:#x} \
+                 len={:#x}: {}{}\n",
+                sid.map_or(-1, |sid| sid as i64),
+                if test.command == dma::COMMAND_WRITE {
+                    "write"
+                } else {
+                    "read"
+                },
+                test.iova,
+                test.length,
+                match &result {
+                    Ok(()) => String::from("ok"),
+                    Err(refused) => format!("refused {refused:?}"),
+                },
+                signalled
+                    .iter()
+                    .map(|msi| format!(
+                        "; MSI vector {} aic {}",
+                        msi.vector,
+                        msi.input.map_or(-1, |input| i64::from(input.irq))
+                    ))
+                    .collect::<String>()
+            ));
+        }
     }
 
     /// The modeled port, if any.
@@ -670,8 +782,25 @@ impl ApcieProbe {
             return;
         };
         let before = (endpoint.bar_register(), endpoint.command());
+        let msi_before = endpoint.msi_message();
         endpoint.write(register, bytes as usize, value);
         let after = (endpoint.bar_register(), endpoint.command());
+        let msi_after = endpoint.msi_message();
+        if msi_before != msi_after {
+            let name = self.name.clone();
+            let (bus, ..) = ecam(offset);
+            let offset = self.model.as_ref().and_then(|model| model.msi_offset);
+            match msi_after {
+                Some((address, data)) => self.event(format_args!(
+                    "APCIE ENUM {name} [{bus:02x}:00.0] endpoint MSI on: address={address:#x} \
+                     data={data:#x} (aic {})\n",
+                    offset.map_or(-1, |offset| i64::from(offset + data))
+                )),
+                None => self.event(format_args!(
+                    "APCIE ENUM {name} [{bus:02x}:00.0] endpoint MSI off\n"
+                )),
+            }
+        }
         // Sizing (all ones) is not an assignment worth a line.
         if before != after && after.0 != 0xffff_f000 {
             let name = self.name.clone();
@@ -747,6 +876,20 @@ impl ApcieProbe {
                         link::TRAINING_TICKS / 24_000
                     ));
                 }
+            }
+            offset
+                if (dma::RID2SID..dma::RID2SID + 4 * dma::RID2SID_ENTRIES as u64)
+                    .contains(&offset)
+                    && stored != next =>
+            {
+                let name = self.name.clone();
+                self.event(format_args!(
+                    "APCIE DART {name} port{port} RID2SID[{}] = {next:#010x}: rid {:#06x} sid {} {}\n",
+                    (offset - dma::RID2SID) / 4,
+                    next & 0xffff,
+                    next >> 16 & 0xf,
+                    if next >> 31 != 0 { "valid" } else { "invalid" }
+                ));
             }
             0x80 if fell => self.link_down("LTSSM stopped"),
             0x800 if fell => self.link_down("APPCLK off"),
