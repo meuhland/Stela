@@ -203,6 +203,16 @@ impl Prepared {
             },
         }
     }
+    /// How far behind the last sample a read on another processor may be:
+    /// that processor's TSC may trail by a few cycles, which is far below
+    /// this (about 19 us at 3.5 GHz). The HPET is one counter for every
+    /// processor, so any read behind it is corrupt.
+    pub(super) fn skew(&self) -> u64 {
+        match self {
+            Self::Hpet(_) => 0,
+            Self::Tsc(_) => 1 << 16,
+        }
+    }
     pub(super) fn delta(&self, previous: u64, current: u64) -> Result<u64, WorkError> {
         match self {
             Self::Hpet(_) | Self::Tsc(_) => {
