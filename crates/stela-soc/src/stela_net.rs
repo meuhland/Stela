@@ -14,6 +14,12 @@
 //! used entries (`VIRTIO_F_EVENT_IDX`), and holds it until the guest
 //! acknowledges every cause. A ring that breaks the format stops the device
 //! with `CAUSE_ERROR` instead of stopping the machine.
+//!
+//! With `MRG_RXBUF` a frame takes as many posted receive buffers as it
+//! needs, `num_buffers` in its header naming them; with `GUEST_TSO4`/`6` as
+//! well, in-order TCP segments of one flow that wait together are joined
+//! into one frame ([`offload::Coalesced`]), so the guest's stack handles one
+//! segment where the wire carried dozens.
 pub mod offload;
 pub mod queue;
 #[cfg(test)]
@@ -42,8 +48,8 @@ const DEFAULT_FILTER: u64 = FILTER_DIRECTED | FILTER_BROADCAST | FILTER_ALL_MULT
 pub struct Net {
     irq: AicInput,
     mac: [u8; 6],
-    /// `FEATURES`: [`features::OFFERED`], with [`features::CHECKSUMS`] when
-    /// the boot offers them.
+    /// `FEATURES`: [`features::OFFERED`], with [`features::CHECKSUMS`] and
+    /// [`features::COALESCING`] as the boot offers them.
     offered: u64,
     accepted: u64,
     control: u64,
@@ -85,6 +91,43 @@ pub struct Net {
     /// The IPv4 address the guest last claimed as an ARP sender, for the
     /// boot log: how a run finds a guest whose address DHCP chose.
     address: Option<[u8; 4]>,
+    /// A frame for the guest, its header made, that found too few posted
+    /// buffers: it goes before the inbound queue once the guest posts more.
+    held: Option<Held>,
+    /// Storage for the next coalesced frame, from the last one placed.
+    coalesce_spare: Option<Vec<u8>>,
+    /// The chains a merged frame is placed in, kept for the next.
+    chains: Vec<queue::Chain>,
+    stats: Stats,
+}
+
+/// A frame waiting for receive buffers, as [`Net::receive`] left it.
+struct Held {
+    frame: Vec<u8>,
+    header: [u8; HEADER_BYTES as usize],
+    /// The frames from the host it carries.
+    segments: u32,
+}
+
+/// What the device did for the guest, for the boot log: how often the
+/// guest was interrupted and kicked for how many frames, and how many
+/// frames receive coalescing spared its stack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Times the line rose: interrupts the guest took.
+    pub interrupts: u64,
+    /// Receive publishes the guest asked to hear of (`CAUSE_RX`).
+    pub rx_signals: u64,
+    /// Transmit completions the guest asked to hear of (`CAUSE_TX`).
+    pub tx_signals: u64,
+    /// `KICK` writes: each a guest MMIO store.
+    pub kicks: u64,
+    /// Frames the guest received, each perhaps several from the host.
+    pub rx_frames: u64,
+    /// Frames that joined more than one TCP segment, and the segments
+    /// they joined.
+    pub coalesced: u64,
+    pub coalesced_segments: u64,
 }
 
 impl Net {
@@ -123,7 +166,16 @@ impl Net {
             link: true,
             link_changed: false,
             address: None,
+            held: None,
+            coalesce_spare: None,
+            chains: Vec::new(),
+            stats: Stats::default(),
         }
+    }
+
+    /// What the device did for the guest so far.
+    pub fn stats(&self) -> Stats {
+        self.stats
     }
 
     /// The host adapter's carrier: `LINK` follows it, and a running device
@@ -209,6 +261,9 @@ impl Net {
         if self.spare.len() < 8 && frame.capacity() <= 2 * FRAME_MAX as usize {
             frame.clear();
             self.spare.push(frame);
+        } else if frame.capacity() >= offload::COALESCED_FRAME_MAX && self.coalesce_spare.is_none()
+        {
+            self.coalesce_spare = Some(frame);
         }
     }
 
@@ -226,7 +281,7 @@ impl Net {
             && (self.kicked != 0
                 || !self.checked
                 || self.link_changed
-                || !self.inbound.is_empty() && !self.starved
+                || (self.held.is_some() || !self.inbound.is_empty()) && !self.starved
                 || self.blocked && self.outbound.len() < QUEUE_FRAMES)
     }
 
@@ -240,6 +295,7 @@ impl Net {
         self.starved = false;
         self.blocked = false;
         self.inbound.clear();
+        self.held = None;
     }
 
     /// Stops the device for `why` and raises `CAUSE_ERROR`.
@@ -250,6 +306,9 @@ impl Net {
     }
 
     fn raise(&mut self, cause: u64, access: &mut Access<'_>) {
+        if self.cause == 0 {
+            self.stats.interrupts += 1;
+        }
         self.cause |= cause;
         access.interrupts.set_level(Wire::Aic(self.irq), true);
     }
@@ -394,14 +453,17 @@ impl Net {
             self.blocked = tx.pending(memory)? != 0;
         }
         if tx.publish(memory, event_idx)? {
+            self.stats.tx_signals += 1;
             self.raise(CAUSE_TX, access);
         }
         Ok(())
     }
 
     /// Copies frames for the guest into the receive buffers it posted, each
-    /// after a `virtio_net_hdr_v1` naming one buffer. A frame that fits no
-    /// posted buffer is dropped and the buffer kept.
+    /// after a `virtio_net_hdr_v1`: one buffer per frame, or with
+    /// `MRG_RXBUF` as many as it needs. A frame that fits no posted buffer,
+    /// or not the whole ring's, is dropped and the buffers kept; one that
+    /// finds too few posted waits for the guest's next receive kick.
     fn receive(
         &mut self,
         rx: &mut Queue,
@@ -409,14 +471,185 @@ impl Net {
         access: &mut Access<'_>,
     ) -> Result<(), RingError> {
         let event_idx = self.event_idx();
+        let merged = self.accepted & features::MRG_RXBUF != 0;
         let mut moved = 0;
         while moved < STEP_FRAMES {
-            let Some(frame) = self.inbound.pop_front() else {
-                break;
+            let next = match self.held.take() {
+                Some(held) => held,
+                None => match self.inbound.pop_front() {
+                    Some(frame) => self.prepare(frame),
+                    None => break,
+                },
             };
+            let placed = if merged {
+                self.place_merged(rx, memory, next.header, &next.frame)?
+            } else {
+                Self::place_single(rx, memory, &next.header, &next.frame)?
+            };
+            let segments = u64::from(next.segments);
+            match placed {
+                Placed::Written => {
+                    self.counters.to_guest += segments;
+                    self.stats.rx_frames += 1;
+                    if segments > 1 {
+                        self.stats.coalesced += 1;
+                        self.stats.coalesced_segments += segments;
+                    }
+                    moved += 1;
+                }
+                Placed::NoRoom => {
+                    self.held = Some(next);
+                    self.starved = true;
+                    break;
+                }
+                Placed::TooLong => {
+                    self.counters.oversized += segments;
+                    self.rx_drops += segments;
+                }
+            }
+            self.recycle(next.frame);
+        }
+        if event_idx {
+            if self.starved {
+                // Buffers posted since the ring was last read, too few or
+                // none, are not enough; the next ones are announced. Any
+                // posted before the driver could see that are looked at
+                // again without a kick.
+                if rx.want_kick_past_seen(memory)? {
+                    self.starved = false;
+                }
+            } else {
+                rx.no_kick(memory)?;
+            }
+        }
+        if rx.publish(memory, event_idx)? {
+            self.stats.rx_signals += 1;
+            self.raise(CAUSE_RX, access);
+        }
+        Ok(())
+    }
+
+    /// Whether the guest takes coalesced TCP segments over `ethertype`:
+    /// with their checksums vouched for and room to span buffers.
+    fn coalesces(&self, ethertype: [u8; 2]) -> bool {
+        let family = match u16::from_be_bytes(ethertype) {
+            0x0800 => features::GUEST_TSO4,
+            0x86dd => features::GUEST_TSO6,
+            _ => return false,
+        };
+        let needed = family | features::GUEST_CSUM | features::MRG_RXBUF;
+        self.accepted & needed == needed
+    }
+
+    /// The header for `frame`, which the inbound queue gave up: its
+    /// checksums vouched for when the host verified them and, when the
+    /// guest takes coalesced segments, the frame joined with the inbound
+    /// frames that continue its TCP flow.
+    fn prepare(&mut self, frame: Vec<u8>) -> Held {
+        let mut header = [0u8; HEADER_BYTES as usize];
+        // num_buffers: one, unless placing the frame says otherwise.
+        header[10..12].copy_from_slice(&1u16.to_le_bytes());
+        let alone = |frame, header| Held {
+            frame,
+            header,
+            segments: 1,
+        };
+        if self.accepted & features::GUEST_CSUM == 0 || !offload::verified(&frame) {
+            return alone(frame, header);
+        }
+        header[0] = offload::DATA_VALID;
+        if !self.coalesces([frame[12], frame[13]]) {
+            return alone(frame, header);
+        }
+        let run = match offload::Coalesced::start(frame) {
+            Ok(run) => run,
+            Err(frame) => return alone(frame, header),
+        };
+        // Only a run the next frame continues is copied into storage that
+        // holds a whole run.
+        let continued = |run: &offload::Coalesced, next: Option<&Vec<u8>>| {
+            next.is_some_and(|next| run.takes(next) && offload::verified(next))
+        };
+        if !continued(&run, self.inbound.front()) {
+            return alone(run.finish().0, header);
+        }
+        let (first, _) = run.finish();
+        let mut storage = self.coalesce_spare.take().unwrap_or_default();
+        storage.clear();
+        storage.reserve(offload::COALESCED_FRAME_MAX);
+        storage.extend_from_slice(&first);
+        self.recycle(first);
+        let Ok(mut run) = offload::Coalesced::start(storage) else {
+            unreachable!("the segment started a run before");
+        };
+        // The first continuation is verified already.
+        let mut verified = true;
+        while let Some(next) = self.inbound.front() {
+            if !verified && !continued(&run, Some(next)) {
+                break;
+            }
+            verified = false;
+            let next = self.inbound.pop_front().unwrap();
+            run.append(&next);
+            self.recycle(next);
+        }
+        let segments = run.segments();
+        let (frame, gso) = run.finish();
+        if let Some(gso) = gso {
+            header[1] = gso.gso_type;
+            header[2..4].copy_from_slice(&gso.hdr_len.to_le_bytes());
+            header[4..6].copy_from_slice(&gso.gso_size.to_le_bytes());
+        }
+        Held {
+            frame,
+            header,
+            segments,
+        }
+    }
+
+    /// Writes the frame after its header into the next posted chain.
+    fn place_single(
+        rx: &mut Queue,
+        memory: &mut dyn Memory,
+        header: &[u8; HEADER_BYTES as usize],
+        frame: &[u8],
+    ) -> Result<Placed, RingError> {
+        let Some(chain) = rx.pop(memory)? else {
+            return Ok(Placed::NoRoom);
+        };
+        if !chain.all(true) {
+            return Err(RingError::Malformed(
+                "a receive buffer the device may not write",
+            ));
+        }
+        let length = HEADER_BYTES + frame.len() as u64;
+        if chain.bytes() < length {
+            rx.unpop(1);
+            return Ok(Placed::TooLong);
+        }
+        chain.write(memory, 0, header)?;
+        chain.write(memory, HEADER_BYTES, frame)?;
+        rx.push_used(memory, chain.head, length as u32)?;
+        Ok(Placed::Written)
+    }
+
+    /// Writes the header and the frame over as many posted chains as they
+    /// fill (`MRG_RXBUF`), `num_buffers` naming them, each with a used
+    /// entry of the bytes it got; the chains all go back while too few are
+    /// posted.
+    fn place_merged(
+        &mut self,
+        rx: &mut Queue,
+        memory: &mut dyn Memory,
+        mut header: [u8; HEADER_BYTES as usize],
+        frame: &[u8],
+    ) -> Result<Placed, RingError> {
+        let length = HEADER_BYTES as usize + frame.len();
+        let mut chains = core::mem::take(&mut self.chains);
+        chains.clear();
+        let mut room = 0;
+        while room < length {
             let Some(chain) = rx.pop(memory)? else {
-                self.inbound.push_front(frame);
-                self.starved = true;
                 break;
             };
             if !chain.all(true) {
@@ -424,39 +657,50 @@ impl Net {
                     "a receive buffer the device may not write",
                 ));
             }
-            let length = HEADER_BYTES + frame.len() as u64;
-            if chain.bytes() < length {
-                rx.unpop();
-                self.counters.oversized += 1;
-                self.rx_drops += 1;
-                self.recycle(frame);
-                continue;
-            }
-            let mut header = [0u8; HEADER_BYTES as usize];
-            if self.accepted & features::GUEST_CSUM != 0 && offload::verified(&frame) {
-                header[0] = offload::DATA_VALID;
-            }
-            // num_buffers: one buffer holds the frame.
-            header[10..12].copy_from_slice(&1u16.to_le_bytes());
-            chain.write(memory, 0, &header)?;
-            chain.write(memory, HEADER_BYTES, &frame)?;
-            rx.push_used(memory, chain.head, length as u32)?;
-            self.counters.to_guest += 1;
-            self.recycle(frame);
-            moved += 1;
+            room += chain.bytes() as usize;
+            chains.push(chain);
         }
-        if event_idx {
-            if self.starved {
-                rx.want_kick(memory)?;
+        let placed = if room < length {
+            rx.unpop(chains.len() as u16);
+            if chains.len() == usize::from(rx.size()) {
+                Placed::TooLong
             } else {
-                rx.no_kick(memory)?;
+                Placed::NoRoom
             }
-        }
-        if rx.publish(memory, event_idx)? {
-            self.raise(CAUSE_RX, access);
-        }
-        Ok(())
+        } else if chains[0].bytes() < HEADER_BYTES {
+            return Err(RingError::Malformed(
+                "a receive buffer shorter than the header",
+            ));
+        } else {
+            header[10..12].copy_from_slice(&(chains.len() as u16).to_le_bytes());
+            let mut offset = 0;
+            for chain in &chains {
+                let take = (chain.bytes() as usize).min(length - offset);
+                let mut written = 0;
+                if offset == 0 {
+                    chain.write(memory, 0, &header)?;
+                    written = header.len();
+                }
+                let start = offset + written - header.len();
+                let end = offset + take - header.len();
+                chain.write(memory, written as u64, &frame[start..end])?;
+                rx.push_used(memory, chain.head, take as u32)?;
+                offset += take;
+            }
+            Placed::Written
+        };
+        self.chains = chains;
+        Ok(placed)
     }
+}
+
+/// What became of a frame [`Net::receive`] tried to place.
+enum Placed {
+    Written,
+    /// Too few buffers are posted: the frame waits.
+    NoRoom,
+    /// No posted buffer, or not the whole ring's, holds it: dropped.
+    TooLong,
 }
 
 /// The sender's IPv4 address of an Ethernet ARP frame from `mac` (request,
@@ -579,7 +823,10 @@ impl MmioDevice for Net {
                 1 => self.enable(access),
                 _ => return Err(refused("ENABLE takes 0 or 1")),
             },
-            KICK => self.kicked |= value & (KICK_TX | KICK_RX),
+            KICK => {
+                self.stats.kicks += 1;
+                self.kicked |= value & (KICK_TX | KICK_RX);
+            }
             ACK => {
                 self.cause &= !value;
                 if self.cause == 0 {

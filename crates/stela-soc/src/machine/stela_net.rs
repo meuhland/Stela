@@ -7,22 +7,20 @@ use crate::stela_net::Net;
 
 impl AppleDevices {
     /// The StelaNet adapter with station address `mac`, its register page at
-    /// `physical` and its interrupt at `irq`, offering the checksum offloads
-    /// when `checksums` says so. One per board.
+    /// `physical` and its interrupt at `irq`, offering the `offloads`
+    /// (`features::CHECKSUMS`, `features::COALESCING`) on top of what it
+    /// always offers. One per board.
     pub fn add_stela_net(
         &mut self,
         physical: u64,
         mac: Mac,
         irq: AicInput,
-        checksums: bool,
+        offloads: u64,
     ) -> Result<(), String> {
         if self.stela_net.is_some() {
             return Err(String::from("the board has a StelaNet adapter already"));
         }
-        let mut offered = stela_contracts::net::features::OFFERED;
-        if checksums {
-            offered |= stela_contracts::net::features::CHECKSUMS;
-        }
+        let offered = stela_contracts::net::features::OFFERED | offloads;
         let device = self
             .bus
             .add(Box::new(Net::with_features(mac.0, irq, offered)));
@@ -60,6 +58,11 @@ impl AppleDevices {
     /// Whether the board has a StelaNet adapter.
     pub fn has_stela_net(&self) -> bool {
         self.stela_net.is_some()
+    }
+
+    /// What the StelaNet adapter did for the guest, for the boot log.
+    pub fn stela_net_stats(&self) -> Option<crate::stela_net::Stats> {
+        Some(self.stela_net_ref()?.stats())
     }
 
     /// The IPv4 address the guest last claimed through StelaNet (ARP), for
@@ -122,11 +125,11 @@ mod tests {
     fn the_board_network_calls_reach_the_adapter() {
         let mut devices = AppleDevices::for_boot_processor(0);
         devices
-            .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a0), false)
+            .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a0), 0)
             .unwrap();
         assert!(
             devices
-                .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a1), false)
+                .add_stela_net(PAGE, Mac(MAC_ADDRESS), AicInput::new(0, 0x2a1), 0)
                 .is_err()
         );
         assert_eq!(devices.network_status().map(|(up, _)| up), Some(false));

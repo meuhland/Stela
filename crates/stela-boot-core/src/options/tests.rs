@@ -168,12 +168,49 @@ fn setup_lines_parse_and_serialize_identically() {
         stelanet.to_string(),
         format!("{preboot} --guest-network-stelanet")
     );
-    assert!(!stelanet.guest_network_stelanet_csum);
-    let csum = round_trip(&format!("{preboot}-stelanet-csum"));
-    assert!(csum.guest_network && csum.guest_network_stelanet && csum.guest_network_stelanet_csum);
+    // Every offload by default; fewer to compare, each flag alone giving
+    // the adapter. The first name of -no-lro still parses.
     assert_eq!(
-        csum.to_string(),
-        format!("{preboot} --guest-network-stelanet-csum")
+        stelanet.guest_network_stelanet_offloads,
+        StelaNetOffloads::Coalescing
+    );
+    for (suffix, offloads, written) in [
+        (
+            "-stelanet-no-lro",
+            StelaNetOffloads::Checksums,
+            "-stelanet-no-lro",
+        ),
+        (
+            "-stelanet-csum",
+            StelaNetOffloads::Checksums,
+            "-stelanet-no-lro",
+        ),
+        (
+            "-stelanet-no-offload",
+            StelaNetOffloads::None,
+            "-stelanet-no-offload",
+        ),
+        (
+            "-stelanet-no-offload --guest-network-stelanet-no-lro",
+            StelaNetOffloads::None,
+            "-stelanet-no-offload",
+        ),
+    ] {
+        let fewer = round_trip(&format!("{preboot}{suffix}"));
+        assert!(
+            fewer.guest_network && fewer.guest_network_stelanet,
+            "{suffix}"
+        );
+        assert_eq!(fewer.guest_network_stelanet_offloads, offloads, "{suffix}");
+        assert_eq!(
+            fewer.to_string(),
+            format!("{preboot} --guest-network{written}")
+        );
+    }
+    assert_eq!(StelaNetOffloads::None.features(), 0);
+    assert_eq!(
+        StelaNetOffloads::Coalescing.features(),
+        stela_contracts::net::features::CHECKSUMS | stela_contracts::net::features::COALESCING
     );
     let bundle = format!("--system --storage {DISK} --nor {DISK} --bundle \\EFI\\stela\\r");
     assert_eq!(round_trip(&bundle).to_string(), bundle);

@@ -377,13 +377,18 @@ impl Service {
                     frames,
                     devices.network_status(),
                     devices.network_room(),
-                    devices
-                        .has_stela_net()
-                        .then(|| (devices.stela_net_error(), devices.stela_net_address())),
+                    devices.has_stela_net().then(|| {
+                        (
+                            devices.stela_net_error(),
+                            devices.stela_net_address(),
+                            devices.stela_net_stats(),
+                        )
+                    }),
                 )
             });
             network.status(status);
-            if let Some((fault, address)) = stela_net {
+            if let Some((fault, address, stats)) = stela_net {
+                network.stela_net_stats(stats);
                 network.fault(fault);
                 network.address(address);
             }
