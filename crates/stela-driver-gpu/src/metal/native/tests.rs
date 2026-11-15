@@ -56,6 +56,32 @@ fn in_flight_retirement_observes_a_timeline_once_per_ready_run() {
     assert_eq!(queries, [main, sparse_step]);
 }
 
+/// A command buffer's part submitted ahead of a wait ends signaling a
+/// Metal event, whose semaphore the device destroys once that work
+/// completed: retirement must then not query it, as RADV's freed
+/// `vk_sync` faulted the host.
+#[test]
+fn in_flight_retirement_never_queries_a_destroyed_events_semaphore() {
+    let main = vk::Semaphore::from_raw(1);
+    let event = vk::Semaphore::from_raw(7);
+    let flight = |timeline, value| InFlight {
+        timeline,
+        value,
+        buffers: CommandBuffers::One(vk::CommandBuffer::null()),
+    };
+    let mut flights: VecDeque<_> = [flight(event, 5), flight(main, 1), flight(main, 2)].into();
+    InFlight::forget(&mut flights, event);
+    let mut queries = Vec::new();
+    assert_eq!(
+        InFlight::completed_prefix(&flights, |timeline| {
+            queries.push(timeline);
+            Ok(1)
+        }),
+        Ok(2),
+    );
+    assert_eq!(queries, [main], "the destroyed semaphore is not queried");
+}
+
 fn memory() -> crate::metal::vulkan::physical::Memory {
     nvk(Chip::find(0x1b3).unwrap(), 16 << 30).memory
 }

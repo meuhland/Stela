@@ -375,6 +375,9 @@ const RECLAIM_AFTER: usize = 64;
 #[derive(Debug)]
 struct InFlight {
     buffers: CommandBuffers,
+    /// The semaphore its last signal reaches: the queue's completion
+    /// timeline, or for a command buffer's part submitted ahead of a wait,
+    /// a Metal event's. Null once that event's semaphore is destroyed.
     timeline: vk::Semaphore,
     value: u64,
 }
@@ -390,6 +393,10 @@ impl InFlight {
         let mut observed = None;
         let mut ready = 0;
         for entry in flights {
+            if entry.timeline == vk::Semaphore::null() {
+                ready += 1;
+                continue;
+            }
             let value = match observed {
                 Some((timeline, value)) if timeline == entry.timeline => value,
                 _ => {
@@ -404,6 +411,20 @@ impl InFlight {
             ready += 1;
         }
         Ok(ready)
+    }
+
+    /// Forgets `semaphore`, which the Metal device destroys: it does so only
+    /// once the work that signals it completed, so the submissions whose
+    /// last signal it was are finished. Querying a destroyed semaphore is a
+    /// use after free in the driver, and a new semaphore given its handle
+    /// would answer for them.
+    fn forget(flights: &mut VecDeque<Self>, semaphore: vk::Semaphore) {
+        for entry in flights
+            .iter_mut()
+            .filter(|entry| entry.timeline == semaphore)
+        {
+            entry.timeline = vk::Semaphore::null();
+        }
     }
 }
 
@@ -2900,6 +2921,7 @@ impl Backend for NativeBackend {
                 Object::PipelineCache(_) => {}
                 Object::QueryPool(pool) => self.device.destroy_query_pool(handle(pool.0), None),
                 Object::Semaphore(semaphore) => {
+                    InFlight::forget(&mut self.in_flight, handle(semaphore.0));
                     // After the turn when the outside work takes it, as the
                     // destruction is a host kernel call.
                     if let Some(semaphore) = self.outside.defer_destroy(handle(semaphore.0)) {
@@ -3105,7 +3127,10 @@ impl Backend for NativeBackend {
         let ready = self
             .in_flight
             .iter()
-            .take_while(|entry| entry.timeline == timeline && entry.value <= value)
+            .take_while(|entry| {
+                entry.timeline == vk::Semaphore::null()
+                    || entry.timeline == timeline && entry.value <= value
+            })
             .count();
         self.free_completed(ready);
     }
