@@ -867,10 +867,11 @@ impl Methods {
     }
 
     /// The counter at which the display next needs a look: its next
-    /// vblank, while the AP's notification clients listen for it, a swap
-    /// waits for one or the scanout holds work for a later flush.
+    /// vblank, while the AP's notification clients listen for it on a lit
+    /// display ([`Self::vsyncs`]), a swap waits for one or the scanout
+    /// holds work for a later flush.
     pub fn refresh_deadline(&self) -> Option<u64> {
-        let wanted = self.notified
+        let wanted = self.vsyncs()
             || (!self.frames.is_empty() && self.display.borrow().active())
             || self.display.borrow().active() != self.sink_powered
             || self
@@ -912,10 +913,19 @@ impl Methods {
         // The latch takes only what is ready at its vblank.
         self.latched = Some(due);
         self.frame_ready(now);
-        if self.notified {
+        if self.vsyncs() {
             self.refresh = Some(due);
         }
         self.close_window(due);
+    }
+
+    /// Whether a vblank sends its vsync (`D588`): while the AP has a
+    /// notification client and the display is lit. A display powered off or
+    /// asleep runs no timing, so it passes no vblank, as Linux turns a
+    /// disabled CRTC's vblank off (`drm_crtc_vblank_off`); its first vblank
+    /// after the wake or power-on sends one again, on the same grid.
+    fn vsyncs(&self) -> bool {
+        self.notified && self.display.borrow().active()
     }
 
     /// Turn the scanout's monitor off or on as the display's power and sleep
