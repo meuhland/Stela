@@ -2678,6 +2678,91 @@ inlined_thread_reference_takes_no_thread_memory(void)
    }
 }
 
+/* Calls LLVM's inliner keeps even of a function that must inline, which
+ * linked and stitched modules make: a call site's own noinline (of a
+ * [[noinline]] function), a callee whose target CPU and features are not the
+ * caller's (a stitched function has none), and a call that passes numbers
+ * typed otherwise than the definition takes them, of as many bits (a half2
+ * as an i32, a float result as an i32). Each is inlined, and every thread
+ * stores what the function computes. All three were refused as "a function
+ * call was not inlined". */
+static void
+kept_calls_are_inlined(void)
+{
+   static const struct {
+      const char *name, *function, *body;
+   } cases[] = {
+      {"noinline call site",
+       "define internal i32 @add3(i32 %x) noinline {\n%r = add i32 %x, 3\nret i32 %r\n}\n",
+       "%r = call i32 @add3(i32 %tid) noinline\n"
+       "store i32 %r, ptr addrspace(1) %out, align 4\nret void\n"},
+      {"another target",
+       "define internal i32 @add3(i32 %x) \"target-cpu\"=\"apple-gpu\" \"target-features\"=\"+simd\" {\n"
+       "%r = add i32 %x, 3\nret i32 %r\n}\n",
+       "%r = call i32 @add3(i32 %tid)\nstore i32 %r, ptr addrspace(1) %out, align 4\nret void\n"},
+      {"numbers typed otherwise",
+       "define internal i32 @mix(i32 %x, <2 x half> %h) {\n"
+       "%b = bitcast <2 x half> %h to i32\n%r = add i32 %x, %b\nret i32 %r\n}\n",
+       "%f = bitcast i32 %tid to float\n%r = call float @mix(float %f, i32 3)\n"
+       "%i = bitcast float %r to i32\nstore i32 %i, ptr addrspace(1) %out, align 4\nret void\n"},
+   };
+   for (unsigned c = 0; c < ARRAY_SIZE(cases); c++) {
+      for (uint32_t tid = 0; tid < 2; tid++) {
+         LLVMMemoryBufferRef input = stela_air_test_bitcode(cases[c].body, cases[c].function);
+         struct stela_air_error error;
+         nir_shader *nir = translate(input, &test_nir_options, 1000, &error);
+         if (!nir)
+            fprintf(stderr, "kept call, %s: %s\n", cases[c].name, error.detail);
+         CHECK(nir);
+         LLVMDisposeMemoryBuffer(input);
+         specialize_invocation(nir, tid);
+         const uint64_t address = 0x100000;
+         const uint32_t value = tid + 3;
+         check_executed_stores(nir, &address, &value, 1);
+         ralloc_free(nir);
+      }
+   }
+}
+
+/* A call inlining leaves is refused with its callee named, as a definition
+ * or declaration with its inlining attributes (translation made it
+ * alwaysinline), and with why LLVM's inliner kept it: a call of other
+ * arguments than the definition takes, with both types, and a function
+ * that reads variable arguments, which LLVM never inlines. A call through a
+ * pointer no table gave names its type and where the pointer came from. */
+static void
+uninlined_calls_name_their_callee(void)
+{
+   static const struct {
+      const char *function, *body, *detail;
+   } cases[] = {
+      {"define internal i32 @add3(i32 %x) noinline {\n%r = add i32 %x, 3\nret i32 %r\n}\n",
+       "%r = call i32 @add3(i32 %tid, i32 1)\nstore i32 %r, ptr addrspace(1) %out, align 4\nret void\n",
+       "a function call was not inlined: definition @add3 (alwaysinline): called as i32 (i32, i32), "
+       "defined as i32 (i32)"},
+      {"define internal i32 @first(i32 %n, ...) {\n%ap = alloca ptr, align 8\n"
+       "call void @llvm.va_start.p0(ptr %ap)\ncall void @llvm.va_end.p0(ptr %ap)\nret i32 %n\n}\n"
+       "declare void @llvm.va_start.p0(ptr)\ndeclare void @llvm.va_end.p0(ptr)\n",
+       "%r = call i32 (i32, ...) @first(i32 %tid, i32 7)\n"
+       "store i32 %r, ptr addrspace(1) %out, align 4\nret void\n",
+       "a function call was not inlined: definition @first (alwaysinline): it reads variable arguments"},
+      {"", "%a = zext i32 %tid to i64\n%fn = inttoptr i64 %a to ptr addrspace(1)\n"
+           "%r = call addrspace(1) i32 %fn(i32 %tid)\nstore i32 %r, ptr addrspace(1) %out, align 4\n"
+           "ret void\n",
+       "function pointers come only from visible function tables, not this call of i32 (i32) through "
+       "`%fn = inttoptr i64 %a to ptr addrspace(1)`"},
+   };
+   for (unsigned c = 0; c < ARRAY_SIZE(cases); c++) {
+      LLVMMemoryBufferRef input = stela_air_test_bitcode(cases[c].body, cases[c].function);
+      struct stela_air_error error;
+      nir_shader *nir = translate(input, &test_nir_options, 1000, &error);
+      if (nir || error.kind != STELA_AIR_INSTRUCTION || strcmp(error.detail, cases[c].detail))
+         fprintf(stderr, "uninlined call: %u %s\n", error.kind, error.detail);
+      CHECK(!nir && error.kind == STELA_AIR_INSTRUCTION && !strcmp(error.detail, cases[c].detail));
+      LLVMDisposeMemoryBuffer(input);
+   }
+}
+
 /* Thread memory holds only what the function accesses: a dynamically
  * indexed array, and none of the variables structurizing a loop and its
  * branches needs. */
@@ -3114,6 +3199,8 @@ tests(void)
    calls_of_null_buffers_stay_separate();
    calls_of_structs_holding_pointers_stay_separate();
    inlined_thread_reference_takes_no_thread_memory();
+   kept_calls_are_inlined();
+   uninlined_calls_name_their_callee();
    thread_memory_holds_only_accessed_variables();
    struct stela_air_error error;
    LLVMMemoryBufferRef input = stela_air_test_bitcode(stela_air_test_store_body, "");
