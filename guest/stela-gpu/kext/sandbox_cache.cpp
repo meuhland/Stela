@@ -20,6 +20,7 @@
 #include <IOKit/IOLib.h>
 #include <StelaGPU/Interface.h>
 #include <stela/sandbox_patch.h>
+#include <stela/stelanet_job.h>
 #include <sys/errno.h>
 
 /* Exported to kexts, but declared only for the kernel's own builds. */
@@ -366,6 +367,21 @@ stelaDeliverSandboxPatch(vfs_context_t context, char *buffer)
 	}
 	if (error) {
 		IOLog("StelaGPU: installing the sandbox patcher failed: %d\n", error);
+	}
+}
+
+/*
+ * stn0 needs `ipconfig set`, which only a job launchd starts may run: the
+ * patcher is outside the trust cache, so AMFI refuses any platform tool it
+ * would start. launchd loads the job from the boot after it first appears.
+ */
+void
+stelaDeliverStelaNetJob(vfs_context_t context, char *buffer)
+{
+	int error = stage(STELANET_JOB_PATH, stelanet_job, sizeof stelanet_job, stelanet_job_sha256, 0644, context,
+	    buffer);
+	if (error) {
+		IOLog("StelaGPU: installing the StelaNet job failed: %d\n", error);
 	}
 }
 

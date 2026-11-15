@@ -8,3 +8,9 @@
 
 /* Installs the patcher and its job unless they are this build's; reports failure. */
 void stelaDeliverSandboxPatch(vfs_context_t context, char *buffer);
+
+/*
+ * Installs org.stela.StelaNet's launchd job, which configures stn0 when the
+ * boot gives the guest StelaNet and exits otherwise; reports failure.
+ */
+void stelaDeliverStelaNetJob(vfs_context_t context, char *buffer);

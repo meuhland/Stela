@@ -14,10 +14,6 @@
  * write the cache's data vault, to swap the rules in. Anything unexpected
  * leaves the cache as WebKit wrote it.
  *
- * Each run also configures stn0, the StelaNet interface, when the boot gave
- * the guest one (--guest-network-stelanet): see configure_stelanet. Without
- * it the run only finds no stn0.
- *
  * Built without an SDK: the few libSystem and IOKit calls are declared here.
  */
 #include <stddef.h>
@@ -57,10 +53,6 @@ void *dlopen(const char *path, int mode);
 void *dlsym(void *handle, const char *symbol);
 char *dlerror(void);
 extern unsigned int mach_task_self_;
-int posix_spawn(int *pid, const char *path, const void *file_actions, const void *attributes, char *const argv[],
-    char *const envp[]);
-int waitpid(int pid, int *status, int options);
-unsigned int if_nametoindex(const char *name);
 
 /* IOKit */
 typedef unsigned int io_object_t;
@@ -443,72 +435,8 @@ static int is_cache_directory(const char *name)
 	    && strncmp(name + sizeof kPrefix - 1, "Networking", 10) != 0;
 }
 
-/*
- * StelaNet's interface is a plain ifnet, not an IONetworkInterface, so
- * configd offers it as no network service: nothing configures it unless
- * asked. Once per boot, and again after five minutes without a DHCP address
- * (IPConfiguration's own retries continue meanwhile), this asks
- * IPConfiguration for DHCP and IPv6 autoconfiguration on stn0. It logs each
- * request and every address stn0 gets, with its router and DNS servers, to
- * /Library/Logs/org.stela.StelaNet.log; the state file names the boot it
- * belongs to, so a new boot starts over.
- */
-static const char kStelaNetScript[] =
-    "LOG=/Library/Logs/org.stela.StelaNet.log\n"
-    "STATE=/private/var/db/org.stela.StelaNet.state\n"
-    "log() { echo \"$(date '+%Y-%m-%d %H:%M:%S') $*\" >> \"$LOG\"; }\n"
-    "boot=$(sysctl -n kern.boottime | sed 's/^{ sec = \\([0-9]*\\).*/\\1/')\n"
-    "set -- $(cat \"$STATE\" 2>/dev/null)\n"
-    "[ \"$1\" = \"$boot\" ] && [ $# -eq 3 ] || set -- \"$boot\" 0 none\n"
-    "applied=$2\n"
-    "last=$3\n"
-    "now=$(date +%s)\n"
-    "address=$(ipconfig getifaddr stn0 2>/dev/null)\n"
-    "case \"$address\" in\n"
-    "\"\"|169.254.*)\n"
-    "\tif [ \"$applied\" = 0 ] || [ $((now - applied)) -ge 300 ]; then\n"
-    "\t\tlog \"stn0 has no DHCP address${address:+ ($address)}: ipconfig set stn0 DHCP\"\n"
-    "\t\tifconfig stn0 up >> \"$LOG\" 2>&1\n"
-    "\t\tif ipconfig set stn0 DHCP >> \"$LOG\" 2>&1; then\n"
-    "\t\t\tapplied=$now\n"
-    "\t\t\tipconfig set stn0 AUTOMATIC-V6 >> \"$LOG\" 2>&1 || log \"ipconfig set stn0 AUTOMATIC-V6 failed\"\n"
-    "\t\telse\n"
-    "\t\t\tlog \"ipconfig set stn0 DHCP failed: $?\"\n"
-    "\t\tfi\n"
-    "\tfi\n"
-    "\taddress=none\n"
-    "\t;;\n"
-    "esac\n"
-    "if [ \"$address\" != \"$last\" ]; then\n"
-    "\tif [ \"$address\" = none ]; then\n"
-    "\t\tlog \"stn0 lost its address $last\"\n"
-    "\telse\n"
-    "\t\tlog \"stn0 $address router $(ipconfig getoption stn0 router 2>/dev/null)"
-    " dns $(ipconfig getoption stn0 domain_name_server 2>/dev/null)\"\n"
-    "\tfi\n"
-    "fi\n"
-    "echo \"$boot $applied $address\" > \"$STATE\"\n";
-
-/* Configures stn0 when it exists; nothing at all when it does not. */
-static void configure_stelanet(void)
-{
-	if (if_nametoindex("stn0") == 0) {
-		return;
-	}
-	char *argv[] = {"/bin/sh", "-c", (char *)kStelaNetScript, NULL};
-	char *envp[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL};
-	int pid = 0;
-	if (posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, envp) != 0) {
-		printf("stn0: /bin/sh did not start\n");
-		return;
-	}
-	int status = 0;
-	waitpid(pid, &status, 0);
-}
-
 int main(void)
 {
-	configure_stelanet();
 	io_object_t service = IOServiceGetMatchingService(0, IOServiceMatching("StelaGPU"));
 	if (!service) {
 		return 0;
