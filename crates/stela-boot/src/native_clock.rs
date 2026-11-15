@@ -109,6 +109,10 @@ pub(crate) struct RootCpu {
     source: Prepared,
     previous: AtomicU64,
     elapsed: AtomicU64,
+    /// Held while a processor updates the `previous`/`elapsed` pair: the
+    /// boot processor and the one running Linux for it
+    /// (`RootIdentity::affinity`) both sample.
+    sampling: AtomicBool,
     closed: AtomicBool,
     health: source::Health,
 }
@@ -126,31 +130,54 @@ impl RootCpu {
     }
     /// Caller holds local IRQ exclusion. A source fault does not
     /// revoke the time-free CPU identity needed to drain/release resources.
+    /// The pair is updated under [`Self::sampling`], as the processor that
+    /// runs Linux for the boot processor samples too; a read on that
+    /// processor up to `source::Prepared::skew` behind the last sample
+    /// counts one tick (`stela_boot_core::linux_pump::advance`).
     fn sample_ticks(&self) -> Result<u64, WorkError> {
+        use stela_boot_core::linux_pump::{Sample, advance};
         SAMPLES.fetch_add(1, Ordering::Relaxed);
         self.health.check()?;
+        // Held for one counter read and two stores, with IRQs off on every
+        // holder, so a waiter spins at most that long.
+        while self
+            .sampling
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
         let result = (|| {
             // No CPUID here: it is slow on every CPU and exits under a
             // hypervisor. The caller's `affinity` already proved this is the
-            // owning processor (its unique GS record and descriptors), whose
-            // vendor and family cannot change; ARAT matters only to the
-            // timer, and `rearm` checks it before every arm.
+            // owning processor (its unique GS record and descriptors) or
+            // the one running Linux for it, whose vendor and family are the
+            // same; ARAT matters only to the timer, and `rearm` checks it
+            // before every arm.
             // SAFETY: original owner and CPU remain held. Source checks
             // real control/power eligibility around the coherent read.
-            let mut raw = unsafe { self.source.read()? };
+            let raw = unsafe { self.source.read()? };
             let previous = self.previous.load(Ordering::Relaxed);
-            if raw == previous {
-                raw = self.source.progress_after(previous)?;
-            }
-            let elapsed = self
-                .elapsed
-                .load(Ordering::Relaxed)
-                .checked_add(self.source.delta(previous, raw)?)
-                .ok_or(WorkError::Exhausted)?;
+            let elapsed = self.elapsed.load(Ordering::Relaxed);
+            let (raw, delta) = match advance(previous, raw, self.source.skew()) {
+                Sample::Moved { delta } => (raw, delta),
+                Sample::Same => {
+                    let raw = self.source.progress_after(previous)?;
+                    match advance(previous, raw, self.source.skew()) {
+                        Sample::Moved { delta } => (raw, delta),
+                        Sample::Same | Sample::Behind => (previous, 1),
+                        Sample::Corrupt => return Err(WorkError::corrupt()),
+                    }
+                }
+                Sample::Behind => (previous, 1),
+                Sample::Corrupt => return Err(WorkError::corrupt()),
+            };
+            let elapsed = elapsed.checked_add(delta).ok_or(WorkError::Exhausted)?;
             self.previous.store(raw, Ordering::Relaxed);
             self.elapsed.store(elapsed, Ordering::Release);
             Ok(elapsed)
         })();
+        self.sampling.store(false, Ordering::Release);
         result.map_err(|error| self.health.fail(error))
     }
     fn sample(&self) -> Result<u64, WorkError> {
@@ -170,8 +197,10 @@ impl RootCpu {
     }
 }
 // SAFETY: immutable root/CPU witnesses are checked before entry; all mutable
-// clock publication is atomic and serialized by same-CPU IRQ exclusion.
-// The lease prevents HostOwner destruction, and foreign CPU entry is refused.
+// clock publication is atomic, and the sample pair is serialized by
+// `sampling` under IRQ exclusion. The lease prevents HostOwner destruction,
+// and foreign CPU entry is refused but for the one processor running Linux
+// in the boot processor's place (`RootIdentity::move_here`).
 unsafe impl Cpu for RootCpu {
     fn check_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
@@ -807,6 +836,7 @@ impl Installed {
                 source,
                 previous: AtomicU64::new(previous),
                 elapsed: AtomicU64::new(0),
+                sampling: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 health: source::Health::new(),
             });
