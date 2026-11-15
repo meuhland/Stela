@@ -290,14 +290,26 @@ float_shape(LLVMTypeRef type, unsigned *components, unsigned *bits)
    return LLVMGetTypeKind(type) == LLVMFloatTypeKind || LLVMGetTypeKind(type) == LLVMHalfTypeKind;
 }
 
-/* A bfloat's 16 bits, which only conversions and memory read as a number:
- * its arithmetic is refused rather than taken for a half's. */
+/* A bfloat's 16 bits, which conversions, memory and arithmetic read as a
+ * number: its arithmetic is single precision's, never a half's. */
 static bool
 bfloat_shape(LLVMTypeRef type, unsigned *components, unsigned *bits)
 {
    *components = LLVMGetTypeKind(type) == LLVMVectorTypeKind ? LLVMGetVectorSize(type) : 1;
    *bits = 16;
    return stela_air_call_bfloat(type);
+}
+
+/* The operands of bfloat arithmetic: a bfloat scalar or vector, or a
+ * SIMD-group matrix of bfloats, whose arithmetic is its thread elements'. */
+static bool
+bfloat_arithmetic_shape(LLVMTypeRef type, unsigned *components, unsigned *bits)
+{
+   if (stela_air_matrix_type(type, bits)) {
+      *components = 2;
+      return LLVMGetTypeKind(LLVMGetElementType(type)) == LLVMBFloatTypeKind;
+   }
+   return bfloat_shape(type, components, bits);
 }
 
 static bool
@@ -5126,7 +5138,7 @@ call_store(void *translator, LLVMValueRef pointer, nir_def *offset, nir_def *val
 
 /* LLVM's conversions to, from and between half, float and bfloat, which
  * converts through single precision: exactly, but from an integer, which
- * would round twice and is refused. */
+ * `stela_air_int_to_bfloat` rounds once. */
 static bool
 fp_conversion(struct translator *t, LLVMValueRef inst, LLVMOpcode op)
 {
@@ -5136,13 +5148,17 @@ fp_conversion(struct translator *t, LLVMValueRef inst, LLVMOpcode op)
    bool from_float = op != LLVMSIToFP && op != LLVMUIToFP;
    bool to_bfloat = stela_air_call_bfloat(result), from_bfloat = stela_air_call_bfloat(source);
    if (to_bfloat || from_bfloat) {
-      if (to_bfloat && !from_float)
-         return fail(t, STELA_AIR_TYPE, "integer to bfloat conversion");
+      if (to_bfloat && !from_float &&
+          (!shape(source, &source_components, &source_bits) ||
+           !bfloat_shape(result, &components, &bits) || components != source_components))
+         return fail(t, STELA_AIR_TYPE, "unsupported integer to bfloat conversion types");
       if (!fp_environment(t))
          return false;
       nir_def *a = get_value(t, LLVMGetOperand(inst, 0));
       if (!a)
          return false;
+      if (to_bfloat && !from_float)
+         return put_value(t, inst, stela_air_int_to_bfloat(&t->b, a, op == LLVMSIToFP), 0);
       nir_def *single = from_bfloat ? stela_air_bfloat_to_float(&t->b, a) : nir_f2f32(&t->b, a);
       if (to_bfloat)
          return put_value(t, inst, stela_air_float_to_bfloat(&t->b, single), 0);
@@ -7254,6 +7270,15 @@ precise_division(struct translator *t, LLVMValueRef inst, LLVMOpcode op)
    nir_def *a = get_value(t, LLVMGetOperand(inst, 0)), *c = get_value(t, LLVMGetOperand(inst, 1));
    if (!a || !c || !fp_environment(t))
       return false;
+   /* A bfloat quotient or remainder is single precision's, rounded once
+    * more: correctly, as a float has more than twice a bfloat's 8 bits. */
+   unsigned components, bits;
+   if (bfloat_arithmetic_shape(LLVMTypeOf(LLVMGetOperand(inst, 0)), &components, &bits)) {
+      nir_def *value = stela_air_precise(&t->b, op == LLVMFDiv ? stela_air_precise_divide : stela_air_precise_fmod,
+                                         stela_air_bfloat_to_float(&t->b, a),
+                                         stela_air_bfloat_to_float(&t->b, c));
+      return put_value(t, inst, stela_air_float_to_bfloat(&t->b, value), 0);
+   }
    bool narrow = a->bit_size == 16;
    stela_air_precise_function *function =
       op == LLVMFDiv ? (narrow ? stela_air_half_divide : stela_air_precise_divide) :
@@ -7723,8 +7748,17 @@ instruction(struct translator *t, LLVMValueRef inst)
       if (!a)
          return false;
       nir_def *b = get_value(t, LLVMGetOperand(inst, 1));
-      if (!b || !float_shape(LLVMTypeOf(LLVMGetOperand(inst, 0)), &components, &bits))
-         return fail(t, STELA_AIR_TYPE, "only half and float arithmetic/comparison supported");
+      LLVMTypeRef operand = LLVMTypeOf(LLVMGetOperand(inst, 0));
+      bool bfloat = bfloat_arithmetic_shape(operand, &components, &bits);
+      if (!b || (!bfloat && !float_shape(operand, &components, &bits)))
+         return fail(t, STELA_AIR_TYPE, "only half, float and bfloat arithmetic/comparison supported");
+      /* A bfloat's sum, difference and product are single precision's
+       * rounded once more, which is correct, as a float has more than twice
+       * a bfloat's 8 bits; its comparisons are single precision's. */
+      if (bfloat) {
+         a = stela_air_bfloat_to_float(&t->b, a);
+         b = stela_air_bfloat_to_float(&t->b, b);
+      }
       nir_def *value = NULL;
       if (op == LLVMFAdd)
          value = nir_fadd(&t->b, a, b);
@@ -7788,6 +7822,8 @@ instruction(struct translator *t, LLVMValueRef inst)
          default: return fail(t, STELA_AIR_INSTRUCTION, "unknown floating comparison");
          }
       }
+      if (bfloat && op != LLVMFCmp)
+         value = stela_air_float_to_bfloat(&t->b, value);
       return put_value(t, inst, value, 0);
    }
    if (bits == 1 && (op == LLVMAdd || op == LLVMSub || op == LLVMMul ||

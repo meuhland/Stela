@@ -721,13 +721,19 @@ lower(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef ca
       *result = integer_value(b, operation, sign == SIGNED, s);
       return STELA_AIR_CALL_LOWERED;
    }
-   if (!stela_air_call_floating(operand) || type != result_type(operand, operation))
+   /* A bfloat function is its single-precision one, rounded at the end. */
+   bool bfloat = stela_air_call_bfloat(operand);
+   if ((!stela_air_call_floating(operand) && !bfloat) || type != result_type(operand, operation))
       return stela_air_call_fail(c, STELA_AIR_TYPE, "unsupported floating-point function types"), STELA_AIR_CALL_FAILED;
    if ((operation == DFDX || operation == DFDY || operation == FWIDTH) && !c->fragment)
       return stela_air_call_fail(c, STELA_AIR_INSTRUCTION, "derivatives exist only in fragment functions"),
              STELA_AIR_CALL_FAILED;
    if (!c->fp_environment(c->translator) || !operands(c, call, operation, count, s))
       return STELA_AIR_CALL_FAILED;
+   for (unsigned i = 0; bfloat && i < count; i++) {
+      if (s[i] && stela_air_call_bfloat(LLVMTypeOf(LLVMGetOperand(call, i))))
+         s[i] = stela_air_bfloat_to_float(b, s[i]);
+   }
    nir_def *second = NULL;
    bool narrow = s[0]->bit_size == 16 && approximate(operation);
    if (narrow) {
@@ -759,6 +765,11 @@ lower(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef ca
       *result = nir_f2f16(b, *result);
       second = second ? nir_f2f16(b, second) : NULL;
    }
+   /* ilogb's result and frexp's exponents are integers. */
+   if (bfloat && stela_air_call_bfloat(type))
+      *result = stela_air_float_to_bfloat(b, *result);
+   if (bfloat && second && operation == SINCOS)
+      second = stela_air_float_to_bfloat(b, second);
    if (second && !c->store(c->translator, LLVMGetOperand(call, count - 1), NULL, second))
       return STELA_AIR_CALL_FAILED;
    return STELA_AIR_CALL_LOWERED;
@@ -777,7 +788,7 @@ boolean(LLVMTypeRef type)
 /* "air.convert.<to>.<from>": each type is "f." with a float type, or "s."
  * or "u." with an integer type; a bool is "u.i1", true converting to one.
  * A bfloat converts through single precision, exact for every source but an
- * integer, which would round twice and is refused. */
+ * integer, which rounds once through `stela_air_int_to_bfloat`. */
 static enum stela_air_call_status
 convert(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef callee,
         const char *name, size_t bytes, nir_def **result)
@@ -815,14 +826,16 @@ convert(const struct stela_air_call_context *c, LLVMValueRef call, LLVMValueRef 
    if (to_sign < 0)
       return stela_air_call_fail(c, STELA_AIR_INSTRUCTION, "conversion name disagrees with its types"),
              STELA_AIR_CALL_FAILED;
-   if (to_bfloat && !from_float && !from_bool)
-      return stela_air_call_fail(c, STELA_AIR_TYPE, "integer to bfloat conversion"), STELA_AIR_CALL_FAILED;
    if ((to_float || from_float) && !c->fp_environment(c->translator))
       return STELA_AIR_CALL_FAILED;
    nir_def *x = c->operand(c->translator, LLVMGetOperand(call, 0));
    if (!x)
       return STELA_AIR_CALL_FAILED;
    nir_builder *b = c->b;
+   if (to_bfloat && !from_float && !from_bool) {
+      *result = stela_air_int_to_bfloat(b, x, from_sign == 0);
+      return STELA_AIR_CALL_LOWERED;
+   }
    if (from_bfloat)
       x = stela_air_bfloat_to_float(b, x);
    unsigned to_bits = to_float ? (LLVMGetTypeKind(stela_air_call_element(to, &to_lanes)) == LLVMHalfTypeKind ? 16 : 32) :
@@ -1081,7 +1094,8 @@ stela_air_math_call(const struct stela_air_call_context *c, LLVMValueRef call, L
       /* Each of these intrinsics is overloaded on its first operand's type. */
       char type[16], expected[64];
       LLVMTypeRef first = LLVMGetNumArgOperands(call) ? LLVMTypeOf(LLVMGetOperand(call, 0)) : NULL;
-      if (!first || (!stela_air_call_floating(first) && !stela_air_call_integer(first)))
+      if (!first || (!stela_air_call_floating(first) && !stela_air_call_bfloat(first) &&
+                     !stela_air_call_integer(first)))
          return stela_air_call_fail(c, STELA_AIR_TYPE, "unsupported intrinsic types"), STELA_AIR_CALL_FAILED;
       stela_air_call_overload(first, type, sizeof(type));
       snprintf(expected, sizeof(expected), "%s.%s", intrinsics[i].name, type);
@@ -1120,7 +1134,8 @@ stela_air_math_call(const struct stela_air_call_context *c, LLVMValueRef call, L
    /* Every other function's overload is its first operand's type. */
    char type[16];
    LLVMTypeRef first = LLVMTypeOf(LLVMGetOperand(call, 0));
-   if (!stela_air_call_floating(first) && !stela_air_call_integer(first))
+   if (!stela_air_call_floating(first) && !stela_air_call_bfloat(first) &&
+       !stela_air_call_integer(first))
       return STELA_AIR_CALL_OTHER;
    stela_air_call_overload(first, type, sizeof(type));
    const struct function *function;
