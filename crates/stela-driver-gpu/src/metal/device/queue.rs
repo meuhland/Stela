@@ -2198,6 +2198,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .then(|| self.queue.passes.take())
     }
 
+    /// Adds a committed command buffer's plane conversions to the
+    /// profile's report.
+    pub(super) fn note_plane_counts(&mut self, counts: pass_times::PlaneCounts) {
+        if self.passes_profiled() {
+            self.queue.passes.planes.add(counts);
+        }
+    }
+
     /// Notes what a pass attaching `view` of `texture` renders into, for
     /// the profile's report.
     fn note_target(&mut self, view: ImageView, texture: TextureId) {

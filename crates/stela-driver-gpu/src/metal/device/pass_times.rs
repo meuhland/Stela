@@ -233,6 +233,40 @@ pub struct CommandBufferCounts {
     pub out_of_marks: bool,
 }
 
+/// What committed passes converted of IOSurface two-plane extended-range
+/// textures: the encodes into the planes, how each wrote them, and the
+/// decodes from them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlaneCounts {
+    /// Encodes whose kernel wrote the planes in guest RAM, and their texels.
+    pub direct: u64,
+    pub direct_texels: u64,
+    /// Encodes into staging memory that copies moved into the planes
+    /// ([`PlaneStaging`](crate::metal::pass::PlaneStaging)), and their
+    /// texels.
+    pub copied: u64,
+    pub copied_texels: u64,
+    /// Encodes of a pass's dirty tiles, and the tiles they looked at.
+    pub stamped: u64,
+    pub stamped_tiles: u64,
+    /// Decodes, and their texels.
+    pub decoded: u64,
+    pub decoded_texels: u64,
+}
+
+impl PlaneCounts {
+    pub fn add(&mut self, other: Self) {
+        self.direct += other.direct;
+        self.direct_texels += other.direct_texels;
+        self.copied += other.copied;
+        self.copied_texels += other.copied_texels;
+        self.stamped += other.stamped;
+        self.stamped_tiles += other.stamped_tiles;
+        self.decoded += other.decoded;
+        self.decoded_texels += other.decoded_texels;
+    }
+}
+
 /// The beat's spans by what they did, and the command buffers' counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PassTimes {
@@ -246,6 +280,7 @@ pub struct PassTimes {
     pub passes: Tally,
     pub copies: Tally,
     pub copied_texels: Tally,
+    pub planes: PlaneCounts,
 }
 
 impl PassTimes {
@@ -316,7 +351,8 @@ pub fn span_key(
 
 /// `GPU PASSES command_buffers=… spans=… busy_us=… out_of_marks=…
 /// per_cb=submits:avg/max segments:… passes:… copies:… copied_ktexels:…
-/// top=key:count/total_us/longest_us/draws/dispatches/ktexels …`.
+/// planes=direct:count/ktexels copied:count/ktexels stamped:count/tiles
+/// decoded:count/ktexels top=key:count/total_us/longest_us/draws/dispatches/ktexels …`.
 impl fmt::Display for PassTimes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let average = |tally: Tally| {
@@ -331,7 +367,8 @@ impl fmt::Display for PassTimes {
         write!(
             formatter,
             "GPU PASSES command_buffers={} spans={} busy_us={} out_of_marks={} per_cb=submits:{} \
-             segments:{} passes:{} copies:{} copied_ktexels:{}/{} top",
+             segments:{} passes:{} copies:{} copied_ktexels:{}/{} planes=direct:{}/{} \
+             copied:{}/{} stamped:{}/{} decoded:{}/{} top",
             self.command_buffers,
             self.spans,
             self.busy_ns / 1000,
@@ -342,6 +379,14 @@ impl fmt::Display for PassTimes {
             average(self.copies),
             self.copied_texels.total / self.command_buffers.max(1) / 1000,
             self.copied_texels.most / 1000,
+            self.planes.direct,
+            self.planes.direct_texels / 1000,
+            self.planes.copied,
+            self.planes.copied_texels / 1000,
+            self.planes.stamped,
+            self.planes.stamped_tiles,
+            self.planes.decoded,
+            self.planes.decoded_texels / 1000,
         )?;
         for (key, entry) in self.top().into_iter().take(SHOWN) {
             write!(
@@ -395,6 +440,16 @@ mod tests {
             copied_texels: 3_686_400,
             out_of_marks: false,
         });
+        times.planes.add(PlaneCounts {
+            direct: 2,
+            direct_texels: 5_000,
+            copied: 1,
+            copied_texels: 3_686_400,
+            stamped: 1,
+            stamped_tiles: 920,
+            decoded: 1,
+            decoded_texels: 2_000,
+        });
         let top = times.top();
         assert_eq!(top[0].0, "render:a+b@2560x1440/Bgra8Unorm/linear-sys");
         assert_eq!(
@@ -413,7 +468,8 @@ mod tests {
             line,
             "GPU PASSES command_buffers=1 spans=3 busy_us=6500 out_of_marks=0 \
              per_cb=submits:1.0/1 segments:1.0/1 passes:2.0/2 copies:1.0/1 \
-             copied_ktexels:3686/3686 top render:a+b@2560x1440/Bgra8Unorm/linear-sys:2/4000/3000/6/0/0 \
+             copied_ktexels:3686/3686 planes=direct:2/5 copied:1/3686 stamped:1/920 \
+             decoded:1/2 top render:a+b@2560x1440/Bgra8Unorm/linear-sys:2/4000/3000/6/0/0 \
              store_texels:-:1/2500/2500/0/0/3686"
         );
         assert_eq!(times.take().spans, 3);
