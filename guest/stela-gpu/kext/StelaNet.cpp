@@ -172,9 +172,15 @@ StelaNet::start(IOService *provider)
 		return false;
 	}
 	// Checksum offloads are taken when offered: the host completes partial
-	// transmit checksums and vouches for received ones.
+	// transmit checksums and vouches for received ones. Coalesced receive
+	// segments come only with the host's word on their checksums and room
+	// to span buffers.
 	accepted = offered & (STELA_NET_F_VERSION_1 | STELA_NET_F_MAC | STELA_NET_F_EVENT_IDX | STELA_NET_F_CSUM |
 	    STELA_NET_F_GUEST_CSUM);
+	static const uint64_t kCoalescing = STELA_NET_F_GUEST_TSO4 | STELA_NET_F_GUEST_TSO6 | STELA_NET_F_MRG_RXBUF;
+	if ((accepted & STELA_NET_F_GUEST_CSUM) && (offered & STELA_NET_F_MRG_RXBUF)) {
+		accepted |= offered & kCoalescing;
+	}
 	uint64_t station = read(STELA_NET_MAC);
 	for (int index = 0; index < ETHER_ADDR_LEN; index++) {
 		mac[index] = uint8_t(station >> (8 * index));
@@ -357,10 +363,19 @@ StelaNet::attachInterface()
 		return false;
 	}
 	bpf_attach(ifp, DLT_EN10MB, ETHER_HDR_LEN, nullptr, nullptr);
+	ifnet_offload_t offload = 0;
 	if (accepted & STELA_NET_F_CSUM) {
 		// The stack then leaves TCP and UDP checksums partial, the pseudo
 		// header's sum in the field, for transmit() to mark.
-		error = ifnet_set_offload(ifp, IFNET_CSUM_TCP | IFNET_CSUM_UDP | IFNET_CSUM_TCPIPV6 | IFNET_CSUM_UDPIPV6);
+		offload |= IFNET_CSUM_TCP | IFNET_CSUM_UDP | IFNET_CSUM_TCPIPV6 | IFNET_CSUM_UDPIPV6;
+	}
+	if (accepted & (STELA_NET_F_GUEST_TSO4 | STELA_NET_F_GUEST_TSO6)) {
+		// Received TCP segments may be longer than the MTU: the host
+		// joined them.
+		offload |= IFNET_LRO;
+	}
+	if (offload != 0) {
+		error = ifnet_set_offload(ifp, offload);
 		if (error != 0) {
 			IOLog("StelaNet: ifnet_set_offload: %d\n", error);
 		}
@@ -665,13 +680,101 @@ StelaNet::kick(Queue *queue, uint16_t old, uint16_t now, uint64_t which)
 }
 
 /*
+ * The frame whose `count` used entries start at rx.used, its header in the
+ * first buffer, copied into one packet: one cluster for a frame in one
+ * buffer, a chain mbuf_allocpacket sizes for a coalesced one. Null when the
+ * entries break the format or no mbuf is free; the caller reposts the
+ * buffers either way.
+ */
+mbuf_t
+StelaNet::receivePacket(uint16_t count)
+{
+	size_t length = 0;
+	for (uint16_t index = 0; index < count; index++) {
+		UsedElement element = *usedSlot(&rx, uint16_t(rx.used + index));
+		if (element.id >= rx.size || element.length > kBufferBytes) {
+			return nullptr;
+		}
+		length += element.length;
+	}
+	UsedElement head = *usedSlot(&rx, rx.used);
+	if (head.length < STELA_NET_HEADER_BYTES || length <= STELA_NET_HEADER_BYTES + ETHER_HDR_LEN) {
+		return nullptr;
+	}
+	length -= STELA_NET_HEADER_BYTES;
+	const uint8_t *header = buffer(&rx, uint16_t(head.id));
+	mbuf_t packet = nullptr;
+	if (count == 1) {
+		if (mbuf_getpacket(MBUF_DONTWAIT, &packet) != 0) {
+			return nullptr;
+		}
+		memcpy(mbuf_data(packet), header + STELA_NET_HEADER_BYTES, length);
+		mbuf_setlen(packet, length);
+	} else {
+		if (mbuf_allocpacket(MBUF_DONTWAIT, length, nullptr, &packet) != 0) {
+			return nullptr;
+		}
+		// Each mbuf of the chain filled from its start, in buffer order.
+		mbuf_t to = packet;
+		uint8_t *start = static_cast<uint8_t *>(mbuf_datastart(to));
+		size_t room = mbuf_maxlen(to);
+		size_t filled = 0;
+		for (uint16_t index = 0; index < count; index++) {
+			UsedElement element = *usedSlot(&rx, uint16_t(rx.used + index));
+			const uint8_t *from = buffer(&rx, uint16_t(element.id));
+			size_t left = element.length;
+			if (index == 0) {
+				from += STELA_NET_HEADER_BYTES;
+				left -= STELA_NET_HEADER_BYTES;
+			}
+			while (left > 0) {
+				if (filled == room) {
+					mbuf_setdata(to, start, filled);
+					to = mbuf_next(to);
+					if (!to) {
+						mbuf_freem(packet);
+						return nullptr;
+					}
+					start = static_cast<uint8_t *>(mbuf_datastart(to));
+					room = mbuf_maxlen(to);
+					filled = 0;
+				}
+				size_t take = left < room - filled ? left : room - filled;
+				memcpy(start + filled, from, take);
+				filled += take;
+				from += take;
+				left -= take;
+			}
+		}
+		mbuf_setdata(to, start, filled);
+		mbuf_t rest = mbuf_next(to);
+		if (rest) {
+			mbuf_setnext(to, nullptr);
+			mbuf_freem(rest);
+		}
+	}
+	mbuf_pkthdr_setlen(packet, length);
+	if ((accepted & STELA_NET_F_GUEST_CSUM) && (header[0] & kDataValid)) {
+		// The host verified the TCP or UDP checksum, and an IPv4 header's,
+		// so the stack skips them. A coalesced frame is always valid.
+		bool ipv4 = header[STELA_NET_HEADER_BYTES + 12] == 0x08 && header[STELA_NET_HEADER_BYTES + 13] == 0x00;
+		mbuf_set_csum_performed(packet,
+		    MBUF_CSUM_DID_DATA | MBUF_CSUM_PSEUDO_HDR | (ipv4 ? MBUF_CSUM_DID_IP | MBUF_CSUM_IP_GOOD : 0), 0xffff);
+	}
+	return packet;
+}
+
+/*
  * Every frame the device wrote goes up the stack in one chain, each buffer
  * posted again; then the next used entry is asked to interrupt, and the ring
- * looked at once more for frames that came meanwhile.
+ * looked at once more for frames that came meanwhile. With MRG_RXBUF a frame
+ * spans the `num_buffers` used entries its header names; the device
+ * publishes whole frames, but one not yet whole waits for the next look.
  */
 void
 StelaNet::harvestReceive()
 {
+	bool merged = accepted & STELA_NET_F_MRG_RXBUF;
 	for (;;) {
 		uint16_t done = __atomic_load_n(usedIndex(&rx), __ATOMIC_ACQUIRE);
 		if (done == rx.used) {
@@ -679,63 +782,69 @@ StelaNet::harvestReceive()
 		}
 		uint16_t old = rx.avail;
 		bool deliver = __atomic_load_n(&attached, __ATOMIC_ACQUIRE);
+		// Entries of a frame not yet whole, which then stops the harvest.
+		uint16_t partial = 0;
 		mbuf_t first = nullptr;
 		mbuf_t last = nullptr;
 		uint32_t packets = 0;
 		uint32_t bytes = 0;
 		while (rx.used != done) {
-			UsedElement element = *usedSlot(&rx, rx.used);
-			rx.used++;
-			uint16_t slot = uint16_t(element.id);
-			if (slot >= rx.size) {
+			uint16_t count = 1;
+			UsedElement head = *usedSlot(&rx, rx.used);
+			if (merged && head.id < rx.size && head.length >= STELA_NET_HEADER_BYTES) {
+				memcpy(&count, buffer(&rx, uint16_t(head.id)) + 10, sizeof count);
+				// A count no ring holds drops this buffer alone.
+				if (count == 0 || count > rx.size) {
+					count = 1;
+				}
+			}
+			if (uint16_t(done - rx.used) < count) {
+				partial = count;
+				break;
+			}
+			mbuf_t packet = deliver ? receivePacket(count) : nullptr;
+			for (uint16_t index = 0; index < count; index++) {
+				uint16_t slot = uint16_t(usedSlot(&rx, rx.used)->id);
+				rx.used++;
+				if (slot < rx.size) {
+					*availSlot(&rx, rx.avail) = slot;
+					rx.avail++;
+				}
+			}
+			if (!packet) {
+				rxDropped++;
 				continue;
 			}
-			uint32_t length = element.length - STELA_NET_HEADER_BYTES;
-			mbuf_t packet = nullptr;
-			if (deliver && element.length > STELA_NET_HEADER_BYTES + ETHER_HDR_LEN &&
-			    element.length <= kBufferBytes && mbuf_getpacket(MBUF_DONTWAIT, &packet) == 0) {
-				const uint8_t *data = buffer(&rx, slot);
-				memcpy(mbuf_data(packet), data + STELA_NET_HEADER_BYTES, length);
-				if ((accepted & STELA_NET_F_GUEST_CSUM) && (data[0] & kDataValid)) {
-					// The host verified the TCP or UDP checksum, and an IPv4
-					// header's, so the stack skips them.
-					bool ipv4 = data[STELA_NET_HEADER_BYTES + 12] == 0x08 &&
-					    data[STELA_NET_HEADER_BYTES + 13] == 0x00;
-					mbuf_set_csum_performed(packet,
-					    MBUF_CSUM_DID_DATA | MBUF_CSUM_PSEUDO_HDR |
-					        (ipv4 ? MBUF_CSUM_DID_IP | MBUF_CSUM_IP_GOOD : 0),
-					    0xffff);
-				}
-				mbuf_setlen(packet, length);
-				mbuf_pkthdr_setlen(packet, length);
-				mbuf_pkthdr_setrcvif(packet, ifp);
-				bpf_tap_in(ifp, DLT_EN10MB, packet, nullptr, 0);
-				// The stack takes the Ethernet header by the packet
-				// header's pointer and the payload after it.
-				mbuf_pkthdr_setheader(packet, mbuf_data(packet));
-				mbuf_adj(packet, ETHER_HDR_LEN);
-				if (last) {
-					mbuf_setnextpkt(last, packet);
-				} else {
-					first = packet;
-				}
-				last = packet;
-				packets++;
-				bytes += length;
+			uint32_t length = uint32_t(mbuf_pkthdr_len(packet));
+			mbuf_pkthdr_setrcvif(packet, ifp);
+			bpf_tap_in(ifp, DLT_EN10MB, packet, nullptr, 0);
+			// The stack takes the Ethernet header by the packet header's
+			// pointer and the payload after it.
+			mbuf_pkthdr_setheader(packet, mbuf_data(packet));
+			mbuf_adj(packet, ETHER_HDR_LEN);
+			if (last) {
+				mbuf_setnextpkt(last, packet);
 			} else {
-				rxDropped++;
+				first = packet;
 			}
-			*availSlot(&rx, rx.avail) = slot;
-			rx.avail++;
+			last = packet;
+			packets++;
+			bytes += length;
 		}
 		__atomic_store_n(availIndex(&rx), rx.avail, __ATOMIC_RELEASE);
-		*usedEvent(&rx) = rx.used;
+		// The next entry interrupts, or for a frame not yet whole its
+		// last one. kick's fence orders this store before the next look.
+		*usedEvent(&rx) = partial ? uint16_t(rx.used + partial - 1) : rx.used;
 		kick(&rx, old, rx.avail, STELA_NET_KICK_RX);
 		if (first) {
 			struct ifnet_stat_increment_param stats = {};
 			stats.packets_in = packets;
 			stats.bytes_in = bytes;
 			ifnet_input(ifp, first, &stats);
+		}
+		if (partial &&
+		    uint16_t(__atomic_load_n(usedIndex(&rx), __ATOMIC_ACQUIRE) - rx.used) < partial) {
+			return;
 		}
 	}
 }

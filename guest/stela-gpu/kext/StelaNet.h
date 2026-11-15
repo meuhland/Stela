@@ -11,8 +11,11 @@
  * 2 KiB each posted once and reposted as they are harvested, and transmit
  * slots of 2 KiB each that every packet is copied into, with a backlog of
  * packets waiting for slots while the ring is full. When the device
- * offers them, TCP and UDP checksums are offloaded both ways; the guest
- * still segments every frame itself.
+ * offers them, TCP and UDP checksums are offloaded both ways, and received
+ * TCP segments come coalesced (LRO): one frame of up to 64 KiB spanning as
+ * many receive buffers as its header's num_buffers names (MRG_RXBUF), which
+ * the kext copies into one mbuf chain. The guest still segments every frame
+ * it sends.
  *
  * The personality matches only the node `--guest-network-stelanet` places,
  * so without it nothing of this class runs.
@@ -55,8 +58,10 @@ private:
 	bool allocateQueue(Queue *queue);
 	void freeQueue(Queue *queue);
 	bool attachInterface();
-	/* Moves every received frame up the stack and reposts its buffer. */
+	/* Moves every received frame up the stack and reposts its buffers. */
 	void harvestReceive();
+	/* The frame of `count` used entries from rx.used as one packet, or null. */
+	mbuf_t receivePacket(uint16_t count);
 	/* With txLock held: takes back the transmit slots the device completed. */
 	void reclaimTransmit();
 	errno_t transmit(mbuf_t packet);
