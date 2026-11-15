@@ -60,6 +60,10 @@ nir_def *stela_air_bfloat_to_float(nir_builder *b, nir_def *bits);
  * bits; a NaN stays a quiet NaN. */
 nir_def *stela_air_float_to_bfloat(nir_builder *b, nir_def *value);
 
+/* Integers, or bools as 0 and 1 (-1 when `is_signed`), rounded once to the
+ * nearest even bfloat, as their 16 bits. */
+nir_def *stela_air_int_to_bfloat(nir_builder *b, nir_def *value, bool is_signed);
+
 /* An 8-, 16-, 32- or 64-bit integer scalar, or a vector of 2 to 4 of them. */
 bool stela_air_call_integer(LLVMTypeRef type);
 

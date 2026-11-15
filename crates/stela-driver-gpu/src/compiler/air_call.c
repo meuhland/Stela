@@ -95,6 +95,34 @@ stela_air_float_to_bfloat(nir_builder *b, nir_def *value)
    return nir_u2u16(b, nir_ushr_imm(b, bits, 16));
 }
 
+/* A float's 24-bit significand holds an integer of up to 16 bits exactly,
+ * which one rounding then takes to a bfloat. A wider one is first rounded to
+ * odd at 24 bits: kept to its top 24, the last of them set when any bit
+ * below is, from which rounding to a bfloat's 8 bits is the integer's own
+ * rounding, as 24 is at least 8 + 2. */
+nir_def *
+stela_air_int_to_bfloat(nir_builder *b, nir_def *value, bool is_signed)
+{
+   if (value->bit_size == 1) {
+      nir_def *integer = nir_b2i32(b, value);
+      return stela_air_float_to_bfloat(b, nir_i2f32(b, is_signed ? nir_ineg(b, integer) : integer));
+   }
+   if (value->bit_size <= 16)
+      return stela_air_float_to_bfloat(b, is_signed ? nir_i2f32(b, value) : nir_u2f32(b, value));
+   /* The magnitude, unsigned: the most negative integer's is itself. */
+   nir_def *magnitude = is_signed ? nir_iabs(b, value) : value;
+   nir_def *shift = nir_imax_imm(b, nir_iadd_imm(b, nir_ufind_msb(b, magnitude), -23), 0);
+   nir_def *kept = nir_ushr(b, magnitude, shift);
+   nir_def *inexact = nir_ine(b, nir_ishl(b, kept, shift), magnitude);
+   nir_def *odd = nir_ior(b, nir_u2u32(b, kept), nir_b2i32(b, inexact));
+   /* 2^shift, which scales the kept bits back exactly. */
+   nir_def *scale = nir_ishl_imm(b, nir_iadd_imm(b, shift, 127), 23);
+   nir_def *single = nir_fmul(b, nir_u2f32(b, odd), scale);
+   if (is_signed)
+      single = nir_bcsel(b, nir_ilt_imm(b, value, 0), nir_fneg(b, single), single);
+   return stela_air_float_to_bfloat(b, single);
+}
+
 bool
 stela_air_call_integer(LLVMTypeRef type)
 {
