@@ -270,6 +270,9 @@ impl Pe {
         let mut screen = Share::new(super::display::BUSY_SHARE);
         loop {
             let limit = machine.statistics.blocks + SLICE;
+            if step_timing {
+                host::sampling::host_service();
+            }
             let stop = machine.run_with_budget(RunBudget {
                 blocks: limit,
                 host_ticks: Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND),
@@ -280,7 +283,9 @@ impl Pe {
                 if stored_report.is_none_or(|before| {
                     counter.wrapping_sub(before) >= super::run::BEAT_SECONDS * host::COUNTER_HZ
                 }) {
-                    report_stored_pages(&machine, counter);
+                    super::run::host_part("stored pages", pe, || {
+                        report_stored_pages(&machine, counter)
+                    });
                     stored_report = Some(counter);
                 }
             }
@@ -343,16 +348,23 @@ impl Pe {
                 }
                 stop => stopped(&hub, pe, stop),
             }
-            hub.publish(pe, machine.counts());
+            super::run::host_part("publish", pe, || hub.publish(pe, machine.counts()));
             // Whether the boot processor's Linux step returns.
-            super::step_watchdog::look();
+            super::run::host_part("watchdog", pe, super::step_watchdog::look);
             if machine.step_timing().is_some() {
-                hub.add_system_exits(pe, &machine.take_system_exits());
-                if machine.has_hot_samples() {
-                    hub.add_hot_samples(|hot| machine.take_hot_samples(hot));
-                }
+                super::run::host_part("profile", pe, || {
+                    hub.add_system_exits(pe, &machine.take_system_exits());
+                    if machine.has_hot_samples() {
+                        hub.add_hot_samples(|hot| machine.take_hot_samples(hot));
+                    }
+                });
             }
-            super::run::host_work(&mut machine, "drain", |_| output::drain_some());
+            // A PE whose guest waits sends the serial queue in its wait; one
+            // whose guest runs only once none did for a while: each burst is
+            // a port access, which a hypervisor can hold for milliseconds.
+            if output::drain_due() {
+                super::run::host_work(&mut machine, "drain", |_| output::drain_some());
+            }
         }
     }
 }

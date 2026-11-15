@@ -3913,3 +3913,50 @@ fn wide_moves_match_the_model_in_every_form() {
     }
     assert!(runs > 2000, "{runs}");
 }
+
+/// A system-mode block's cold range (`CompiledBlock::cold`), which
+/// `--profile`'s host samples tell apart, covers its out-of-line slow paths:
+/// it starts after the jump over them, the jumps over its parts reach its
+/// end, and no instruction's inline code starts in it. A block without slow
+/// paths has none.
+#[test]
+fn cold_ranges_cover_the_code_behind_the_jumps_over_it() {
+    use crate::{
+        Options, TargetCpu,
+        block::{BlockProfile, CompilationPlan, Features},
+    };
+    let compile = |words: &[u32]| {
+        let source: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let options = Options::new(
+            BlockProfile::new(Features::SYSTEM_MODE),
+            TargetCpu::Baseline,
+        );
+        CompilationPlan::new(&source, GuestAddress(0x1000), &options)
+            .unwrap()
+            .compile()
+            .unwrap()
+    };
+    let block = compile(&[
+        0x1e21_0802, // fmul s2,s0,s1
+        0x1e20_2843, // fadd s3,s2,s0
+        0x1e20_1909, // fdiv s9,s8,s0
+        0x1e61_c0d3, // fsqrt d19,d6
+        0x9100_0400, // add x0,x0,#1
+    ]);
+    let (start, end) = (block.cold.0 as usize, block.cold.1 as usize);
+    assert!(start < end, "slow paths out of line: {:?}", block.cold);
+    let code = &block.native.x86_64_code;
+    assert!(end <= code.len());
+    let jump = start - super::super::chain::JUMP_BYTES;
+    assert_eq!(code[jump], 0xe9, "a jump over the cold code");
+    let mut target = target_of(code, jump + 1);
+    while target < end {
+        assert_eq!(code[target], 0xe9, "a jump over the next cold part");
+        target = target_of(code, target + 1);
+    }
+    assert_eq!(target, end);
+    for &(_, offset) in &block.native.source_map {
+        assert!(!(start..end).contains(&offset), "inline code at {offset}");
+    }
+    assert_eq!(compile(&[0x9100_0400, 0x9100_0421]).cold, (0, 0));
+}

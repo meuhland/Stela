@@ -607,22 +607,45 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
             // put out for another (a capacity eviction, not a drop) and the
             // stamped tail enters the cell's block while the page tables
             // still map the page to the cell's key.
+            // A lower-half page is translated in the upper half's context
+            // too (`translate`), as in the stamped tails' test.
             let page = predicted & !0xfff;
-            let context = contexts[half(predicted)];
-            let resident = itlb.find(itlb.page_slot(predicted, context), page, context);
+            let candidates = match half(predicted) {
+                0 => &contexts[..],
+                _ => &contexts[1..],
+            };
+            let translated = candidates.iter().find_map(|&context| {
+                let resident = itlb.find(itlb.page_slot(predicted, context), page, context);
+                (resident.pc == page && resident.key == context).then_some(resident.entry)
+            });
             let cell = table.site_cell(site).unwrap();
+            // The stamp names the lower half's context alone, so for a
+            // lower-half page it outlives a change of the upper half's.
+            let stamped_in = match half(predicted) {
+                0 => &CONTEXTS[..],
+                _ => &contexts[1..],
+            };
+            let mapped = stamped_in
+                .iter()
+                .any(|&context| keys.get(&(page, context)) == Some(&cell.key));
+            // The lookup exits, or takes the other translation it holds.
             let evicted = stamped
-                && !(resident.pc == page && resident.key == context)
-                && keys.get(&(page, context)) == Some(&cell.key)
-                && lookup.0 == predicted
+                && translated != Some(cell.key)
+                && mapped
+                && (lookup.0 == predicted || translated.is_some())
                 && linked.is_some_and(|linked| linked.entry == cell.entry);
             // And the one difference a cell makes: the table put the
             // target's entry out of its set for another (a capacity
             // eviction, not a forget), and the cell, which keeps it,
             // enters its block where the table probe exits for a refill.
-            let resident_key = (resident.pc == page && resident.key == context)
-                .then_some(resident.entry)
-                .or_else(|| keys.get(&(page, context)).copied().filter(|_| stamped));
+            let resident_key = translated.or_else(|| {
+                stamped
+                    .then(|| match mapped {
+                        true => Some(cell.key),
+                        false => keys.get(&(page, candidates[0])).copied(),
+                    })
+                    .flatten()
+            });
             let held = resident_key
                 .map(|key| table.find(table.slot(predicted, key), predicted, key))
                 .unwrap_or_default();

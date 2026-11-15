@@ -93,7 +93,7 @@ fn enclosure_restrictions_fail_before_dma_or_native_submission() {
         .is_err()
     );
     assert!(state.borrow().events.is_empty());
-    assert_eq!(engine.tag, 0);
+    assert_eq!(engine.lanes[0].tag, 0);
 }
 
 #[test]
@@ -162,6 +162,6 @@ fn mode_page_and_standard_alias_policies_reject_before_native_submission() {
         .is_err()
     );
     assert!(state.borrow().events.is_empty());
-    assert_eq!(engine.tag, 0);
+    assert_eq!(engine.lanes[0].tag, 0);
     assert!(always.permits(&[0x1a, 0, 0, 0, 4, 0]));
 }

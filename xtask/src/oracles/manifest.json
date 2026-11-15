@@ -86,6 +86,14 @@
   },
   {
     "package": "stela-compiler",
+    "test": "executed_paths_of_real_blocks",
+    "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host instruction trace of real blocks named by DENSITY_IN; run on request"
+  },
+  {
+    "package": "stela-compiler",
     "test": "region_census_of_real_code",
     "source": "crates/stela-compiler/src/x86_64/block/tests.rs",
     "kind": "manual",
@@ -4771,6 +4779,30 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "eret_alternating_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/native_exceptions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "raised_timer_write_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/timer_native.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "memo_replay_of_a_process_mix",
+    "source": "crates/stela-engine/src/machine/engine/pointer.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "PAC memo miss measurement over a modelled process mix; run on request"
   },
   {
     "package": "stela-engine",

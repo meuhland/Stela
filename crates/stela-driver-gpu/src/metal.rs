@@ -29,6 +29,7 @@ pub mod library;
 #[cfg(feature = "metal-vulkan")]
 pub mod native;
 pub mod nvidia;
+pub mod open;
 pub mod pass;
 pub mod pipeline;
 pub mod pixel_format;

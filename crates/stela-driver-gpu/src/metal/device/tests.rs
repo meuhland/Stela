@@ -26,7 +26,8 @@ use crate::metal::{
     },
     heap::{HeapDescriptor, PAGE, SizeAndAlign},
     indirect::{IndirectCommandBufferDescriptor, RecordLayout},
-    nvidia::{CHIPS, PcieLink},
+    nvidia::CHIPS,
+    open::PcieLink,
     pipeline::{
         ColorAttachmentDescriptor, MAX_COLOR_ATTACHMENTS, RenderTargets, StageThreads,
         TessellationDescriptor,
@@ -92,7 +93,7 @@ fn complete(device: &mut TestDevice, serial: u64) {
 fn devices_missing_a_required_feature_are_refused() {
     let mut backend = MockBackend::new();
     backend.physical.as_mut().unwrap().features.null_descriptor = false;
-    let platform = CHIPS[0].platform(crate::metal::nvidia::Attachment {
+    let platform = CHIPS[0].platform(crate::metal::open::Attachment {
         link: PcieLink {
             speed: 4,
             width: 16,

@@ -162,12 +162,20 @@ where
     let released = unsafe { bridge.set_secondary_bus_reset(false) };
     held?;
     released?;
-    let ready = wait_for_bus(bridge, express, function, siblings, &mut delay);
+    let ready = wait_for_bus(bridge, express, &function.config, siblings, &mut delay);
     let unmasked = slot.map_or(Ok(()), |slot| slot.restore(bridge));
-    if !ready? {
-        return Err(BlockError::Unsupported(
-            "PCI function did not return from its bus reset",
-        ));
+    match ready? {
+        SecondaryBus::Ready => {}
+        SecondaryBus::NoLink => {
+            return Err(BlockError::Unsupported(
+                "PCI link did not come back after its bus reset",
+            ));
+        }
+        SecondaryBus::Silent => {
+            return Err(BlockError::Unsupported(
+                "PCI function did not return from its bus reset",
+            ));
+        }
     }
     unmasked?;
     first.restore(&mut function.config)?;
@@ -264,17 +272,52 @@ fn mask_slot<B: ConfigSpace>(bridge: &mut B, express: u16) -> Result<Option<Slot
     Ok(Some(Slot { express, masked }))
 }
 
-/// `pci_bridge_wait_for_secondary_bus`: after the reset, wait for the link
-/// and then for every function to answer. False when one never did.
+/// How a wait for a bridge's secondary bus ended
+/// ([`wait_for_secondary_bus`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecondaryBus {
+    /// Every function waited for answers.
+    Ready,
+    /// The link reports itself and did not come up within Linux's 1 s.
+    NoLink,
+    /// A function did not answer within Linux's bound for it.
+    Silent,
+}
+
+/// Linux `pci_bridge_wait_for_secondary_bus` for a bridge whose secondary
+/// bus was just powered on, as after a reset. A link that reports Data
+/// Link Layer Link Active gets 20 ms, up to 1 s to come up, then 100 ms; a
+/// faster one that does not report gets 1.1 s. `child` then has up to 60 s
+/// in all to answer with neither all-ones nor Configuration RRS, polled at
+/// waits doubling from 1 ms ([`wait_ready`]). A link of 5 GT/s or less
+/// gets 100 ms, then `child` Linux's first second, and the rest of the 60
+/// s only when the link reports itself up. `delay` waits its microseconds;
+/// a caller that must not wait long in one step takes them in slices.
+/// Linux's `pcie_failed_link_retrain`, a quirk's retrain of a link stuck at
+/// 2.5 GT/s, is not done.
+pub fn wait_for_secondary_bus<B: ConfigSpace, C: ConfigSpace>(
+    bridge: &B,
+    child: &C,
+    mut delay: impl FnMut(u64) -> Result<(), BlockError>,
+) -> Result<SecondaryBus, BlockError> {
+    let express = express_offset(bridge)?;
+    wait_for_bus::<B, C, C>(bridge, express, child, &[], &mut delay)
+}
+
+/// `pci_bridge_wait_for_secondary_bus`: wait for the link and then for
+/// `function` and each sibling to answer.
 fn wait_for_bus<B: ConfigSpace, C: ConfigSpace, S: ConfigSpace>(
     bridge: &B,
     express: Option<u16>,
-    function: &Function<C>,
+    function: &C,
     siblings: &[Function<S>],
     delay: &mut impl FnMut(u64) -> Result<(), BlockError>,
-) -> Result<bool, BlockError> {
+) -> Result<SecondaryBus, BlockError> {
     let ready = |delay: &mut dyn FnMut(u64) -> Result<(), BlockError>, limit| {
-        answered(&function.config, siblings, delay, limit)
+        answered(function, siblings, delay, limit).map(|answered| match answered {
+            true => SecondaryBus::Ready,
+            false => SecondaryBus::Silent,
+        })
     };
     let Some(express) = express else {
         // A conventional bridge: Linux waits one second and the delay.
@@ -287,12 +330,15 @@ fn wait_for_bus<B: ConfigSpace, C: ConfigSpace, S: ConfigSpace>(
         |bridge: &B| Ok::<_, BlockError>(bridge.read16(express + LINK_STATUS)? & LINK_ACTIVE != 0);
     if link & MAX_LINK_SPEED <= SPEED_5GT {
         delay(RESET_DELAY_US)?;
-        if ready(delay, RESET_WAIT_US - RESET_DELAY_US)? {
-            return Ok(true);
+        if ready(delay, RESET_WAIT_US - RESET_DELAY_US)? == SecondaryBus::Ready {
+            return Ok(SecondaryBus::Ready);
         }
         // A link that reports itself up gets the long wait.
-        if !reporting || !active(bridge)? {
-            return Ok(false);
+        if !reporting {
+            return Ok(SecondaryBus::Silent);
+        }
+        if !active(bridge)? {
+            return Ok(SecondaryBus::NoLink);
         }
         return ready(delay, READY_POLL_US - RESET_WAIT_US);
     }
@@ -301,9 +347,7 @@ fn wait_for_bus<B: ConfigSpace, C: ConfigSpace, S: ConfigSpace>(
         let mut waited = 0;
         while !active(bridge)? {
             if waited >= LINK_TIMEOUT_US {
-                return Err(BlockError::Unsupported(
-                    "PCI link did not come back after its bus reset",
-                ));
+                return Ok(SecondaryBus::NoLink);
             }
             delay(LINK_POLL_US)?;
             waited += LINK_POLL_US;

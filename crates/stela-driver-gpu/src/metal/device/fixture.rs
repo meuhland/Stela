@@ -9,7 +9,8 @@ use crate::metal::{
     command_buffer::Segment,
     error::{Error, NO_FUNCTION, Result},
     library::tests::fixture,
-    nvidia::{CHIPS, Chip, PcieLink, fixture::nvk},
+    nvidia::{CHIPS, Chip, fixture::nvk},
+    open::PcieLink,
     reflection::{
         ArrayType, Binding, BindingAccess, BindingKind, PointerType, StructMember, StructType,
         TextureReferenceType, Type,
@@ -1010,7 +1011,7 @@ pub(crate) fn device() -> TestDevice {
 /// A device of the first chip over `backend`, holding [`LIBRARY`].
 pub(crate) fn device_on(backend: MockBackend) -> TestDevice {
     let chip: &Chip = &CHIPS[0];
-    let platform = chip.platform(crate::metal::nvidia::Attachment {
+    let platform = chip.platform(crate::metal::open::Attachment {
         link: PcieLink {
             speed: 4,
             width: 16,

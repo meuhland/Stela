@@ -559,6 +559,9 @@ fn hot_blocks_report<H: Host>(
     total.merge(&hot);
     if whole {
         hot_total_report(total);
+        // Address spaces are reused by later processes: the total by
+        // address space covers the beats since the last total report.
+        total.asids = Default::default();
     }
     if hot.is_empty() {
         return;
@@ -575,6 +578,50 @@ fn hot_blocks_report<H: Host>(
         let mut line = format!("PES HOT {name} samples={samples} other={}", hot.other);
         for block in hot.top(level, SHOWN) {
             push_hot_block(&mut line, level, &block);
+        }
+        output::arguments(format_args!("{line}\n"));
+    }
+    hot_asids_report("PES HOT", &hot.asids, 10, 3, 8);
+}
+
+/// `{prefix} ASIDS samples=N other=M asid:user/kernel/guarded ...`: the
+/// samples by the guest address space they ran in (`step_timing::AsidSamples`;
+/// per beat, and under `PES HOT TOTAL` over the [`HOT_TOTAL_BEATS`] beats
+/// since the last total),
+/// the `spaces` with most first, then for the `named` first of them a
+/// `{prefix} ASID asid pc:count ...` line of its `blocks` most sampled EL0
+/// blocks, whose frameworks name the process: how much of the guest's time
+/// one process takes, in user code and in the kernel on its behalf, where
+/// the per-level lines mix every process.
+fn hot_asids_report(
+    prefix: &str,
+    asids: &step_timing::AsidSamples,
+    spaces: usize,
+    named: usize,
+    blocks: usize,
+) {
+    let top = asids.top(spaces);
+    if top.is_empty() {
+        return;
+    }
+    let samples: u64 = asids.spaces.iter().map(|space| space.total()).sum();
+    let mut line = format!(
+        "{prefix} ASIDS samples={samples} other={} asid:user/kernel/guarded",
+        asids.other
+    );
+    for space in &top {
+        let [user, kernel, guarded] = space.samples;
+        line.push_str(&format!(" {:#x}:{user}/{kernel}/{guarded}", space.asid));
+    }
+    output::arguments(format_args!("{line}\n"));
+    for space in top.iter().take(named) {
+        let shown = asids.top_blocks(space.asid, blocks);
+        if shown.is_empty() {
+            continue;
+        }
+        let mut line = format!("{prefix} ASID {:#x}", space.asid);
+        for block in shown {
+            line.push_str(&format!(" {:#x}:{}", block.pc, block.count));
         }
         output::arguments(format_args!("{line}\n"));
     }
@@ -632,6 +679,7 @@ fn hot_total_report(total: &step_timing::HotBlocks) {
         }
         output::arguments(format_args!("{line}\n"));
     }
+    hot_asids_report("PES HOT TOTAL", &total.asids, 16, 6, 24);
 }
 
 /// The end of the `PES STAMPED` line under step timing: for RET, BLR, BR
@@ -963,7 +1011,8 @@ const DRAIN_MILLIS: u64 = 50;
 /// none of the PE's translations, which the PE's mail updates before its
 /// next block. A call of `part` that held the PE [`LONG_STEP_MILLIS`] gets
 /// a `HOST STEP LONG` line
-/// ([`stela_boot_core::service_watch::LongSteps`]).
+/// ([`stela_boot_core::service_watch::LongSteps`]); one that held it
+/// [`NAMED_STEP_MILLIS`] counts in the beat's `HOST STEPS` line.
 pub(super) fn host_work<H: Host, R>(
     machine: &mut Machine<H, parallel::Board>,
     part: &'static str,
@@ -975,6 +1024,7 @@ pub(super) fn host_work<H: Host, R>(
     // for it a stall limit past that or its own timer's deadline.
     let result = machine.serve_host(work);
     let took = host::fresh_counter().wrapping_sub(started);
+    named_step(part, machine.processor(), took);
     if LONG_STEPS.worth(took, host::COUNTER_HZ / 1000 * LONG_STEP_MILLIS) {
         let pstate = &machine.cpu.pstate;
         output::arguments(format_args!(
@@ -988,10 +1038,30 @@ pub(super) fn host_work<H: Host, R>(
     result
 }
 
+/// Host work between two slices that is no [`host_work`] call of its own,
+/// `part`, timed for the beat's `HOST STEPS` line: what else a gap in
+/// `PES STALLS` with phase `host` may hold.
+pub(super) fn host_part<R>(part: &'static str, pe: usize, work: impl FnOnce() -> R) -> R {
+    let started = host::fresh_counter();
+    let result = work();
+    named_step(part, pe, host::fresh_counter().wrapping_sub(started));
+    result
+}
+
+/// Count a step of `part` on PE `pe` that took `ticks` in the beat's
+/// `HOST STEPS` line once it reached [`NAMED_STEP_MILLIS`].
+fn named_step(part: &'static str, pe: usize, ticks: u64) {
+    if ticks >= host::COUNTER_HZ / 1000 * NAMED_STEP_MILLIS {
+        HOST_STEPS.record(part, pe, ticks);
+    }
+}
+
 /// Per PE: its longest gap between two progress marks with guest work since
 /// the last report, and the engine phase that took most of it (`host`
 /// outside the step loop, `?` without `--profile`); a PE that shows no
-/// progress for 50 ms holds the count (`stalled_ms`).
+/// progress for 50 ms holds the count (`stalled_ms`). Then the host steps
+/// over [`NAMED_STEP_MILLIS`] since the last report, by part, which a `host`
+/// gap is made of, if any.
 fn report_stalls<H: Host>(machine: &Machine<H, parallel::Board>) {
     let mut stalls = String::from("PES STALLS longest_ms/phase");
     for (pe, (ticks, phase)) in machine.devices.hub().clock_stalls().iter().enumerate() {
@@ -999,7 +1069,33 @@ fn report_stalls<H: Host>(machine: &Machine<H, parallel::Board>) {
         stalls.push_str(&format!(" {pe}:{millis}/{phase}"));
     }
     output::arguments(format_args!("{stalls}\n"));
+    if let Some(steps) = HOST_STEPS.line(NAMED_STEP_MILLIS, host::COUNTER_HZ) {
+        output::arguments(format_args!("{steps}\n"));
+    }
 }
+
+/// A host step that kept its PE from guest code this long counts in the
+/// beat's `HOST STEPS` line: a frame at 60 Hz has 16 ms.
+const NAMED_STEP_MILLIS: u64 = 2;
+
+/// The host steps over [`NAMED_STEP_MILLIS`] since the last beat, by part:
+/// every [`host_work`] and [`host_part`] name; the last takes any other.
+static HOST_STEPS: stela_boot_core::service_watch::HostSteps<13> =
+    stela_boot_core::service_watch::HostSteps::new([
+        "slice end",
+        "beat",
+        "beat step",
+        "reports",
+        "idle service",
+        "display",
+        "gpu job",
+        "drain",
+        "publish",
+        "profile",
+        "stored pages",
+        "watchdog",
+        "other",
+    ]);
 
 /// A single host step that kept its PE from guest code this long is named:
 /// XNU on another core times a lock that PE's guest may hold, a mutex
@@ -1614,6 +1710,22 @@ impl Heartbeat {
                         micros(longest),
                     ));
                 }
+                // A core whose counter moved after its synchronization:
+                // the device clock held it at the last value given, once a
+                // boot past a millisecond.
+                static BEHIND_REPORTED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                let behind = host::device_counter_behind();
+                if behind > tsc_hz / 1000
+                    && !BEHIND_REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    output::arguments(format_args!(
+                        "HOST CLOCK a processor's counter read {} us behind the device clock: \
+                         it moved after its TSC synchronization, and device times on it held \
+                         until it caught up\n",
+                        u128::from(behind) * 1_000_000 / u128::from(tsc_hz.max(1)),
+                    ));
+                }
                 survey_report(machine);
                 occupancy_report(machine, &mut self.occupancy);
                 let next = if self.beats.is_multiple_of(SUSPENSION_BEATS) {
@@ -1831,8 +1943,11 @@ impl Heartbeat {
             // TLBIs of everything that forgot every context (its own, and
             // another PE's or its mail's), ones that reached nothing of the
             // regime it translates in (forgetting other regimes' contexts,
-            // or none), contexts made, TLBIs its mail merged, and pages
-            // walked again at once for contexts made anew.
+            // or none), contexts made, TLBIs its mail merged, pages
+            // walked again at once for contexts made anew, entries dropped
+            // in every context by where (the upper half, no ASID, a global
+            // page), pages taken with another page of their leaf, and
+            // lower-half global pages taken in the shared context.
             // Per PE: GENTER completed natively and by the engine, then
             // GEXIT's, SVC's and ERET's.
             let mut transitions =
@@ -1848,7 +1963,7 @@ impl Heartbeat {
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
-                "/drop_upper/drop_no_asid/drop_global",
+                "/drop_upper/drop_no_asid/drop_global/leaf_fills/shared_fills",
             ));
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered

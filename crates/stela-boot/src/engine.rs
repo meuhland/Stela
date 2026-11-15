@@ -35,6 +35,7 @@ pub(crate) use kernel_work::FirmwareContext;
 mod network;
 pub(crate) mod nor;
 mod parallel;
+mod pci_power;
 #[cfg(feature = "nvk")]
 pub(crate) mod pipelines;
 pub(crate) mod power;
@@ -559,6 +560,8 @@ enum ConsoleRepair {
     #[default]
     Unknown,
     Driving(stela_boot_core::bundle_repair::Driver),
+    /// Keep host input isolated until reset after an automatic repair ends.
+    Closed,
     Off,
 }
 
@@ -606,7 +609,7 @@ impl GuestConsole {
             ));
         }
         if restart {
-            self.repair = ConsoleRepair::Off;
+            self.repair = ConsoleRepair::Closed;
             if unanswered && bundle_repair::unanswered() {
                 output::arguments(format_args!(
                     "BUNDLE REPAIR nothing ran; restarting the PC into one more repair boot\n"
@@ -635,6 +638,9 @@ impl ConsoleSink for GuestConsole {
         let taken = input.taken.load(Ordering::Relaxed);
         let put = input.put.load(Ordering::Acquire);
         if taken == put {
+            return None;
+        }
+        if matches!(self.repair, ConsoleRepair::Closed) {
             return None;
         }
         if matches!(self.repair, ConsoleRepair::Driving(_)) {
@@ -1165,10 +1171,18 @@ fn panic_region_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
 }
 
 /// How the guest went down: the first panic, else `otherwise`.
+/// A check-in stall on a disk too slow for it names that disk first
+/// (`storage::slow_disk_note`).
 fn guest_down(otherwise: String) -> String {
-    match guest_panic() {
-        Some(message) => format!("macOS crashed: {message}"),
-        None => otherwise,
+    let Some(message) = guest_panic() else {
+        return otherwise;
+    };
+    match storage::slow_disk_note(&message) {
+        Some(note) => {
+            output::arguments(format_args!("STOP SLOW DISK {note}\n"));
+            format!("macOS could not start in time: {note}. macOS crashed: {message}")
+        }
+        None => format!("macOS crashed: {message}"),
     }
 }
 

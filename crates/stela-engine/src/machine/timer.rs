@@ -243,6 +243,20 @@ pub fn deadline(cpu: &Cpu, mut physical: impl FnMut() -> u64) -> Option<u64> {
         .min()
 }
 
+/// [`deadline`] of every channel but the one `control` names.
+pub fn deadline_without(
+    cpu: &Cpu,
+    control: Register,
+    mut physical: impl FnMut() -> u64,
+) -> Option<u64> {
+    let mut now = None;
+    let mut physical = || *now.get_or_insert_with(&mut physical);
+    timers(cpu)
+        .filter(|(_, channel)| channel.control != control)
+        .filter_map(|(bank, channel)| channel.deadline(cpu, bank, &mut physical))
+        .min()
+}
+
 /// Timer observation cutoff for a bounded native epoch. The caller polls and
 /// delivers pending interrupts before entry, and the epoch cannot change timer
 /// controls or interrupt masks/routing. An unscaled, zero-offset asserted channel

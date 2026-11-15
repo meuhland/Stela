@@ -17,18 +17,26 @@ impl DmaAllocator for NoAllocation {
     }
 }
 fn geometry(host: &Host) -> [(u64, usize); 3] {
-    [&host.engine.command, &host.engine.status, &host.engine.data]
-        .map(|buffer| (buffer.physical(), buffer.len()))
+    [
+        &host.engine.lanes[0].command,
+        &host.engine.lanes[0].status,
+        &host.engine.lanes[0].data,
+    ]
+    .map(|buffer| (buffer.physical(), buffer.len()))
 }
 fn contents(host: &Host) -> [Vec<u8>; 3] {
-    [&host.engine.command, &host.engine.status, &host.engine.data]
-        .map(|buffer| buffer.bytes().to_vec())
+    [
+        &host.engine.lanes[0].command,
+        &host.engine.lanes[0].status,
+        &host.engine.lanes[0].data,
+    ]
+    .map(|buffer| buffer.bytes().to_vec())
 }
 fn empty(host: &Host) {
     assert!(host.requires_rebind());
-    assert!(!host.engine.command.present());
-    assert!(!host.engine.status.present());
-    assert!(!host.engine.data.present());
+    assert!(!host.engine.lanes[0].command.present());
+    assert!(!host.engine.lanes[0].status.present());
+    assert!(!host.engine.lanes[0].data.present());
 }
 fn native_fixture(
     memory: &mut [u64],
@@ -187,9 +195,9 @@ fn native_uas_failed_reset_keeps_all_three_original_owners_and_bytes() {
                 let old = owner(&storage);
                 let (original, before, id) = {
                     let mut old = old.borrow_mut();
-                    old.transport.engine.command.bytes_mut().fill(0xa5);
-                    old.transport.engine.status.bytes_mut().fill(0x5a);
-                    old.transport.engine.data.bytes_mut().fill(0xc3);
+                    old.transport.engine.lanes[0].command.bytes_mut().fill(0xa5);
+                    old.transport.engine.lanes[0].status.bytes_mut().fill(0x5a);
+                    old.transport.engine.lanes[0].data.bytes_mut().fill(0xc3);
                     (
                         geometry(&old.transport),
                         contents(&old.transport),
@@ -243,14 +251,14 @@ fn native_uas_failed_reset_keeps_all_three_original_owners_and_bytes() {
 /// The payload and matching Status IU are completed first.
 fn read_with_unread_command(host: &mut Host) -> NativeTicket {
     let command = command_iu(1, [0; 8], &[0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
-    host.engine.command.bytes_mut().fill(0);
-    host.engine.command.bytes_mut()[..command.len()].copy_from_slice(&command);
+    host.engine.lanes[0].command.bytes_mut().fill(0);
+    host.engine.lanes[0].command.bytes_mut()[..command.len()].copy_from_slice(&command);
     let io = &mut host.engine.io;
     let ticket = io
         .submit(
             Pipe::Command,
             1,
-            host.engine.command.physical(),
+            host.engine.lanes[0].command.physical(),
             command.len(),
         )
         .unwrap();
@@ -259,7 +267,7 @@ fn read_with_unread_command(host: &mut Host) -> NativeTicket {
             .submit(
                 Pipe::Status,
                 1,
-                host.engine.status.physical(),
+                host.engine.lanes[0].status.physical(),
                 IU_BUFFER_BYTES,
             )
             .unwrap();
@@ -269,18 +277,21 @@ fn read_with_unread_command(host: &mut Host) -> NativeTicket {
         .submit(
             Pipe::Status,
             1,
-            host.engine.status.physical(),
+            host.engine.lanes[0].status.physical(),
             IU_BUFFER_BYTES,
         )
         .unwrap();
     let data = io
-        .submit(Pipe::Input, 1, host.engine.data.physical(), 512)
+        .submit(Pipe::Input, 1, host.engine.lanes[0].data.physical(), 512)
         .unwrap();
     assert_eq!(io.completed(&data), Some(Ok(512)));
     assert_eq!(io.completed(&status), Some(Ok(16)));
-    assert_eq!(&host.engine.data.bytes()[..512], &[0x6d; 512]);
-    assert_eq!(host.engine.status.bytes()[0], STATUS_IU);
-    assert_eq!(&host.engine.status.bytes()[2..4], &1u16.to_be_bytes());
+    assert_eq!(&host.engine.lanes[0].data.bytes()[..512], &[0x6d; 512]);
+    assert_eq!(host.engine.lanes[0].status.bytes()[0], STATUS_IU);
+    assert_eq!(
+        &host.engine.lanes[0].status.bytes()[2..4],
+        &1u16.to_be_bytes()
+    );
     ticket
 }
 fn command_pointer(ticket: &NativeTicket) -> u64 {

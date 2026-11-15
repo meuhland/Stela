@@ -79,6 +79,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.step_timing.as_ref()
     }
 
+    /// Under step timing, describe the `bytes` of code at `code` to the host
+    /// as one `region` ([`super::Host::profile_code`]).
+    #[inline]
+    pub(super) fn profile_code(
+        &mut self,
+        code: NativeCode,
+        bytes: usize,
+        region: step_timing::CodeRegion,
+    ) {
+        if self.step_timing.is_some() {
+            self.host.profile_code(code, bytes, &[(0, region)]);
+        }
+    }
+
     /// The profile clock, while timing is on.
     #[inline]
     pub(super) fn timing_start(&mut self) -> u64 {
@@ -140,7 +154,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             _ => slot,
         };
         let now = self.host.profile_ticks();
-        self.host.profile_boundary(step_timing::Phase::Exit, now);
+        self.host.profile_exit(slot, now);
         let closed = core::mem::take(&mut self.timed_closed);
         let waited = device.map_or(0, |_| self.devices.take_lock_wait());
         if let Some(timing) = &mut self.step_timing {
@@ -257,8 +271,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Add the hot-block samples since the last call to `hot`
     /// ([`step_timing::HotBlocks`]).
     pub fn take_hot_samples(&mut self, hot: &mut step_timing::HotBlocks) {
-        for (pc, level) in self.hot_samples.drain(..) {
+        for (pc, level, asid) in self.hot_samples.drain(..) {
             hot.add(pc, level, 1);
+            hot.asids.add(asid, pc, level, 1);
         }
         hot.add_dynamic(&self.dynamic_samples);
         self.dynamic_samples.clear();

@@ -51,6 +51,7 @@ use core::arch::{
 };
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering::Relaxed};
+use stela_boot_core::host_samples::SAMPLED;
 use stela_engine::machine::engine::step_timing::Phase;
 
 /// Counters this module uses at most.
@@ -73,7 +74,7 @@ const READ_SHARE: u64 = 500;
 /// A read of the set dearer than this (RDPMC trapped by a hypervisor)
 /// switches the core to windows: reading around short intervals would
 /// measure the refill after each trap, not the interval.
-const WINDOW_READ_TICKS: u64 = 2_000;
+pub(super) const WINDOW_READ_TICKS: u64 = 2_000;
 /// A window lasts at least this many ticks (about 2 ms at 3 GHz), and at
 /// least READ_SHARE reads' cost. A tick count, not a time.
 const WINDOW_TICKS: u64 = 6_000_000;
@@ -353,6 +354,23 @@ impl Layout {
         events
     }
 
+    /// Counter `counter`'s count register.
+    fn counter(&self, counter: usize) -> u32 {
+        let counter = counter as u32;
+        match (self.amd, self.stride) {
+            (true, 2) => self.select + 1 + 2 * counter,
+            (true, _) => 0xc001_0004 + counter,
+            (false, _) => 0xc1 + counter,
+        }
+    }
+
+    /// The register that clears counters' overflow status, where there is
+    /// one: AMD's PerfCntrGlobalStatusClr, Intel's IA32_PERF_GLOBAL_OVF_CTRL.
+    fn overflow_clear(&self) -> Option<u32> {
+        self.global
+            .map(|_| if self.amd { 0xc000_0302 } else { 0x390 })
+    }
+
     fn select(&self, event: Event) -> u64 {
         const OS: u64 = 1 << 17;
         const USR: u64 = 1 << 16;
@@ -450,9 +468,17 @@ fn core() -> Option<&'static Core> {
 /// core refused.
 fn program(layout: &Layout, set: usize) -> usize {
     let events = layout.events(set);
+    // The sampled counters interrupt on overflow (`sampling`).
+    const INTERRUPT: u64 = 1 << 20;
     for counter in 0..layout.counters {
         let index = layout.select + counter as u32 * layout.stride;
-        let value = events.get(counter).map_or(0, |event| layout.select(*event));
+        let interrupt = match counter < SAMPLED && super::sampling::enabled() {
+            true => INTERRUPT,
+            false => 0,
+        };
+        let value = events
+            .get(counter)
+            .map_or(0, |event| layout.select(*event) | interrupt);
         if !write(index, value) && value != 0 {
             let bit = 1 << (set * MAX_COUNTERS + counter);
             if REFUSED.fetch_or(bit, Relaxed) & bit == 0 {
@@ -544,6 +570,7 @@ pub(crate) fn start(pe: usize) {
         ));
         return;
     }
+    super::sampling::enable(layout.fixed.len());
     let read = program(layout, SET.load(Relaxed) as usize % layout.sets());
     // What reading the set costs: RDPMC may trap under a hypervisor.
     let before = crate::apic::rdtsc();
@@ -583,6 +610,12 @@ pub(crate) fn start(pe: usize) {
             layout.described
         ));
     }
+    super::sampling::start(
+        pe,
+        [layout.counter(0), layout.counter(1)],
+        layout.overflow_clear(),
+        cost / read.max(1) as u64,
+    );
     let started = crate::apic::rdtsc();
     let own = Own {
         set: SET.load(Relaxed) as usize % layout.sets(),
@@ -612,7 +645,7 @@ pub(crate) fn start(pe: usize) {
 fn read_all(read: usize) -> [u64; MAX_COUNTERS] {
     let mut values = [0; MAX_COUNTERS];
     for (counter, value) in values.iter_mut().enumerate().take(read) {
-        *value = rdpmc(counter as u32);
+        *value = super::sampling::read(counter, rdpmc);
     }
     values
 }
@@ -763,6 +796,7 @@ pub(crate) fn fill_begin() {
     };
     // SAFETY: the owner core; its boundary code is not running.
     let own = unsafe { &mut *core.own.get() };
+    super::sampling::fill(true);
     let now = crate::apic::rdtsc();
     // A fill inside a sampled interval is read at both ends while the
     // budget allows; else the interval's `nat` sample still holds it.
@@ -778,6 +812,7 @@ pub(crate) fn fill_end() {
     };
     // SAFETY: as `fill_begin`.
     let own = unsafe { &mut *core.own.get() };
+    super::sampling::fill(false);
     let Some((then, before)) = own.fill.take() else {
         return;
     };
@@ -799,6 +834,8 @@ pub(crate) struct Seen {
     totals: Vec<[[[u64; MAX_COUNTERS + 2]; BUCKETS + 1]; MAX_SETS]>,
     /// Each core's reading and programming ticks at the last beat.
     spent: Vec<u64>,
+    /// The `PES WHERE` lines' ([`super::sampling::report`]).
+    sampled: super::sampling::Seen,
 }
 
 impl Seen {
@@ -806,6 +843,7 @@ impl Seen {
         Self {
             totals: Vec::new(),
             spent: Vec::new(),
+            sampled: super::sampling::Seen::new(),
         }
     }
 }
@@ -977,6 +1015,7 @@ pub(crate) fn report(seen: &mut Seen) {
     }
     line.push('\n');
     output::arguments(format_args!("{line}"));
+    super::sampling::report(&mut seen.sampled);
     if sets > 1 {
         SET.store(((set + 1) % sets) as u32, Relaxed);
     }

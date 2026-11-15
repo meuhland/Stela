@@ -92,6 +92,35 @@ pub struct Loader {
     pub relax: fn(),
 }
 
+/// A Vulkan driver linked into the image: its loader entry point and the
+/// driver-internal calls Vulkan cannot express, with the same signatures for
+/// every driver. A [`Loader`] is made from it ([`Driver::loader`]).
+#[derive(Clone, Copy)]
+pub struct Driver {
+    /// The driver's own `vk_icdGetInstanceProcAddr`.
+    pub get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    /// The `nir_shader_compiler_options` the driver builds a device's shaders
+    /// with, for the AIR compiler, lasting as long as the physical device.
+    pub nir_options: unsafe extern "C" fn(vk::PhysicalDevice) -> *const c_void,
+    /// [`Loader::submit_thread`].
+    pub submit_thread: Option<unsafe extern "C" fn(vk::Queue) -> vk::Result>,
+    /// [`Loader::refusals`].
+    pub refusals: Option<Refusals>,
+}
+
+impl Driver {
+    /// The driver's loader, with the platform's message sink and wait.
+    pub fn loader(&self, log: fn(&str), relax: fn()) -> Loader {
+        Loader {
+            get_instance_proc_addr: self.get_instance_proc_addr,
+            log,
+            submit_thread: self.submit_thread,
+            refusals: self.refusals,
+            relax,
+        }
+    }
+}
+
 /// The driver's record of submissions it refused while keeping the device:
 /// it still made their signals, after their waits.
 #[derive(Clone, Copy)]

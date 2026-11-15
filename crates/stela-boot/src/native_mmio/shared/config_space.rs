@@ -86,6 +86,18 @@ impl ConfigScope {
     /// # Safety
     /// The caller holds this original configuration extent and exclusion.
     unsafe fn open(source: &Source, span: PhysicalSpan) -> Result<Self, Error> {
+        // SAFETY: forwarded.
+        unsafe { Self::open_as(source, span, Protection::ReadOnly) }
+    }
+
+    /// # Safety
+    /// As [`Self::open`]; a writable scope also excludes every observer of
+    /// the extent that a write could invalidate.
+    unsafe fn open_as(
+        source: &Source,
+        span: PhysicalSpan,
+        protection: Protection,
+    ) -> Result<Self, Error> {
         let bytes = usize::try_from(span.bytes()).map_err(|_| Error::InvalidRange)?;
         let (resource, assignment) = source.reservation(span, ResourceKind::Registers)?;
         let close = assignment.admission_close();
@@ -97,14 +109,34 @@ impl ConfigScope {
             })),
             close: Some(close),
         };
-        scope.pending.mapping = Some(source.authority.map(
-            resource,
-            0,
-            bytes,
-            CacheAttribute::Uncached,
-            Protection::ReadOnly,
-        )?);
+        scope.pending.mapping =
+            Some(
+                source
+                    .authority
+                    .map(resource, 0, bytes, CacheAttribute::Uncached, protection)?,
+            );
         Ok(scope)
+    }
+
+    /// Write `width` bytes of `value` at `offset` of a writable scope.
+    fn write(&self, offset: usize, width: u16, value: u32) -> Result<(), Error> {
+        let mapping = self.pending.mapping.as_ref().ok_or(Error::Unavailable)?;
+        if !offset.is_multiple_of(usize::from(width)) || !matches!(width, 1 | 2 | 4) {
+            return Err(Error::InvalidRange);
+        }
+        let address = mapping.address(offset, usize::from(width))?;
+        // SAFETY: the live writable map covers these naturally aligned bytes.
+        unsafe {
+            match width {
+                1 => address.as_ptr().write_volatile(value as u8),
+                2 => address
+                    .cast::<u16>()
+                    .as_ptr()
+                    .write_volatile((value as u16).to_le()),
+                _ => address.cast::<u32>().as_ptr().write_volatile(value.to_le()),
+            }
+        }
+        Ok(())
     }
 
     fn read(&self, offset: usize, width: u16) -> Result<u32, Error> {
@@ -401,6 +433,51 @@ impl Source {
         // SAFETY: the only reader was the synchronous scalar access above.
         unsafe { scope.retire() }?;
         value
+    }
+
+    /// Whether nothing has taken the PCI census yet ([`Self::contain_pci`]).
+    pub(crate) fn before_census(&self) -> bool {
+        self.pci_slots.unclaimed()
+    }
+
+    /// Write one register of `address` through a scoped writable map, for
+    /// what powers PCI ports on before the census: the firmware's AML and
+    /// Linux's `pci_power_up`. No function is observed or parked yet, so
+    /// the census and containment read what these writes leave as they read
+    /// what firmware left. Refused once the census has begun. A write to a
+    /// bus no root bridge forwards ends at the root complex, as there.
+    pub(crate) fn write_before_census(
+        &self,
+        address: Address,
+        offset: u16,
+        width: u16,
+        value: u32,
+    ) -> Result<(), Error> {
+        if !self.before_census() {
+            return Err(Error::Busy);
+        }
+        if !matches!(width, 1 | 2 | 4)
+            || offset > PAGE as u16 - width
+            || !offset.is_multiple_of(width)
+            || address.device >= 32
+            || address.function >= 8
+        {
+            return Err(Error::InvalidRange);
+        }
+        let wire = self.platform.wire();
+        let windows = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
+        if stela_boot_core::ecam::ends_at_root_complex(&windows, wire.roots(), address, offset) {
+            return Ok(());
+        }
+        let (_, span) = self.config_page(address)?;
+        // SAFETY: the original capture supplies this function extent, and
+        // before the census no other owner observes or maps it. This
+        // synchronous BSP call lends no mapping.
+        let mut scope = unsafe { ConfigScope::open_as(self, span, Protection::ReadWrite) }?;
+        let written = scope.write(usize::from(offset), width, value);
+        // SAFETY: the only access was the synchronous scalar write above.
+        unsafe { scope.retire() }?;
+        written
     }
 
     /// Map one exact read-only function for a kept native observer.

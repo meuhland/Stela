@@ -435,3 +435,73 @@ fn a_sibling_that_can_still_master_refuses_before_any_effect() {
     assert!(log.borrow().is_empty());
     assert_eq!(gpu.config.0.words.borrow()[1] & 0xffff, 6);
 }
+
+/// A port whose slot power was just turned on: a fast link that comes up
+/// after a few Link Status reads, then a function that is silent for a few
+/// more polls, is ready after Linux's 20 ms, the polls, 100 ms and the
+/// function's doubling waits.
+#[test]
+fn a_powered_port_waits_for_its_link_and_then_its_function() {
+    let log = Log::default();
+    let gpu = child(address(1, 0, 0), 0);
+    let port = bridge(3, true, vec![gpu.config.clone()], &log);
+    port.down.set(3);
+    gpu.config.0.silence.set(4);
+    let mut waited = 0;
+    let outcome = wait_for_secondary_bus(&port, &gpu.config, |microseconds| {
+        waited += microseconds;
+        Ok(())
+    });
+    assert_eq!(outcome, Ok(SecondaryBus::Ready));
+    assert_eq!(
+        waited,
+        20_000 + 3 * 1_000 + 100_000 + (1 + 2 + 4 + 8) * 1_000
+    );
+    assert!(log.borrow().is_empty(), "the wait writes nothing");
+}
+
+/// A link that reports itself and never comes up ends the wait after 20 ms
+/// and Linux's 1 s, before any read of the function.
+#[test]
+fn a_powered_port_whose_link_stays_down_stops_after_one_second() {
+    let log = Log::default();
+    let gpu = child(address(1, 0, 0), 0);
+    let port = bridge(3, true, vec![gpu.config.clone()], &log);
+    port.down.set(u32::MAX);
+    gpu.config.0.silence.set(u32::MAX);
+    let mut waited = 0;
+    let outcome = wait_for_secondary_bus(&port, &gpu.config, |microseconds| {
+        waited += microseconds;
+        Ok(())
+    });
+    assert_eq!(outcome, Ok(SecondaryBus::NoLink));
+    assert_eq!(waited, 20_000 + 1_000_000);
+    assert_eq!(
+        gpu.config.0.silence.get(),
+        u32::MAX,
+        "the function is not read"
+    );
+}
+
+/// A slow link that does not report itself gets 100 ms and the function
+/// Linux's first second; a fast one that reports itself up but whose
+/// function never answers gets the 60 s bound in all.
+#[test]
+fn a_powered_port_whose_function_stays_silent_is_bounded() {
+    for (speed, reporting, bound) in [
+        (1, false, 100_000 + 1_023_000),
+        (3, true, 20_000 + 100_000 + 65_535_000),
+    ] {
+        let log = Log::default();
+        let gpu = child(address(1, 0, 0), 0);
+        let port = bridge(speed, reporting, vec![gpu.config.clone()], &log);
+        gpu.config.0.silence.set(u32::MAX);
+        let mut waited = 0;
+        let outcome = wait_for_secondary_bus(&port, &gpu.config, |microseconds| {
+            waited += microseconds;
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(SecondaryBus::Silent));
+        assert_eq!(waited, bound);
+    }
+}

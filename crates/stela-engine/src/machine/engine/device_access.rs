@@ -148,6 +148,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             direct_exits: Vec::new(),
             fault_recovery: Vec::new(),
             self_loop: false,
+            cold: (0, 0),
         };
         let preparation = self.preparation(variant);
         let emission = Arc::new(super::stored::Emission::new(

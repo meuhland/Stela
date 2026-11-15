@@ -5,8 +5,8 @@
 use super::*;
 use crate::machine::cpu::Cpu;
 use stela_compiler::x86_64::transition::{
-    CHAIN_FREE, CHAIN_LOGGED, EXCEPTION_RETURN, GUARDED_ENTER, GUARDED_EXIT, KINDS, Record,
-    SUPERVISOR_CALL,
+    CHAIN_FREE, CHAIN_LOGGED, EXCEPTION_RETURN, GUARDED_ENTER, GUARDED_EXIT, KINDS, RETURN_WITHIN,
+    Record, SUPERVISOR_CALL,
 };
 
 /// The SPSR bits a GEXIT record fixes: M[4:0], D, BTYPE, IL, SS, PAN, TCO
@@ -66,6 +66,16 @@ pub mod miss {
     pub const REASONS: usize = 9;
 }
 
+/// The record slot of a transition of `kind` from EL `from` to EL `to`:
+/// an ERET that stays at its EL has its own ([`RETURN_WITHIN`]).
+fn record_slot(kind: usize, from: u8, to: u8) -> usize {
+    if kind == EXCEPTION_RETURN && from == to {
+        RETURN_WITHIN
+    } else {
+        kind
+    }
+}
+
 /// [`dynamic_branch`] of a block ending with a native transition: its
 /// thunk's exit to the target, which sets no BTYPE.
 pub(super) fn transition_branch(word: u32) -> Option<(ExitKind, Option<u8>)> {
@@ -122,8 +132,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         }
         let returning = matches!(kind, GUARDED_EXIT | EXCEPTION_RETURN);
+        // An ERET's record is the one of the EL SPSR returns to (M[3:2]).
+        let to = if kind == EXCEPTION_RETURN {
+            (self.cpu.read(SystemRegister::SPSR_EL2) >> 2 & 3) as u8
+        } else {
+            pstate.el
+        };
         let table = &self.mirrors.transitions;
-        let record = table.records[self.mirror_state()][kind];
+        let record = table.records[self.mirror_state()][record_slot(kind, pstate.el, to)];
         let frame = &self.cpu.state as *const GuestState as u64;
         let reason = if record.generation == 0 {
             miss::NEVER
@@ -353,7 +369,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             };
             (spsr, elr, esr, 0, 0)
         };
-        let scratch = at(&self.mirrors.transitions.records[from_state][note.kind].scratch);
+        let slot = record_slot(note.kind, from.el, to.el);
+        let scratch = at(&self.mirrors.transitions.records[from_state][slot].scratch);
         let aspsr = if guarded { aspsr } else { scratch };
         let (sp_save, sp_load) = if Cpu::same_stack(from, to) {
             (scratch, scratch)
@@ -469,7 +486,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .pointer
                 .map_or([0; x86_64_pointer::TAG_WORDS], |([_, to], _)| to),
         };
-        let slot = &mut self.mirrors.transitions.records[from_state][note.kind];
+        let slot = &mut self.mirrors.transitions.records[from_state][slot];
         *slot = record;
         if !guarded {
             slot.target = at(&slot.vector);
@@ -685,6 +702,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         self.install_stream = self.stream_at(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
+        self.profile_code(installed, thunk.code.len(), step_timing::CodeRegion::Other);
         let site = code.0 as u64 + site as u64;
         let jump = chain::jump(site, installed.0 as u64)?;
         // Its part was chosen meanwhile: the instruction stays an exit.

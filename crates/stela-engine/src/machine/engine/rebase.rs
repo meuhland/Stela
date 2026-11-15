@@ -242,6 +242,7 @@ mod tests {
             context: Digest::default(),
             offset,
             source_bytes: 4,
+            cold: (0, 0),
             input: alloc::vec![0; 4],
             code: alloc::vec![0; code],
             relocations: alloc::vec![],

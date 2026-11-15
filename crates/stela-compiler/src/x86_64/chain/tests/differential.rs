@@ -466,3 +466,91 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
     }
     assert!(entered > 8000 && exited > 8000, "{entered} {exited}");
 }
+
+/// A lower-half page the ITLB lacks in the lower half's context is
+/// translated through the upper half's, where the engine keeps the pages
+/// whose walk ended in a global leaf; the lower half's own entry comes
+/// first; an upper-half page is never translated through the lower half's
+/// context, nor any page through a context the control does not name.
+#[test]
+fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
+    let blocks = pages(PAGE);
+    let region = pages(REGION);
+    let mut code = vec![0x48, 0xb8];
+    code.extend(marker(0).to_le_bytes());
+    code.extend([0xba, 99, 0, 0, 0, 0xc3]);
+    put(&blocks, 0, &code);
+    let dispatcher = dispatcher_with_policy(0, Interruption::Epoch).unwrap();
+    assert!(dispatcher.len() <= DISPATCHER_BYTES);
+    put(&region, PROBES, &dispatcher);
+    let tail = lookup_tail(
+        region.0 as u64 + 3,
+        ExitWord::from(ExitKind::Direct),
+        1,
+        region.0 as u64 + (PROBES + PROBE_ENTRY) as u64,
+        0,
+    )
+    .unwrap();
+    put(&region, 0, &[0x48, 0x89, 0xf0]); // mov rax,rsi
+    put(&region, 3, &tail);
+    let [lower, upper] = [pcs()[0], pcs()[4]];
+    let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+    let stamps = table.new_stamps();
+    for pc in [lower, upper] {
+        let entry = LookupEntry {
+            pc,
+            key: KEYS[0],
+            entry: blocks.0 as u64,
+            block: 0,
+            targets: 0b1111,
+        };
+        table.insert(table.slot(pc, KEYS[0]), entry);
+    }
+    let control = |itlb: &LookupTable| {
+        let mut control = ChainControl {
+            budget: 5,
+            contexts: [CONTEXTS[0], CONTEXTS[1]],
+            table: table.address(),
+            itlb: itlb.address(),
+            masks: [table.mask(), itlb.mask()],
+            stamps,
+            ..ChainControl::default()
+        };
+        control.salts = control.contexts.map(|context| itlb.salt(context));
+        control
+    };
+    let put_page = |itlb: &mut LookupTable, pc: u64, context: u64, key: u64| {
+        let entry = LookupEntry::global_page(pc & !0xfff, context, key);
+        itlb.insert(itlb.page_slot(pc, context), entry);
+    };
+    let entered = |itlb: &LookupTable, pc: u64| run(&region, &mut control(itlb), pc).1 == 99;
+    // Only in the upper half's context: entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, lower, CONTEXTS[1], KEYS[0]);
+    assert!(entered(&itlb, lower));
+    // Its own context's entry comes first, here of a key the table lacks.
+    put_page(&mut itlb, lower, CONTEXTS[0], KEYS[1]);
+    assert!(!entered(&itlb, lower));
+    // Of a context the control does not name: not entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, lower, CONTEXTS[2], KEYS[0]);
+    assert!(!entered(&itlb, lower));
+    // An upper-half page in the lower half's context: not entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, upper, CONTEXTS[0], KEYS[0]);
+    assert!(!entered(&itlb, upper));
+    put_page(&mut itlb, upper, CONTEXTS[1], KEYS[0]);
+    assert!(entered(&itlb, upper));
+    // No upper context (0, as no engine names one): not entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, lower, CONTEXTS[1], KEYS[0]);
+    let mut none = control(&itlb);
+    none.contexts[1] = 0;
+    assert_eq!(
+        run(&region, &mut none, lower),
+        (
+            lower,
+            u64::from(ExitWord::from(ExitKind::Direct).encoded() | 1 << ExitWord::RAN_SHIFT)
+        )
+    );
+}

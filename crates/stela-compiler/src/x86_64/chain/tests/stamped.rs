@@ -286,16 +286,35 @@ fn stamped_tails_transfer_as_their_cell_tails() {
         // ITLB put out for another (a capacity eviction, not a drop), and
         // the stamped tail entered the cell's block while the page tables
         // still map the page to the cell's key, as a refill would find.
-        let context = contexts[half(pc)];
+        // A lower-half page is translated in the upper half's context too
+        // (`translate`), where an entry of the cell's key may have stamped
+        // the cell while the lower half's context took another key since:
+        // a TLB holding both (a conflict) may give either.
         let page = pc & !0xfff;
-        let resident = itlb.find(itlb.page_slot(pc, context), page, context);
+        let candidates = match half(pc) {
+            0 => &contexts[..],
+            _ => &contexts[1..],
+        };
+        let translated = candidates.iter().find_map(|&context| {
+            let resident = itlb.find(itlb.page_slot(pc, context), page, context);
+            (resident.pc == page && resident.key == context).then_some(resident.entry)
+        });
         let cell = table.site_cell(site).unwrap();
         let exit = (
             pc,
             u64::from(ExitWord::from(ExitKind::Direct).encoded() | ran << ExitWord::RAN_SHIFT),
         );
-        let evicted = !(resident.pc == page && resident.key == context)
-            && keys.get(&(page, context)) == Some(&cell.key)
+        // The stamp names the lower half's context alone, so for a
+        // lower-half page it outlives a change of the upper half's: its
+        // translation stays good until a TLBI grows the epoch.
+        let stamped_in = match half(pc) {
+            0 => &CONTEXTS[..],
+            _ => &contexts[1..],
+        };
+        let evicted = translated != Some(cell.key)
+            && stamped_in
+                .iter()
+                .any(|&context| keys.get(&(page, context)) == Some(&cell.key))
             && rb == exit
             && linked.is_some_and(|linked| linked.entry == cell.entry)
             && (ra == (0x7700 + u64::from(cell.block), 99)

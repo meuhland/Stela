@@ -20,7 +20,8 @@
 //! repair by itself. In that boot the engine types [`steps`] at the guest's
 //! root console ([`Driver`]) once the shell's prompt shows, as the manual
 //! remedy does: it mounts the Data
-//! volume, creates the plugin's directories root-owned and 0755, marks them
+//! volume, creates the plugin's directories (and `GPUBundles`, when the
+//! Data volume lacks it) root-owned and 0755, marks them
 //! restricted, syncs, remounts it read-only and restarts quickly
 //! ([`REBOOT`]). The next boot's kext then creates the
 //! files in place. Only mounting and the directories are required: a
@@ -52,7 +53,7 @@
 //!
 //! A plugin file the kext can neither read nor rewrite (`EIO`: a boot
 //! stopped while the guest wrote it, run of 2026-11-12) takes the same
-//! repair, which first removes the plugin's files ([`remove_files`]): the
+//! repair, which also removes the plugin's files ([`remove_files`]): the
 //! next boot's kext creates them again, where a stop would leave the boot
 //! failing until someone removed them by hand in a single-user boot.
 //!
@@ -402,13 +403,14 @@ pub fn stop_reason(
     )
 }
 
-/// The step that removes the plugin's files, when its bundle exists, so the
-/// kext writes them again: one it can neither read nor rewrite stops every
-/// boot. Directories stay, with their owner and flags. Optional: a file
-/// that cannot be removed leaves the kext's report to say so.
+/// The step that removes the plugin's files, so the kext writes them
+/// again: one it can neither read nor rewrite stops every boot. It runs
+/// right after the directories are made, so the bundle exists and no step
+/// tests for it. Directories stay, with their owner and flags. Optional: a
+/// file that cannot be removed leaves the kext's report to say so.
 pub fn remove_files() -> String {
     let bundle = format!("{PLUGINS}/{}", DIRECTORIES[0]);
-    format!("/bin/test ! -d {bundle} || /usr/bin/find {bundle} -type f -delete")
+    format!("/usr/bin/find {bundle} -type f -delete")
 }
 
 /// One console command and the seconds it may take.
@@ -444,10 +446,14 @@ pub fn steps() -> Vec<Step> {
         step("/sbin/mount -P 1".into(), 120),
         step("/usr/libexec/init_data_protection".into(), 180),
         step("/sbin/mount -P 2".into(), 180),
-        step(format!("/bin/test -d {PLUGINS}"), 30),
+        // The Data volume may lack Apple's `GPUBundles`, so the plugins'
+        // parent is created too; each is named so `-m` gives each its mode,
+        // and `-p` leaves an existing one as it is. A file in a directory's
+        // place fails here (`File exists`): nothing is removed.
+        step(format!("/bin/mkdir -p -m 0755 {PLUGINS} {directories}"), 30),
+        // A plugin file the kext could not write goes, in a bundle the
+        // mkdir just made sure of.
         optional(remove_files(), 60),
-        // Each named last, so `-m` gives each its mode.
-        step(format!("/bin/mkdir -p -m 0755 {directories}"), 30),
         step(format!("/usr/sbin/chown root:wheel {directories}"), 30),
         optional(format!("/usr/bin/chflags restricted {directories}"), 30),
         step("/bin/sync".into(), 120),

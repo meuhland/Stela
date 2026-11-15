@@ -188,11 +188,70 @@ fn later_deadlines_complete_natively_and_fire_at_the_new_count() {
     assert_eq!(machine.mirrors.lines_until, 200);
     assert!(!fiq_at(&mut machine, &clock, 199));
     assert!(fiq_at(&mut machine, &clock, 200));
-    // The line is high now: every write is the engine's.
+    // The line is high now: a write that keeps it high is the engine's
+    // (one that lowers it completes: the test below).
     machine.mirrors.lines_until = 300;
-    assert!(!native(&mut machine, TimerAccess::WriteCompare, 400));
+    assert!(!native(&mut machine, TimerAccess::WriteCompare, 150));
     let written = fixed(&machine);
-    assert!(!native(&mut machine, TimerAccess::WriteControl(written), 0));
+    assert!(!native(
+        &mut machine,
+        TimerAccess::WriteControl(written),
+        ENABLE
+    ));
+    assert_eq!(stored(&machine), (200, ENABLE));
+}
+
+/// With the timer's FIQ taken and waiting under every mask, as a kernel's
+/// timer handler runs, each write that lowers the output completes
+/// natively, storing what the engine's write stores, and leaves waiting
+/// what the engine's next look finds: no FIQ, or the FIQ still where
+/// another channel (CNTHP) raises it too. A write that keeps the output
+/// high exits with storage and the waiting FIQ as they were.
+#[test]
+fn writes_that_lower_a_raised_timer_complete_and_leave_what_else_waits() {
+    let clock = count_state();
+    let written = fixed(&armed(&clock));
+    let cases = [
+        (TimerAccess::WriteValue, TVAL, 100, true),
+        (TimerAccess::WriteCompare, CVAL, 400, true),
+        (TimerAccess::WriteControl(written), CTL_WRITE, 0, true),
+        (
+            TimerAccess::WriteControl(written),
+            CTL_WRITE,
+            ENABLE | IMASK,
+            true,
+        ),
+        (TimerAccess::WriteCompare, CVAL, 150, false),
+        (TimerAccess::WriteValue, TVAL, 0, false),
+    ];
+    for other in [false, true] {
+        for (access, word, value, lowers) in cases {
+            let case = alloc::format!("other {other} {access:?} {value:#x}");
+            let [mut engine_path, mut machine] = [armed(&clock), armed(&clock)];
+            for machine in [&mut engine_path, &mut machine] {
+                if other {
+                    let registers = &mut machine.cpu.registers;
+                    registers.set(SystemRegister::CNTHP_CVAL_EL2, 0, 160);
+                    registers.set(SystemRegister::CNTHP_CTL_EL2, 0, ENABLE);
+                    machine.timers = None;
+                }
+                assert!(fiq_at(machine, &clock, 200), "{case}");
+            }
+            let before = stored(&machine);
+            assert_eq!(native(&mut machine, access, value), lowers, "{case}");
+            if !lowers {
+                assert_eq!(stored(&machine), before, "{case}");
+                assert_eq!(machine.cpu.state.pending & FIQ, FIQ, "{case}");
+                continue;
+            }
+            engine(&mut engine_path, word, value);
+            assert_eq!(stored(&machine), stored(&engine_path), "{case}");
+            let waiting = if other { FIQ } else { 0 };
+            assert_eq!(machine.cpu.state.pending & FIQ, waiting, "{case}");
+            assert_eq!(fiq_at(&mut engine_path, &clock, 200), other, "{case}");
+            assert_eq!(fiq_at(&mut machine, &clock, 200), other, "{case}");
+        }
+    }
 }
 
 /// An earlier deadline completes natively too: it pulls the count where
@@ -334,4 +393,95 @@ fn control_reads_match_the_engine_in_every_case() {
             assert_eq!(read & 4 != 0, control & ENABLE != 0 && past);
         }
     }
+}
+
+/// `cargo test -p stela-engine --release --lib raised_timer_write_costs --
+/// --ignored --nocapture`: nanoseconds per MSR CNTV_TVAL_EL0 that rearms a
+/// raised timer under its waiting FIQ, as a kernel's timer handler does:
+/// through the engine path (every such write before native completion)
+/// and through the thunk, each after the same reset of the compare and the
+/// waiting FIQ. The VM's engine path adds its native exit and entry.
+#[test]
+#[ignore = "manual: opt-in"]
+fn raised_timer_write_costs() {
+    use super::super::transitions::tests::enter_native;
+    use core::ffi::c_void;
+    unsafe extern "C" {
+        fn mmap(
+            address: *mut c_void,
+            bytes: usize,
+            protection: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        fn mprotect(address: *mut c_void, bytes: usize, protection: i32) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const ROUNDS: u32 = 20_000;
+    let time = |round: &mut dyn FnMut()| {
+        for _ in 0..ROUNDS / 10 {
+            round();
+        }
+        (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for _ in 0..ROUNDS {
+                    round();
+                }
+                started.elapsed().as_nanos() as u64 / u64::from(ROUNDS)
+            })
+            .min()
+            .unwrap()
+    };
+    let raise = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::CNTHV_CVAL_EL2, 0, 150);
+        machine.cpu.state.pending = FIQ;
+    };
+    let clock = count_state();
+    let mut engine_path = armed(&clock);
+    assert!(fiq_at(&mut engine_path, &clock, 200));
+    let ns = time(&mut || {
+        raise(&mut engine_path);
+        engine(&mut engine_path, TVAL, 100);
+    });
+    std::println!("TIMER raised tval path=engine ns_per_write={ns}");
+    let mut machine = armed(&clock);
+    assert!(fiq_at(&mut machine, &clock, 200));
+    let thunk = register_read::timer_thunk(GuestAddress(BASE), 19, TimerAccess::WriteValue, TIMER);
+    let code = stela_compiler::x86_64::pinned::entered(&thunk.code);
+    // SAFETY: private anonymous memory made RX after the copy, kept for
+    // the process; the thunk touches only the machine's frame and what its
+    // anchors and cells name, which outlive the calls.
+    let entry: unsafe extern "sysv64" fn(*mut GuestState) -> [u64; 2] = unsafe {
+        let page = mmap(core::ptr::null_mut(), 4096, 3, 2 | MAP_ANONYMOUS, -1, 0);
+        assert_ne!(page as usize, usize::MAX);
+        core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
+        assert_eq!(mprotect(page, 4096, 5), 0);
+        core::mem::transmute(page)
+    };
+    machine.cpu.state.x[19] = 100;
+    let lines_until = machine.mirrors.lines_until;
+    let ns = time(&mut || {
+        raise(&mut machine);
+        machine.mirrors.lines_until = lines_until;
+        enter_native(&mut machine);
+        // SAFETY: as above.
+        let exit = unsafe { entry(&mut machine.cpu.state) };
+        assert_eq!(exit, [BASE + 4, ExitKind::Fallthrough as u64]);
+        assert_eq!(machine.cpu.state.pending, 0);
+    });
+    std::println!("TIMER raised tval path=native ns_per_write={ns} (with the entry setup)");
+    let ns = time(&mut || {
+        raise(&mut machine);
+        machine.mirrors.lines_until = lines_until;
+        enter_native(&mut machine);
+    });
+    std::println!("TIMER raised tval path=entry-setup-alone ns={ns}");
 }

@@ -29,13 +29,13 @@ use stela_crypto::digest::Digest as _;
 
 /// The bytes of the fetch page a record covers: no block leaves it.
 pub const PAGE_BYTES: usize = 4096;
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 const RECORD_MAGIC: [u8; 8] = *b"STLTPAGE";
 const HEADER_BYTES: usize = 88;
 const TRAILER_BYTES: usize = 32;
 /// Context, guest offset, source and input lengths, code length, and four
 /// metadata counts. Variable-length payloads follow these fixed fields.
-const ENTRY_MIN_BYTES: usize = 32 + 3 * 2 + 5 * 4;
+const ENTRY_MIN_BYTES: usize = 32 + 3 * 2 + 7 * 4;
 const RELOCATION_BYTES: usize = 4;
 const SOURCE_MAP_BYTES: usize = 6;
 const EXIT_BYTES: usize = 15;
@@ -107,6 +107,8 @@ pub struct Entry {
     /// The page offset of its entry PC.
     pub offset: u16,
     pub source_bytes: u16,
+    /// The code offsets of its cold code (`CompiledBlock::cold`).
+    pub cold: (u32, u32),
     /// Exact admitted instruction bytes given to the compiler, including any
     /// analyzed suffix beyond the emitted block. Raw fetch-page identity and
     /// the preparation context remain separate record bindings.
@@ -492,6 +494,8 @@ impl Record {
             out.extend(entry.context.0);
             out.extend(entry.offset.to_le_bytes());
             out.extend(entry.source_bytes.to_le_bytes());
+            out.extend(entry.cold.0.to_le_bytes());
+            out.extend(entry.cold.1.to_le_bytes());
             out.extend((entry.input.len() as u16).to_le_bytes());
             out.extend(&entry.input);
             out.extend((entry.code.len() as u32).to_le_bytes());
@@ -673,12 +677,16 @@ impl<'a> Reader<'a> {
         let context = self.digest()?;
         let offset = self.u16()?;
         let source_bytes = self.u16()?;
+        let cold = (self.u32()?, self.u32()?);
         let input_bytes = usize::from(self.u16()?);
         if input_bytes > PAGE_BYTES {
             return Err(FormatError::Entry);
         }
         let input = self.take(input_bytes)?.to_vec();
         let code_bytes = self.u32()? as usize;
+        if cold.0 > cold.1 || cold.1 as usize > code_bytes {
+            return Err(FormatError::Entry);
+        }
         let relocations = decode_items(self.count(RELOCATION_BYTES)?, || self.u32())?;
         let source_map = decode_items(self.count(SOURCE_MAP_BYTES)?, || {
             Ok((self.u16()?, self.u32()?))
@@ -759,6 +767,7 @@ impl<'a> Reader<'a> {
             context,
             offset,
             source_bytes,
+            cold,
             input,
             code,
             relocations,
@@ -930,6 +939,7 @@ impl Entry {
             context,
             offset: page_offset(pc)?,
             source_bytes: u16::try_from(block.source_bytes).ok()?,
+            cold: block.cold,
             input: input.to_vec(),
             code: stored,
             relocations,

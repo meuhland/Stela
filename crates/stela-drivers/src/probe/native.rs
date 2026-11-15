@@ -802,13 +802,13 @@ impl wifi::intel::boot::FunctionOwner for IntelOwner {
 /// way down, then the function. `bridges` lists each PCI bridge with its
 /// secondary bus.
 #[cfg(feature = "native-acpi")]
-pub(super) fn companion(
-    session: &'static crate::platform::acpi::Session,
+pub(super) fn companion<'a>(
+    session: &'a crate::platform::acpi::Session,
     address: Address,
     bridges: &[Bridge],
-) -> Option<crate::platform::acpi::Handle<'static>> {
+) -> Option<crate::platform::acpi::Handle<'a>> {
     use crate::platform::acpi::Handle;
-    let parent = |handle: Handle<'static>| -> Option<String> {
+    let parent = |handle: Handle<'a>| -> Option<String> {
         let path = handle.path().ok()?;
         path.rsplit_once('.')
             .map(|(parent, _)| String::from(parent))
@@ -829,7 +829,7 @@ pub(super) fn companion(
         // acpi_find_child_device and find_child_checks: an enabled device
         // without _HID wins; one without _STA or with a _HID only scores
         // lower; a bridge's companion needs children.
-        let mut best: Option<(u8, Handle<'static>)> = None;
+        let mut best: Option<(u8, Handle<'a>)> = None;
         for &device in &devices {
             if parent(device).as_deref() != Some(path.as_str())
                 || integer(device, "_ADR") != Some(adr)
@@ -1168,9 +1168,9 @@ pub(super) fn root_buses(
 
 /// Each ACPI PCI host bridge with its `_SEG` and `_BBN`, zero when absent.
 #[cfg(feature = "native-acpi")]
-fn roots(
-    session: &'static crate::platform::acpi::Session,
-) -> Vec<(crate::platform::acpi::Handle<'static>, u16, u8)> {
+pub(super) fn roots(
+    session: &crate::platform::acpi::Session,
+) -> Vec<(crate::platform::acpi::Handle<'_>, u16, u8)> {
     let mut roots = session.devices("PNP0A08").unwrap_or_default();
     roots.extend(session.devices("PNP0A03").unwrap_or_default());
     roots
@@ -1185,7 +1185,7 @@ fn roots(
 
 /// The integer `name` evaluates to on `handle`, when it has one.
 #[cfg(feature = "native-acpi")]
-fn integer(handle: crate::platform::acpi::Handle<'static>, name: &str) -> Option<u64> {
+pub(super) fn integer(handle: crate::platform::acpi::Handle<'_>, name: &str) -> Option<u64> {
     use crate::platform::acpi::Value;
     handle.child(name).ok()?;
     match handle.evaluate(Some(name), &[]).ok()? {

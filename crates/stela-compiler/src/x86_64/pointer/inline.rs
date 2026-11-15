@@ -170,6 +170,20 @@ mod tests {
             .unwrap()
     }
 
+    /// A block's service call through the cell ends as `--profile`'s host
+    /// samples look for it before a return address.
+    #[test]
+    fn block_service_calls_end_as_host_samples_look_for_them() {
+        const PACIBSP: u32 = 0xd503_237f;
+        const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+        let block = compile(&[PACIBSP, ADD], Some(CELLS));
+        let [cell, address] = super::super::service_call_ends(CELLS.routine, 0x1234_5678);
+        let code = &block.native.x86_64_code;
+        let contains = |end: &[u8]| code.windows(end.len()).any(|bytes| bytes == end);
+        assert!(contains(&cell));
+        assert!(!contains(&address));
+    }
+
     #[test]
     fn blocks_given_the_cells_run_on_past_register_forms_only() {
         // ... BLRAA X8,X16 ends the block either way.

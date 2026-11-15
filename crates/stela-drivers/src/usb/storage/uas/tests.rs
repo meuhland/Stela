@@ -262,6 +262,7 @@ mod media_changes;
 mod native_admission;
 mod native_rescan;
 mod native_reset;
+mod queued;
 mod retirement;
 mod scsi;
 mod streams;

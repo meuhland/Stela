@@ -17,6 +17,7 @@ pub mod nouveau;
 pub mod cold;
 pub mod gsp_perf;
 pub mod nouveau_chip;
+pub mod stack;
 
 #[cfg(feature = "linux-kernel")]
 pub mod drm;
@@ -59,6 +60,16 @@ pub enum Vendor {
 }
 
 impl Vendor {
+    /// The PCI vendor ID.
+    pub fn pci_id(self) -> u16 {
+        match self {
+            Self::Nvidia => NVIDIA_VENDOR,
+            Self::Amd => AMD_VENDOR,
+            Self::Intel => INTEL_VENDOR,
+            Self::Other(id) => id,
+        }
+    }
+
     pub fn from_pci(id: u16) -> Self {
         match id {
             NVIDIA_VENDOR => Self::Nvidia,

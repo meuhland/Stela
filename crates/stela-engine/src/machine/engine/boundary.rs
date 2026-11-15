@@ -425,6 +425,24 @@ pub trait Host {
     /// performance counters attributes them to the interval since its last
     /// call; the default ignores it.
     fn profile_boundary(&mut self, _phase: step_timing::Phase, _now: u64) {}
+    /// [`Self::profile_boundary`] of an exit's handling, which step timing
+    /// counts in exit slot `slot` (`step_timing::EXIT_SLOTS`): a host that
+    /// samples where its time goes names the exit kind.
+    fn profile_exit(&mut self, _slot: usize, now: u64) {
+        self.profile_boundary(step_timing::Phase::Exit, now);
+    }
+    /// Under `--profile`, the `bytes` of code just installed at `code` are
+    /// `regions`: `(offset, region)` pairs in ascending offsets, each
+    /// running to the next one's offset and the last to `bytes`
+    /// ([`step_timing::CodeRegion`]). A host that samples where native code
+    /// runs tags its arena with them; the default ignores them.
+    fn profile_code(
+        &mut self,
+        _code: NativeCode,
+        _bytes: usize,
+        _regions: &[(u32, step_timing::CodeRegion)],
+    ) {
+    }
     /// Interrupt the host at this counter value, or never.
     fn arm_timer(&mut self, deadline: Option<u64>);
     /// Block until a host interrupt arrives.

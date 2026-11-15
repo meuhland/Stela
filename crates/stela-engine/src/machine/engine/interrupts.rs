@@ -107,6 +107,46 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.mirrors.lines_until = deadline;
     }
 
+    /// Open [`Mirrors::timer_quiet`] on what the frame's waiting interrupts
+    /// would be, at count `now` where the step found them, were the EL2
+    /// virtual timer's output low (the channel native timer writes reach,
+    /// `mirrors::TIMER`): the same without a FIQ, or with the FIQ only
+    /// where a device, the PMI or another timer channel raises it too.
+    /// Closed under a virtual interrupt, whose pending word stands for
+    /// every line, and on a chip with two timer banks, where no native
+    /// timer write completes.
+    fn refresh_timer_quiet(&mut self, virtual_pending: bool, now: u64) {
+        let pending = self.cpu.state.pending;
+        let quiet = if virtual_pending || timer::agt::present(self.cpu.registers.chip()) {
+            None
+        } else if pending & u32::from(DAIF_F) == 0 {
+            Some(pending)
+        } else {
+            let device = self.device_lines_of(self.current, now);
+            let others = timer::deadline_without(&self.cpu, SystemRegister::CNTHV_CTL_EL2, || now);
+            let others = self.clock.timer_due(others);
+            let fiq = self
+                .cpu
+                .core_lines(Lines {
+                    irq: false,
+                    fiq: device.fiq
+                        || others.is_some_and(|deadline| now >= deadline)
+                        || monitor_asserted(&self.cpu, now),
+                })
+                .fiq;
+            Some(if fiq {
+                pending
+            } else {
+                pending & !u32::from(DAIF_F)
+            })
+        };
+        self.mirrors.timer_quiet =
+            quiet.map_or_else(register_read::Cell::default, |value| register_read::Cell {
+                readable: 1,
+                value: u64::from(value),
+            });
+    }
+
     /// The lines the devices drive into PE `pe` at count `now`: the cached
     /// ones, or the latched pins of another PE, until a device changes or
     /// the devices' deadline passes; else the devices are brought up to
@@ -287,6 +327,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else {
             u32::from(if lines.irq { DAIF_I } else { 0 } | if lines.fiq { DAIF_F } else { 0 })
         };
+        self.refresh_timer_quiet(virtual_pending != 0, now);
         self.refresh_interrupt_status(now);
         if !lines.irq && !lines.fiq && virtual_pending == 0 {
             return false;

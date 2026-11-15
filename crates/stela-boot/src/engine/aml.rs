@@ -16,8 +16,15 @@
 //! the native PCI source takes configuration custody, AML has scoped scalar
 //! reads through that source, for its PCI_Config fields and for its
 //! SystemMemory fields that land in an ECAM window, which ACPICA reaches
-//! through [`read_memory`]. Otherwise the firmware provider uses PCI
-//! configuration mechanism #1 and the MCFG's ECAM windows.
+//! through [`read_memory`]. Its writes there are refused, except inside
+//! [`HostAcpi::firmware`] calls that admit them before the PCI census,
+//! while PCI ports are powered on (`super::pci_power`). Otherwise the
+//! firmware provider uses PCI configuration mechanism #1 and the MCFG's
+//! ECAM windows.
+//!
+//! The namespace loads before the PCI census, so ports can be powered on
+//! before it; hardware mode, with its SCI route, follows the census
+//! ([`HostAcpi::activate`]).
 pub(super) mod sci;
 use super::{
     host,
@@ -127,6 +134,9 @@ enum Gap {
     EcamRead = 16,
     /// An AML SystemMemory write in ECAM, under native PCI custody.
     EcamWrite = 32,
+    /// An AML configuration write admitted before the census that the
+    /// native PCI owner refused.
+    PowerWrite = 64,
 }
 
 struct Provider {
@@ -147,6 +157,9 @@ struct Provider {
     sci: RefCell<Option<sci::Armed>>,
     polling: Cell<bool>,
     needs_rearm: Cell<bool>,
+    /// AML may write PCI configuration through the native owner while it
+    /// powers ports on before the census ([`HostAcpi::firmware`]).
+    config_writes: Cell<bool>,
 }
 
 impl Provider {
@@ -255,6 +268,47 @@ impl Provider {
                 None
             }
         }
+    }
+
+    /// AML's write of `bytes` of `value` at `physical` in an ECAM window, as
+    /// the configuration writes of the functions it decodes to, when writes
+    /// are admitted before the census; false, reported once, when refused.
+    fn write_configuration(
+        &self,
+        pci: &native_mmio::Source,
+        physical: u64,
+        bytes: u64,
+        value: u64,
+    ) -> bool {
+        if !self.config_writes.get() {
+            self.report(
+                Gap::EcamWrite,
+                format_args!(
+                    "native PCI configuration excludes AML writes to ECAM at {physical:#x}"
+                ),
+            );
+            return false;
+        }
+        let written = ecam_memory::write(
+            &self.ecam,
+            physical,
+            bytes,
+            value,
+            |address, offset, width, piece| {
+                pci.write_before_census(address, offset, width, piece)
+                    .map_err(|error| (address, offset, error))
+            },
+        );
+        if let Err(refusal) = written {
+            self.report(
+                Gap::PowerWrite,
+                format_args!(
+                    "AML write of {bytes} bytes at {physical:#x} in ECAM refused: {refusal:?}"
+                ),
+            );
+            return false;
+        }
+        true
     }
 
     /// Whether the loader root maps `address`.
@@ -764,7 +818,8 @@ unsafe extern "C" fn read_memory(
 }
 
 /// As [`read_memory`]. Native PCI custody excludes AML configuration
-/// writes, through ECAM as through PCI_Config fields ([`write_pci`]).
+/// writes, through ECAM as through PCI_Config fields ([`write_pci`]),
+/// except while they are admitted before the census.
 unsafe extern "C" fn write_memory(
     context: *mut c_void,
     physical: u64,
@@ -773,15 +828,14 @@ unsafe extern "C" fn write_memory(
 ) -> Status {
     // SAFETY: ACPICA passes the session's provider.
     let provider = unsafe { provider(context) };
-    if provider
-        .configuration_owner(physical, u64::from(width / 8))
-        .is_some()
-    {
-        provider.report(
-            Gap::EcamWrite,
-            format_args!("native PCI configuration excludes AML writes to ECAM at {physical:#x}"),
-        );
-        return AE_SUPPORT;
+    if !matches!(width, 8 | 16 | 32 | 64) {
+        return AE_BAD_PARAMETER;
+    }
+    if let Some(pci) = provider.configuration_owner(physical, u64::from(width / 8)) {
+        return match provider.write_configuration(pci, physical, u64::from(width / 8), value) {
+            true => AE_OK,
+            false => AE_SUPPORT,
+        };
     }
     let Some(pointer) = provider.reach(physical, u64::from(width / 8)) else {
         return AE_ERROR;
@@ -807,6 +861,19 @@ fn mechanism_one(id: &PciId, register: u32) -> Option<u32> {
     )
 }
 
+/// The function and register a PCI_Config access names, when they fit.
+fn native_address(id: &PciId, register: u32) -> Option<(Address, u16)> {
+    Some((
+        Address {
+            segment: id.segment,
+            bus: u8::try_from(id.bus).ok()?,
+            device: u8::try_from(id.device).ok()?,
+            function: u8::try_from(id.function).ok()?,
+        },
+        u16::try_from(register).ok()?,
+    ))
+}
+
 unsafe extern "C" fn read_pci(
     context: *mut c_void,
     id: *mut PciId,
@@ -820,19 +887,8 @@ unsafe extern "C" fn read_pci(
         return AE_ERROR;
     }
     let read = if let Some(pci) = provider.pci {
-        let (Ok(bus), Ok(device), Ok(function), Ok(offset)) = (
-            u8::try_from(id.bus),
-            u8::try_from(id.device),
-            u8::try_from(id.function),
-            u16::try_from(register),
-        ) else {
+        let Some((address, offset)) = native_address(id, register) else {
             return AE_BAD_PARAMETER;
-        };
-        let address = Address {
-            segment: id.segment,
-            bus,
-            device,
-            function,
         };
         match pci.read_firmware_config(address, offset, (width / 8) as u16) {
             Ok(value) => u64::from(value),
@@ -890,12 +946,29 @@ unsafe extern "C" fn write_pci(
     if !matches!(width, 8 | 16 | 32) {
         return AE_ERROR;
     }
-    if provider.pci.is_some() {
-        provider.report(
-            Gap::PciCustody,
-            format_args!("native PCI configuration excludes AML writes"),
-        );
-        return AE_SUPPORT;
+    if let Some(pci) = provider.pci {
+        if !provider.config_writes.get() {
+            provider.report(
+                Gap::PciCustody,
+                format_args!("native PCI configuration excludes AML writes"),
+            );
+            return AE_SUPPORT;
+        }
+        let Some((address, offset)) = native_address(id, register) else {
+            return AE_BAD_PARAMETER;
+        };
+        return match pci.write_before_census(address, offset, (width / 8) as u16, value as u32) {
+            Ok(()) => AE_OK,
+            Err(error) => {
+                provider.report(
+                    Gap::PowerWrite,
+                    format_args!(
+                        "native PCI write of {address} register {offset:#x} refused: {error:?}"
+                    ),
+                );
+                AE_SUPPORT
+            }
+        };
     }
     if let Some(address) = mechanism_one(id, register) {
         let port = PCI_DATA + (register & 3) as u16;
@@ -999,6 +1072,9 @@ unsafe extern "C" fn fatal(_: *mut c_void, status: Status) -> ! {
 pub struct HostAcpi {
     session: Session,
     provider: *const Provider,
+    /// The services the namespace was loaded with; nonzero admits hardware
+    /// mode ([`Self::activate`]).
+    capabilities: u64,
     ec: RefCell<Option<stela_drivers::platform::ec::binding::Binding<'static>>>,
     installed_ec: RefCell<Option<stela_drivers::platform::ec::capability::Installed<'static>>>,
     power: RefCell<stela_drivers::probe::Power>,
@@ -1013,16 +1089,16 @@ static POWER_CHANGED: AtomicBool = AtomicBool::new(false);
 static POWER_BUTTON: AtomicBool = AtomicBool::new(false);
 
 impl HostAcpi {
-    /// Load the tables at `rsdp` and their namespace; `None`, reported,
-    /// when ACPICA refuses them. `root` is the loader root. The namespace
-    /// lives until the host powers off, so it is leaked here, once.
+    /// Load the tables at `rsdp` and their namespace, in interpreter mode;
+    /// `None`, reported, when ACPICA refuses them. `root` is the loader
+    /// root. The namespace lives until the host powers off, so it is leaked
+    /// here, once. Hardware mode follows the PCI census ([`Self::activate`]).
     pub(super) fn start(
         rsdp: u64,
         root: u64,
         mut ecam: Vec<EcamWindow>,
         pci: Option<&'static native_mmio::Source>,
         tsc_hz: u64,
-        prepared_sci: Option<sci::Prepared>,
         executor: Option<&'static KernelWork>,
     ) -> Option<&'static Self> {
         let Some(executor) = executor else {
@@ -1049,7 +1125,7 @@ impl HostAcpi {
             None
         };
         match executor.call_owned(5_000_000, move || {
-            Self::start_entered(rsdp, root, ecam, pci, tsc_hz, prepared_sci, executor)
+            Self::start_entered(rsdp, root, ecam, pci, tsc_hz, executor)
         }) {
             Ok(acpi) => acpi,
             Err(error) => {
@@ -1068,7 +1144,6 @@ impl HostAcpi {
         ecam: Vec<EcamWindow>,
         pci: Option<&'static native_mmio::Source>,
         tsc_hz: u64,
-        prepared_sci: Option<sci::Prepared>,
         executor: &'static KernelWork,
     ) -> Option<&'static Self> {
         if rsdp == 0 {
@@ -1080,13 +1155,6 @@ impl HostAcpi {
         // exact resource-owned map/unmap leases. Keep namespace-only operation
         // until that complete provider is admitted by the work owner.
         let capabilities = 0;
-        // Controller containment can prepare the route while ACPICA stays
-        // in namespace mode. No hardware callback may take it in that mode.
-        let prepared_sci = if capabilities == 0 {
-            None
-        } else {
-            prepared_sci
-        };
         let provider = Box::new(Provider {
             executor,
             root,
@@ -1097,10 +1165,11 @@ impl HostAcpi {
             queued: AtomicBool::new(false),
             closed: Cell::new(false),
             reported: Cell::new(0),
-            prepared_sci: RefCell::new(prepared_sci),
+            prepared_sci: RefCell::new(None),
             sci: RefCell::new(None),
             polling: Cell::new(false),
             needs_rearm: Cell::new(false),
+            config_writes: Cell::new(false),
         });
         let provider = Box::into_raw(provider);
         let services = Services {
@@ -1177,9 +1246,10 @@ impl HostAcpi {
                 return None;
             }
         };
-        let host = Box::leak(Box::new(Self {
+        Some(Box::leak(Box::new(Self {
             session,
             provider,
+            capabilities,
             ec: RefCell::new(None),
             installed_ec: RefCell::new(None),
             power: RefCell::new(Default::default()),
@@ -1188,74 +1258,125 @@ impl HostAcpi {
             hardware: AtomicBool::new(false),
             ec_failed: AtomicBool::new(false),
             deferred_failed: AtomicBool::new(false),
-        }));
-        if capabilities != 0 {
-            // SAFETY: the boot keeps the provider's exclusive EC resources
-            // before namespace initialization and through this permanent owner.
-            let installation =
-                unsafe { stela_drivers::probe::install_embedded_controller(&host.session) };
-            host.ec_failed
-                .store(!installation.failures.is_empty(), Ordering::Release);
-            for (location, error) in installation.failures {
-                output::arguments(format_args!("HOST ACPI EC {location}: {error}\n"));
-            }
-            *host.ec.borrow_mut() = installation.binding;
-            match host.session.enable_hardware() {
-                Ok(()) => {
-                    host.hardware.store(true, Ordering::Release);
-                    if let Some(binding) = host.ec.borrow().as_ref() {
-                        match stela_drivers::platform::ec::capability::Installed::from_binding(
-                            binding,
-                        ) {
-                            Ok(installed) => *host.installed_ec.borrow_mut() = Some(installed),
-                            Err(error) => output::arguments(format_args!(
-                                "HOST ACPI EC activation refused: {error:?}\n"
-                            )),
-                        }
-                        if let Some(gpe) = binding.device().gpe
-                            && let Err(error) = host.session.flag_gpe(gpe, true, &EC_EVENT)
-                        {
-                            output::arguments(format_args!(
-                                "HOST ACPI EC GPE refused: {error:?}\n"
-                            ));
-                        }
-                    }
-                    if let Err(error) = host.session.flag_fixed_event(
-                        stela_drivers::platform::acpi::EVENT_POWER_BUTTON,
-                        &POWER_BUTTON,
-                    ) {
-                        output::arguments(format_args!(
-                            "HOST ACPI power button refused: {error:?}\n"
-                        ));
-                    }
-                    match host
-                        .session
-                        .notify_all(|_, _| POWER_CHANGED.store(true, Ordering::Release))
-                    {
-                        Ok(notification) => *host.notification.borrow_mut() = Some(notification),
-                        Err(error) => {
-                            output::arguments(format_args!("HOST ACPI notify refused: {error:?}\n"))
-                        }
-                    }
-                    if let Err(error) = host.session.update_all_gpes() {
-                        output::arguments(format_args!(
-                            "HOST ACPI GPE update refused: {error:?}\n"
-                        ));
-                    }
-                    output::arguments(format_args!(
-                        "HOST ACPI hardware active: routed SCI and deferred events\n"
-                    ));
-                }
-                Err(error) => output::arguments(format_args!(
-                    "UNSUPPORTED ACPI hardware activation: {error:?}\n"
-                )),
-            }
-        } else {
+        })))
+    }
+
+    /// Hardware mode, once the PCI census and containment have taken the
+    /// SCI's route: `prepared_sci`, which an interpreter-only namespace
+    /// drops. Reported either way.
+    pub(super) fn activate(&'static self, prepared_sci: Option<sci::Prepared>) {
+        if self.capabilities == 0 {
+            // No hardware callback may take the route in namespace mode: it
+            // is dropped here.
             output::arguments(format_args!(
                 "UNSUPPORTED ACPI hardware activation: native firmware services are not qualified\n"
             ));
+            return;
         }
-        Some(host)
+        // SAFETY: this permanent provider is held by the leaked Session.
+        let provider = unsafe { &*self.provider };
+        if let Err(error) = provider
+            .executor
+            .call_owned(5_000_000, move || self.activate_entered(prepared_sci))
+        {
+            output::arguments(format_args!(
+                "UNSUPPORTED ACPI hardware activation: continuation unavailable: {error}\n"
+            ));
+        }
+    }
+    fn activate_entered(&'static self, prepared_sci: Option<sci::Prepared>) {
+        // SAFETY: this permanent provider is held by the leaked Session.
+        let provider = unsafe { &*self.provider };
+        *provider.prepared_sci.borrow_mut() = prepared_sci;
+        // SAFETY: the boot keeps the provider's exclusive EC resources
+        // before namespace initialization and through this permanent owner.
+        let installation =
+            unsafe { stela_drivers::probe::install_embedded_controller(&self.session) };
+        self.ec_failed
+            .store(!installation.failures.is_empty(), Ordering::Release);
+        for (location, error) in installation.failures {
+            output::arguments(format_args!("HOST ACPI EC {location}: {error}\n"));
+        }
+        *self.ec.borrow_mut() = installation.binding;
+        match self.session.enable_hardware() {
+            Ok(()) => {
+                self.hardware.store(true, Ordering::Release);
+                if let Some(binding) = self.ec.borrow().as_ref() {
+                    match stela_drivers::platform::ec::capability::Installed::from_binding(binding)
+                    {
+                        Ok(installed) => *self.installed_ec.borrow_mut() = Some(installed),
+                        Err(error) => output::arguments(format_args!(
+                            "HOST ACPI EC activation refused: {error:?}\n"
+                        )),
+                    }
+                    if let Some(gpe) = binding.device().gpe
+                        && let Err(error) = self.session.flag_gpe(gpe, true, &EC_EVENT)
+                    {
+                        output::arguments(format_args!("HOST ACPI EC GPE refused: {error:?}\n"));
+                    }
+                }
+                if let Err(error) = self.session.flag_fixed_event(
+                    stela_drivers::platform::acpi::EVENT_POWER_BUTTON,
+                    &POWER_BUTTON,
+                ) {
+                    output::arguments(format_args!("HOST ACPI power button refused: {error:?}\n"));
+                }
+                match self
+                    .session
+                    .notify_all(|_, _| POWER_CHANGED.store(true, Ordering::Release))
+                {
+                    Ok(notification) => *self.notification.borrow_mut() = Some(notification),
+                    Err(error) => {
+                        output::arguments(format_args!("HOST ACPI notify refused: {error:?}\n"))
+                    }
+                }
+                if let Err(error) = self.session.update_all_gpes() {
+                    output::arguments(format_args!("HOST ACPI GPE update refused: {error:?}\n"));
+                }
+                output::arguments(format_args!(
+                    "HOST ACPI hardware active: routed SCI and deferred events\n"
+                ));
+            }
+            Err(error) => output::arguments(format_args!(
+                "UNSUPPORTED ACPI hardware activation: {error:?}\n"
+            )),
+        }
+    }
+
+    /// `call` with the loaded namespace, in a bounded firmware call
+    /// ([`bounded`]) on the work owner's continuation; `None`, reported,
+    /// when it did not finish or could not run. `writes` admits AML's PCI
+    /// configuration writes through the native owner for this call alone,
+    /// which it allows only before the census (`Source::write_before_census`).
+    pub(super) fn firmware<T: 'static>(
+        &'static self,
+        what: &'static str,
+        then: &'static str,
+        writes: bool,
+        call: impl FnOnce(&'static Session) -> T + 'static,
+    ) -> Option<T> {
+        // SAFETY: this permanent provider is held by the leaked Session.
+        let provider = unsafe { &*self.provider };
+        let timeout = u64::from(AML_BOUND_MS) * 1000 + 1_000_000;
+        match provider.executor.call_owned(timeout, move || {
+            bounded(what, then, || {
+                // SAFETY: as above.
+                let provider = unsafe { &*self.provider };
+                provider.config_writes.set(writes);
+                let value = call(&self.session);
+                provider.config_writes.set(false);
+                value
+            })
+        }) {
+            Ok((value, true)) => Some(value),
+            Ok((_, false)) => None,
+            Err(error) => {
+                output::arguments(format_args!(
+                    "UNSUPPORTED ACPI {what}: continuation unavailable: {error}; {then}\n"
+                ));
+                None
+            }
+        }
     }
 
     /// What `\_S5` evaluates to, for the load's line.

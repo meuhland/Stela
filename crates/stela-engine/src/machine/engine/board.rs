@@ -195,6 +195,10 @@ pub(super) struct Code {
     /// Units of work a retirement step takes under the lock
     /// ([`super::code_cache::STEP_VISITS`]; tests take fewer).
     pub(super) step_visits: u64,
+    /// PEs waiting for the lock now ([`Self::cache_at`]): a retirement
+    /// step ends early while one does ([`Self::wanted`]). On a line of its
+    /// own, as only waiters write it.
+    pub(super) waiting: Padded<AtomicU32>,
     /// The fetch pages its PEs compile in the tagged variant.
     pub(super) tagged: super::page_sets::PageSet,
     /// The fetch pages its PEs compile with the two-sided range check at
@@ -700,6 +704,7 @@ impl Code {
             retiring: Mutex::new(None),
             retire_pending: AtomicBool::new(false),
             step_visits: super::code_cache::STEP_VISITS,
+            waiting: Padded(AtomicU32::new(0)),
             tagged: Default::default(),
             two_sided: Default::default(),
             rebases: super::rebase::Rebases::new(super::rebase::BOUND),
@@ -759,7 +764,9 @@ impl Code {
             };
         }
         let start = timestamp();
+        self.waiting.fetch_add(1, Ordering::Relaxed);
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
         let since = timestamp();
         let waited = since.wrapping_sub(start);
         let lock = &mut cache.lock;
@@ -774,6 +781,12 @@ impl Code {
             site,
             since,
         }
+    }
+
+    /// Whether a PE waits for the code lock now: a holder doing work that
+    /// can stop at any of its bounds (a retirement step) lets it in first.
+    pub(super) fn wanted(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) != 0
     }
 
     /// The indexed block at `pc`, `physical` and `variant` (with `aliases`,

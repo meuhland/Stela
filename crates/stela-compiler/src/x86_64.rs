@@ -129,6 +129,8 @@ pub mod modeled {
         crate::TargetCpu::detect()
     }
 }
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod executed_paths;
 pub(crate) mod memory_store;
 #[cfg(all(
     test,

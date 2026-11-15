@@ -38,7 +38,7 @@ fn native_root_reset_rebind_preserves_old_alias_quarantine_and_reprobes_geometry
                 lun: unit.lun,
                 identity: unit.identity.clone(),
                 media: unit.media.clone(),
-                running: None,
+                running: Vec::new(),
                 next_tag: 0,
                 cache_refused: false,
                 first_blocks: None,
@@ -70,9 +70,9 @@ fn native_root_reset_rebind_preserves_old_alias_quarantine_and_reprobes_geometry
         let original = {
             let host = owner.borrow();
             [
-                &host.transport.engine.command,
-                &host.transport.engine.status,
-                &host.transport.engine.data,
+                &host.transport.engine.lanes[0].command,
+                &host.transport.engine.lanes[0].status,
+                &host.transport.engine.lanes[0].data,
             ]
             .map(|buffer| (buffer.physical(), buffer.len()))
         };
@@ -91,9 +91,9 @@ fn native_root_reset_rebind_preserves_old_alias_quarantine_and_reprobes_geometry
         let current_bytes = {
             let host = current_owner.borrow();
             let buffers = [
-                &host.transport.engine.command,
-                &host.transport.engine.status,
-                &host.transport.engine.data,
+                &host.transport.engine.lanes[0].command,
+                &host.transport.engine.lanes[0].status,
+                &host.transport.engine.lanes[0].data,
             ];
             assert_eq!(
                 buffers.map(|buffer| (buffer.physical(), buffer.len())),
@@ -108,15 +108,24 @@ fn native_root_reset_rebind_preserves_old_alias_quarantine_and_reprobes_geometry
         {
             let host = owner.borrow();
             assert!(host.transport.requires_rebind());
-            assert!(!host.transport.engine.command.present());
-            assert!(!host.transport.engine.status.present());
-            assert!(!host.transport.engine.data.present());
+            assert!(!host.transport.engine.lanes[0].command.present());
+            assert!(!host.transport.engine.lanes[0].status.present());
+            assert!(!host.transport.engine.lanes[0].data.present());
         }
         {
             let host = current_owner.borrow();
-            assert_eq!(host.transport.engine.command.bytes(), current_bytes[0]);
-            assert_eq!(host.transport.engine.status.bytes(), current_bytes[1]);
-            assert_eq!(host.transport.engine.data.bytes(), current_bytes[2]);
+            assert_eq!(
+                host.transport.engine.lanes[0].command.bytes(),
+                current_bytes[0]
+            );
+            assert_eq!(
+                host.transport.engine.lanes[0].status.bytes(),
+                current_bytes[1]
+            );
+            assert_eq!(
+                host.transport.engine.lanes[0].data.bytes(),
+                current_bytes[2]
+            );
         }
         fresh[0].write(1500, &[0xa7; 512]).unwrap();
         fresh[0].flush().unwrap();

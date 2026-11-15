@@ -105,16 +105,6 @@ pub(super) struct DrmDevice {
     pub revision: u8,
 }
 
-/// `struct drm_nouveau_getparam`.
-#[repr(C)]
-struct GetParam {
-    parameter: u64,
-    value: u64,
-}
-
-/// `DRM_IOCTL_NOUVEAU_GETPARAM`.
-const GET_PARAM: u32 = 0xc010_6440;
-const CHIPSET_ID: u64 = 11;
 /// The first render node's minor.
 pub(super) const RENDER_MINOR: u32 = 128;
 
@@ -1409,45 +1399,33 @@ pub(super) fn unmap(address: NonNull<u8>) {
     }
 }
 
-/// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
-pub(super) fn chipset(index: u32) -> Option<u16> {
+/// What the kernel driver of the bound GPU at `index` answers `ask`, one of
+/// its stack's queries (`stela_drivers::gpu::stack::Kernel`), on a render
+/// node opened for it.
+pub(super) fn query<T>(
+    index: u32,
+    ask: fn(stela_drivers::gpu::stack::Control) -> Option<T>,
+) -> Option<T> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
     if fd < 0 {
         return None;
     }
-    let mut parameter = GetParam {
-        parameter: CHIPSET_ID,
-        value: 0,
-    };
-    let result = submit(Operation::Control {
-        fd,
-        request: GET_PARAM,
-        argument: (&raw mut parameter).cast(),
+    let answer = ask(&mut |request, argument| {
+        submit(Operation::Control {
+            fd,
+            request,
+            argument,
+        }) as i32
     });
     close_descriptor(fd);
-    (result == 0).then_some(parameter.value as u16)
+    answer
 }
 
-/// `NOUVEAU_GETPARAM_FB_SIZE`: the VRAM nouveau makes available.
-const FB_SIZE: u64 = 8;
-
-/// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
+/// The device memory bytes of the bound GPU at `index`, for the guest's
+/// `StelaHost`.
 pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
-    let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
-    if fd < 0 {
-        return None;
-    }
-    let mut parameter = GetParam {
-        parameter: FB_SIZE,
-        value: 0,
-    };
-    let result = submit(Operation::Control {
-        fd,
-        request: GET_PARAM,
-        argument: (&raw mut parameter).cast(),
-    });
-    close_descriptor(fd);
-    (result == 0 && parameter.value != 0).then_some(parameter.value)
+    let stack = installed()?.start.bound.get(index as usize)?.stack;
+    query(index, stack.kernel.memory_bytes)
 }
 
 /// Whether a fault at `address` may be on a client's mapping: a page past

@@ -1,7 +1,7 @@
 //! AML SystemMemory accesses that land in an MCFG window. ECAM is memory
 //! mapped, so firmware AML may read a function's configuration through a
 //! SystemMemory field, as Linux serves it by mapping the window. Here each
-//! access is decoded into configuration reads the native owner performs.
+//! access is decoded into configuration accesses the native owner performs.
 use stela_drivers::bus::pci::{Address, EcamWindow};
 
 /// The function and register `physical` decodes to in `windows`.
@@ -39,7 +39,7 @@ pub enum Refusal<E> {
     Width,
     /// Part of the access lies outside every window.
     Outside { physical: u64 },
-    /// The configuration owner refused one read.
+    /// The configuration owner refused one access.
     Config {
         address: Address,
         offset: u16,
@@ -92,10 +92,113 @@ pub fn read<E>(
     Ok(value)
 }
 
+/// Write the low `bytes` (1, 2, 4 or 8) of `value` at `physical` in
+/// `windows`, little-endian, through `write(address, offset, width,
+/// value)`, which writes one naturally aligned register of 1, 2 or 4 bytes
+/// as the configuration owner allows. Every piece is decoded before the
+/// first is written, so an access that leaves the windows writes nothing.
+pub fn write<E>(
+    windows: &[EcamWindow],
+    physical: u64,
+    bytes: u64,
+    value: u64,
+    mut write: impl FnMut(Address, u16, u16, u32) -> Result<(), E>,
+) -> Result<(), Refusal<E>> {
+    if !matches!(bytes, 1 | 2 | 4 | 8) || physical.checked_add(bytes).is_none() {
+        return Err(Refusal::Width);
+    }
+    if let Some((at, _)) = pieces(physical, bytes).find(|&(at, _)| decode(windows, at).is_none()) {
+        return Err(Refusal::Outside { physical: at });
+    }
+    for (at, width) in pieces(physical, bytes) {
+        let (address, offset) = decode(windows, at).expect("decoded above");
+        let mask = (1u64 << (u32::from(width) * 8)) - 1;
+        let piece = ((value >> ((at - physical) * 8)) & mask) as u32;
+        write(address, offset, width, piece).map_err(|error| Refusal::Config {
+            address,
+            offset,
+            error,
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    #[test]
+    fn writes_each_width_as_aligned_registers() {
+        let base = 0xc00e_0000;
+        for (offset, bytes, value, writes) in [
+            (0x50u64, 2u64, 0x0010u64, &[(0x50u16, 2u16, 0x0010u32)][..]),
+            (0x50, 4, 0x2010_0040, &[(0x50, 4, 0x2010_0040)]),
+            (0x51, 1, 0x7f, &[(0x51, 1, 0x7f)]),
+            (
+                0x18,
+                8,
+                0x1f1e_1d1c_1b1a_1918,
+                &[(0x18, 4, 0x1b1a_1918), (0x1c, 4, 0x1f1e_1d1c)],
+            ),
+            // Unaligned: as a processor splits it into byte-enabled dwords.
+            (
+                0x1a,
+                4,
+                0x1d1c_1b1a,
+                &[(0x1a, 2, 0x1b1a), (0x1c, 2, 0x1d1c)],
+            ),
+        ] {
+            let mut log = Vec::new();
+            let written = write(
+                &WINDOWS,
+                base + offset,
+                bytes,
+                value,
+                |address, register, width, piece| {
+                    log.push((address, register, width, piece));
+                    Ok::<_, ()>(())
+                },
+            );
+            assert_eq!(written, Ok(()), "{bytes} bytes at {offset:#x}");
+            let expected: Vec<_> = writes
+                .iter()
+                .map(|&(register, width, piece)| (at(0, 0, 0x1c, 0), register, width, piece))
+                .collect();
+            assert_eq!(log, expected, "{bytes} bytes at {offset:#x}");
+        }
+    }
+
+    #[test]
+    fn a_write_that_leaves_ecam_or_is_refused_says_so() {
+        let mut log = Vec::new();
+        let mut record = |address: Address, register: u16, width: u16, piece: u32| {
+            log.push((address, register, width, piece));
+            Ok::<_, &str>(())
+        };
+        assert_eq!(
+            write(&WINDOWS, 0xc000_0000, 3, 0, &mut record),
+            Err(Refusal::Width)
+        );
+        assert_eq!(
+            write(&WINDOWS, 0xc7ff_fffc, 8, 0, &mut record),
+            Err(Refusal::Outside {
+                physical: 0xc800_0000
+            })
+        );
+        assert!(
+            log.is_empty(),
+            "nothing written of an access that leaves ECAM"
+        );
+        assert_eq!(
+            write(&WINDOWS, 0xc00a_3004, 2, 6, |_, _, _, _| Err("custody")),
+            Err(Refusal::Config {
+                address: at(0, 0, 0x14, 3),
+                offset: 4,
+                error: "custody"
+            })
+        );
+    }
 
     const WINDOWS: [EcamWindow; 2] = [
         EcamWindow {

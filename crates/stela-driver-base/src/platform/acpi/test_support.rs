@@ -540,6 +540,16 @@ pub(crate) fn fixture_tables(dsdt: Vec<u8>, extra: Vec<Vec<u8>>) -> (Services, A
     )
 }
 
+/// The fixture platform for an interpreter-only session whose DSDT holds
+/// `body`, the AML after the table header; its PCI configuration
+/// callbacks refuse until the caller replaces them.
+pub fn dsdt_fixture(body: &[u8]) -> Services {
+    let mut dsdt = table(b"DSDT", 36 + body.len(), 2);
+    dsdt[36..].copy_from_slice(body);
+    checksum(&mut dsdt, 9);
+    fixture_dsdt(dsdt).0
+}
+
 /// Reuse the ACPICA fixture with a reduced-hardware FADT. Hardware
 /// mode then executes C activation and AML _INI without inventing
 /// legacy SCI/PM hardware. Extra AML methods are part of the real DSDT.

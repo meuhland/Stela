@@ -5,7 +5,8 @@
 //! runtime query: format support is simplified to NVK's broad rules
 //! (renderable uncompressed color and depth formats, BC sampling, no ETC2,
 //! ASTC or PVRTC on discrete GPUs, buffer-only three-component formats).
-use super::{Architecture, Attachment, Chip, PcieLink};
+use super::{Architecture, Chip};
+use crate::metal::open::{Attachment, PcieLink};
 use crate::metal::{
     capabilities::{ApiFeatures, Capabilities, ShaderFeatures},
     pixel_format::{Compression, Kind, PixelFormat},

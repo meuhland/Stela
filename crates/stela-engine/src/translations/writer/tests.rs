@@ -194,6 +194,7 @@ fn entry(offset: u16, fill: u8, bytes: usize) -> crate::translations::Entry {
         context: Digest::of(b"context"),
         offset,
         source_bytes: 4,
+        cold: (0, 0),
         input: vec![0; 4],
         code: vec![fill; bytes],
         relocations: Vec::new(),

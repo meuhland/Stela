@@ -155,6 +155,43 @@ pub mod firmware_boot {
     }
 }
 
+/// What nouveau's device file answers about the bound chip
+/// (`DRM_IOCTL_NOUVEAU_GETPARAM`, `include/uapi/drm/nouveau_drm.h`).
+pub mod query {
+    use crate::stack::Control;
+
+    /// `struct drm_nouveau_getparam`.
+    #[repr(C)]
+    struct GetParam {
+        parameter: u64,
+        value: u64,
+    }
+
+    /// `DRM_IOCTL_NOUVEAU_GETPARAM`.
+    const GET_PARAM: u32 = 0xc010_6440;
+    /// `NOUVEAU_GETPARAM_FB_SIZE`: the VRAM nouveau makes available.
+    const FB_SIZE: u64 = 8;
+    /// `NOUVEAU_GETPARAM_CHIPSET_ID`.
+    const CHIPSET_ID: u64 = 11;
+
+    fn get(control: Control, parameter: u64) -> Option<u64> {
+        let mut record = GetParam {
+            parameter,
+            value: 0,
+        };
+        (control(GET_PARAM, (&raw mut record).cast()) == 0).then_some(record.value)
+    }
+
+    /// nouveau's `device->chipset` ([`super::Chip::chipset`]).
+    pub fn chipset(control: Control) -> Option<u32> {
+        get(control, CHIPSET_ID).map(|chipset| u32::from(chipset as u16))
+    }
+
+    pub fn memory_bytes(control: Control) -> Option<u64> {
+        get(control, FB_SIZE).filter(|bytes| *bytes != 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

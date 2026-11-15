@@ -107,14 +107,14 @@ fn stream_errors_drain_all_contributors_or_quarantine_without_dma_reuse() {
             } else {
                 assert!(engine.poisoned, "{fault:?}");
                 let count = state.borrow().events.len();
-                let data = engine.data.bytes().to_vec();
+                let data = engine.lanes[0].data.bytes().to_vec();
                 assert!(
                     engine
                         .command([0; 8], &rw(false, 512), Data::Out(&outgoing))
                         .is_err()
                 );
                 assert_eq!(state.borrow().events.len(), count);
-                assert_eq!(engine.data.bytes(), data);
+                assert_eq!(engine.lanes[0].data.bytes(), data);
                 if fault == Fault::CancelError {
                     assert!(
                         state

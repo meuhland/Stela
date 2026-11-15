@@ -216,8 +216,18 @@ pub(crate) fn emit_system_mode(
     (block, recovery)
 }
 
-/// [`emit_system_mode`], and whether the block runs its iterations inside
-/// itself ([`SelfLoop`]).
+/// What a block's emission leaves beside its code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shape {
+    /// The block runs its iterations inside itself ([`SelfLoop`]).
+    pub self_loop: bool,
+    /// The code offsets of its cold code, the slow paths moved out of line
+    /// and the paths placed behind the jumps over them, start to end; `(0,
+    /// 0)` with none (`CompiledBlock::cold`).
+    pub cold: (u32, u32),
+}
+
+/// [`emit_system_mode`], and the block's [`Shape`].
 pub(crate) fn emit_system_mode_looped(
     instructions: &[Instruction],
     terminal: Option<&(GuestAddress, Terminator)>,
@@ -225,7 +235,7 @@ pub(crate) fn emit_system_mode_looped(
     target: crate::TargetCpu,
     checks: super::MemoryChecks,
     native: super::NativeSystem,
-) -> (NativeBlock, Vec<crate::block::FaultRecovery>, bool) {
+) -> (NativeBlock, Vec<crate::block::FaultRecovery>, Shape) {
     // Guest registers stay in host registers (`x86_64::pinned`), which the
     // engine's fault settlement reads. Pure spans can temporarily keep other
     // values in scratch registers; the ordinary regions use the reserved
@@ -488,7 +498,7 @@ fn emit_selected(
     regions: RegionPolicy,
     checks: super::MemoryChecks,
     native: super::NativeSystem,
-) -> (NativeBlock, Vec<crate::block::FaultRecovery>, bool) {
+) -> (NativeBlock, Vec<crate::block::FaultRecovery>, Shape) {
     let RegionPolicy {
         optimize: optimize_regions,
         fault_table,
@@ -1481,6 +1491,8 @@ fn emit_selected(
     // terminal's branch: only the jumps over the moved code and the paths
     // below come between, and moved code returns into the body.
     let flags_live = after.rax == super::Rax::Nzcv && code.ends_with(&nzcv_store(code.is_pinned()));
+    // The cold code below starts after the first jump over it.
+    let cold_start = code.len() + super::chain::JUMP_BYTES;
     out_of_line.place(code);
     // Before the terminal, whose direct exits end the code.
     if !pointer_paths.is_empty()
@@ -1507,6 +1519,10 @@ fn emit_selected(
         }
         code.asm().bind(over);
     }
+    let cold = match code.len() > cold_start {
+        true => (cold_start as u32, code.len() as u32),
+        false => (0, 0),
+    };
     if let Some(fast) = prefix_sum {
         code.asm().bind(fast);
         // All fast-path state is settled. The scalar source rows describe
@@ -1667,7 +1683,11 @@ fn emit_selected(
             fault_recovery,
         );
     }
-    (block.into_native(), fault_recovery, self_loop.is_some())
+    let shape = Shape {
+        self_loop: self_loop.is_some(),
+        cold,
+    };
+    (block.into_native(), fault_recovery, shape)
 }
 
 /// The zero test can consume the adjacent frame ALU result's host flags.

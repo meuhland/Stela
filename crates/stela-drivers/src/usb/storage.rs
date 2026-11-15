@@ -126,23 +126,32 @@ trait Scsi {
     fn queued(&self) -> bool {
         false
     }
-    /// Begin `cdb` without waiting for its transfers; `None` from a
-    /// transport that runs commands only to completion.
+    /// How many commands [`Self::begin`] runs at once.
+    fn depth(&self) -> usize {
+        1
+    }
+    /// Begin `cdb` without waiting for its transfers, and return the handle
+    /// [`Self::end`] takes; `None` from a transport that runs commands only
+    /// to completion.
     fn begin(
         &mut self,
         _lun: Self::Lun,
         _cdb: &[u8],
         _data: Data<'_>,
-    ) -> Option<Result<(), BlockError>> {
+    ) -> Option<Result<usize, BlockError>> {
         None
     }
-    /// The begun command's result once complete; never waits.
-    fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
+    /// Begun command `handle`'s result once complete; never waits.
+    fn end(&mut self, _handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
         None
     }
     /// Whether a begun command has not ended, or the transport recovers.
     fn busy(&mut self) -> bool {
         false
+    }
+    /// Whether [`Self::begin`] takes another command now.
+    fn room(&mut self) -> bool {
+        !self.busy()
     }
     /// What the last command's data phase moved in before it failed.
     fn take_failed_data(&mut self) -> Option<Vec<u8>>;
@@ -263,10 +272,11 @@ impl<I: Io> Scsi for Bot<I> {
     fn queued(&self) -> bool {
         true
     }
-    fn begin(&mut self, lun: u8, cdb: &[u8], data: Data<'_>) -> Option<Result<(), BlockError>> {
-        Some(Bot::begin(self, lun, cdb, data))
+    fn begin(&mut self, lun: u8, cdb: &[u8], data: Data<'_>) -> Option<Result<usize, BlockError>> {
+        Some(Bot::begin(self, lun, cdb, data).map(|()| 0))
     }
-    fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
+    /// Bulk-only transport runs one command at a time, its only handle.
+    fn end(&mut self, _handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
         Bot::end(self)
     }
     fn busy(&mut self) -> bool {
@@ -357,19 +367,25 @@ impl Scsi for uas::Host {
     fn queued(&self) -> bool {
         true
     }
+    fn depth(&self) -> usize {
+        uas::Host::depth(self)
+    }
     fn begin(
         &mut self,
         lun: uas::Lun,
         cdb: &[u8],
         data: Data<'_>,
-    ) -> Option<Result<(), BlockError>> {
+    ) -> Option<Result<usize, BlockError>> {
         Some(uas::Host::begin(self, lun.bytes(), cdb, data))
     }
-    fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
-        uas::Host::end(self)
+    fn end(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
+        uas::Host::end(self, handle)
     }
     fn busy(&mut self) -> bool {
         uas::Host::busy(self)
+    }
+    fn room(&mut self) -> bool {
+        uas::Host::room(self)
     }
     fn write_protect_page(&self) -> Option<u8> {
         uas::Host::write_protect_page(self)
@@ -426,9 +442,10 @@ struct Disk<T: Scsi> {
     media: Rc<Cell<bool>>,
     /// INQUIRY's RMB: a UNIT ATTENTION reports a media change.
     removable: bool,
-    /// The command this unit runs, as SCSI commands one at a time
+    /// The block commands this unit runs, each as SCSI commands one at a
+    /// time, as many at once as the transport has room for
     /// ([`Disk::start`]).
-    running: Option<Running>,
+    running: Vec<Running>,
     next_tag: u32,
     /// The unit answered SYNCHRONIZE CACHE with ILLEGAL REQUEST, INVALID
     /// COMMAND OPERATION CODE: it has no cache command, and its flushes
@@ -471,8 +488,8 @@ struct Running {
     command: Command,
     /// The bytes of the transfer its SCSI commands have moved.
     done: usize,
-    /// The begun SCSI command's transfer bytes.
-    begun: Option<usize>,
+    /// The begun SCSI command's transport handle and transfer bytes.
+    begun: Option<(usize, usize)>,
     /// A read's bytes so far.
     data: Vec<u8>,
     result: Option<Finished>,
@@ -732,7 +749,7 @@ fn publication<T: Scsi>(
         identity,
         media,
         removable,
-        running: None,
+        running: Vec::new(),
         next_tag: 0,
         cache_refused: false,
         first_blocks,
@@ -1340,10 +1357,10 @@ impl<T: Scsi> Disk<T> {
         length
     }
 
-    /// Begin the running command's next SCSI command, or settle its result
-    /// once it needs none or one cannot begin.
-    fn step(&mut self) {
-        let Some(running) = self.running.as_ref() else {
+    /// Begin running command `index`'s next SCSI command, or settle its
+    /// result once it needs none or one cannot begin.
+    fn step(&mut self, index: usize) {
+        let Some(running) = self.running.get(index) else {
             return;
         };
         if running.begun.is_some() || running.result.is_some() {
@@ -1365,7 +1382,7 @@ impl<T: Scsi> Disk<T> {
                 )
             }
             Command::Read { .. } | Command::Write { .. } => {
-                let running = self.running.as_mut().unwrap();
+                let running = &mut self.running[index];
                 let read = matches!(running.command, Command::Read { .. });
                 let data = core::mem::take(&mut running.data);
                 running.result = Some(Ok(read.then_some(data)));
@@ -1375,17 +1392,17 @@ impl<T: Scsi> Disk<T> {
                 (scsi::Cdb::Ten(scsi::synchronize_cache()), 0)
             }
             Command::Flush => {
-                self.running.as_mut().unwrap().result = Some(Ok(None));
+                self.running[index].result = Some(Ok(None));
                 return;
             }
             Command::Discard { .. } | Command::WriteZeroes { .. } => {
-                self.running.as_mut().unwrap().result =
+                self.running[index].result =
                     Some(Err(BlockError::Unsupported("USB storage takes no discard")));
                 return;
             }
         };
         let begun = {
-            let running = self.running.as_ref().unwrap();
+            let running = &self.running[index];
             let mut bot = self.bot.borrow_mut();
             let cdb = cdb.as_ref();
             match &running.command {
@@ -1397,9 +1414,9 @@ impl<T: Scsi> Disk<T> {
                 _ => bot.begin(self.lun, cdb, Data::None),
             }
         };
-        let running = self.running.as_mut().unwrap();
+        let running = &mut self.running[index];
         match begun {
-            Some(Ok(())) => running.begun = Some(length),
+            Some(Ok(handle)) => running.begun = Some((handle, length)),
             Some(Err(error)) => running.result = Some(Err(error)),
             None => {
                 running.result = Some(Err(BlockError::Unsupported(
@@ -1446,7 +1463,7 @@ impl<T: Scsi> BlockDevice for Disk<T> {
             .is_ok_and(|transport| transport.signals())
     }
     fn posted(&self) -> bool {
-        self.running.is_some()
+        !self.running.is_empty()
             && self
                 .bot
                 .try_borrow()
@@ -1487,14 +1504,23 @@ impl<T: Scsi> BlockDevice for Disk<T> {
         self.synchronized(result)
     }
 
-    /// A transport that begins commands without waiting runs one block
-    /// command at a time.
+    /// A transport that begins commands without waiting runs as many block
+    /// commands at once as it runs SCSI commands: a UAS device with
+    /// streams queues them under its tags, as Linux sd over uas does.
+    /// Commands go to the device as SIMPLE tasks, which it may run in any
+    /// order (Linux `UAS_SIMPLE_TAG`); a flush makes durable what completed
+    /// before it, as an NVMe flush does.
     fn depth(&self) -> usize {
-        usize::from(self.bot.borrow().queued())
+        let transport = self.bot.borrow();
+        if transport.queued() {
+            transport.depth()
+        } else {
+            0
+        }
     }
 
     fn room(&self) -> bool {
-        self.running.is_none() && !self.bot.borrow_mut().busy()
+        self.bot.borrow_mut().room()
     }
 
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
@@ -1502,12 +1528,12 @@ impl<T: Scsi> BlockDevice for Disk<T> {
         let command = command.within(&self.identity, 0)?;
         if !self.room() {
             return Err(BlockError::Protocol(
-                "a USB storage unit runs one command at a time",
+                "every command tag of the USB storage transport is in use",
             ));
         }
         let tag = self.next_tag;
         self.next_tag = tag.wrapping_add(1);
-        self.running = Some(Running {
+        self.running.push(Running {
             tag,
             command,
             done: 0,
@@ -1515,20 +1541,18 @@ impl<T: Scsi> BlockDevice for Disk<T> {
             data: Vec::new(),
             result: None,
         });
-        self.step();
+        self.step(self.running.len() - 1);
         Ok(tag)
     }
 
     fn finish(&mut self, tag: u32) -> Option<Finished> {
-        if self.running.as_ref()?.tag != tag {
-            return None;
-        }
-        if let Some(length) = self.running.as_ref()?.begun {
-            let mut ended = self.bot.borrow_mut().end()?;
-            if matches!(self.running.as_ref()?.command, Command::Flush) {
+        let index = self.running.iter().position(|running| running.tag == tag)?;
+        if let Some((handle, length)) = self.running[index].begun {
+            let mut ended = self.bot.borrow_mut().end(handle)?;
+            if matches!(self.running[index].command, Command::Flush) {
                 ended = self.synchronized(ended.map(drop)).map(|()| Vec::new());
             }
-            let running = self.running.as_mut()?;
+            let running = &mut self.running[index];
             running.begun = None;
             match ended {
                 Err(error) => {
@@ -1552,10 +1576,10 @@ impl<T: Scsi> BlockDevice for Disk<T> {
                     running.done += length.max(1);
                 }
             }
-            self.step();
+            self.step(index);
         }
-        let result = self.running.as_mut()?.result.take()?;
-        self.running = None;
+        let result = self.running[index].result.take()?;
+        self.running.swap_remove(index);
         Some(result)
     }
 }
@@ -1688,12 +1712,17 @@ mod tests {
         fn queued(&self) -> bool {
             true
         }
-        fn begin(&mut self, lun: u8, cdb: &[u8], data: Data<'_>) -> Option<Result<(), BlockError>> {
+        fn begin(
+            &mut self,
+            lun: u8,
+            cdb: &[u8],
+            data: Data<'_>,
+        ) -> Option<Result<usize, BlockError>> {
             let result = self.command(lun, cdb, data);
             self.begun = Some(result);
-            Some(Ok(()))
+            Some(Ok(0))
         }
-        fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
+        fn end(&mut self, _: usize) -> Option<Result<Vec<u8>, BlockError>> {
             self.begun.take()
         }
         fn command(&mut self, _: u8, cdb: &[u8], data: Data<'_>) -> Result<Vec<u8>, BlockError> {
@@ -1761,7 +1790,7 @@ mod tests {
             },
             media: Rc::new(Cell::new(true)),
             removable,
-            running: None,
+            running: Vec::new(),
             next_tag: 0,
             cache_refused: false,
             first_blocks: None,

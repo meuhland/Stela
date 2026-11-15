@@ -297,8 +297,9 @@ fn start(handoff: u64) -> Started {
     crate::status::set_clock(handoff.tsc_hz);
     // Before any AP agrees with the BSP through a software offset: from
     // then on the drivers' times and deadlines read the BSP's counter on
-    // every core, as the engine's own reads do.
-    stela_drivers::on_counter(super::host::rdtsc);
+    // every core, as the engine's own reads do, and never one earlier than
+    // another core already took.
+    stela_drivers::on_counter(super::host::device_counter);
     stela_drivers::on_wait(crate::status::tick);
     stela_drivers::on_work(device_starting);
     stela_drivers::budget::on_processor(processor_gs);
@@ -1581,7 +1582,7 @@ fn open_gpus(
             // The display adapters Stela's GPU driver does not run, and why.
             for adapter in found
                 .iter()
-                .filter(|adapter| adapter.vendor != stela_drivers::gpu::Vendor::Nvidia)
+                .filter(|adapter| stela_drivers::gpu::stack::GpuStack::select(adapter).is_err())
             {
                 crate::status::info(&gpu_status::unused(adapter));
             }
@@ -1703,20 +1704,28 @@ fn place_devices(
     let firmware = |name: &str| -> Option<&[u8]> {
         carried(name).or_else(|| flash.and_then(|flash| flash.image(name)))
     };
-    let firmware_scanout = || {
+    // `copied`: a bound GPU draws the frames, with no display of its own.
+    let firmware_scanout = |copied: bool| {
         handoff
             .screen
             .filter(|screen| screen.available())
             .map(|screen| {
                 let screen = screen.relocated(layout::physical(screen.base as u64) as usize);
-                alloc::boxed::Box::new(display::GopScanout::new(screen, options.scanout_mirror))
+                let scanout = display::GopScanout::new(screen, options.scanout_mirror);
+                let scanout = match copied {
+                    true => scanout.copying_gpu_frames(),
+                    false => scanout,
+                };
+                alloc::boxed::Box::new(scanout)
                     as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
             })
     };
     // The firmware's scanout keeps its newest frame itself; a GPU's is
-    // wrapped to keep one for `--scanout-mirror`. With neither a GPU's
-    // display nor the firmware's screen, which a bound GPU's reset ended, the
-    // guest keeps that screen's mode and a GPU's display found later shows it.
+    // wrapped to keep one for `--scanout-mirror`. A bound GPU with no display
+    // leaves the firmware's screen on another adapter showing its frames
+    // (`GopScanout::copying_gpu_frames`). With neither a GPU's display nor
+    // the firmware's screen, which a bound GPU's reset ended, the guest keeps
+    // that screen's mode and a GPU's display found later shows it.
     #[cfg(feature = "nvk")]
     let mirrored = |scanout: alloc::boxed::Box<dyn stela_soc::machine::Scanout>| match options
         .scanout_mirror
@@ -1727,10 +1736,10 @@ fn place_devices(
     #[cfg(feature = "nvk")]
     let scanout = gpu::display::scanout()
         .map(mirrored)
-        .or_else(firmware_scanout)
-        .or_else(|| gpu::display::awaited(handoff.screen?).map(mirrored));
+        .or_else(|| firmware_scanout(gpu::display::drawn_without_display()))
+        .or_else(|| gpu::display::awaited(handoff.screen).map(mirrored));
     #[cfg(not(feature = "nvk"))]
-    let scanout = firmware_scanout();
+    let scanout = firmware_scanout(false);
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();
@@ -2621,6 +2630,70 @@ fn start_platform(
         Ok(()) => output::arguments(format_args!("NATIVE IRQ device vectors attached\n")),
         Err(error) => output::arguments(format_args!("NATIVE IRQ unavailable: {error:?}\n")),
     }
+    crate::status::progress("clocks");
+    let clock = if options.boots_macos() {
+        // SAFETY: this BSP owns the existing timer/IDT before any driver,
+        // and the HPET only after its whole-controller handoff above.
+        unsafe { service_clock(handoff, host_owner, native_mmio) }
+            .inspect_err(|error| {
+                output::arguments(format_args!(
+                    "NATIVE SERVICE CLOCK unavailable: {error:?}\n"
+                ));
+            })
+            .ok()
+            .map(|clock| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(clock)))
+    } else {
+        None
+    };
+    // SAFETY: validated BSP handoff, before AP/driver producers.
+    let work = match unsafe { kernel_work::KernelWork::prepare(handoff, host_owner, clock) } {
+        Ok(work) => {
+            // SAFETY: the BSP in the engine's root, before the APs start and
+            // before any producer uses its counters or its APIC's entry.
+            unsafe { super::step_watchdog::install(handoff.tsc_hz) };
+            #[cfg(feature = "diagnostics")]
+            output::arguments(format_args!(
+                "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"
+            ));
+            Ok(&*alloc::boxed::Box::leak(alloc::boxed::Box::new(work)))
+        }
+        // The record keeps this line until the USB log opens again, which
+        // the devices' start on the boot stack (`start_devices`) reaches.
+        Err(error) => {
+            output::arguments(format_args!("NATIVE WORK unavailable: {error}\n"));
+            Err(error.reason())
+        }
+    };
+    crate::status::progress("ACPI tables");
+    // The step watchdog's stop names this step: its AML calls are bounded
+    // (`aml::bounded`), but an access that never completes is not.
+    static ACPI_TABLES: &str = "the firmware's ACPI tables";
+    super::step_watchdog::stage(&ACPI_TABLES);
+    // Loaded before the PCI census, so PCI ports whose slot power firmware
+    // left off are powered on before it (`pci_power`) and the census sees
+    // what lies below them; hardware mode follows the census.
+    let host_acpi = aml::HostAcpi::start(
+        handoff.rsdp,
+        handoff.root,
+        handoff
+            .storage
+            .handoff()
+            .map(|storage| storage.ecam)
+            .unwrap_or_default(),
+        native_mmio,
+        handoff.tsc_hz,
+        work.as_ref().ok().copied(),
+    );
+    crate::native_idle::install(
+        host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
+    );
+    if let (Some(acpi), Some(mmio)) = (host_acpi, native_mmio) {
+        crate::status::progress("PCI ports");
+        static PCI_PORTS: &str = "powering on PCI ports through ACPI";
+        super::step_watchdog::stage(&PCI_PORTS);
+        super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
+    }
+    super::step_watchdog::clear_stage();
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
     crate::status::progress("PCI functions");
@@ -2667,13 +2740,28 @@ fn start_platform(
                     )),
                 }
             }
-            (Some(_), None) => {
+            (Some(pci), None) => {
+                let base = screen.base as u64;
+                let span = base..base.saturating_add(screen.bytes as u64);
+                // SAFETY: as above; no bridge's forwarding is restored yet.
+                let apart = match unsafe { pci.screen_apart(span) } {
+                    Ok(apart) => apart,
+                    Err(error) => {
+                        output::arguments(format_args!(
+                            "HOST GOP PCI bridge windows unreadable: {error:?}\n"
+                        ));
+                        stela_boot_core::firmware_screen::BusesApart::none()
+                    }
+                };
                 output::arguments(format_args!(
                     "HOST GOP PCI source unknown: no GOP device path or display function's \
-                     BAR holds the firmware framebuffer; the firmware screen stops before a \
-                     GPU starts\n"
+                     BAR holds the firmware framebuffer at {base:#x}; {} buses lie below a \
+                     bridge that forwards none of it, and a GPU there leaves the screen to \
+                     the adapter showing it; any other GPU ends the firmware screen before \
+                     it starts\n",
+                    apart.count()
                 ));
-                mmio.framebuffer_owner_unknown();
+                mmio.framebuffer_owner_unknown(apart);
                 None
             }
             // The containment failure is kept and logged above.
@@ -2731,62 +2819,9 @@ fn start_platform(
         }
         _ => None,
     };
-    crate::status::progress("clocks");
-    let clock = if options.boots_macos() {
-        // SAFETY: this BSP owns the existing timer/IDT before any driver,
-        // and the HPET only after its whole-controller handoff above.
-        unsafe { service_clock(handoff, host_owner, native_mmio) }
-            .inspect_err(|error| {
-                output::arguments(format_args!(
-                    "NATIVE SERVICE CLOCK unavailable: {error:?}\n"
-                ));
-            })
-            .ok()
-            .map(|clock| &*alloc::boxed::Box::leak(alloc::boxed::Box::new(clock)))
-    } else {
-        None
-    };
-    // SAFETY: validated BSP handoff, before AP/driver producers.
-    let work = match unsafe { kernel_work::KernelWork::prepare(handoff, host_owner, clock) } {
-        Ok(work) => {
-            // SAFETY: the BSP in the engine's root, before the APs start and
-            // before any producer uses its counters or its APIC's entry.
-            unsafe { super::step_watchdog::install(handoff.tsc_hz) };
-            #[cfg(feature = "diagnostics")]
-            output::arguments(format_args!(
-                "NATIVE WORK owned stacks=32 foreground=verified services=unpublished\n"
-            ));
-            Ok(&*alloc::boxed::Box::leak(alloc::boxed::Box::new(work)))
-        }
-        // The record keeps this line until the USB log opens again, which
-        // the devices' start on the boot stack (`start_devices`) reaches.
-        Err(error) => {
-            output::arguments(format_args!("NATIVE WORK unavailable: {error}\n"));
-            Err(error.reason())
-        }
-    };
-    crate::status::progress("ACPI tables");
-    // The step watchdog's stop names this step: its AML calls are bounded
-    // (`aml::bounded`), but an access that never completes is not.
-    static ACPI_TABLES: &str = "the firmware's ACPI tables";
-    super::step_watchdog::stage(&ACPI_TABLES);
-    let host_acpi = aml::HostAcpi::start(
-        handoff.rsdp,
-        handoff.root,
-        handoff
-            .storage
-            .handoff()
-            .map(|storage| storage.ecam)
-            .unwrap_or_default(),
-        native_mmio,
-        handoff.tsc_hz,
-        prepared_sci,
-        work.as_ref().ok().copied(),
-    );
-    crate::native_idle::install(
-        host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
-    );
-    super::step_watchdog::clear_stage();
+    if let Some(acpi) = host_acpi {
+        acpi.activate(prepared_sci);
+    }
     crate::status::done("");
     Platform {
         acpi: host_acpi,

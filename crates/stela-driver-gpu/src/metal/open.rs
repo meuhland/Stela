@@ -1,38 +1,105 @@
-//! Opens the Metal service for one NVIDIA GPU: admits its Vulkan device,
-//! derives the platform facts Vulkan does not report, and serves a
-//! [`Device`] over the backend and compiler. [`open`] composes the native
-//! stack: NVK through [`NativeBackend`], which builds its pipelines from the
-//! AIR compiler service's internal kernels, and an [`AirCompiler`] for the
-//! device NVK reports.
-use super::{Attachment, Chip, Refusal};
+//! Opens the Metal service for one GPU through its [`GpuStack`]: admits its
+//! Vulkan device, derives the platform facts Vulkan does not report, and
+//! serves a [`Device`] over the backend and compiler. [`open`] composes the
+//! native stack: the stack's Vulkan driver through [`NativeBackend`], which
+//! builds its pipelines from the AIR compiler service's internal kernels, and
+//! an [`AirCompiler`] for the device the driver reports.
 #[cfg(feature = "metal-vulkan")]
 use crate::metal::{
     compiler::{self, AirCompiler},
     native::{InternalKernels, Loader, MemoryExporter, NativeBackend, vk},
 };
-use crate::metal::{
-    device::Device,
-    error::Error,
-    service::{Service, identity::DeviceEpoch},
-    shader::Compiler,
-    vulkan::{backend::Backend, physical::PciBusInfo},
+use crate::{
+    metal::{
+        capabilities::Platform,
+        device::Device,
+        error::Error,
+        nvidia,
+        service::{Service, identity::DeviceEpoch},
+        shader::Compiler,
+        vulkan::{
+            backend::Backend,
+            physical::{Identity, PciBusInfo},
+        },
+    },
+    stack::GpuStack,
 };
 #[cfg(feature = "metal-vulkan")]
 use alloc::boxed::Box;
 
-/// The GPU the platform hands the Metal device.
+/// The negotiated PCI Express link, from the Link Status register
+/// (`PCI_EXP_LNKSTA`) of the GPU's PCIe capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PcieLink {
+    /// Current Link Speed: 1 for 2.5 GT/s through 6 for 64 GT/s.
+    pub speed: u8,
+    /// Negotiated Link Width in lanes.
+    pub width: u8,
+}
+
+impl PcieLink {
+    pub const fn from_link_status(status: u16) -> Self {
+        Self {
+            speed: (status & 0xf) as u8,
+            width: ((status >> 4) & 0x3f) as u8,
+        }
+    }
+
+    /// Data bandwidth in bytes per second after line encoding, as Linux's
+    /// `PCIE_SPEED2MBS_ENC`: 8b/10b through 5 GT/s, 128b/130b from 8 GT/s,
+    /// and FLIT mode at 64 GT/s. Unknown speeds report zero.
+    pub const fn bytes_per_second(self) -> u64 {
+        let megabits_per_lane: u64 = match self.speed {
+            1 => 2500 * 8 / 10,
+            2 => 5000 * 8 / 10,
+            3 => 8000 * 128 / 130,
+            4 => 16000 * 128 / 130,
+            5 => 32000 * 128 / 130,
+            6 => 64000,
+            _ => 0,
+        };
+        megabits_per_lane * self.width as u64 * 1_000_000 / 8
+    }
+}
+
+/// Where the GPU is attached, as the platform's PCI and ACPI owners report it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Attachment {
+    pub link: PcieLink,
+    /// Behind a hot-pluggable Thunderbolt or USB4 tunnel.
+    pub external: bool,
+    /// The slot or enclosure index Metal reports as `locationNumber`.
+    pub location_number: u64,
+}
+
+/// A stack's admission of its Vulkan device as a Metal device.
+pub struct Admission {
+    /// Admits the Vulkan device `identity` whose kernel driver reports the
+    /// chip ([`crate::stack::Kernel::chip`]), and answers the facts Vulkan
+    /// does not report for it.
+    pub admit: fn(&Identity, u32, Attachment) -> Result<Platform, Refusal>,
+}
+
+/// Why a stack did not admit a Vulkan device, in its vendor's terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Refusal {
+    Nvidia(nvidia::Refusal),
+}
+
+/// The GPU the platform hands the Metal device.
+#[derive(Clone, Copy)]
 pub struct Gpu {
+    pub stack: &'static GpuStack,
     pub pci: PciBusInfo,
-    /// nouveau's `NOUVEAU_GETPARAM_CHIPSET_ID`.
-    pub chipset: u16,
+    /// The kernel driver's identifier of the chip.
+    pub chip: u32,
     pub attachment: Attachment,
 }
 
 /// Why the Metal service did not open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenError {
-    /// The device is not an NVIDIA GPU this route drives.
+    /// The device is not one its stack drives.
     Refused(Refusal),
     /// The device lacks a requirement or could not be created.
     Device(Error),
@@ -65,12 +132,12 @@ fn device<B: Backend, C: Compiler>(
     if identity.pci_bus != Some(gpu.pci) {
         return Err(Error::Invalid("the backend drives another GPU").into());
     }
-    let chip = Chip::admit(identity, gpu.chipset).map_err(OpenError::Refused)?;
-    let platform = chip.platform(gpu.attachment);
+    let platform =
+        (gpu.stack.metal.admit)(identity, gpu.chip, gpu.attachment).map_err(OpenError::Refused)?;
     Ok(Device::new(backend, compiler, &platform)?)
 }
 
-/// The Metal service over NVK and the AIR compiler.
+/// The Metal service over a linked Vulkan driver and the AIR compiler.
 #[cfg(feature = "metal-vulkan")]
 pub type NativeService = Service<NativeBackend, AirCompiler>;
 
@@ -135,14 +202,14 @@ pub unsafe fn stack(
     Ok((backend, compiler))
 }
 
-/// Opens NVK's device for `gpu` and serves it with the AIR compiler service
-/// `compiler` answers for that device.
+/// Opens the Vulkan driver's device for `gpu` and serves it with the AIR
+/// compiler service `compiler` answers for that device.
 ///
 /// # Safety
 ///
-/// `loader` is NVK's entry point and `compiler` answers the AIR compiler
-/// service with NVK's NIR options for the device it is given, both outliving
-/// the service.
+/// `loader` is the entry point of `gpu`'s stack's driver and `compiler`
+/// answers the AIR compiler service with that driver's NIR options for the
+/// device it is given, both outliving the service.
 #[cfg(feature = "metal-vulkan")]
 pub unsafe fn open(
     loader: Loader,
@@ -156,7 +223,7 @@ pub unsafe fn open(
     serve(backend, compiler, gpu, epoch)
 }
 
-/// Opens NVK's device for `gpu` as [`open`] does, for a service whose device
+/// Opens the driver's device for `gpu` as [`open`] does, for a service whose device
 /// was lost ([`Service::with_reopen`]).
 ///
 /// # Safety
@@ -182,20 +249,22 @@ mod tests {
     use super::*;
     use crate::metal::{
         device::fixture::{MockBackend, MockCompiler},
-        nvidia::{CHIPS, PcieLink},
+        nvidia::CHIPS,
         vulkan::DriverId,
     };
+    use crate::stack::NVIDIA;
     use core::num::NonZeroU64;
 
     fn gpu(chipset: u16) -> Gpu {
         Gpu {
+            stack: &NVIDIA,
             pci: PciBusInfo {
                 domain: 0,
                 bus: 1,
                 device: 0,
                 function: 0,
             },
-            chipset,
+            chip: chipset.into(),
             attachment: Attachment {
                 link: PcieLink {
                     speed: 4,
@@ -236,14 +305,18 @@ mod tests {
         );
         assert_eq!(
             serve_on(MockBackend::new(), &gpu(0x140)).err(),
-            Some(OpenError::Refused(Refusal::PreTuring { chipset: 0x140 }))
+            Some(OpenError::Refused(Refusal::Nvidia(
+                nvidia::Refusal::PreTuring { chipset: 0x140 }
+            )))
         );
         let mut backend = MockBackend::new();
         let physical = backend.physical.as_mut().unwrap();
         physical.identity.driver_id = DriverId::MesaRadv;
         assert_eq!(
             serve_on(backend, &gpu(CHIPS[0].chipset)).err(),
-            Some(OpenError::Refused(Refusal::NotNvk(DriverId::MesaRadv)))
+            Some(OpenError::Refused(Refusal::Nvidia(
+                nvidia::Refusal::NotNvk(DriverId::MesaRadv)
+            )))
         );
     }
 }

@@ -30,6 +30,8 @@ use stela_driver_base::budget;
 #[cfg(feature = "native-acpi")]
 mod companion;
 #[cfg(feature = "native-acpi")]
+pub mod d3cold;
+#[cfg(feature = "native-acpi")]
 mod i2c;
 #[cfg(feature = "native-acpi")]
 mod power;
@@ -2248,6 +2250,21 @@ pub unsafe fn probe_observed(
         handoff,
         &mut devices,
     );
+    // A port still powered off after the power-on before the census
+    // (`d3cold`) is named.
+    #[cfg(feature = "native-acpi")]
+    if let Some(session) = services.and_then(|services| services.acpi()) {
+        for address in d3cold::powered_off_ports(session, &bridges, &devices.classes) {
+            let class = devices
+                .classes
+                .iter()
+                .find(|(found, _)| *found == address)
+                .map_or([6, 4, 0], |&(_, class)| class);
+            devices
+                .unsupported
+                .push((address, class, d3cold::POWERED_OFF_PORT));
+        }
+    }
     attach_usb4_hosts(usb4_hosts, services, &bridges, handoff, &mut devices);
     attach_broadcom_bluetooth(
         broadcom_bluetooth,

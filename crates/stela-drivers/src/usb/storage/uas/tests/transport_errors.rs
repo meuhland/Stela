@@ -25,16 +25,16 @@ fn invalid_ready_tag_status_or_command_length_quarantines_without_reusing_dma() 
         );
         assert!(engine.poisoned);
         let events = state.borrow().events.len();
-        let data = engine.data.bytes().to_vec();
-        let status = engine.status.bytes().to_vec();
+        let data = engine.lanes[0].data.bytes().to_vec();
+        let status = engine.lanes[0].status.bytes().to_vec();
         assert!(
             engine
                 .command([0; 8], &rw(false, 512), Data::Out(&vec![0xff; 512]))
                 .is_err()
         );
         assert_eq!(state.borrow().events.len(), events);
-        assert_eq!(engine.data.bytes(), data);
-        assert_eq!(engine.status.bytes(), status);
+        assert_eq!(engine.lanes[0].data.bytes(), data);
+        assert_eq!(engine.lanes[0].status.bytes(), status);
     }
 }
 

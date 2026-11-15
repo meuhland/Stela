@@ -202,6 +202,13 @@ impl<'a> Template<'a> {
             Self::Stored { entry, .. } => entry.relocations.is_empty(),
         }
     }
+    /// The code offsets of its cold code (`CompiledBlock::cold`).
+    pub(super) fn cold(&self) -> (u32, u32) {
+        match self {
+            Self::Compiled(emission) => emission.block.cold,
+            Self::Stored { entry, .. } => entry.cold,
+        }
+    }
     /// The native template's direct exits to static successors.
     pub(super) fn direct_exits(&self) -> &[DirectExit] {
         match self {

@@ -2060,6 +2060,11 @@ pub fn is_dynamic_exit(bytes: &[u8], kind: ExitKind) -> bool {
     exit_word_of(bytes) == Some(ExitWord::from(kind).encoded())
 }
 
+/// Whether `bytes` are a dynamic exit of any kind and padding.
+pub fn is_dynamic_exit_of_any_kind(bytes: &[u8]) -> bool {
+    exit_word_of(bytes).is_some()
+}
+
 /// Pad the direct exit at `offset` of `code`, which runs at host address
 /// `at + offset`, for its patch point there. Whether it is one.
 pub fn align_direct_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
@@ -2762,19 +2767,53 @@ fn seqlock_check(asm: &mut crate::x86_64::asm::Asm, entry: Gpr) -> [crate::x86_6
 }
 
 /// Translate the target in RAX through the ITLB, RCX at the control: R8
-/// is then the block key of its page in the current context of its half;
-/// a page with no entry there takes one of `misses`. Clobbers R9 and R11.
+/// is then the block key of its page in the current context of its half,
+/// or for a lower-half page in the upper half's, where the engine keeps
+/// the lower-half pages whose walk ended in a global leaf (a global entry
+/// matches every ASID, and the upper half's context is keyed by the same
+/// translation inputs, EL and variant but TTBR0); a page with no entry in
+/// either takes one of `misses`. Clobbers R9 and R11.
 fn translate(asm: &mut crate::x86_64::asm::Asm, misses: &mut Vec<crate::x86_64::asm::Patch>) {
     // R8 = the target's half; R9 = the first slot of its page's ITLB set
     // in that half's context.
     asm.mov(Qword, R8, Rax);
     asm.shift_imm(ShiftOp::Shr, Qword, R8, 55);
     asm.alu_imm8(Alu::And, Dword, R8, 1);
+    itlb_set(asm, Mem::indexed(Rcx, R8, 4, SALTS));
+    asm.mov_load(Qword, R8, Mem::indexed(Rcx, R8, 8, CONTEXTS));
+    // R11 = the target's page; either entry of the set may hold it.
+    asm.mov(Qword, R11, Rax);
+    asm.alu_imm32(Alu::And, Qword, R11, -(1 << PAGE_SHIFT));
+    let mut absent = Vec::new();
+    let first = itlb_compare(asm, &mut absent, false);
+    let second = asm.jmp();
+    // A lower-half page absent from its half's context: its global entry,
+    // in the upper half's.
+    for miss in absent {
+        asm.bind(miss);
+    }
+    asm.bit_imm(BitTest::Bt, Qword, Rax, 55);
+    misses.push(asm.jcc(Cond::B));
+    asm.mov_load(Qword, R8, Mem::base(Rcx, CONTEXTS + 8));
+    // Context 0 is none: an empty entry's key.
+    asm.test(Qword, R8, R8);
+    misses.push(asm.jcc(Cond::E));
+    itlb_set(asm, Mem::base(Rcx, SALTS + 4));
+    let shared = itlb_compare(asm, misses, true);
+    asm.bind(first);
+    asm.bind(second);
+    asm.bind(shared);
+    asm.mov_load(Qword, R8, Mem::base(R9, ENTRY_CODE));
+}
+
+/// R9 = the first slot of the ITLB set of the target's page in RAX for a
+/// context whose salt is at `salt`, RCX at the control.
+fn itlb_set(asm: &mut crate::x86_64::asm::Asm, salt: Mem) {
     asm.mov(Dword, R9, Rax);
     asm.shift_imm(ShiftOp::Shr, Dword, R9, ITLB_SET_BITS as u8);
     asm.alu(Alu::Xor, Dword, R9, Rax);
     asm.shift_imm(ShiftOp::Shr, Dword, R9, PAGE_SHIFT as u8);
-    asm.alu_load(Alu::Xor, Dword, R9, Mem::indexed(Rcx, R8, 4, SALTS));
+    asm.alu_load(Alu::Xor, Dword, R9, salt);
     asm.alu_load(Alu::And, Dword, R9, Mem::base(Rcx, MASKS + 4));
     asm.shift_imm(
         ShiftOp::Shl,
@@ -2783,14 +2822,25 @@ fn translate(asm: &mut crate::x86_64::asm::Asm, misses: &mut Vec<crate::x86_64::
         core::mem::size_of::<[LookupEntry; 2]>().trailing_zeros() as u8,
     );
     asm.alu_load(Alu::Add, Qword, R9, Mem::base(Rcx, ITLB));
-    asm.mov_load(Qword, R8, Mem::indexed(Rcx, R8, 8, CONTEXTS));
-    // R11 = the target's page; either entry of the set may hold it.
-    asm.mov(Qword, R11, Rax);
-    asm.alu_imm32(Alu::And, Qword, R11, -(1 << PAGE_SHIFT));
+}
+
+/// Find the entry of the page in R11 and the context in R8 in the ITLB set
+/// at R9, leaving R9 at it: a hit in the second entry falls through, one in
+/// the first takes the jump returned (8-bit when `near`), and a miss takes
+/// one of the jumps pushed to `misses`.
+fn itlb_compare(
+    asm: &mut crate::x86_64::asm::Asm,
+    misses: &mut Vec<crate::x86_64::asm::Patch>,
+    near: bool,
+) -> crate::x86_64::asm::Patch {
     asm.alu_load(Alu::Cmp, Qword, R11, Mem::base(R9, 0));
     let other_page = asm.jcc8(Cond::Ne);
     asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(R9, ENTRY_KEY));
-    let hit = asm.jcc8(Cond::E);
+    let first = if near {
+        asm.jcc8(Cond::E)
+    } else {
+        asm.jcc(Cond::E)
+    };
     asm.bind(other_page);
     asm.alu_imm8(
         Alu::Xor,
@@ -2802,8 +2852,7 @@ fn translate(asm: &mut crate::x86_64::asm::Asm, misses: &mut Vec<crate::x86_64::
     misses.push(asm.jcc(Cond::Ne));
     asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(R9, ENTRY_KEY));
     misses.push(asm.jcc(Cond::Ne));
-    asm.bind(hit);
-    asm.mov_load(Qword, R8, Mem::base(R9, ENTRY_CODE));
+    first
 }
 
 /// A probe's transfer, counted: into the block at R9.
@@ -3737,14 +3786,28 @@ mod tests {
             translate(&mut itlb, TARGET, 9);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
             assert_eq!((control.budget, control.hits), (4, 3));
-            // The lower half's context translates a lower-half target.
+            // The lower half's context translates a lower-half target, and
+            // the upper half's one the lower half's lacks (a global page).
             let lower = TARGET & !(1 << 55);
             table.set(lookup_slot(lower, KEY), LookupEntry { pc: lower, ..entry });
             translate(&mut itlb, lower, 9);
+            let before = (control.budget, control.retired, control.hits);
+            assert_eq!(exit(dynamic(frame, lower)), (0x5151, 99));
+            (control.budget, control.retired, control.hits) = before;
+            itlb.forget_range_where(lower & !0xfff..=lower & !0xfff, |_| true);
             assert_eq!(
                 exit(dynamic(frame, lower)),
                 (lower, ExitKind::Return as u64)
             );
+            // An upper-half target is never translated in the lower half's.
+            control.contexts = [9, 5];
+            control.salts = [itlb_salt(9), itlb_salt(5)];
+            assert_eq!(
+                exit(dynamic(frame, TARGET)),
+                (TARGET, ExitKind::Return as u64)
+            );
+            control.contexts = [5, 9];
+            control.salts = [itlb_salt(5), itlb_salt(9)];
             translate(&mut itlb, lower, 5);
             assert_eq!(exit(dynamic(frame, lower)), (0x5151, 99));
             assert_eq!((control.budget, control.hits), (3, 4));

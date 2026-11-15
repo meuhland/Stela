@@ -21,6 +21,13 @@ const EVICT_STEP: usize = 32;
 /// per PE (run 20261111-100711: 2.1 M a beat over 8 PEs); an eighth of the
 /// first keeps a step under that gap.
 pub(super) const STEP_VISITS: u64 = 128;
+/// The units a retirement step takes while another PE waits for the lock
+/// ([`board::Code::wanted`]): a fetch, link or install waits for a few
+/// microseconds of a step at most, not for all of it. Steps were 16.6 us
+/// each in run 20261115-112116 (66 K a beat, 38% of the lock's holds), so
+/// a holder found the lock held by one a tenth of the time and waited
+/// about half a step: most of the 2.3 s waited a beat.
+pub(super) const YIELD_VISITS: u64 = 16;
 
 /// Cells one step of an eviction releases under the board's lock.
 const CELL_STEP: usize = 256;
@@ -287,13 +294,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// [`Self::forget_spaces`] for a caller that advances the generation.
     fn forget_contexts(&mut self, halves: core::ops::RangeInclusive<usize>, cause: usize) {
+        let upper_stays = !halves.contains(&1);
         for half in halves {
             self.refill_after(half);
             self.statistics.lookup_forgets[cause] += 1;
             self.spaces[half].clear();
             self.recent[half] = [None; RECENT];
+            // The upper half's live contexts may hold lower-half global
+            // pages (`itlb_context`), which TLBIs by VA must still reach
+            // through what the lower half's fetches recorded.
+            let keep_filter = half == 0 && upper_stays && self.spaces[1].len() != 0;
             // Bits are inserted with a fetched size and only cleared here.
-            if core::mem::take(&mut self.fetched_sizes[half]) != 0 {
+            if !keep_filter && core::mem::take(&mut self.fetched_sizes[half]) != 0 {
                 let filter = &mut self.fetched_leaves[half];
                 match &mut self.fetched_words[half] {
                     Some(words) => {
@@ -466,7 +478,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     statistics.itlb_sources[every as usize] += 1;
                 }
                 super::compilation::note_itlb_ghost(ghosts, entry, ItlbMiss::Forgotten);
-                if spaces.live(entry.key).is_some() {
+                // A lower-half global page's entry is in an upper-half
+                // context (`itlb_context`).
+                if every.iter().any(|spaces| spaces.live(entry.key).is_some()) {
                     Self::keep_dropped(
                         dropped,
                         |number| every.iter().any(|spaces| spaces.live(number).is_some()),
@@ -1179,8 +1193,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let mut cache = code.cache_at(board::LockSite::Evict);
         let mut visits = 0;
         if job.next < job.slots.len() || job.page.is_some() {
-            while visits < code.step_visits {
-                let left = code.step_visits - visits;
+            loop {
+                let budget = match code.wanted() {
+                    true => YIELD_VISITS.min(code.step_visits),
+                    false => code.step_visits,
+                };
+                if visits >= budget {
+                    break;
+                }
+                let left = budget - visits;
                 if job.page.is_none() {
                     if job.next >= job.slots.len() {
                         break;
@@ -1225,7 +1246,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         };
                     }
                     board::PagePhase::Retire(from) => {
-                        let to = page.end.min(from + EVICT_STEP);
+                        let to = page.end.min(from + EVICT_STEP.min(left as usize));
                         self.retire_blocks(&mut cache, &job.slots[from..to]);
                         visits += (to - from) as u64;
                         if to == page.end {
@@ -1240,7 +1261,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         } else if let Some(from) = job.cells {
             // The exits in the range go, and with them their cells: no
             // block in it is live now, so none links through a cell again.
-            let most = CELL_STEP.min(code.step_visits as usize);
+            let most = match code.wanted() {
+                true => CELL_STEP.min(YIELD_VISITS as usize),
+                false => CELL_STEP,
+            }
+            .min(code.step_visits as usize);
             job.cells = cache
                 .targets
                 .release_some_cells(from..=job.range.end as u64 - 1, most);

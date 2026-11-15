@@ -21,6 +21,10 @@ pub(super) fn changed(sense: &Sense, removable: bool) -> bool {
 /// that the device is left failed until an explicit rescan rebinds it.
 const RESET_LIMIT: usize = 3;
 const RESET_WINDOW_US: u64 = 60_000_000;
+/// What a command still running when its device was reset ends with, once
+/// it has had its one more run.
+pub(super) const RESET_ENDED: BlockError =
+    BlockError::Protocol("a USB device reset ended the command");
 
 /// A unit's LUN, what its probe gave (its identity and whether its medium
 /// is removable), and its first blocks ([`FIRST_BLOCKS`]) where they read.
@@ -92,11 +96,14 @@ pub(super) struct Owner<T: Scsi> {
     rebound: bool,
     /// Port resets that rebound the transport.
     rebinds: u64,
-    /// The command begun without waiting ([`Scsi::begin`]), for its retries.
-    begun: Option<Begun<T::Lun>>,
-    /// The begun command's result, taken while a waiting command ran first
-    /// ([`Self::run`]), for the next [`Scsi::end`].
-    ended: Option<Result<Vec<u8>, BlockError>>,
+    /// The commands begun without waiting ([`Scsi::begin`]), by the handle
+    /// [`Scsi::end`] takes: each running with its retries, or its result,
+    /// taken while a waiting command ran first ([`Self::run`]) or when a
+    /// device reset ended it.
+    commands: Vec<Option<Queued<T::Lun>>>,
+    /// The transport failed and its device reset was declined or failed:
+    /// the commands it still ends are not reset again.
+    declined: bool,
     /// The port's status when a command last failed in the transport
     /// ([`Scsi::take_failure_status`]).
     failure_status: Option<String>,
@@ -119,6 +126,12 @@ struct Begun<L> {
     /// The unit's first blocks once the command completes, where it
     /// writes them ([`Owner::first_blocks_after`]).
     first_blocks: Option<Option<Vec<u8>>>,
+}
+/// A command begun without waiting: running on the transport under its
+/// handle there, or ended with its result.
+enum Queued<L> {
+    Running(Begun<L>, usize),
+    Ended(Result<Vec<u8>, BlockError>),
 }
 /// A begun command's data, kept for its retry.
 enum Retry {
@@ -166,8 +179,8 @@ impl<T: Scsi> Owner<T> {
             resets: Vec::new(),
             rebound: false,
             rebinds: 0,
-            begun: None,
-            ended: None,
+            commands: Vec::new(),
+            declined: false,
             failure_status: None,
             reset_failure: None,
             returned: 0,
@@ -331,23 +344,45 @@ impl<T: Scsi> Owner<T> {
         result
     }
 
-    /// The transport runs one command at a time: a begun one ends before a
-    /// waiting one starts, its result kept for the disk that began it.
+    /// A waiting command runs on the transport alone: every begun one
+    /// ends before it starts, each result kept for the disk that began it.
     fn end_first(&mut self) {
-        while self.begun.is_some() && self.ended.is_none() {
-            if let Some(result) = self.end_begun() {
-                self.ended = Some(result);
-            } else {
-                crate::waiting();
-                core::hint::spin_loop();
+        loop {
+            let mut running = false;
+            for handle in 0..self.commands.len() {
+                if !matches!(self.commands[handle], Some(Queued::Running(..))) {
+                    continue;
+                }
+                match self.end_begun(handle) {
+                    Some(result) => self.commands[handle] = Some(Queued::Ended(result)),
+                    None => running = true,
+                }
             }
+            if !running {
+                return;
+            }
+            crate::waiting();
+            core::hint::spin_loop();
         }
     }
 
-    /// Begin attempt `begun` of a command; its failure ends it as
-    /// [`Self::end_begun`] would. `None` from a transport that runs commands only to completion.
-    fn begin_attempt(&mut self, begun: Begun<T::Lun>) -> Option<Result<(), BlockError>> {
-        self.rebound = false;
+    /// Keep `queued` under `handle`.
+    fn store(&mut self, handle: usize, queued: Queued<T::Lun>) {
+        if handle == self.commands.len() {
+            self.commands.push(Some(queued));
+        } else {
+            self.commands[handle] = Some(queued);
+        }
+    }
+
+    /// Begin attempt `begun` of command `handle`; its failure ends it as
+    /// [`Self::end_begun`] would. `None` from a transport that runs commands
+    /// only to completion.
+    fn begin_attempt(
+        &mut self,
+        handle: usize,
+        begun: Begun<T::Lun>,
+    ) -> Option<Result<(), BlockError>> {
         let started = self
             .transport
             .begin(begun.lun, &begun.cdb, begun.data.data())?;
@@ -355,40 +390,53 @@ impl<T: Scsi> Owner<T> {
         if begun.first_blocks.is_some() {
             self.keep_first_blocks(begun.lun, None);
         }
-        self.begun = Some(begun);
         Some(match started {
-            Ok(()) => Ok(()),
+            Ok(running) => {
+                self.store(handle, Queued::Running(begun, running));
+                Ok(())
+            }
             // A retry may have begun meanwhile.
-            Err(error) => self
-                .ended_with(Err(error))
-                .map_or(Ok(()), |result| result.map(drop)),
+            Err(error) => match self.ended_with(handle, begun, Err(error)) {
+                None => Ok(()),
+                Some(result) => result.map(drop),
+            },
         })
     }
 
-    /// The begun command's result once it has one, after the retries
+    /// Command `handle`'s result once it has one, after the retries
     /// [`Self::run`] makes of a waiting command: once for a UNIT ATTENTION
     /// a reset raised, and once more after a port reset rebound the
     /// transport. A retry begins at once; its result comes at a later look.
-    fn end_begun(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
-        if self.begun.is_none() {
-            return self.transport.end();
+    fn end_begun(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
+        match self.commands.get(handle)? {
+            None => None,
+            Some(Queued::Ended(_)) => match self.commands[handle].take() {
+                Some(Queued::Ended(result)) => Some(result),
+                _ => None,
+            },
+            Some(Queued::Running(_, running)) => {
+                let result = self.transport.end(*running)?;
+                let Some(Queued::Running(begun, _)) = self.commands[handle].take() else {
+                    return None;
+                };
+                self.ended_with(handle, begun, result)
+            }
         }
-        let result = self.transport.end()?;
-        self.ended_with(result)
     }
 
     fn ended_with(
         &mut self,
+        handle: usize,
+        mut begun: Begun<T::Lun>,
         result: Result<Vec<u8>, BlockError>,
     ) -> Option<Result<Vec<u8>, BlockError>> {
-        let mut begun = self.begun.take()?;
         if let Err(BlockError::Sense(sense)) = &result
             && sense.key == Sense::UNIT_ATTENTION
             && core::mem::take(&mut begun.attention)
             && core::mem::take(&mut self.expecting_reset)
             && !(sense.asc == Sense::MEDIUM_CHANGED && sense.ascq == 0)
         {
-            return self.retry(begun);
+            return self.retry(handle, begun);
         }
         let removable = self.removable(begun.lun);
         if matches!(&result, Err(BlockError::Sense(sense)) if changed(sense, removable))
@@ -402,14 +450,15 @@ impl<T: Scsi> Owner<T> {
             self.changed(begun.lun);
         }
         self.settle(begun.generation, &result);
+        let rebound = core::mem::take(&mut self.rebound);
         if result.is_err()
-            && core::mem::take(&mut self.rebound)
+            && rebound
             && core::mem::take(&mut begun.rebound)
             && self.valid(begun.lun)
         {
             begun.attention = true;
             begun.generation = self.transport.generation();
-            return self.retry(begun);
+            return self.retry(handle, begun);
         }
         if result.is_ok()
             && let Some(Some(first)) = begun.first_blocks
@@ -421,10 +470,44 @@ impl<T: Scsi> Owner<T> {
 
     /// Begin `begun` again: `None` while it runs, its failure to begin as
     /// its result.
-    fn retry(&mut self, begun: Begun<T::Lun>) -> Option<Result<Vec<u8>, BlockError>> {
-        match self.begin_attempt(begun)? {
+    fn retry(
+        &mut self,
+        handle: usize,
+        begun: Begun<T::Lun>,
+    ) -> Option<Result<Vec<u8>, BlockError>> {
+        match self.begin_attempt(handle, begun)? {
             Ok(()) => None,
             Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// The commands still running on a transport a device reset replaced:
+    /// each that may run once more begins again on the new one, as Linux's
+    /// SCSI error handling retries the commands a uas host reset ended
+    /// (`DID_RESET`); the others end failed.
+    fn restart_after_reset(&mut self) {
+        for handle in 0..self.commands.len() {
+            if !matches!(self.commands[handle], Some(Queued::Running(..))) {
+                continue;
+            }
+            let Some(Queued::Running(mut begun, _)) = self.commands[handle].take() else {
+                continue;
+            };
+            if !(core::mem::take(&mut begun.rebound) && self.valid(begun.lun)) {
+                self.commands[handle] = Some(Queued::Ended(Err(RESET_ENDED)));
+                continue;
+            }
+            begun.attention = true;
+            begun.generation = self.transport.generation();
+            let queued = match self
+                .transport
+                .begin(begun.lun, &begun.cdb, begun.data.data())
+            {
+                Some(Ok(running)) => Queued::Running(begun, running),
+                Some(Err(error)) => Queued::Ended(Err(error)),
+                None => Queued::Ended(Err(RESET_ENDED)),
+            };
+            self.commands[handle] = Some(queued);
         }
     }
 
@@ -468,7 +551,10 @@ impl<T: Scsi> Owner<T> {
         let now = self.transport.now_us();
         self.resets
             .retain(|at| now.wrapping_sub(*at) < RESET_WINDOW_US);
-        if self.resets.len() >= RESET_LIMIT {
+        // The other commands a failed transport still ends find it failed
+        // too: one reset, as Linux's error handler runs one host reset.
+        if self.declined || self.resets.len() >= RESET_LIMIT {
+            self.declined = true;
             self.invalidate();
             return;
         }
@@ -479,12 +565,14 @@ impl<T: Scsi> Owner<T> {
         // allocates, so begun here it would lose the device for good. The
         // transport stays poisoned for the service's reset.
         if self.transport.reset_needs_allocation() {
+            self.declined = true;
             self.invalidate();
             return;
         }
         // SAFETY: the empty range hands out no memory.
         let mut none = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
         let Some(replaced) = self.transport.reset_device(&mut none) else {
+            self.declined = true;
             self.invalidate();
             return;
         };
@@ -494,10 +582,12 @@ impl<T: Scsi> Owner<T> {
                 self.transport = transport;
                 self.expecting_reset = true;
                 self.revalidate();
+                self.restart_after_reset();
                 self.rebound = true;
                 self.rebinds += 1;
             }
             Err((operation, error)) => {
+                self.declined = true;
                 self.reset_failure = Some((
                     format!(
                         "{} port reset after a failed command: {operation}",
@@ -569,11 +659,14 @@ impl<T: Scsi> Owner<T> {
                 .unwrap_or(OTHER_IDENTITY);
             return Err(why);
         }
-        if self.begun.take().is_some() && self.ended.is_none() {
-            self.ended = Some(Err(BlockError::Unsupported(
-                "USB storage device left the bus during the command",
-            )));
+        for queued in &mut self.commands {
+            if matches!(queued, Some(Queued::Running(..))) {
+                *queued = Some(Queued::Ended(Err(BlockError::Unsupported(
+                    "USB storage device left the bus during the command",
+                ))));
+            }
         }
+        self.declined = false;
         for (_, valid, _) in &self.pending {
             valid.set(false);
         }
@@ -725,19 +818,29 @@ impl<T: Scsi> Scsi for Owner<T> {
     fn queued(&self) -> bool {
         self.transport.queued()
     }
+    fn depth(&self) -> usize {
+        self.transport.depth()
+    }
     fn begin(
         &mut self,
         lun: Self::Lun,
         cdb: &[u8],
         data: Data<'_>,
-    ) -> Option<Result<(), BlockError>> {
-        if self.begun.is_some() || self.ended.is_some() {
+    ) -> Option<Result<usize, BlockError>> {
+        if !self.transport.room() {
             return Some(Err(BlockError::Protocol(
-                "a USB storage transport runs one command at a time",
+                "every command tag of the USB storage transport is in use",
             )));
         }
+        // A reset no command ended here is no reason to retry this one.
+        self.rebound = false;
+        let handle = self
+            .commands
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.commands.len());
         let first_blocks = self.first_blocks_after(lun, cdb, &data);
-        self.begin_attempt(Begun {
+        let begun = Begun {
             lun,
             cdb: cdb.to_vec(),
             data: Retry::new(&data),
@@ -745,13 +848,17 @@ impl<T: Scsi> Scsi for Owner<T> {
             attention: true,
             rebound: true,
             first_blocks,
-        })
+        };
+        Some(self.begin_attempt(handle, begun)?.map(|()| handle))
     }
-    fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
-        self.ended.take().or_else(|| self.end_begun())
+    fn end(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
+        self.end_begun(handle)
     }
     fn busy(&mut self) -> bool {
-        self.begun.is_some() || self.ended.is_some() || self.transport.busy()
+        self.commands.iter().any(Option::is_some) || self.transport.busy()
+    }
+    fn room(&mut self) -> bool {
+        self.transport.room()
     }
 }
 

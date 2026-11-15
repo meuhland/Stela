@@ -678,7 +678,23 @@ impl Host for BareHost<'_> {
         phase: stela_engine::machine::engine::step_timing::Phase,
         now: u64,
     ) {
+        super::sampling::charge(phase, None);
         pmu::boundary(phase, now);
+    }
+
+    fn profile_exit(&mut self, slot: usize, now: u64) {
+        let phase = stela_engine::machine::engine::step_timing::Phase::Exit;
+        super::sampling::charge(phase, Some(slot));
+        pmu::boundary(phase, now);
+    }
+
+    fn profile_code(
+        &mut self,
+        code: NativeCode,
+        bytes: usize,
+        regions: &[(u32, stela_engine::machine::engine::step_timing::CodeRegion)],
+    ) {
+        super::sampling::tag(code.0 as u64, bytes, regions);
     }
 
     fn counter(&mut self) -> u64 {

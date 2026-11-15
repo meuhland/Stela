@@ -16,7 +16,6 @@ use super::{
 use crate::{engine::host, output};
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::{
-    ffi::{c_char, c_void},
     hint,
     num::NonZeroU64,
     ptr::{self, NonNull},
@@ -29,13 +28,8 @@ use stela_drivers::gpu::metal::{
     deferred::{busy_pause_after_slice, busy_pause_millis},
     device::{lifecycle::QuiesceStatus, pass_times},
     error::Error,
-    native::{
-        self, ExportedMemory, Loader, MemoryExporter, NativeBackend, Refusals, pipeline_store, vk,
-    },
-    nvidia::{
-        Attachment,
-        open::{Gpu, OpenError, open, reopen},
-    },
+    native::{self, ExportedMemory, Loader, MemoryExporter, NativeBackend, pipeline_store},
+    open::{Attachment, Gpu, OpenError, open, reopen},
     service::{JobSlice, Served, ServiceHost, SharedService, identity::DeviceEpoch, wire::Status},
     timing::{ExitWatch, Totals},
     vulkan::physical::PciBusInfo,
@@ -59,19 +53,6 @@ const STOP_UNLOAD_SECONDS: u64 = 10;
 
 /// The services for the kernel's interrupts, once all are open.
 static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
-
-unsafe extern "C" {
-    fn stela_nvk_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
-    /// `compat/mesa/submit_thread.c`.
-    fn stela_nvk_submit_thread(queue: vk::Queue) -> vk::Result;
-    fn stela_nvk_submit_failure(
-        queue: vk::Queue,
-        semaphore: vk::Semaphore,
-        value: u64,
-    ) -> vk::Result;
-    fn stela_nvk_forget_failures(queue: vk::Queue) -> u32;
-    fn stela_nvk_count_failures(queue: vk::Queue, outstanding: *mut u32);
-}
 
 /// The compile stacks ([`open_gpu`]), whose jobs [`run`] runs with the
 /// shootdown vector open; a GPU past these runs its jobs masked.
@@ -1071,21 +1052,6 @@ fn report_lock(tsc_hz: u64) {
     output::arguments(format_args!("{line}\n"));
 }
 
-/// NVK's entry point, as Vulkan types it.
-unsafe extern "system" fn entry(
-    instance: vk::Instance,
-    name: *const c_char,
-) -> vk::PFN_vkVoidFunction {
-    use vk::Handle;
-    // SAFETY: the loader's call, and both ends are one function pointer.
-    unsafe {
-        core::mem::transmute(stela_mesa::vk_icdGetInstanceProcAddr(
-            instance.as_raw() as *mut c_void,
-            name,
-        ))
-    }
-}
-
 /// The host pages behind whole pages of guest RAM.
 fn guest_pages(ranges: &[MemoryRange]) -> Result<Vec<Run>, Error> {
     const NOT_RAM: Error = Error::Invalid("imported memory is whole pages of guest RAM");
@@ -1107,7 +1073,7 @@ fn guest_pages(ranges: &[MemoryRange]) -> Result<Vec<Run>, Error> {
     Ok(runs)
 }
 
-/// Guest RAM the kext wired, for NVK to import. The GPU reaches it through
+/// Guest RAM the kext wired, for the Vulkan driver to import. The GPU reaches it through
 /// the host pages behind it.
 struct Exporter;
 
@@ -1130,26 +1096,18 @@ impl MemoryExporter for Exporter {
 }
 
 fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
+    let driver = &gpu.stack.vulkan;
     let compiler = |physical| {
-        // SAFETY: NVK's own physical device, whose options last as long.
-        let options = unsafe { stela_nvk_nir_options(physical) };
-        compiler::Service::linked(NonNull::new(options.cast_mut()).expect("NVK has NIR options"))
+        // SAFETY: the driver's own physical device, whose options last as long.
+        let options = unsafe { (driver.nir_options)(physical) };
+        compiler::Service::linked(
+            NonNull::new(options.cast_mut()).expect("the Vulkan driver has NIR options"),
+        )
     };
-    let loader = Loader {
-        get_instance_proc_addr: entry,
-        log: driver_message,
-        // A commit's submission runs where Linux does, not on its PE.
-        submit_thread: Some(stela_nvk_submit_thread),
-        // A refused submission fails its command buffer, not the device.
-        refusals: Some(Refusals {
-            take: stela_nvk_submit_failure,
-            forget: stela_nvk_forget_failures,
-            count: stela_nvk_count_failures,
-        }),
-        // An import's driver work after its turn may wait for Linux here.
-        relax,
-    };
-    // SAFETY: the linked NVK and compiler, which last for the boot.
+    // An import's driver work after its turn may wait for Linux in `relax`.
+    let loader: Loader = driver.loader(driver_message, relax);
+    // SAFETY: the stack's linked Vulkan driver and the compiler, which last
+    // for the boot.
     let service = unsafe {
         open(
             loader,
@@ -1222,7 +1180,7 @@ fn open_gpu(
     let Some(link) = bound.link else {
         return refuse("no PCIe link");
     };
-    let Some(chipset) = client::chipset(index as u32) else {
+    let Some(chip) = client::query(index as u32, bound.stack.kernel.chip) else {
         return refuse("no chipset reported");
     };
     let Some(stack) = Stack::map(gpu.window, STACK_BYTES) else {
@@ -1232,13 +1190,14 @@ fn open_gpu(
     // It serves for the boot.
     core::mem::forget(stack);
     let target = Gpu {
+        stack: bound.stack,
         pci: PciBusInfo {
             domain: bound.drm.segment.into(),
             bus: bound.drm.bus.into(),
             device: bound.drm.slot.into(),
             function: bound.drm.function.into(),
         },
-        chipset,
+        chip,
         // A GPU in a Thunderbolt enclosure reaches Stela as the function
         // firmware enumerated, like any other in a slot.
         attachment: Attachment {

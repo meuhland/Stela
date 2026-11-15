@@ -1,26 +1,27 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 10:17:34 +0000
-Subject: [PATCH] feat(nouveau): sample GSP-RM's P-state every second for the
- host's log, asking no more if RM refuses the control
+Subject: [PATCH] feat(nouveau): sample GSP-RM's P-state and the GPU's PCIe
+ link every second for the host's log, asking RM no more if it refuses the
+ control
 
 ---
- .../drm/nouveau/include/nvkm/core/counts.h    |  18 +++
+ .../drm/nouveau/include/nvkm/core/counts.h    |  26 +++
  .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  11 ++
  .../nouveau/nvkm/subdev/gsp/rm/r535/Kbuild    |   1 +
  .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c |  10 +-
  .../nvkm/subdev/gsp/rm/r535/nvrm/perf.h       |  20 +++
- .../nouveau/nvkm/subdev/gsp/rm/r535/perf.c    | 118 ++++++++++++++++++
+ .../nouveau/nvkm/subdev/gsp/rm/r535/perf.c    | 158 ++++++++++++++++++
  .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |   2 +
- 7 files changed, 177 insertions(+), 3 deletions(-)
+ 7 files changed, 225 insertions(+), 3 deletions(-)
  create mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
  create mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
 
 diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
-index 46f9ffaa063a3729b18a74afed06468f87c66acc..1e12c9f8774cbedb3f90987e1b01a18f1c16844b 100644
+index 46f9ffaa063a3729b18a74afed06468f87c66acc..2bfd1f058e25244f6b0287d41a2055239c935a4e 100644
 --- a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
 +++ b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
-@@ -28,6 +28,24 @@ enum nvkm_count {
+@@ -28,6 +28,32 @@ enum nvkm_count {
  
  extern u64 nvkm_counts[NVKM_COUNTS][3];
  
@@ -29,8 +30,12 @@ index 46f9ffaa063a3729b18a74afed06468f87c66acc..1e12c9f8774cbedb3f90987e1b01a18f
 + * since a host last took it: the rounds that asked RM, the current P-state
 + * as its NV2080_CTRL_PERF_PSTATES bit and every one seen. The status is the
 + * errno of the control RM refused, or -ERANGE for an answer that is not one
-+ * P-state, after which it is asked no more. A host takes the counts with
-+ * atomic swaps and reads the rest.
++ * P-state, after which it is asked no more. Each round also reads the GPU's
++ * PCIe link: its Link Status and Link Control registers as last read, a bit
++ * per Link Status speed code seen (bit 1 is 2.5 GT/s) and the Link
++ * Capabilities' low word, all zero for a function with no PCIe capability or
++ * a read that failed. A host takes the counts and the speeds seen with atomic
++ * swaps and reads the rest.
 + */
 +struct nvkm_perf_report {
 +	u32 started;
@@ -38,6 +43,10 @@ index 46f9ffaa063a3729b18a74afed06468f87c66acc..1e12c9f8774cbedb3f90987e1b01a18f
 +	u32 pstate;
 +	u32 pstates;
 +	s32 pstate_status;
++	u32 link_status;
++	u32 link_control;
++	u32 link_speeds;
++	u32 link_cap;
 +};
 +
 +extern struct nvkm_perf_report nvkm_perf;
@@ -152,10 +161,10 @@ index 0000000000000000000000000000000000000000..978a1f494d9f42a2fe696701dd9dfb60
 +#endif
 diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..301fb82f7cc270fe5c10cdcf97301a60d024df80
+index 0000000000000000000000000000000000000000..8722a6587a516678e1952628e85956d2f94f4fe3
 --- /dev/null
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,158 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * The GPU's performance state as GSP-RM reports it, for a host to read
@@ -165,14 +174,21 @@ index 0000000000000000000000000000000000000000..301fb82f7cc270fe5c10cdcf97301a60
 + * the GPU's load, and nouveau requests none. A work item asks RM every
 + * R535_GSP_PERF_MS for the current P-state and adds it to nvkm_perf. If RM
 + * refuses the control it is asked no more: RM's error line names it once,
-+ * and nvkm_perf keeps the errno, so the host reports the state as unknown.
-+ * Clocks are not read: the clock sample control's parameters are not in the
-+ * RM headers this tree has for GSP-RM 570.144, and GSP-RM refused the
-+ * 615.78.08 layout.
++ * and nvkm_perf keeps the errno, so the host reports the state as unknown
++ * while the rounds go on reading the link.
++ * Clocks are not read: GSP-RM 570.144's RM headers define no clock control
++ * (its ctrl2080clk.h has none), and it refused the 615.78.08 PMUMON layout.
++ *
++ * Each round also reads the GPU's own PCIe Link Status and Link Control, as
++ * RM moves the link speed with the P-state: a link that stays slow while RM
++ * runs at P0 limits every transfer from system memory.
 + */
 +#include <rm/rpc.h>
 +
++#include <linux/pci.h>
++
 +#include <core/counts.h>
++#include <core/pci.h>
 +
 +#include "nvrm/perf.h"
 +
@@ -239,6 +255,38 @@ index 0000000000000000000000000000000000000000..301fb82f7cc270fe5c10cdcf97301a60
 +	__atomic_fetch_or(&nvkm_perf.pstates, pstate, __ATOMIC_RELAXED);
 +}
 +
++/*
++ * The GPU's PCIe link as its own capability reports it, as Linux's
++ * pcie_capability_read_word() reads it; a function with no PCIe capability
++ * or a failed read leaves zeros.
++ */
++static void
++r535_gsp_perf_link(struct nvkm_gsp *gsp)
++{
++	struct nvkm_device *device = gsp->subdev.device;
++	struct pci_dev *pdev;
++	u16 status, control;
++	u32 cap;
++	int pos;
++
++	if (device->type != NVKM_DEVICE_PCI)
++		return;
++	pdev = container_of(device, struct nvkm_device_pci, device)->pdev;
++	pos = pci_pcie_cap(pdev);
++	if (!pos)
++		return;
++	if (pci_read_config_word(pdev, pos + PCI_EXP_LNKSTA, &status) ||
++	    pci_read_config_word(pdev, pos + PCI_EXP_LNKCTL, &control) ||
++	    pci_read_config_dword(pdev, pos + PCI_EXP_LNKCAP, &cap) ||
++	    PCI_POSSIBLE_ERROR(status))
++		return;
++	__atomic_store_n(&nvkm_perf.link_status, status, __ATOMIC_RELAXED);
++	__atomic_store_n(&nvkm_perf.link_control, control, __ATOMIC_RELAXED);
++	__atomic_store_n(&nvkm_perf.link_cap, cap & 0xffff, __ATOMIC_RELAXED);
++	__atomic_fetch_or(&nvkm_perf.link_speeds, BIT(status & PCI_EXP_LNKSTA_CLS),
++			  __ATOMIC_RELAXED);
++}
++
 +static void
 +r535_gsp_perf_work(struct work_struct *work)
 +{
@@ -248,11 +296,12 @@ index 0000000000000000000000000000000000000000..301fb82f7cc270fe5c10cdcf97301a60
 +	if (READ_ONCE(gsp->stopping) || READ_ONCE(gsp->dead) || !gsp->running)
 +		return;
 +
-+	r535_gsp_perf_pstate(gsp);
++	r535_gsp_perf_link(gsp);
++	if (!gsp->perf.pstate_off)
++		r535_gsp_perf_pstate(gsp);
 +	__atomic_fetch_add(&nvkm_perf.rounds, 1, __ATOMIC_RELAXED);
 +
-+	if (!gsp->perf.pstate_off)
-+		schedule_delayed_work(&gsp->perf.work, msecs_to_jiffies(R535_GSP_PERF_MS));
++	schedule_delayed_work(&gsp->perf.work, msecs_to_jiffies(R535_GSP_PERF_MS));
 +}
 +
 +/* GSP-RM runs: sample its performance state from now on. */

@@ -54,7 +54,7 @@ use core::{
 };
 use stela_boot_core::page_window::{self, Cache};
 #[cfg(feature = "nvk")]
-use stela_drivers::gpu::metal::nvidia::PcieLink;
+use stela_drivers::gpu::metal::open::PcieLink;
 use stela_drivers::{
     bus::{
         irq::{Disposition, Handler, IrqError, IrqRegistration, Route, Source},
@@ -65,7 +65,7 @@ use stela_drivers::{
         },
     },
     firmware::{Catalog, ErrorKind as FirmwareError, Provider},
-    gpu,
+    gpu::{self, stack::GpuStack},
     platform::work::{
         WorkError,
         service::{Clock, Domain, Idle},
@@ -111,11 +111,6 @@ const SUBSYSTEM_ID: u16 = 0x2c;
 const RESOURCE_MEMORY: u64 = 0x200;
 const RESOURCE_PREFETCHABLE: u64 = 0x2000;
 const RESOURCE_WIDE: u64 = 0x10_0000;
-/// Every DMA mask nouveau sets on the GPUs Stela drives holds 47 bits: the
-/// Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c` 47,
-/// `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask. A mapping
-/// past it is refused (`function::Mappings`), not truncated.
-const DMA_LIMIT: u64 = (1 << 47) - 1;
 /// How long the GPUs may take to boot their firmware before the guest starts.
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
@@ -972,11 +967,16 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
 
 /// A function claimed from probe, before Linux sees it.
 pub(super) struct Claimed {
+    /// Whether this GPU may be the one showing the firmware's screen.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    shows_screen: bool,
     device: Device,
     firmware: PciFirmware,
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read to open Metal"))]
+    stack: &'static GpuStack,
     #[cfg(feature = "nvk")]
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
@@ -985,6 +985,7 @@ pub(super) struct Claimed {
 
 fn claim(
     services: &dyn NativeServices,
+    stack: &'static GpuStack,
     adapter: &gpu::Adapter,
     line: u32,
     gop: crate::pci_io::ScreenOwner,
@@ -996,7 +997,8 @@ fn claim(
     let mut requester = services.prepare_requester(address)?;
     let bus_reset = requester.bus_reset_available();
     let function = requester.function_mut();
-    if (function.vendor, function.device, function.class) != (0x10de, adapter.device, adapter.class)
+    if (function.vendor, function.device, function.class)
+        != (stack.vendor.pci_id(), adapter.device, adapter.class)
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
@@ -1024,8 +1026,22 @@ fn claim(
             })?;
             true
         }
-        // Any GPU may show the screen, so none starts beside its writer.
-        ScreenOwner::Unknown => true,
+        // A GPU below a bridge that forwards none of the screen cannot hold
+        // it; any other may show it, so none starts beside its writer.
+        ScreenOwner::Unknown(apart) => {
+            let may = stela_boot_core::firmware_screen::gpu_may_show(
+                &apart,
+                address.segment,
+                address.bus,
+            );
+            if !may {
+                output::arguments(format_args!(
+                    "GPU {address}: the firmware's screen lies outside the bridge windows \
+                     above it, so it stays with the adapter showing it\n"
+                ));
+            }
+            may
+        }
         ScreenOwner::Function(_) | ScreenOwner::NoScreen => false,
     };
     // BAR sizing below temporarily turns off memory decode.
@@ -1038,7 +1054,9 @@ fn claim(
         bus: address.bus,
         devfn: address.device << 3 | address.function,
         irq: line,
-        dma_limit: DMA_LIMIT,
+        // A mapping past the driver's mask is refused
+        // (`function::Mappings`), not truncated.
+        dma_limit: stack.kernel.dma_limit(),
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
@@ -1128,7 +1146,7 @@ fn claim(
     }
     crate::host_inventory::text(
         alloc::format!("GPU{line}PCIID"),
-        alloc::format!("10de:{:04x}", adapter.device),
+        alloc::format!("{:04x}:{:04x}", stack.vendor.pci_id(), adapter.device),
     );
     let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
         requester,
@@ -1234,6 +1252,7 @@ fn claim(
         .transpose()
         .map_err(ServiceError::Config)?;
     Ok(Claimed {
+        shows_screen: owns_screen,
         device: Device {
             config: SharedConfig(Rc::new(RefCell::new(ManuallyDrop::into_inner(function)))),
             msi,
@@ -1245,6 +1264,7 @@ fn claim(
         placement,
         bars,
         name: format!("{address}"),
+        stack,
         #[cfg(feature = "nvk")]
         drm,
         #[cfg(feature = "nvk")]
@@ -1432,7 +1452,7 @@ fn cold_refusal(
 /// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
 
-/// An NVIDIA adapter [`claim_all`] did not claim, for the boot screen
+/// An adapter with a driver stack that [`claim_all`] did not claim, for the boot screen
 /// (`stela_boot_core::gpu_status`).
 pub(super) struct Refused {
     pub(super) address: String,
@@ -1442,8 +1462,9 @@ pub(super) struct Refused {
     pub(super) why: String,
 }
 
-/// Claim every NVIDIA adapter, each reported if it cannot be, and the ones
-/// refused. In a foreground continuation, with probe finished.
+/// Claim every adapter Stela has a driver stack for ([`GpuStack::select`]),
+/// each reported if it cannot be, and the ones refused. In a foreground
+/// continuation, with probe finished.
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
@@ -1457,24 +1478,19 @@ pub(super) fn claim_all(
         reason,
         why: format!("{why}"),
     };
-    for adapter in adapters
-        .iter()
-        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia)
-    {
-        output::arguments(format_args!(
-            "GPU {} vendor={:?} device={:04x} unused: {}\n",
-            adapter.address,
-            adapter.vendor,
-            adapter.device,
-            adapter.unavailable_reason()
-        ));
+    let mut driven = Vec::new();
+    for adapter in adapters {
+        match GpuStack::select(adapter) {
+            Ok(stack) => driven.push((stack, adapter)),
+            Err(reason) => output::arguments(format_args!(
+                "GPU {} vendor={:?} device={:04x} unused: {reason}\n",
+                adapter.address, adapter.vendor, adapter.device,
+            )),
+        }
     }
-    let nvidia = adapters
-        .iter()
-        .filter(|adapter| adapter.vendor == gpu::Vendor::Nvidia);
     if !cfg!(feature = "nvk") {
         let mut refused = Vec::new();
-        for adapter in nvidia {
+        for (_, adapter) in driven {
             let why = "this image has no GPU driver: build it with `cargo xtask boot build`";
             output::arguments(format_args!(
                 "GPU {} left with firmware: {why}\n",
@@ -1489,19 +1505,20 @@ pub(super) fn claim_all(
     let source = match gop {
         Ok(source) => source,
         Err(why) => {
-            for adapter in nvidia {
+            for (_, adapter) in driven {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
                 refused.push(refused_as(adapter, Reason::Other, &why));
             }
             return (claimed, refused);
         }
     };
-    for adapter in nvidia {
+    for (stack, adapter) in driven {
         let result = catalog
             .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
             .and_then(|catalog| {
                 claim(
                     services,
+                    stack,
                     adapter,
                     claimed.len() as u32,
                     source,
@@ -1523,10 +1540,14 @@ pub(super) fn claim_all(
     (claimed, refused)
 }
 
-/// A GPU nouveau bound.
+/// A GPU its stack's kernel driver bound.
 #[cfg(feature = "nvk")]
 struct Bound {
     name: String,
+    /// Whether it may be the GPU that showed the firmware's screen, when the
+    /// screen's function is unknown.
+    shows_screen: bool,
+    stack: &'static GpuStack,
     drm: client::DrmDevice,
     link: Option<PcieLink>,
 }
@@ -1566,7 +1587,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         result: Ok(()),
     };
     // SAFETY: entered, on a task.
-    job.result = unsafe { gpu::nouveau::start() };
+    job.result = unsafe { gpu::stack::start_kernel() };
     if job.result.is_err() {
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
@@ -1610,13 +1631,15 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                     #[cfg(feature = "nvk")]
                     job.bound.push(Bound {
                         name: claimed.name,
+                        shows_screen: claimed.shows_screen,
+                        stack: claimed.stack,
                         drm: claimed.drm,
                         link: claimed.link,
                     });
                 } else {
                     output::arguments(format_args!(
-                        "GPU {}: nouveau did not bind it\n",
-                        claimed.name
+                        "GPU {}: {} did not bind it\n",
+                        claimed.name, claimed.stack.kernel.driver
                     ));
                 }
                 job._attached.push(attached);
@@ -2726,8 +2749,8 @@ fn nvkm_report() -> String {
     times + &sizes
 }
 
-/// `\nGPU PERF pstate=… seen=… rounds=…`: the GPU's P-state as GSP-RM
-/// reported it since the last report
+/// `\nGPU PERF pstate=… seen=… pcie=… rounds=…`: the GPU's P-state as GSP-RM
+/// reported it and its PCIe link since the last report
 /// (`stela_drivers::gpu::gsp_perf`), at the first report after GSP starts and
 /// then when they changed. Empty otherwise.
 #[cfg(feature = "nvk")]

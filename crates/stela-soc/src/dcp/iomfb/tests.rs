@@ -940,6 +940,55 @@ fn clients_are_told_of_each_refresh_and_a_late_one_replaces_the_last() {
 }
 
 #[test]
+fn a_display_asleep_or_powered_off_sends_no_vsync_and_its_wake_resumes_the_grid() {
+    // 60 Hz on the 24 MHz counter.
+    const REFRESH_TICKS: u64 = 400_000;
+    let display = Rc::new(RefCell::new(DisplayState::new(true)));
+    let mut methods = Methods::with_display_state(
+        Box::new(TestScreen::default()),
+        Rc::clone(&display),
+        interface(),
+    );
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    methods.refresh(1000);
+    let first = methods.take_callback().unwrap();
+    assert_eq!(first.tag, SWAP_NOTIFY);
+    (first.then)(&mut methods, &[]).unwrap();
+    // Asleep: no vblank passes, so nothing is due and nothing is sent,
+    // however long it sleeps.
+    display.borrow_mut().asleep = true;
+    // One look applies the sleep to the scanout's monitor.
+    assert_eq!(methods.refresh_deadline(), Some(1000 + REFRESH_TICKS));
+    methods.refresh(1000 + REFRESH_TICKS / 2);
+    assert_eq!(methods.refresh_deadline(), None);
+    for period in 1..=120 {
+        methods.refresh(1000 + period * REFRESH_TICKS);
+        assert!(methods.take_callback().is_none());
+    }
+    // Awake: the next vblank on the grid sends its vsync.
+    display.borrow_mut().asleep = false;
+    assert_eq!(methods.refresh_deadline(), Some(1000 + 121 * REFRESH_TICKS));
+    methods.refresh(1000 + 121 * REFRESH_TICKS + 5);
+    let callback = methods.take_callback().unwrap();
+    assert_eq!(callback.tag, SWAP_NOTIFY);
+    assert_eq!(
+        callback.input[..8],
+        (1000 + 121 * REFRESH_TICKS).to_le_bytes()
+    );
+    (callback.then)(&mut methods, &[]).unwrap();
+    // Powered off: the same.
+    display.borrow_mut().powered = Some(false);
+    methods.refresh(1000 + 121 * REFRESH_TICKS + 6);
+    assert_eq!(methods.refresh_deadline(), None);
+    methods.refresh(1000 + 130 * REFRESH_TICKS);
+    assert!(methods.take_callback().is_none());
+    display.borrow_mut().powered = Some(true);
+    assert_eq!(methods.refresh_deadline(), Some(1000 + 131 * REFRESH_TICKS));
+}
+
+#[test]
 fn a_late_look_sends_the_vblanks_own_time_and_keeps_the_grid() {
     const REFRESH_TICKS: u64 = 400_000;
     // 5 ms of the 24 MHz counter.

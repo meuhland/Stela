@@ -657,8 +657,21 @@ struct FetchEntry {
     guarded: bool,
     /// The walk ended in a global leaf (nG=0).
     global: bool,
+    /// Bytes the leaf maps over both stages (`mmu::Translation::size`).
+    size: u64,
     el: u8,
     epoch: FetchEpoch,
+}
+
+/// A walk no instruction asked for ([`Machine::quiet_fetch_physical`]):
+/// the page's frame, its leaf's guarded and global bits, and the bytes the
+/// leaf maps over both stages.
+#[derive(Clone, Copy)]
+struct QuietFetch {
+    physical: u64,
+    guarded: bool,
+    global: bool,
+    size: u64,
 }
 
 /// What a half's cached fetches and lookup contexts last as long as: the
@@ -713,8 +726,10 @@ const CONTEXT_FRAMES: usize = 64;
 
 /// The fills a PE remembers for [`Machine::refill_after`]: more than the
 /// pages a kernel and the processes it switches between take between two
-/// TLBIs of everything (about 300 kernel pages, then each process's).
-const FILL_LOG: usize = 4096;
+/// TLBIs of everything (about 300 kernel pages, then each process's; about
+/// 1500 a PE in run 20261115-112116, before leaf fills logged each page
+/// of a granule).
+const FILL_LOG: usize = 8192;
 
 /// Whether the context `space` translates `asid`.
 /// ASIDs compare by the eight bits every TCR.AS gives them.
@@ -821,7 +836,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// Hot-block samples not yet taken, under step timing
     /// ([`step_timing::HotBlocks`], [`Self::take_hot_samples`]), the runs
     /// until the next sampled one and the generator of sampled budgets.
-    hot_samples: Vec<(u64, step_timing::Level)>,
+    /// Each is a PC, its level and the ASID of its regime
+    /// ([`step_timing::AsidSamples`]).
+    hot_samples: Vec<(u64, step_timing::Level, u16)>,
     /// The sampled runs among those whose last transfer was their block's
     /// RET, BLR or BR form's ([`step_timing::HotBlocks::dynamic`]).
     dynamic_samples: Vec<step_timing::DynamicSample>,
