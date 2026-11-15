@@ -2108,12 +2108,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         } else {
             TEXEL_BUFFER_ARRAYS
         };
-        let low_length = if texture.second_plane.is_some() {
-            2
+        // A two-plane texture's high half holds no storage descriptors: its
+        // plane flags lie in the storage index's bits.
+        let (id, low_length) = if texture.second_plane.is_some() {
+            (ResourceId::new(texture.id.low(), NULL_DESCRIPTOR), 2)
         } else {
-            resource::sampled_descriptors(resource::view_type(texture.descriptor.texture_type))
+            let view_type = resource::view_type(texture.descriptor.texture_type);
+            (texture.id, resource::sampled_descriptors(view_type))
         };
-        self.release_id(texture.id, arrays, low_length);
+        self.release_id(id, arrays, low_length);
         for view in texture
             .views
             .iter()

@@ -1042,6 +1042,40 @@ mod tests {
         device.destroy_texture(texture).unwrap();
     }
 
+    /// Destroying a two-plane IOSurface texture frees its two sampled
+    /// descriptors and its working image's storage descriptor, and nothing
+    /// its plane flags would name as a storage index (`XR10`, `XR10_SRGB`
+    /// sit in those bits): the counts return to where they were, where the
+    /// flags were released as a storage run that was never allocated.
+    #[test]
+    fn destroyed_surface_textures_free_only_their_descriptors() {
+        let mut device = device();
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let in_use = |device: &crate::metal::device::fixture::TestDevice| {
+            [HeapArray::SampledImages, HeapArray::StorageImages]
+                .map(|array| device.descriptors.in_use(array))
+        };
+        let before = in_use(&device);
+        for format in [PixelFormat::Rgb10A8_2pXr10, PixelFormat::Rgb10A8_2pXr10Srgb] {
+            let texture = device
+                .new_extended_plane_texture(buffer, &surface_texture(format), PLANES)
+                .unwrap();
+            let mut commands = device.new_command_buffer();
+            device
+                .begin_render(&mut commands, &pass(texture, LoadAction::Clear))
+                .unwrap();
+            commands.end_encoding(&mut device.resolver()).unwrap();
+            device.commit(commands).unwrap();
+            device.destroy_texture(texture).unwrap();
+            let (timeline, serial) = (device.timeline, device.submitted_serial());
+            device.backend().complete(timeline, serial);
+            device.poll().unwrap();
+            assert_eq!(in_use(&device), before, "{format:?}");
+        }
+    }
+
     #[test]
     fn only_the_two_plane_formats_have_extended_planes() {
         assert!(extended(PixelFormat::Rgb10A8_2pXr10));
