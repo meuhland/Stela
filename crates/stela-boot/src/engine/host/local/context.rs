@@ -54,6 +54,55 @@ fn unavailable<T>(_: T) -> WorkError {
     WorkError::Unavailable
 }
 
+/// The processor running an identity's Linux work in its place
+/// ([`RootIdentity::move_here`]): the GS record of the identity's own
+/// processor and of the one in its place, zero while none is.
+static MOVED_FROM: AtomicU64 = AtomicU64::new(0);
+static MOVED_TO: AtomicU64 = AtomicU64::new(0);
+/// No processor takes an identity's place any more ([`close_moves`]).
+static MOVES_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// This processor runs Linux work in place of an identity's own processor
+/// until dropped ([`RootIdentity::move_here`]).
+pub(crate) struct Moved {
+    _local: PhantomData<*mut ()>,
+}
+impl Drop for Moved {
+    fn drop(&mut self) {
+        MOVED_TO.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Whether [`close_moves`] ran.
+pub(crate) fn moves_closed() -> bool {
+    MOVES_CLOSED.load(Ordering::Relaxed)
+}
+
+/// Whether this processor runs an identity's Linux work in its place now.
+pub(crate) fn moved_here() -> bool {
+    let to = MOVED_TO.load(Ordering::Acquire);
+    to != 0 && to == gs_base()
+}
+
+/// No processor takes an identity's place from now on, and the one that
+/// has, if any, is waited for, for at most `ticks` TSC ticks: the GPUs'
+/// stop, whose Linux work changes interrupt routes and unloads firmware,
+/// runs on the boot processor only. Whether none runs in its place now.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(crate) fn close_moves(ticks: u64) -> bool {
+    MOVES_CLOSED.store(true, Ordering::SeqCst);
+    let start = crate::engine::host::rdtsc();
+    while MOVED_TO.load(Ordering::SeqCst) != 0 {
+        if crate::engine::host::rdtsc().wrapping_sub(start) >= ticks {
+            return false;
+        }
+        // The processor in its place may be retiring a mapping.
+        crate::native_mmio::shootdown::service();
+        core::hint::spin_loop();
+    }
+    true
+}
+
 /// Immutable CPU/descriptor/fixed-root identity, pinned by HostOwner.
 /// This survives only checked RAM ownership joins. It grants no RAM-absence,
 /// mutable mapping-publication, task switching, or cross-CPU execution permission.
@@ -173,7 +222,17 @@ impl RootIdentity {
         // so none can borrow this processor's removable scope. Every Linux
         // context check comes here; CPUID or reading APIC_BASE would exit to
         // a hypervisor, and the GS record already names one processor.
-        if gs_base() != self.gs {
+        // The one processor in its place ([`Self::move_here`]) holds the
+        // host drivers' lock, which every Linux entry takes, and has its
+        // own descriptors.
+        let gs = gs_base();
+        if gs != self.gs {
+            if gs != 0
+                && MOVED_TO.load(Ordering::Acquire) == gs
+                && MOVED_FROM.load(Ordering::Acquire) == self.gs
+            {
+                return Ok(());
+            }
             return Err(WorkError::WrongCpu);
         }
         // SAFETY: immutable architectural observation; original owner kept.
@@ -225,6 +284,41 @@ impl RootIdentity {
             return result;
         }
         Ok(())
+    }
+    /// Whether this is the identity's own processor.
+    pub(crate) fn owner_here(&self) -> bool {
+        gs_base() == self.gs
+    }
+    /// Have this processor run the identity's Linux work in its place
+    /// until the result drops: its checks accept this processor then, and
+    /// only it. `None` on the identity's own processor, while another
+    /// processor is in its place, or once [`close_moves`] ran.
+    ///
+    /// # Safety
+    /// This processor holds the host drivers' lock, which every Linux entry
+    /// takes, from before this until after the result drops, and runs only
+    /// the identity's Linux work meanwhile: no interrupt route, timer or
+    /// idle wait of the identity's processor.
+    pub(crate) unsafe fn move_here(&self) -> Option<Moved> {
+        let gs = gs_base();
+        if gs == self.gs || gs == 0 {
+            return None;
+        }
+        if MOVED_TO
+            .compare_exchange(0, gs, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        MOVED_FROM.store(self.gs, Ordering::SeqCst);
+        let moved = Moved {
+            _local: PhantomData,
+        };
+        // Against `close_moves`' store before its look at `MOVED_TO`.
+        if MOVES_CLOSED.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(moved)
     }
     pub(crate) fn in_interrupt(&self) -> bool {
         self.affinity().is_err() || irq_active()

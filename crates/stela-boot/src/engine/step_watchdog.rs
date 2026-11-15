@@ -50,6 +50,48 @@ static SAVED_LVT: AtomicU32 = AtomicU32::new(0);
 /// The boot processor's APIC ID, which the other processors' NMI goes to
 /// once they run ([`retire`]); `u32::MAX` before.
 static TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The processor running Linux's steps in the boot processor's place
+/// (`KernelWork::dispatch_linux_moved`), its index and APIC ID, which the
+/// watchers' NMI then goes to; `u32::MAX` while none does ([`Moved`]).
+static MOVED_PROCESSOR: AtomicU32 = AtomicU32::new(u32::MAX);
+static MOVED_TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Each processor's APIC ID once read, `u32::MAX` before: reading it exits
+/// to a hypervisor, and a processor in the boot processor's place needs it
+/// at every entry.
+static APIC_IDS: [AtomicU32; 256] = [const { AtomicU32::new(u32::MAX) }; 256];
+
+/// Linux's steps run on this processor in the boot processor's place until
+/// dropped: a step the watchers find stuck sends its NMI here, and the NMI
+/// is the watchdog's here.
+pub(super) struct Moved;
+
+impl Moved {
+    pub(super) fn enter() -> Self {
+        let processor = host::local::processor();
+        let id = match APIC_IDS.get(processor as usize) {
+            Some(slot) => match slot.load(Ordering::Relaxed) {
+                u32::MAX => {
+                    let id = apic().id();
+                    slot.store(id, Ordering::Relaxed);
+                    id
+                }
+                id => id,
+            },
+            None => apic().id(),
+        };
+        MOVED_PROCESSOR.store(processor, Ordering::Release);
+        MOVED_TARGET.store(id, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for Moved {
+    fn drop(&mut self) {
+        MOVED_TARGET.store(u32::MAX, Ordering::Release);
+        MOVED_PROCESSOR.store(u32::MAX, Ordering::Release);
+    }
+}
+
 /// The step a watcher last saw (its start, 0 for none), when one first saw
 /// it, by the shared count, and one look at a time.
 static SEEN_BEGAN: AtomicU64 = AtomicU64::new(0);
@@ -310,6 +352,11 @@ pub(super) fn look() {
     if target == u32::MAX || LOOKING.swap(true, Ordering::Acquire) {
         return;
     }
+    // The step may run on a processor in the boot processor's place.
+    let target = match MOVED_TARGET.load(Ordering::Acquire) {
+        u32::MAX => target,
+        moved => moved,
+    };
     let last = match SEEN_BEGAN.load(Ordering::Relaxed) {
         0 => None,
         began => Some(Sighting {
@@ -457,7 +504,10 @@ pub(crate) fn nmi_is_watchdog() -> bool {
 /// What the watchdog found when an NMI on this processor is its own: the
 /// stage, and the watchers' catch or the counter's stuck step.
 fn nmi_finding() -> Option<(&'static str, Result<decide::Caught, decide::Stuck>)> {
-    if PROCESSOR.load(Ordering::Relaxed) != super::host::local::processor() {
+    let processor = super::host::local::processor();
+    if PROCESSOR.load(Ordering::Relaxed) != processor
+        && MOVED_PROCESSOR.load(Ordering::Acquire) != processor
+    {
         return None;
     }
     let observation = Observation {

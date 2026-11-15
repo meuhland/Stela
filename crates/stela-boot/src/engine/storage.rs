@@ -195,6 +195,39 @@ pub(super) fn host_drivers_held_here() -> bool {
     let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
     gs != 0 && HOST_DRIVERS_GS.load(Ordering::Acquire) == gs
 }
+/// Whether this activated processor holds the host drivers' lock, which
+/// every Linux entry holds on whichever processor it runs: one load while
+/// nobody holds it, and no RDMSR.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(super) fn holds_host_drivers() -> bool {
+    HOST_DRIVERS.load(Ordering::Acquire)
+        && HOST_DRIVERS_GS.load(Ordering::Acquire) == super::host::activated_base()
+}
+
+/// Run `read`, a bounded read of state only Linux entries change, with no
+/// Linux entry running on another processor: holding the host drivers'
+/// lock, taken only when free (`None` when another processor holds it), or
+/// as this processor already does. No root changes and no driver is called.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(super) fn with_drivers_held<T>(read: impl FnOnce() -> T) -> Option<T> {
+    if holds_host_drivers() {
+        return Some(read());
+    }
+    if !try_lock_host_drivers() {
+        return None;
+    }
+    let flags: u64;
+    // SAFETY: CPL0 IF save; restored below on this processor.
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    HOST_DRIVERS_GS.store(super::host::activated_base(), Ordering::Release);
+    let result = read();
+    HOST_DRIVERS_GS.store(0, Ordering::Release);
+    HOST_DRIVERS.store(false, Ordering::Release);
+    // SAFETY: the save above, on this processor.
+    unsafe { asm!("push {}", "popfq", in(reg) flags) };
+    Some(result)
+}
+
 /// The GS base of the processor starting the host's devices, zero while
 /// none does ([`starting_devices_here`]).
 static STARTING_GS: AtomicU64 = AtomicU64::new(0);

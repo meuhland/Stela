@@ -82,7 +82,9 @@ use stela_boot_core::native_profile as profile;
 use stela_boot_core::ram;
 mod translated;
 pub(crate) use local::activated_base;
-pub(crate) use local::context::RootIdentity;
+#[cfg(feature = "nvk")]
+pub(crate) use local::context::close_moves;
+pub(crate) use local::context::{RootIdentity, moved_here, moves_closed};
 pub(crate) use local::processor;
 #[cfg(feature = "nvk")]
 pub(crate) use local::processors;
