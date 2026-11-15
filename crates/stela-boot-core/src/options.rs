@@ -71,6 +71,45 @@ pub const DNS: &str = "--dns";
 pub const MAX_DNS_SERVERS: usize = 3;
 
 /// A `--audio-check` mode.
+/// What the StelaNet adapter offers beyond its rings, each level adding to
+/// the one before; a boot asks for fewer to compare against them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StelaNetOffloads {
+    /// Nothing: the guest checksums everything itself and takes one frame
+    /// per buffer, as the adapter was first built
+    /// (`--guest-network-stelanet-no-offload`).
+    None,
+    /// Checksums: partial transmit checksums completed and received ones
+    /// verified natively (`--guest-network-stelanet-no-lro`, or its first
+    /// name `--guest-network-stelanet-csum`).
+    Checksums,
+    /// Checksums and receive coalescing (LRO): in-order TCP segments that
+    /// arrive together reach the guest as one frame. The default.
+    Coalescing,
+}
+
+impl StelaNetOffloads {
+    /// The feature bits (`stela_contracts::net::features`) the adapter adds
+    /// to what it always offers.
+    pub fn features(self) -> u64 {
+        use stela_contracts::net::features::{CHECKSUMS, COALESCING};
+        match self {
+            Self::None => 0,
+            Self::Checksums => CHECKSUMS,
+            Self::Coalescing => CHECKSUMS | COALESCING,
+        }
+    }
+
+    /// Its name in the boot log.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Checksums => "checksums",
+            Self::Coalescing => "checksums+lro",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioCheck {
     Playback,
@@ -360,10 +399,10 @@ pub struct System {
     /// (`--guest-network-stelanet`, which also gives the guest the network).
     /// A prototype: the StelaGPU kext's StelaNet front end drives it.
     pub guest_network_stelanet: bool,
-    /// The StelaNet adapter also offers checksum offloads: partial transmit
-    /// checksums completed and received ones verified natively
-    /// (`--guest-network-stelanet-csum`, which implies the adapter).
-    pub guest_network_stelanet_csum: bool,
+    /// The offloads the StelaNet adapter offers: all by default, fewer to
+    /// compare (`--guest-network-stelanet-no-lro`,
+    /// `--guest-network-stelanet-no-offload`, each implying the adapter).
+    pub guest_network_stelanet_offloads: StelaNetOffloads,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -461,7 +500,7 @@ impl Default for System {
             external_disks: false,
             guest_network: false,
             guest_network_stelanet: false,
-            guest_network_stelanet_csum: false,
+            guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -879,14 +918,23 @@ impl fmt::Display for System {
         }
         line.flag(EXTERNAL_DISKS, self.external_disks)?;
         line.flag("--guest-network", self.guest_network)?;
-        line.flag(
-            "--guest-network-stelanet",
-            self.guest_network && self.guest_network_stelanet && !self.guest_network_stelanet_csum,
-        )?;
-        line.flag(
-            "--guest-network-stelanet-csum",
-            self.guest_network && self.guest_network_stelanet && self.guest_network_stelanet_csum,
-        )?;
+        let stelanet = self.guest_network && self.guest_network_stelanet;
+        for (flag, offloads) in [
+            ("--guest-network-stelanet", StelaNetOffloads::Coalescing),
+            (
+                "--guest-network-stelanet-no-lro",
+                StelaNetOffloads::Checksums,
+            ),
+            (
+                "--guest-network-stelanet-no-offload",
+                StelaNetOffloads::None,
+            ),
+        ] {
+            line.flag(
+                flag,
+                stelanet && self.guest_network_stelanet_offloads == offloads,
+            )?;
+        }
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

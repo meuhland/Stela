@@ -374,15 +374,20 @@ impl Service {
                     frames,
                     devices.network_status(),
                     devices.network_room(),
-                    devices
-                        .has_stela_net()
-                        .then(|| (devices.stela_net_error(), devices.stela_net_address())),
+                    devices.has_stela_net().then(|| {
+                        (
+                            devices.stela_net_error(),
+                            devices.stela_net_address(),
+                            devices.stela_net_stats(),
+                        )
+                    }),
                 )
             });
             network.status(status);
             // StelaNet's link follows the host adapter's carrier; the USB
             // adapter's does not.
-            let carrier = stela_net.and_then(|(fault, address)| {
+            let carrier = stela_net.and_then(|(fault, address, stats)| {
+                network.stela_net_stats(stats);
                 network.fault(fault);
                 network.address(address);
                 network.carrier_now(now, *tsc_hz)

@@ -143,6 +143,12 @@ pub mod features {
     /// The checksum offloads a boot may add to [`OFFERED`]: partial transmit
     /// checksums completed, received ones verified.
     pub const CHECKSUMS: u64 = CSUM | GUEST_CSUM;
+    /// Receive coalescing (LRO) a boot may add with [`CHECKSUMS`]: in-order
+    /// TCP segments of one flow joined into one frame of up to 64 KiB, which
+    /// spans as many receive buffers as it needs (`num_buffers`). A
+    /// coalesced frame is always `DATA_VALID`, so a driver accepts
+    /// `GUEST_TSO4`/`GUEST_TSO6` only with `GUEST_CSUM` and `MRG_RXBUF`.
+    pub const COALESCING: u64 = GUEST_TSO4 | GUEST_TSO6 | MRG_RXBUF;
     /// What a driver must accept.
     pub const REQUIRED: u64 = VERSION_1;
     const _: () = assert!(OFFERED & REQUIRED == REQUIRED);

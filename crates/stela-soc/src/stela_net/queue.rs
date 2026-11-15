@@ -125,6 +125,8 @@ pub struct Queue {
     used: u16,
     /// The used index the device last published.
     shown: u16,
+    /// The available index [`Self::pop`] last read.
+    seen: u16,
 }
 
 impl Queue {
@@ -146,6 +148,7 @@ impl Queue {
             last_avail: 0,
             used: 0,
             shown: 0,
+            seen: 0,
         })
     }
 
@@ -209,6 +212,18 @@ impl Queue {
         self.set_avail_event(memory, self.last_avail)
     }
 
+    /// Asks for a kick once the driver publishes past the available index
+    /// [`Self::pop`] last read, and answers whether it already has: chains
+    /// it published before it could see this event may come with no kick,
+    /// so the device must look at them without one.
+    pub fn want_kick_past_seen(&self, memory: &mut dyn Memory) -> Result<bool, RingError> {
+        self.set_avail_event(memory, self.seen)?;
+        // The event's store before the index's load, as the driver's own
+        // fence orders its index store before its event load.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(Self::read16(memory, self.avail() + 2)? != self.seen)
+    }
+
     /// Asks for no kick until the device next asks.
     pub fn no_kick(&self, memory: &mut dyn Memory) -> Result<(), RingError> {
         self.set_avail_event(memory, self.last_avail.wrapping_add(0x8000))
@@ -228,7 +243,9 @@ impl Queue {
 
     /// Takes the next available chain, `None` when there is none.
     pub fn pop(&mut self, memory: &mut dyn Memory) -> Result<Option<Chain>, RingError> {
-        if self.pending(memory)? == 0 {
+        let pending = self.pending(memory)?;
+        self.seen = self.last_avail.wrapping_add(pending);
+        if pending == 0 {
             return Ok(None);
         }
         let slot = u64::from(self.last_avail % self.size);
@@ -238,9 +255,9 @@ impl Queue {
         Ok(Some(chain))
     }
 
-    /// Gives back the chain [`Self::pop`] took last, untouched.
-    pub fn unpop(&mut self) {
-        self.last_avail = self.last_avail.wrapping_sub(1);
+    /// Gives back the last `chains` [`Self::pop`] took, untouched.
+    pub fn unpop(&mut self, chains: u16) {
+        self.last_avail = self.last_avail.wrapping_sub(chains);
     }
 
     /// Walks the chain at descriptor `head`: at most a ring of descriptors,
