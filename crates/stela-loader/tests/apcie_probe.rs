@@ -365,6 +365,24 @@ fn the_model_unmaps_only_the_modeled_ports_endpoint_and_admission_accepts_it() {
     assert!(hidden.iter().any(|entry| entry == wlan));
     let lan = "/arm-io/apcie/pci-bridge0/lan-1gb";
     assert!(modeled.node(lan).is_some());
+    // The other port gets `manual-enable` (no link training, so no
+    // link-training timeout panic); the modeled port keeps auto-enable.
+    let other = "/arm-io/apcie/pci-bridge1";
+    assert!(modeled.property(other, "manual-enable").is_some());
+    assert!(
+        modeled
+            .property("/arm-io/apcie/pci-bridge0", "manual-enable")
+            .is_none()
+    );
+    assert!(
+        ledger
+            .iter()
+            .any(|entry| *entry == format!("{other} +manual-enable"))
+    );
+    assert!(
+        on.property("/arm-io/apcie/pci-bridge0", "manual-enable")
+            .is_none()
+    );
     assert!(modeled.property(lan, "iommu-parent").is_none());
     assert!(
         ledger
@@ -413,4 +431,14 @@ fn the_model_unmaps_only_the_modeled_ports_endpoint_and_admission_accepts_it() {
     hide_unmodeled(&mut off);
     apcie_probe::set_model_port(None);
     assert!(off.property(wlan, "iommu-parent").is_some());
+    // The probe alone leaves every port auto-enabled.
+    apcie_probe::set_apcie(true);
+    let mut probe = DeviceTree::parse(&board_tree()).unwrap();
+    hide_unmodeled(&mut probe);
+    apcie_probe::set_apcie(false);
+    assert!(
+        probe
+            .property("/arm-io/apcie/pci-bridge1", "manual-enable")
+            .is_none()
+    );
 }
