@@ -1154,3 +1154,73 @@ fn physical_candidates_follow_nested_bus_domains_and_never_alias_protocol_slaves
     );
     assert_eq!(owner("/arm-io/serial/uart"), None);
 }
+
+#[test]
+fn the_pcie_models_unmapped_endpoint_is_a_valid_note_on_a_kept_node() {
+    // `--apcie`: the hidden endpoint below the modeled port stays, without
+    // its `iommu-parent`; the ledger notes the drop.
+    let endpoint = |iommu: bool| {
+        let mut properties: Vec<(&str, &[u8])> = vec![("name", b"lan-1gb")];
+        if iommu {
+            properties.push(("iommu-parent", &[0x31, 0, 0, 0]));
+        }
+        let lan = encode(&properties, &[]);
+        let bridge = encode(&[("name", b"pci-bridge2")], &[lan]);
+        let apcie = encode(
+            &[("name", b"apcie"), ("clock-gates", &words(&[1]))],
+            &[bridge],
+        );
+        tree(&[(1, Some(0), [0, 0])], &[apcie])
+    };
+    let ledger: Vec<String> = vec![
+        "/arm-io/apcie/pci-bridge2/lan-1gb".into(),
+        "/arm-io/apcie/pci-bridge2/lan-1gb iommu-parent".into(),
+    ];
+    let bytes = endpoint(false);
+    let mut states = power_states(
+        &Node::root(&bytes).unwrap(),
+        &flat_fixture_extent(&Some),
+        0x8112,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(states.apply_admission(&bytes, &ledger), Ok(1));
+    // The note is evidence only while the property is gone.
+    let kept = endpoint(true);
+    let mut states = power_states(
+        &Node::root(&kept).unwrap(),
+        &flat_fixture_extent(&Some),
+        0x8112,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        states
+            .apply_admission(&kept, &ledger)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid preparation note")
+    );
+    // A removed node is missing evidence (apcie1's stop).
+    let removed = tree(
+        &[(1, Some(0), [0, 0])],
+        &[encode(
+            &[("name", b"apcie"), ("clock-gates", &words(&[1]))],
+            &[encode(&[("name", b"pci-bridge2")], &[])],
+        )],
+    );
+    let mut states = power_states(
+        &Node::root(&removed).unwrap(),
+        &flat_fixture_extent(&Some),
+        0x8112,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        states
+            .apply_admission(&removed, &ledger[..1])
+            .unwrap_err()
+            .to_string()
+            .contains("names missing resource")
+    );
+}

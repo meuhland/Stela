@@ -562,23 +562,40 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
     retire_hidden_acio_parents(tree, &mut hidden);
     retire_hidden_capabilities(tree, &mut hidden);
     if let Some(port) = board::apcie_probe::model_port() {
-        detach_modeled_endpoints(tree, port, &mut hidden);
+        unmap_modeled_endpoints(tree, port, &mut hidden);
     }
     hidden
 }
 
-/// The root-complex model (`--apcie`): remove the DeviceTree nodes below the
-/// modeled port, the endpoint the real board has there (J473AP's built-in
-/// Ethernet). IOPCIFamily gives a found function the bridge's child node of
-/// its device and function as its registry entry, and that node's
-/// `iommu-parent` names a PCIe mapper the probe hides (`reg`-less), so
-/// `IOMapper::copyMapperForDevice`, called for every new nub from
-/// `IOPCIBridge::getNubResources` (0xfffffe000aee7518), would wait for that
-/// mapper forever. Without the node the modeled endpoint is a plain nub with
-/// no mapper (`_mapRIDToSID` logs "no mapper defined" and returns). Last, so
-/// no earlier pass looks for a removed path. Each removal is a ledger entry
-/// `PATH removed` and an `APCIE PREPARE` line.
-fn detach_modeled_endpoints(tree: &mut DeviceTree, port: u32, hidden: &mut Vec<String>) {
+/// The root-complex model (`--apcie`): drop `iommu-parent` from every node
+/// below the modeled port, the endpoint the real board has there (J473AP's
+/// built-in Ethernet, `lan-1gb`). IOPCIFamily gives a found function the
+/// bridge's child node of its device and function as its registry entry,
+/// and that node's `iommu-parent` names a PCIe mapper the probe hides
+/// (`reg`-less), so `IOMapper::copyMapperForDevice`, called for every new
+/// nub from `IOPCIBridge::getNubResources` (0xfffffe000aee7518), would wait
+/// for that mapper forever. Without it the modeled endpoint's nub has no
+/// mapper (`_mapRIDToSID` logs "no mapper defined" and returns). The node
+/// itself stays, hidden as before: the PMGR admission and the other board
+/// checks know it by path (apcie1 stopped on "PMGR admission names missing
+/// resource .../lan-1gb" when it was removed). Each drop is a ledger note
+/// `PATH iommu-parent` (checked by the PMGR admission like `acio-parent`)
+/// and an `APCIE PREPARE` line. Last, after every pass that reads it.
+fn unmap_modeled_endpoints(tree: &mut DeviceTree, port: u32, hidden: &mut Vec<String>) {
+    fn strip(node: &mut Node, path: &str, hidden: &mut Vec<String>) {
+        if node.remove_property(IOMMU_PARENT).is_some() {
+            board::apcie_probe::note(format_args!(
+                "APCIE PREPARE {path} iommu-parent dropped: the modeled port's endpoint is \
+                 Stela's, and the mapper it names is hidden\n"
+            ));
+            hidden.push(format!("{path} {IOMMU_PARENT}"));
+        }
+        for child in &mut node.children {
+            let name = child.name().unwrap_or("?");
+            let path = format!("{path}/{name}");
+            strip(child, &path, hidden);
+        }
+    }
     fn walk(node: &mut Node, path: &str, port: u32, inside: bool, hidden: &mut Vec<String>) {
         let complex = compatibles(node).any(board::apcie_probe::is_root_complex);
         if inside
@@ -587,13 +604,10 @@ fn detach_modeled_endpoints(tree: &mut DeviceTree, port: u32, hidden: &mut Vec<S
                 .and_then(|p| p.as_u32())
                 .is_some_and(|index| index == port)
         {
-            for child in node.children.drain(..) {
-                let removed = format!("{path}/{}", child.name().unwrap_or("?"));
-                board::apcie_probe::note(format_args!(
-                    "APCIE PREPARE {removed} removed: the modeled port's endpoint is Stela's, \
-                     and this node's iommu-parent names a mapper the probe hides\n"
-                ));
-                hidden.push(format!("{removed} removed"));
+            for child in &mut node.children {
+                let name = child.name().unwrap_or("?");
+                let path = format!("{path}/{name}");
+                strip(child, &path, hidden);
             }
             return;
         }
