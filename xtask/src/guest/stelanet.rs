@@ -1,9 +1,20 @@
 //! `org.stela.StelaNet`, the launchd job that configures `stn0`, StelaNet's
 //! interface (`--guest-network-stelanet`). `stn0` is a plain ifnet, not an
-//! IONetworkInterface, so configd offers it as no network service and
-//! nothing configures it unless asked. The kext installs the job's plist
-//! beside the sandbox patcher's (`kext/sandbox_cache.cpp`); launchd loads it
-//! from the next boot on.
+//! IONetworkInterface, so configd's preferences hold no network service for
+//! it and nothing configures it unless asked. The kext installs the job's
+//! plist beside the sandbox patcher's (`kext/sandbox_cache.cpp`); launchd
+//! loads it from the next boot on.
+//!
+//! The job publishes a DHCP service for `stn0` in configd's dynamic store,
+//! where PreferencesMonitor publishes the preferences' services
+//! (`Setup:/Network/Service/<id>/{Interface,IPv4,IPv6}`). IPConfiguration
+//! runs the services it finds there and keeps them across configuration
+//! changes; an `ipconfig set` service, which the first version used, is
+//! dropped at the next configuration change for an interface without a
+//! service of its own (seen 60 s after the first lease), and the new one got
+//! another address. The job publishes the service again if the store loses
+//! it, falls back to `ipconfig set` if the service gets no address, and logs
+//! IPConfiguration's state whenever `stn0` has no address.
 //!
 //! The job is `/bin/sh` and the tools macOS ships, started by launchd. A
 //! process of ours that is not in the trust cache, such as the sandbox
@@ -15,63 +26,137 @@ use anyhow::Result;
 pub const JOB_PATH: &str = "/System/Volumes/Data/Library/LaunchDaemons/org.stela.StelaNet.plist";
 const LABEL: &str = "org.stela.StelaNet";
 const LOG: &str = "/Library/Logs/org.stela.StelaNet.log";
+/// The service's ID in the store: fixed, so a restarted job finds its own.
+const SERVICE: &str = "5354454C-414E-4554-0000-73746E300000";
 /// How long the script waits for `stn0` after launchd starts it, in seconds:
 /// without it (the option off) it then exits for the rest of the boot.
 const WAIT_SECONDS: u32 = 60;
-/// How long without a DHCP address before DHCP is asked for again, in
-/// seconds; IPConfiguration retries on its own meanwhile.
-const RETRY_SECONDS: u32 = 300;
-/// How often the script looks at `stn0`'s address, in seconds.
-const POLL_SECONDS: u32 = 10;
+/// How long the store's service may go without an address before the job
+/// falls back to `ipconfig set`, in seconds.
+const STORE_GRACE_SECONDS: u32 = 90;
+/// How long an `ipconfig set` service may go without an address before it
+/// is set again, in seconds.
+const ADHOC_GRACE_SECONDS: u32 = 20;
+/// How often the script looks at `stn0`, in seconds.
+const POLL_SECONDS: u32 = 5;
 
-/// The job's script, for `/bin/sh` as root from boot. It waits a minute
-/// for `stn0` and exits when there is none. While `stn0` exists it asks
-/// IPConfiguration for DHCP and IPv6 autoconfiguration once, and again after
-/// [`RETRY_SECONDS`] without a DHCP address, and logs every address `stn0`
-/// gets with its router and DNS servers.
-pub fn script() -> String {
-    format!(
-        r#"log() {{ echo "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*"; }}
+const SCRIPT: &str = r#"ID=@SERVICE@
+log() { echo "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*"; }
+publish() {
+  /usr/sbin/scutil <<EOF
+d.init
+d.add UserDefinedName StelaNet
+set Setup:/Network/Service/$ID
+d.init
+d.add DeviceName stn0
+d.add Type Ethernet
+d.add Hardware Ethernet
+d.add UserDefinedName StelaNet
+set Setup:/Network/Service/$ID/Interface
+d.init
+d.add ConfigMethod DHCP
+set Setup:/Network/Service/$ID/IPv4
+d.init
+d.add ConfigMethod Automatic
+set Setup:/Network/Service/$ID/IPv6
+quit
+EOF
+}
+withdraw() {
+  /usr/sbin/scutil <<EOF
+remove Setup:/Network/Service/$ID/IPv4
+remove Setup:/Network/Service/$ID/IPv6
+remove Setup:/Network/Service/$ID/Interface
+remove Setup:/Network/Service/$ID
+quit
+EOF
+}
+published() {
+  printf 'show Setup:/Network/Service/%s/IPv4\nquit\n' "$ID" | /usr/sbin/scutil | /usr/bin/grep -q 'ConfigMethod : DHCP'
+}
+explain() {
+  echo "--- ipconfig getsummary stn0"
+  /usr/sbin/ipconfig getsummary stn0 2>&1
+  echo "--- store"
+  printf 'show Setup:/Network/Service/%s/IPv4\nshow State:/Network/Service/%s/IPv4\nshow State:/Network/Interface/stn0/Link\nshow State:/Network/Global/IPv4\nquit\n' "$ID" "$ID" | /usr/sbin/scutil 2>&1
+  echo "--- ifconfig stn0"
+  /sbin/ifconfig stn0 2>&1
+  echo "---"
+}
 waited=0
 until /sbin/ifconfig stn0 >/dev/null 2>&1; do
-  [ "$waited" -ge {WAIT_SECONDS} ] && exit 0
+  [ "$waited" -ge @WAIT@ ] && exit 0
   /bin/sleep 2
   waited=$((waited + 2))
 done
 log "stn0 is present"
-applied=0
+/sbin/ifconfig stn0 up
+mode=store
+grace=@STORE_GRACE@
+publish
+log "published DHCP service $ID for stn0 in the dynamic store"
+since=$(/bin/date +%s)
 last=none
 while /sbin/ifconfig stn0 >/dev/null 2>&1; do
   now=$(/bin/date +%s)
+  if [ "$mode" = store ] && ! published; then
+    log "the dynamic store lost service $ID: publishing it again"
+    explain
+    publish
+  fi
   address=$(/usr/sbin/ipconfig getifaddr stn0 2>/dev/null)
   case "$address" in
-  ""|169.254.*)
-    if [ "$applied" = 0 ] || [ $((now - applied)) -ge {RETRY_SECONDS} ]; then
-      log "stn0 has no DHCP address${{address:+ ($address)}}: ipconfig set stn0 DHCP"
-      /sbin/ifconfig stn0 up
-      if /usr/sbin/ipconfig set stn0 DHCP; then
-        applied=$now
-        /usr/sbin/ipconfig set stn0 AUTOMATIC-V6 || log "ipconfig set stn0 AUTOMATIC-V6 failed"
-      else
-        log "ipconfig set stn0 DHCP failed: $?"
-      fi
-    fi
-    address=none
-    ;;
+  ""|169.254.*) address=none ;;
   esac
   if [ "$address" != "$last" ]; then
     if [ "$address" = none ]; then
-      log "stn0 lost its address $last"
+      log "stn0 lost its address $last ($mode)"
+      explain
     else
-      log "stn0 $address router $(/usr/sbin/ipconfig getoption stn0 router 2>/dev/null) dns $(/usr/sbin/ipconfig getoption stn0 domain_name_server 2>/dev/null)"
+      log "stn0 $address router $(/usr/sbin/ipconfig getoption stn0 router 2>/dev/null) dns $(/usr/sbin/ipconfig getoption stn0 domain_name_server 2>/dev/null) ($mode)"
     fi
     last=$address
+    since=$now
   fi
-  /bin/sleep {POLL_SECONDS}
+  if [ "$address" = none ] && [ $((now - since)) -ge "$grace" ]; then
+    if [ "$mode" = store ]; then
+      log "service $ID got no address in $grace s: falling back to ipconfig set stn0 DHCP"
+      explain
+      withdraw
+      mode=adhoc
+      grace=@ADHOC_GRACE@
+    else
+      log "stn0 has no address: ipconfig set stn0 DHCP again"
+      explain
+    fi
+    if /usr/sbin/ipconfig set stn0 DHCP; then
+      /usr/sbin/ipconfig set stn0 AUTOMATIC-V6 || log "ipconfig set stn0 AUTOMATIC-V6 failed"
+    else
+      log "ipconfig set stn0 DHCP failed: $?"
+    fi
+    since=$now
+  fi
+  /bin/sleep @POLL@
 done
 log "stn0 is gone"
-"#
-    )
+if [ "$mode" = store ]; then
+  withdraw
+fi
+"#;
+
+/// The job's script, for `/bin/sh` as root from boot. It waits a minute
+/// for `stn0` and exits when there is none. While `stn0` exists it keeps a
+/// DHCP and IPv6-automatic service for it in configd's dynamic store, falls
+/// back to `ipconfig set` when that service gets no address, and logs every
+/// address `stn0` gets, with its router and DNS servers, and
+/// IPConfiguration's state whenever `stn0` has none.
+pub fn script() -> String {
+    SCRIPT
+        .replace("@SERVICE@", SERVICE)
+        .replace("@WAIT@", &WAIT_SECONDS.to_string())
+        .replace("@STORE_GRACE@", &STORE_GRACE_SECONDS.to_string())
+        .replace("@ADHOC_GRACE@", &ADHOC_GRACE_SECONDS.to_string())
+        .replace("@POLL@", &POLL_SECONDS.to_string())
 }
 
 /// The job's launchd plist: started at load, started again only if the
@@ -135,19 +220,22 @@ mod tests {
     #[test]
     fn the_script_parses_and_names_every_tool_by_path() {
         let script = script();
+        assert!(!script.contains('@'), "every placeholder is filled");
         // A minute's wait for stn0, then nothing without it.
         assert!(script.contains("[ \"$waited\" -ge 60 ] && exit 0"));
         // Outside the quoted log messages, every tool goes by its path:
         // launchd gives the job a minimal PATH.
         for line in script.lines() {
             let commands: String = line.split('"').step_by(2).collect();
-            for word in commands.split([' ', '(', '$', ';']) {
+            for word in commands.split([' ', '(', '$', ';', '|']) {
                 assert!(
-                    !["date", "sleep", "ifconfig", "ipconfig"].contains(&word),
+                    !["date", "sleep", "ifconfig", "ipconfig", "scutil", "grep"].contains(&word),
                     "{word} without its path: {line}"
                 );
             }
         }
+        assert!(script.contains("set Setup:/Network/Service/$ID/IPv4"));
+        assert!(script.contains("d.add ConfigMethod DHCP"));
         assert!(script.contains("/usr/sbin/ipconfig set stn0 DHCP"));
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("stelanet.sh");
