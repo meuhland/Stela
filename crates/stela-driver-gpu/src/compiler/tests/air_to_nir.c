@@ -1251,6 +1251,66 @@ pointer_phi_authority_refusals(void)
    LLVMDisposeMemoryBuffer(raw); free(metadata);
 }
 
+#define CARRIED "{ [2 x i32], { i16, <2 x i32> } }"
+
+/* Arrays and structs of them join leaf by leaf: each invocation stores its
+ * edge's leaves, and a loop's nested accumulator moves every leaf at once,
+ * each reading the trip before's. */
+static void
+aggregate_phis_join_by_leaf(void)
+{
+   for (uint32_t tid = 0; tid < 2; tid++) {
+      nir_shader *nir = translate_body(
+         "entry:\n%c = icmp eq i32 %tid, 0\nbr i1 %c, label %left, label %right\n"
+         "left:\nbr label %join\nright:\nbr label %join\n"
+         "join:\n%p = phi [2 x i32] [[i32 1, i32 2], %left], [[i32 3, i32 4], %right]\n"
+         "%a = extractvalue [2 x i32] %p, 0\n%b = extractvalue [2 x i32] %p, 1\n"
+         "store i32 %a, ptr addrspace(1) %out, align 4\n"
+         "%q = getelementptr i32, ptr addrspace(1) %out, i32 1\n"
+         "store i32 %b, ptr addrspace(1) %q, align 4\nret void\n");
+      specialize_invocation(nir, tid);
+      const uint64_t addresses[] = {0x100000, 0x100004};
+      const uint32_t values[2][2] = {{1, 2}, {3, 4}};
+      check_stores(nir, addresses, values[tid], 2);
+      ralloc_free(nir);
+   }
+   nir_shader *nir = translate_body(
+      "entry:\nbr label %header\nheader:\n%i = phi i32 [0, %entry], [%next, %latch]\n"
+      "%acc = phi " CARRIED " [{ [2 x i32] [i32 10, i32 20], { i16, <2 x i32> }"
+      " { i16 5, <2 x i32> <i32 7, i32 8> } }, %entry], [%acc4, %latch]\n"
+      "%more = icmp ult i32 %i, 3\nbr i1 %more, label %latch, label %exit\n"
+      "latch:\n%a0 = extractvalue " CARRIED " %acc, 0, 0\n%a1 = add i32 %a0, 1\n"
+      "%acc1 = insertvalue " CARRIED " %acc, i32 %a1, 0, 0\n"
+      "%acc2 = insertvalue " CARRIED " %acc1, i32 %a0, 0, 1\n"
+      "%h = extractvalue " CARRIED " %acc, 1, 0\n%h2 = add i16 %h, 2\n"
+      "%acc3 = insertvalue " CARRIED " %acc2, i16 %h2, 1, 0\n"
+      "%v = extractvalue " CARRIED " %acc, 1, 1\n"
+      "%s = shufflevector <2 x i32> %v, <2 x i32> poison, <2 x i32> <i32 1, i32 0>\n"
+      "%acc4 = insertvalue " CARRIED " %acc3, <2 x i32> %s, 1, 1\n"
+      "%next = add i32 %i, 1\nbr label %header\n"
+      "exit:\n%r0 = extractvalue " CARRIED " %acc, 0, 0\n"
+      "store i32 %r0, ptr addrspace(1) %out, align 4\n"
+      "%r1 = extractvalue " CARRIED " %acc, 0, 1\n"
+      "%p1 = getelementptr i32, ptr addrspace(1) %out, i32 1\n"
+      "store i32 %r1, ptr addrspace(1) %p1, align 4\n"
+      "%r2h = extractvalue " CARRIED " %acc, 1, 0\n%r2 = zext i16 %r2h to i32\n"
+      "%p2 = getelementptr i32, ptr addrspace(1) %out, i32 2\n"
+      "store i32 %r2, ptr addrspace(1) %p2, align 4\n"
+      "%rv = extractvalue " CARRIED " %acc, 1, 1\n"
+      "%r3 = extractelement <2 x i32> %rv, i32 0\n%r4 = extractelement <2 x i32> %rv, i32 1\n"
+      "%p3 = getelementptr i32, ptr addrspace(1) %out, i32 3\n"
+      "store i32 %r3, ptr addrspace(1) %p3, align 4\n"
+      "%p4 = getelementptr i32, ptr addrspace(1) %out, i32 4\n"
+      "store i32 %r4, ptr addrspace(1) %p4, align 4\nret void\n");
+   specialize_invocation(nir, 0);
+   /* Three trips: 10, 11, 12, 13; the array's second leaf the first's trip
+    * before; 5 + 2 * 3; the lanes swapped an odd number of times. */
+   const uint64_t addresses[] = {0x100000, 0x100004, 0x100008, 0x10000c, 0x100010};
+   const uint32_t values[] = {13, 12, 11, 8, 7};
+   check_executed_stores(nir, addresses, values, ARRAY_SIZE(values));
+   ralloc_free(nir);
+}
+
 static void
 cfg_limits_and_refusals(void)
 {
@@ -2810,6 +2870,7 @@ tests(void)
    pointer_equality_semantics();
    pointer_phi_authority_refusals();
    cfg_limits_and_refusals();
+   aggregate_phis_join_by_leaf();
    floating_semantics();
    floating_loop_semantics();
    floating_backend_options();
