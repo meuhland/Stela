@@ -7628,11 +7628,23 @@ instruction(struct translator *t, LLVMValueRef inst)
          return true;
       /* Inlining leaves no call of a defined function but os_log's, whose
        * varargs do not inline, and dispatch only calls through other
-       * pointers than a table's. */
-      if (stela_air_defined_function(callee))
-         return fail(t, STELA_AIR_INSTRUCTION, "a function call was not inlined");
-      if (!LLVMIsAFunction(callee))
-         return fail(t, STELA_AIR_INSTRUCTION, "function pointers come only from visible function tables");
+       * pointers than a table's. What else is left, the refusal names. */
+      if (stela_air_defined_function(callee)) {
+         char callee_text[sizeof(t->error->detail)];
+         stela_air_uninlined_call(inst, callee_text, sizeof(callee_text));
+         return fail(t, STELA_AIR_INSTRUCTION, "a function call was not inlined: %s", callee_text);
+      }
+      if (!LLVMIsAFunction(callee)) {
+         char *type = LLVMPrintTypeToString(LLVMGetCalledFunctionType(inst));
+         char *pointer = LLVMPrintValueToString(callee);
+         const char *text = pointer + strspn(pointer, " ");
+         fail(t, STELA_AIR_INSTRUCTION,
+              "function pointers come only from visible function tables, not this call of %s through `%.96s`",
+              type, text);
+         LLVMDisposeMessage(pointer);
+         LLVMDisposeMessage(type);
+         return false;
+      }
       if (LLVMIsAFunction(callee)) {
          bool lowered;
          if (!memory_intrinsic(t, inst, LLVMGetIntrinsicID(callee), &lowered))

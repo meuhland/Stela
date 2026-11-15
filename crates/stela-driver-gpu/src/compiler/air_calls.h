@@ -10,6 +10,11 @@
  * refuses its calls as AIR's. */
 bool stela_air_defined_function(LLVMValueRef fn);
 
+/* Names the function `call` calls, which inlining left, into text of size
+ * bytes: a definition or declaration with its inlining attributes, and why
+ * LLVM's inliner keeps it, as far as its checks of the call tell. */
+void stela_air_uninlined_call(LLVMValueRef call, char *text, size_t size);
+
 /* Whether module has a direct call to one of its defined AIR functions. */
 bool stela_air_has_defined_calls(LLVMModuleRef module);
 
