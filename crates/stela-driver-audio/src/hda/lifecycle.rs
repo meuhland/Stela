@@ -67,9 +67,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.routing_failed = true;
             return Err(error);
         }
-        for stream in &mut self.streams {
-            *stream = None;
-        }
+        // Every stream's DMA stop was acknowledged and the link reset: its
+        // ring and BDL are kept for the next allocation of the same sizes.
+        self.retire_streams();
         self.routes.clear();
         self.codec_controls.clear();
         self.converter_bindings.clear();

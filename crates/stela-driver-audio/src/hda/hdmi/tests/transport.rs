@@ -411,8 +411,9 @@ fn a_transient_bad_answer_does_not_end_playback() {
     let mut f = Fixture::new(false);
     let (mut c, port, s, p) = playing(&mut f);
     let fmt = c.stream_format(s).unwrap();
-    // One wrong pin-control readback at a status read.
+    // One wrong pin-control readback at the turn's readback.
     f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+    c.schedule_hdmi_readback(port).unwrap();
     f.advance(p, fmt);
     assert_eq!(
         c.refill_hdmi_period(s, &vec![2; p]),
@@ -420,23 +421,26 @@ fn a_transient_bad_answer_does_not_end_playback() {
     );
     only_the_stream_stopped(&f, &c, port);
     let before = f.hardware.lock().unwrap().commands.len();
-    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
-    assert!(
-        f.hardware.lock().unwrap().commands[before..]
-            .iter()
-            .all(|c| !walks(*c) && !sets(*c))
-    );
+    // The route's verbs set again, with no graph walk, then the stream.
+    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Reprogrammed));
+    {
+        let h = f.hardware.lock().unwrap();
+        let restart = &h.commands[before..];
+        assert!(restart.iter().all(|c| !walks(*c)), "{restart:x?}");
+        assert!(restart.iter().any(|c| sets(*c)), "{restart:x?}");
+    }
     f.advance(p, fmt);
     assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
     // Faults spread out by played periods never add up.
     for _ in 0..2 * HDMI_TRANSIENT_FAULTS {
         f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+        c.schedule_hdmi_readback(port).unwrap();
         f.advance(p, fmt);
         assert_eq!(
             c.refill_hdmi_period(s, &vec![4; p]),
             Err(Error::RouteRejected)
         );
-        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Reprogrammed));
         f.advance(p, fmt);
         assert!(c.refill_hdmi_period(s, &vec![5; p]).unwrap().is_some());
     }
@@ -480,6 +484,7 @@ fn the_route_state_reads_back_and_a_rejection_names_its_answer() {
         assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
         // One wrong pin-control readback is named, once.
         f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+        c.schedule_hdmi_readback(port).unwrap();
         f.advance(p, fmt);
         assert_eq!(
             c.refill_hdmi_period(s, &vec![3; p]),
@@ -501,7 +506,7 @@ fn the_route_state_reads_back_and_a_rejection_names_its_answer() {
             "node 0x04 verb 0xf07 payload 0x0000: answered 0x00000000, expected 0x00000040"
         ));
         assert_eq!(c.take_rejection(), None);
-        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Reprogrammed));
         c.close_hdmi(port).unwrap();
         assert_eq!(c.hdmi_route_state(port), Err(Error::SinkUnavailable));
         c.detach_hdmi_port(port).unwrap();
@@ -515,14 +520,23 @@ fn a_codec_that_keeps_answering_wrong_needs_a_reset_after_the_bound() {
     let (mut c, port, s, p) = playing(&mut f);
     let fmt = c.stream_format(s).unwrap();
     f.hardware.lock().unwrap().reject = Some(0xf07);
+    c.schedule_hdmi_readback(port).unwrap();
     f.advance(p, fmt);
     assert_eq!(
         c.refill_hdmi_period(s, &vec![2; p]),
         Err(Error::RouteRejected)
     );
-    for _ in 1..HDMI_TRANSIENT_FAULTS {
+    // Not counted yet: each restart sets the route's verbs again, and
+    // its readback, still wrong right after, counts.
+    assert_eq!(route_faults(&c, port), 0);
+    for fault in 1..=HDMI_TRANSIENT_FAULTS {
+        let before = f.hardware.lock().unwrap().commands.len();
         assert_eq!(c.restart_hdmi(port), Err(Error::RouteRejected));
         only_the_stream_stopped(&f, &c, port);
+        assert_eq!(route_faults(&c, port), fault);
+        let h = f.hardware.lock().unwrap();
+        assert!(h.commands[before..].contains(&((4 << 20) | (0x707 << 8) | 0x40)));
+        assert!(h.commands[before..].iter().all(|c| !walks(*c)));
     }
     assert_eq!(c.restart_hdmi(port), Err(Error::NeedsReset));
     assert_eq!(c.restart_hdmi(port), Err(Error::NeedsReset));
@@ -558,7 +572,8 @@ fn a_sleeping_monitor_pauses_and_resumes() {
         assert_eq!(c.restart_hdmi(port), Err(Error::SinkUnavailable));
     }
     only_the_stream_stopped(&f, &c, port);
-    // Awake with the same ELD: the stream resumes, the route as prepared.
+    // Awake with the same ELD: the stream resumes on the route as
+    // prepared, its verbs set again, with no graph walk.
     f.hardware.lock().unwrap().sense = 0xc000_0000;
     let before = f.hardware.lock().unwrap().commands.len();
     assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Resumed));
@@ -571,7 +586,7 @@ fn a_sleeping_monitor_pauses_and_resumes() {
                 .iter()
                 .all(|c| !matches!((c >> 8) & 0xfff, 0xf00 | 0xf02 | 0xf1c))
         );
-        assert!(resume.iter().all(|c| !sets(*c)), "{resume:x?}");
+        assert!(resume.iter().any(|c| sets(*c)), "{resume:x?}");
         assert_eq!(h.starts, 2);
     }
     assert!(!c.hdmi_paused(port).unwrap());
@@ -628,4 +643,295 @@ fn enable_failure_requires_reset() {
         assert_eq!(Arc::strong_count(&f.owner), 1);
         assert_eq!(c.hdmi_first_error(port), Err(Error::InvalidHdmiPort));
     }
+}
+
+/// The prepared route's transient faults in a row.
+fn route_faults(c: &Controller<Regs, Clock>, port: HdmiPortId) -> u8 {
+    c.hdmi_ports[port.index]
+        .as_ref()
+        .unwrap()
+        .route
+        .as_ref()
+        .unwrap()
+        .faults
+}
+
+/// The codec commands since `before` whose verb is `verb`.
+fn count(f: &Fixture, before: usize, verb: u32) -> usize {
+    f.hardware.lock().unwrap().commands[before..]
+        .iter()
+        .filter(|c| (*c >> 8) & 0xfff == verb)
+        .count()
+}
+
+#[test]
+fn a_fifo_error_restarts_only_the_stream() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    for n in 0..2 * HDMI_TRANSIENT_FAULTS {
+        // audio7's SDnSTS 0x28: FIFOE and FIFORDY, no descriptor error.
+        f.advance(p, fmt);
+        f.hardware.lock().unwrap().bar[0x83] |= 0x28;
+        let error = c.refill_hdmi_period(s, &vec![2; p]).unwrap_err();
+        assert!(
+            matches!(error, Error::StreamDma { status } if status & 0x18 == 0x08),
+            "{error:?}"
+        );
+        only_the_stream_stopped(&f, &c, port);
+        // The stop acknowledged it: FIFOE, DESE and BCIS are clear.
+        assert_eq!(f.hardware.lock().unwrap().bar[0x83] & 0x1c, 0);
+        if n == 0 {
+            assert_eq!(c.hdmi_first_error(port).unwrap(), Some(error));
+        }
+        let before = f.hardware.lock().unwrap().commands.len();
+        // Never a reset, however often: the stream alone restarts.
+        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+        {
+            let h = f.hardware.lock().unwrap();
+            let restart = &h.commands[before..];
+            assert!(restart.iter().all(|c| !walks(*c) && !sets(*c)));
+            assert_eq!(h.starts, 2 + n as usize);
+            assert_eq!(h.get(0x84, 4), 0);
+        }
+        f.advance(p, fmt);
+        assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
+    }
+    assert_eq!(f.owner.state.lock().unwrap().disable, 0);
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_descriptor_error_or_an_unacknowledged_stop_needs_a_reset() {
+    for unacknowledged in [false, true] {
+        let mut f = Fixture::new(false);
+        let (mut c, port, s, p) = playing(&mut f);
+        let fmt = c.stream_format(s).unwrap();
+        f.advance(p, fmt);
+        {
+            let mut h = f.hardware.lock().unwrap();
+            if unacknowledged {
+                // A FIFO error whose stop the DMA never acknowledges.
+                h.bar[0x83] |= 0x08;
+                h.stop_stuck = true;
+            } else {
+                // DESE: a BDL or buffer fetch failed.
+                h.bar[0x83] |= 0x10;
+            }
+        }
+        let error = c.refill_hdmi_period(s, &vec![2; p]).unwrap_err();
+        assert!(matches!(error, Error::StreamDma { .. }), "{error:?}");
+        assert_eq!(c.restart_hdmi(port), Err(Error::NeedsReset));
+        assert_eq!(c.start(s), Err(Error::NeedsReset));
+        f.hardware.lock().unwrap().stop_stuck = false;
+        c.reinitialize().unwrap();
+        assert_eq!(Arc::strong_count(&f.owner), 1);
+    }
+}
+
+#[test]
+fn a_controller_reset_plays_again_on_the_same_dma_buffers() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    let buffers = |c: &Controller<Regs, Clock>, s: StreamId| {
+        let stream = c.streams[usize::from(s.descriptor_index())]
+            .as_ref()
+            .unwrap();
+        (stream.buffer.bus_address(), stream._bdl.bus_address())
+    };
+    let before = buffers(&c, s);
+    f.advance(p, fmt);
+    f.hardware.lock().unwrap().bar[0x83] |= 0x10;
+    assert!(matches!(
+        c.refill_hdmi_period(s, &vec![2; p]),
+        Err(Error::StreamDma { .. })
+    ));
+    assert_eq!(c.restart_hdmi(port), Err(Error::NeedsReset));
+    // The owner's recovery: the controller's own reset (CRST), the codecs
+    // walked again, the port attached again, a stream allocated, the route
+    // prepared. No function-level reset is involved.
+    c.reinitialize().unwrap();
+    assert_eq!(Arc::strong_count(&f.owner), 1);
+    assert_eq!(c.start(s), Err(Error::InvalidStream));
+    let discovery = c.discover_codecs().unwrap();
+    let graph = discovery
+        .codecs
+        .iter()
+        .find(|graph| graph.address == 0)
+        .unwrap()
+        .clone();
+    // SAFETY: owner and controller share this fixture's locked hardware
+    // and the display grant identifies the enumerated codec/pin.
+    let port = unsafe { c.attach_hdmi_port(&graph, 4, 0, f.owner.clone()) }.unwrap();
+    let (s, _) = f.stream(&mut c, 2, 16);
+    // The retired stream's ring and BDL, not new memory.
+    assert_eq!(buffers(&c, s), before);
+    c.prepare_hdmi(port, s, 2, None).unwrap();
+    c.write_pcm(s, 0, &vec![0; p * 4]).unwrap();
+    c.start(s).unwrap();
+    f.advance(p, fmt);
+    assert!(c.refill_hdmi_period(s, &vec![4; p]).unwrap().is_some());
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_resume_programs_the_route_again_without_a_graph_walk() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    // The display side's sleep: presence and ELD valid drop, and the pin
+    // control and infoframe transmit it shares with the codec are cleared.
+    {
+        let mut h = f.hardware.lock().unwrap();
+        h.sense = 0;
+        h.pin = 0;
+        h.transmit = 0;
+    }
+    f.advance(p, fmt);
+    assert_eq!(
+        c.refill_hdmi_period(s, &vec![2; p]),
+        Err(Error::SinkUnavailable)
+    );
+    assert!(c.hdmi_paused(port).unwrap());
+    f.hardware.lock().unwrap().sense = 0xc000_0000;
+    let before = f.hardware.lock().unwrap().commands.len();
+    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Resumed));
+    {
+        let h = f.hardware.lock().unwrap();
+        let resume = &h.commands[before..];
+        // No graph walk, connection list or configuration default.
+        assert!(
+            resume
+                .iter()
+                .all(|c| !matches!((c >> 8) & 0xfff, 0xf00 | 0xf02 | 0xf1c)),
+            "{resume:x?}"
+        );
+        // Pin control and the infoframe's transmit set again, before the
+        // start's readback passed.
+        assert!(resume.contains(&((4 << 20) | (0x707 << 8) | 0x40)));
+        assert!(resume.contains(&((4 << 20) | (0x732 << 8) | 0xc0)));
+        assert_eq!((h.pin, h.transmit), (0x40, 0xc0));
+        assert_eq!(h.starts, 2);
+    }
+    // Same route, same owner: neither closed nor prepared again.
+    let owner = f.owner.state.lock().unwrap();
+    assert_eq!((owner.enable, owner.disable), (1, 0));
+    drop(owner);
+    f.advance(p, fmt);
+    assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_rejected_readback_programs_the_route_before_it_counts() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, _) = playing(&mut f);
+    // More rejections in a row than the bound, with no period refilled
+    // between them: each is fixed by setting the route's verbs again, so
+    // none counts and the route is never given up.
+    for _ in 0..2 * HDMI_TRANSIENT_FAULTS {
+        // The display side cleared the infoframe's transmit.
+        f.hardware.lock().unwrap().transmit = 0;
+        c.schedule_hdmi_readback(port).unwrap();
+        assert_eq!(c.status(s), Err(Error::RouteRejected));
+        let rejection = c.take_rejection().unwrap();
+        assert_eq!((rejection.verb, rejection.read), (0xf32, 0));
+        only_the_stream_stopped_but_transmit(&f, &c, port);
+        assert_eq!(route_faults(&c, port), 0);
+        let before = f.hardware.lock().unwrap().commands.len();
+        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Reprogrammed));
+        let h = f.hardware.lock().unwrap();
+        let restart = &h.commands[before..];
+        assert!(restart.iter().all(|c| !walks(*c)), "{restart:x?}");
+        assert!(restart.contains(&((4 << 20) | (0x732 << 8) | 0xc0)));
+        assert_eq!(h.transmit, 0xc0);
+        drop(h);
+        assert_eq!(route_faults(&c, port), 0);
+    }
+    // A stream-only restart (an underrun) sets nothing again.
+    f.clock.0.fetch_add(100_000, Ordering::SeqCst);
+    assert_eq!(c.status(s), Err(Error::PlaybackUnderrun));
+    let before = f.hardware.lock().unwrap().commands.len();
+    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+    assert!(
+        f.hardware.lock().unwrap().commands[before..]
+            .iter()
+            .all(|c| !sets(*c))
+    );
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+/// As [`only_the_stream_stopped`], for a route whose infoframe transmit
+/// the display side cleared.
+fn only_the_stream_stopped_but_transmit(
+    f: &Fixture,
+    c: &Controller<Regs, Clock>,
+    port: HdmiPortId,
+) {
+    let h = f.hardware.lock().unwrap();
+    assert_eq!(h.bar[0x80] & 2, 0);
+    assert_eq!(h.pin, 0x40);
+    assert_ne!(h.binding, 0);
+    assert_eq!(f.owner.state.lock().unwrap().disable, 0);
+    assert!(c.hdmi_prepared(port).unwrap());
+}
+
+#[test]
+fn the_route_is_read_back_once_a_turn_and_its_pin_sense_at_each_status() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    for turn in 0..4u8 {
+        let before = f.hardware.lock().unwrap().commands.len();
+        // The turn's start: one whole readback scheduled.
+        c.schedule_hdmi_readback(port).unwrap();
+        f.advance(2 * p, fmt);
+        let mut refilled = 0;
+        while c.refill_hdmi_period(s, &vec![turn; p]).unwrap().is_some() {
+            refilled += 1;
+        }
+        assert_eq!(refilled, 2);
+        // Two status reads a refilled period and one for the period not
+        // yet due: each senses the pin, one reads the whole route back.
+        let statuses = 2 * refilled + 1;
+        assert_eq!(count(&f, before, 0xf09), statuses);
+        for verb in [0xf01, 0xf07, 0xf06, 0xf2d, 0xf32, 0xf0d] {
+            assert_eq!(count(&f, before, verb), 1, "{verb:#x}");
+        }
+        // The format, a long verb (0xa).
+        let formats = f.hardware.lock().unwrap().commands[before..]
+            .iter()
+            .filter(|c| (*c >> 16) & 15 == 0xa)
+            .count();
+        assert_eq!(formats, 1);
+        // Eight verbs of readback a turn, plus one pin sense a status
+        // read: no longer eight at every status read.
+        assert_eq!(
+            f.hardware.lock().unwrap().commands.len() - before,
+            statuses + 7
+        );
+    }
+    // No turn scheduled a readback: the pin sense alone.
+    let before = f.hardware.lock().unwrap().commands.len();
+    f.advance(p, fmt);
+    assert!(c.refill_hdmi_period(s, &vec![9; p]).unwrap().is_some());
+    assert_eq!(count(&f, before, 0xf09), 2);
+    assert_eq!(f.hardware.lock().unwrap().commands.len() - before, 2);
+    // A start always reads the whole route back.
+    c.stop(s).unwrap();
+    let before = f.hardware.lock().unwrap().commands.len();
+    c.start(s).unwrap();
+    assert_eq!(count(&f, before, 0xf32), 1);
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
 }

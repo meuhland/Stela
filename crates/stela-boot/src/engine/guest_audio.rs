@@ -19,15 +19,20 @@
 //! in the loader's root without waiting for the host drivers' lock, writes
 //! each period the DMA completed: the queue's oldest frames, silence for
 //! any it lacks. More than 20 ms left queued after that is dropped, oldest
-//! first. A stream an underrun or a transient codec fault stopped restarts
-//! alone at the next turn, on its route as prepared; a monitor that went
-//! away pauses the route until it returns; a route that was lost is
-//! prepared again, at most once a second.
+//! first. A stream an underrun, a DMA FIFO error or a transient codec fault
+//! stopped restarts alone at the next turn, on its route as prepared (after
+//! a rejected readback, with the route's verbs set again); a monitor that
+//! went away pauses the route until it returns, and its verbs are set again
+//! when it does; a route that was lost is prepared again, at most once a
+//! second; a controller that needs a reset gets its own CRST, at most
+//! `HDMI_RESETS` times a boot, 10 s apart. Each turn reads the route back
+//! once. With `--guest-audio-hdmi-tone` the route plays a 1 kHz test tone
+//! instead of the guest's frames.
 use super::{host, output, storage::RestoreRoot};
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use stela_boot_core::guest_audio::{
-    self, BACKLOG_FRAMES, Counters, MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts, Step,
-    s16_period,
+    self, BACKLOG_FRAMES, Counters, Dbfs, MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts,
+    Step, Tone, s16_period,
 };
 use stela_drivers::{
     audio::{
@@ -38,7 +43,10 @@ use stela_drivers::{
         },
     },
     bus::pci::Address,
-    probe::native::hda::{HdmiPlayback, HdmiStart, Host, RetirementError},
+    probe::native::hda::{
+        HDMI_RESET_SPACING_US, HDMI_RESETS, HdmiPlayback, HdmiResetError, HdmiResetRefusal,
+        HdmiStart, Host, RetirementError,
+    },
 };
 use stela_soc::machine::{AppleDevices, USB_AUDIO_CHANNELS, UsbAudioStatus};
 
@@ -82,7 +90,9 @@ pub(super) struct GuestAudio {
 }
 
 impl GuestAudio {
-    pub(super) fn new(display: Option<DisplayAudio>, root: u64) -> Self {
+    /// `tone`: the HDMI route plays the built-in test tone instead of the
+    /// guest's sound (`--guest-audio-hdmi-tone`).
+    pub(super) fn new(display: Option<DisplayAudio>, root: u64, tone: bool) -> Self {
         let (hdmi, display) = match display {
             Some(DisplayAudio {
                 hosts,
@@ -105,6 +115,18 @@ impl GuestAudio {
                     MAX_STEP_FRAMES * 1000 / guest_audio::RATE,
                     ring_ms + BACKLOG_FRAMES * 1000 / guest_audio::RATE as usize,
                 ));
+                if tone {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI test tone on {place}: a {} Hz sine at -{}.{} dBFS (peak \
+                         {}) on both channels from the route's start, instead of the guest's \
+                         sound (--guest-audio-hdmi-tone); the guest's frames are still taken, \
+                         and discarded\n",
+                        guest_audio::TONE_HZ,
+                        guest_audio::TONE_TENTHS_DBFS / 10,
+                        guest_audio::TONE_TENTHS_DBFS % 10,
+                        guest_audio::TONE_PEAK,
+                    ));
+                }
                 (
                     Some(Hdmi {
                         host,
@@ -124,6 +146,13 @@ impl GuestAudio {
                         reported: None,
                         dumps: 0,
                         resume_dumped: false,
+                        tone: tone.then(Tone::default),
+                        peak: 0,
+                        first_frames: false,
+                        reset_pending: false,
+                        reset_cause: None,
+                        reset_waiting: false,
+                        gave_up: false,
                     }),
                     Some(DisplayAudio {
                         hosts,
@@ -132,6 +161,11 @@ impl GuestAudio {
                 )
             }
             display => {
+                if tone {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI test tone not played: no HDMI playback was set up\n"
+                    ));
+                }
                 output::arguments(format_args!(
                     "GUEST AUDIO speaker on the native hub: 48 kHz stereo, played to a sink at \
                      the host's counter; HDMI audio functions claimed: {}\n",
@@ -258,11 +292,27 @@ struct Hdmi {
     retry_at: u64,
     /// The last error, reported once.
     error: Option<RetirementError>,
-    reported: Option<(bool, bool, u64, Restarts)>,
+    reported: Option<(bool, bool, u64, Restarts, u8)>,
     /// Route state dumps printed (`HDMI_STATE_DUMPS` at most), and whether
     /// one followed a resume yet.
     dumps: u8,
     resume_dumped: bool,
+    /// With `--guest-audio-hdmi-tone`: the test tone, played instead of
+    /// the guest's frames.
+    tone: Option<Tone>,
+    /// The largest absolute sample written since the last report.
+    peak: u32,
+    /// Whether the guest's first frames were reported.
+    first_frames: bool,
+    /// The controller needs a reset (`NeedsReset`, or a reset that failed):
+    /// the next start resets it, as `Host::reset_hdmi` admits.
+    reset_pending: bool,
+    /// The error before the first `NeedsReset` of the pending reset.
+    reset_cause: Option<RetirementError>,
+    /// The pending reset's wait for the spacing was reported.
+    reset_waiting: bool,
+    /// Every reset was taken and the route still needs one: given up.
+    gave_up: bool,
 }
 
 /// Route state dumps per boot: each preparation of the route, and the
@@ -276,14 +326,20 @@ fn logged(count: u64) -> bool {
 }
 
 /// Why the playback stopped, from the error the refill returned; the
-/// driver stops the same way (`hda::hdmi`): an underrun or a codec fault
-/// stops the stream only, a sink away pauses the route, anything else
-/// closes it.
+/// driver stops the same way (`hda::hdmi`): an underrun, a DMA FIFO error
+/// or a codec fault stops the stream only, a sink away pauses the route,
+/// anything else closes it (a DMA descriptor error needs a controller
+/// reset).
 fn restart_reason(error: &RetirementError) -> RestartReason {
     use hd_audio::Error;
     match error {
         RetirementError::Controller(Error::PlaybackUnderrun | Error::InvalidPosition(_)) => {
             RestartReason::Underrun
+        }
+        RetirementError::Controller(Error::StreamDma { status })
+            if guest_audio::StreamStatus(*status).fifo_error_only() =>
+        {
+            RestartReason::DmaFault
         }
         RetirementError::Controller(Error::SinkUnavailable) => RestartReason::SinkAway,
         RetirementError::Controller(
@@ -326,9 +382,16 @@ impl Hdmi {
         }
         let how = match start {
             HdmiStart::Stream => "stream only: its descriptor reset and re-armed",
+            HdmiStart::Reprogrammed => {
+                "route programmed again after a rejected readback (no codec walk: converter \
+                 format and stream tag, DIG1, channel count and mapping, connection select, pin \
+                 control, amp, infoframe), then the stream: its descriptor reset and re-armed"
+            }
             HdmiStart::Resumed => {
-                "resumed: the monitor is back with the same ELD; stream only, its descriptor \
-                 reset and re-armed"
+                "resumed: the monitor is back with the same ELD; route programmed again (no \
+                 codec walk: converter format and stream tag, DIG1, channel count and mapping, \
+                 connection select, pin control, amp, infoframe), then the stream: its \
+                 descriptor reset and re-armed"
             }
             HdmiStart::Prepared => "route prepared again: codec walked, ELD read",
         };
@@ -437,32 +500,30 @@ impl Hdmi {
 
     /// Starts the route when it is due, at counter `now`: whether it runs.
     fn start(&mut self, now: u64) -> bool {
-        if now < self.retry_at {
+        if self.gave_up || now < self.retry_at {
             return false;
+        }
+        if self.reset_pending {
+            return self.reset(now);
         }
         // A route the stop left prepared restarts its stream alone; one
         // that was lost is prepared again (`Host::start_hdmi`).
         match self.host.start_hdmi(&mut self.playback) {
             Ok(start) => {
-                // A readback that closed the route before it was prepared
-                // again.
-                if let Some(rejection) = self.host.take_hdmi_rejection() {
-                    output::arguments(format_args!(
-                        "GUEST AUDIO HDMI rejected on {}: {rejection}\n",
-                        self.place
-                    ));
-                }
-                self.started(start);
-                self.error = None;
-                match start {
-                    HdmiStart::Prepared => self.dump("prepared"),
-                    HdmiStart::Resumed if !self.resume_dumped => {
-                        self.resume_dumped = true;
-                        self.dump("resumed");
-                    }
-                    _ => {}
-                }
+                self.on_start(start);
                 true
+            }
+            Err(RetirementError::Controller(hd_audio::Error::NeedsReset)) => {
+                // The controller needs its own reset: CRST, never a
+                // function-level reset (`Host::reset_hdmi`).
+                self.detail(
+                    &RetirementError::Controller(hd_audio::Error::NeedsReset),
+                    true,
+                );
+                self.reset_pending = true;
+                self.reset_waiting = false;
+                self.reset_cause = self.error;
+                self.reset(now)
             }
             Err(RetirementError::Controller(hd_audio::Error::SinkUnavailable)) => {
                 // The monitor sleeps or was unplugged: look again soon, one
@@ -502,16 +563,161 @@ impl Hdmi {
         }
     }
 
+    /// The route started (`start`): its line, the readback that closed it
+    /// before it was prepared again, and the state dump.
+    fn on_start(&mut self, start: HdmiStart) {
+        // A readback that closed the route before it was prepared again.
+        if let Some(rejection) = self.host.take_hdmi_rejection() {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI rejected on {}: {rejection}\n",
+                self.place
+            ));
+        }
+        self.started(start);
+        self.error = None;
+        match start {
+            HdmiStart::Prepared => self.dump("prepared"),
+            HdmiStart::Resumed if !self.resume_dumped => {
+                self.resume_dumped = true;
+                self.dump("resumed");
+            }
+            _ => {}
+        }
+    }
+
+    /// The controller needs a reset, at counter `now`: `Host::reset_hdmi`
+    /// (its own CRST, the codecs walked again, the port attached again, a
+    /// stream allocated), then the route prepared and started. At most
+    /// `HDMI_RESETS` a boot, `HDMI_RESET_SPACING_US` apart; after the last,
+    /// the route stays stopped. Whether it runs.
+    fn reset(&mut self, now: u64) -> bool {
+        let now_us = (u128::from(now) * 1_000_000 / u128::from(host::COUNTER_HZ)) as u64;
+        let cause = match self.reset_cause {
+            Some(error) => alloc::format!("{error:?}, then NeedsReset"),
+            None => String::from("NeedsReset"),
+        };
+        let next = self.playback.resets() + 1;
+        match self.host.reset_hdmi(&mut self.playback, now_us) {
+            Ok(reset) => {
+                self.reset_pending = false;
+                self.reset_waiting = false;
+                output::arguments(format_args!(
+                    "GUEST AUDIO HDMI controller reset {}/{HDMI_RESETS} on {}: after {cause}: the \
+                     HD Audio controller's own reset (CRST; no function-level reset or D3), {} \
+                     codecs found again, the port attached again, stream tag {} allocated on {}; \
+                     preparing the route\n",
+                    reset.reset,
+                    self.place,
+                    reset.codecs,
+                    self.playback.stream_tag(),
+                    if reset.same_buffers {
+                        "the reset stream's ring and BDL"
+                    } else {
+                        "newly allocated DMA memory"
+                    },
+                ));
+                self.reset_cause = None;
+                self.error = None;
+                match self.host.start_hdmi(&mut self.playback) {
+                    Ok(start) => {
+                        self.on_start(start);
+                        true
+                    }
+                    Err(error) => {
+                        self.retry_at = now.wrapping_add(HDMI_RETRY_TICKS);
+                        output::arguments(format_args!(
+                            "GUEST AUDIO HDMI cannot start on {} after controller reset {}/\
+                             {HDMI_RESETS}: {error:?}; trying again each second\n",
+                            self.place, reset.reset
+                        ));
+                        self.detail(&error, true);
+                        self.reset_pending =
+                            error == RetirementError::Controller(hd_audio::Error::NeedsReset);
+                        self.reset_cause = Some(error);
+                        self.error = Some(error);
+                        false
+                    }
+                }
+            }
+            Err(HdmiResetError::Refused(HdmiResetRefusal::TooSoon { wait_us })) => {
+                self.retry_at = now.wrapping_add(HDMI_RETRY_TICKS);
+                if !core::mem::replace(&mut self.reset_waiting, true) {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI controller reset {next}/{HDMI_RESETS} on {} waits {} ms \
+                         (resets at least {} s apart): after {cause}\n",
+                        self.place,
+                        wait_us.div_ceil(1000),
+                        HDMI_RESET_SPACING_US / 1_000_000,
+                    ));
+                }
+                false
+            }
+            Err(HdmiResetError::Refused(HdmiResetRefusal::Exhausted)) => {
+                self.gave_up = true;
+                output::arguments(format_args!(
+                    "GUEST AUDIO HDMI controller reset on {}: all {HDMI_RESETS} resets of this \
+                     boot taken, and the route needs another after {cause}; giving up: the route \
+                     stays stopped (running=false)\n",
+                    self.place
+                ));
+                false
+            }
+            Err(HdmiResetError::Failed { reset, error }) => {
+                self.retry_at = now.wrapping_add(HDMI_RETRY_TICKS);
+                self.reset_waiting = false;
+                output::arguments(format_args!(
+                    "GUEST AUDIO HDMI controller reset {reset}/{HDMI_RESETS} on {} failed: \
+                     {error:?} (after {cause}); another reset when one is due\n",
+                    self.place
+                ));
+                self.error = Some(error);
+                false
+            }
+        }
+    }
+
     /// Writes every period the DMA completed: the queue's oldest frames,
     /// silence for any it lacks.
     fn refill(&mut self, streaming: bool, counters: &mut Counters) {
+        // One whole route readback a turn, at its first status read; the
+        // others sense the pin only. A failure shows at the refill.
+        let _ = self.host.schedule_hdmi_readback(&self.playback);
         loop {
             let take = self.pending.len().min(HDMI_PERIOD_FRAMES);
-            s16_period(self.pending.iter().take(take).copied(), &mut self.period);
+            // The test tone instead of the guest's frames, which are still
+            // taken (and discarded) as they would be played.
+            let tone = self.tone;
+            match self.tone.as_mut() {
+                Some(tone) => tone.fill(&mut self.period),
+                None => {
+                    s16_period(self.pending.iter().take(take).copied(), &mut self.period);
+                }
+            }
             match self.host.refill_hdmi(&mut self.playback, &self.period) {
                 Ok(true) => {
                     self.pending.drain(..take);
                     self.refills += 1;
+                    let peak = guest_audio::peak(&self.period);
+                    self.peak = self.peak.max(peak);
+                    if take > 0 && !self.first_frames {
+                        self.first_frames = true;
+                        if self.tone.is_some() {
+                            output::arguments(format_args!(
+                                "GUEST AUDIO HDMI first guest frames on the route on {} at period \
+                                 {}: {take} frames taken and discarded; the test tone plays \
+                                 instead\n",
+                                self.place, self.refills
+                            ));
+                        } else {
+                            output::arguments(format_args!(
+                                "GUEST AUDIO HDMI first guest frames on the route on {} at period \
+                                 {}: {take} frames written into the ring (peak {})\n",
+                                self.place,
+                                self.refills,
+                                Dbfs(peak)
+                            ));
+                        }
+                    }
                     // Silence counts only while the guest streams.
                     let silent = if streaming {
                         (HDMI_PERIOD_FRAMES - take) as u64
@@ -524,8 +730,13 @@ impl Hdmi {
                         silent,
                     });
                 }
-                Ok(false) => break,
+                // Not written: the tone's phase stays where the ring is.
+                Ok(false) => {
+                    self.tone = tone;
+                    break;
+                }
                 Err(error) => {
+                    self.tone = tone;
                     self.stopped(error);
                     break;
                 }
@@ -539,16 +750,26 @@ impl Hdmi {
             self.paused,
             self.refills,
             self.restarts,
+            self.playback.resets(),
         );
         if self.reported != Some(state) {
             self.reported = Some(state);
+            // The peak: the largest sample written since the last report.
             output::arguments(format_args!(
-                "GUEST AUDIO HDMI running={} paused={} periods={} {} pending={}\n",
+                "GUEST AUDIO HDMI running={} paused={} periods={} {} resets={}/{HDMI_RESETS} \
+                 pending={} peak={}{}\n",
                 state.0,
                 state.1,
                 state.2,
                 state.3,
-                self.pending.len()
+                state.4,
+                self.pending.len(),
+                Dbfs(core::mem::take(&mut self.peak)),
+                if self.tone.is_some() {
+                    " source=tone"
+                } else {
+                    ""
+                },
             ));
         }
     }

@@ -189,6 +189,8 @@ pub struct Controller<R, T> {
     writes: cache::Writes,
     stopped: bool,
     streams: Vec<Option<Stream>>,
+    /// Rings and BDLs of the streams a reset retired, for reuse.
+    spare_dma: Vec<DmaBuffer>,
     routes: Vec<(StreamId, AnalogRoute)>,
     // Non-route codec controls: owner, codec address, node. Observing or
     // preconditioning a pin does not invent a converter path for it.
@@ -438,6 +440,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 writes: cache::Writes::default(),
                 stopped: false,
                 streams: (0..total).map(|_| None).collect(),
+                spare_dma: Vec::new(),
                 routes: Vec::new(),
                 codec_controls: Vec::new(),
                 converter_bindings: Vec::new(),
@@ -500,6 +503,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             core::mem::ManuallyDrop::drop(&mut self.rirb);
         }
         drop(core::mem::take(&mut self.streams));
+        drop(core::mem::take(&mut self.spare_dma));
         drop(core::mem::take(&mut self.routes));
         drop(core::mem::take(&mut self.codec_controls));
         drop(core::mem::take(&mut self.converter_bindings));
@@ -1091,6 +1095,7 @@ impl<R, T> Drop for Controller<R, T> {
         // Registers, timing and rings are ManuallyDrop; retain every dependent
         // codec/stream/GPU owner until the explicit drained extraction path.
         core::mem::forget(core::mem::take(&mut self.streams));
+        core::mem::forget(core::mem::take(&mut self.spare_dma));
         core::mem::forget(core::mem::take(&mut self.routes));
         core::mem::forget(core::mem::take(&mut self.codec_controls));
         core::mem::forget(core::mem::take(&mut self.converter_bindings));
