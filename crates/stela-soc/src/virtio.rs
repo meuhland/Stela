@@ -11,6 +11,7 @@
 //! queues are split virtqueues ([`queue`]), shared with StelaNet.
 pub mod console;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 pub mod rng;
 #[cfg(test)]
@@ -30,6 +31,9 @@ pub struct Served {
     /// The driver asked to hear of a used chain: the transport raises
     /// `INT_VRING`.
     pub interrupt: bool,
+    /// The configuration space changed: the transport raises `INT_CONFIG`
+    /// and moves `CONFIG_GENERATION` on.
+    pub config: bool,
 }
 
 /// A device type behind the transport: its identity, its queues and the
@@ -74,6 +78,17 @@ pub trait VirtioDevice {
     /// Counters of its own for the boot log's report, by name.
     fn counters(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
+    }
+    /// Whether it has work for the host's service, which asking clears.
+    fn take_service_due(&mut self) -> bool {
+        false
+    }
+    /// The network device, which the board's network calls reach.
+    fn net(&mut self) -> Option<&mut net::VirtioNet> {
+        None
+    }
+    fn net_ref(&self) -> Option<&net::VirtioNet> {
+        None
     }
     /// Its DMA step on `queues` (`None` where a queue is not ready), the
     /// ones in `notified` (bit per index) told of new buffers, with
