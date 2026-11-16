@@ -217,6 +217,69 @@ fn setup_lines_parse_and_serialize_identically() {
 }
 
 #[test]
+fn virtio_is_off_unless_asked_and_round_trips() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    assert!(!round_trip(&preboot).virtio);
+    let line = format!("{preboot} --external-disks --virtio --page-relative --shared-aliases");
+    let options = round_trip(&line);
+    assert!(options.virtio && options.page_relative && options.shared_aliases);
+    assert!(!options.virtio_console_echo);
+    assert_eq!(options.to_string(), line);
+    // The console's echo source, the K2 boot's line.
+    let line = format!("{preboot} --virtio --virtio-console-echo --page-relative --shared-aliases");
+    let options = round_trip(&line);
+    assert!(options.virtio && options.virtio_console_echo);
+    assert!(!options.virtio_snd && options.virtio_snd_capture.is_none());
+    assert_eq!(options.to_string(), line);
+}
+
+#[test]
+fn virtio_snd_needs_virtio_and_its_capture_a_number_of_seconds() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    // The K5 boot's line.
+    let line = format!(
+        "{preboot} --virtio --virtio-snd --virtio-snd-capture 10 --page-relative --shared-aliases"
+    );
+    let options = round_trip(&line);
+    assert!(options.virtio && options.virtio_snd);
+    assert_eq!(options.virtio_snd_capture, Some(10));
+    assert_eq!(options.to_string(), line);
+    // The capture implies the device.
+    let options = round_trip(&format!("{preboot} --virtio --virtio-snd-capture 1"));
+    assert!(options.virtio_snd);
+    assert_eq!(
+        options.to_string(),
+        format!("{preboot} --virtio --virtio-snd --virtio-snd-capture 1")
+    );
+    let options = round_trip(&format!("{preboot} --virtio --virtio-snd"));
+    assert!(options.virtio_snd && options.virtio_snd_capture.is_none());
+    for (words, error) in [
+        (
+            "--virtio-snd",
+            Error::Constraint(Constraint::VirtioSndDependency),
+        ),
+        (
+            "--virtio-snd-capture 10",
+            Error::Constraint(Constraint::VirtioSndDependency),
+        ),
+        ("--virtio --virtio-snd-capture 0", Error::VirtioSndCapture),
+        ("--virtio --virtio-snd-capture 61", Error::VirtioSndCapture),
+        ("--virtio --virtio-snd-capture ten", Error::VirtioSndCapture),
+        ("--virtio --virtio-snd-capture", Error::VirtioSndCapture),
+        (
+            "--virtio --virtio-snd-capture 5 --virtio-snd-capture 5",
+            Error::DuplicateVirtioSndCapture,
+        ),
+    ] {
+        assert_eq!(
+            System::parse(&format!("{preboot} {words}")).unwrap_err(),
+            error,
+            "{words}"
+        );
+    }
+}
+
+#[test]
 fn chosen_disk_round_trips_and_the_mount_refuses_it_unreplaced() {
     let line = "--system --storage @disk --nor @disk --preboot @disk";
     let options = round_trip(line);

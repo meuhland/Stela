@@ -22,6 +22,8 @@
 mod boot;
 mod commands;
 mod fixups;
+pub mod itanium;
+pub mod manifest;
 mod plist;
 mod prelink;
 mod receipt;
@@ -50,6 +52,7 @@ use unit::{Region, Unit};
 pub const TRUSTED_CODE_FILE: &str = "TrustedCode";
 
 /// A kext to link into the collection.
+#[derive(Clone)]
 pub struct Kext<'a> {
     /// The bundle's `Info.plist`.
     pub info: &'a [u8],
@@ -63,6 +66,14 @@ pub struct Kext<'a> {
 }
 
 impl Kext<'_> {
+    /// The bundle's name: the last component of its path.
+    pub fn bundle_name(&self) -> &str {
+        self.bundle_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.bundle_path)
+    }
+
     /// Source identity shared by the prelinked and on-disk executables.
     /// Placement and the boot collection do not change this UUID.
     pub fn uuid(&self) -> [u8; 16] {
@@ -175,6 +186,54 @@ impl Linked {
             receipt: digest(&self.receipt),
         }
     }
+}
+
+/// Links `kexts` as [`link`] does, except that a kext which cannot be
+/// linked is left out and the others linked without it, so one bad kext
+/// does not cost the rest their collection. Answers the collection and the
+/// indices in `kexts` of those it holds; `dropped` hears of each kext left
+/// out, with why. Only when no kext links is the first refusal returned.
+///
+/// The kexts are first linked together, as `link` does. Once that fails,
+/// each is linked alone and those refused are dropped; kexts that link
+/// alone but not together are then dropped from the last on.
+pub fn link_dropping(
+    boot: &[u8],
+    kexts: &[Kext<'_>],
+    dropped: &mut dyn FnMut(usize, &crate::Error),
+) -> Result<(Linked, Vec<usize>)> {
+    let refusal = match link(boot, kexts) {
+        Ok(linked) => return Ok((linked, (0..kexts.len()).collect())),
+        Err(error) => error,
+    };
+    if kexts.len() < 2 {
+        return Err(refusal);
+    }
+    let mut kept = Vec::new();
+    for (index, kext) in kexts.iter().enumerate() {
+        match link(boot, core::slice::from_ref(kext)) {
+            Ok(_) => kept.push(index),
+            Err(error) => dropped(index, &error),
+        }
+    }
+    while !kept.is_empty() {
+        let together: Vec<Kext<'_>> = kept.iter().map(|&index| kexts[index].clone()).collect();
+        match link(boot, &together) {
+            Ok(linked) => return Ok((linked, kept)),
+            Err(error) => {
+                let last = kept.pop().expect("a kext is kept");
+                dropped(last, &error);
+            }
+        }
+    }
+    Err(refusal)
+}
+
+/// What linking `kext` against `boot` checked of the vtable slots its
+/// classes override ([`unit::Overrides`]), or why it cannot be linked.
+pub fn overrides(boot: &[u8], kext: &Kext<'_>) -> Result<unit::Overrides> {
+    let boot = BootCollection::parse(boot)?;
+    Ok(Unit::new(kext, &boot)?.overrides)
 }
 
 /// Links `kexts` against the boot collection `boot` into an auxiliary

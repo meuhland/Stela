@@ -26,6 +26,33 @@ pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
     lock_scale_arguments(scale)
 }
 
+/// The auxiliary collection's link in the boot's log: the kexts it holds and
+/// how long the link took, and each kext left out and why.
+#[derive(Default)]
+struct KextLog {
+    started: core::cell::Cell<u64>,
+}
+
+impl installed::LinkReport for KextLog {
+    fn linking(&self) {
+        self.started.set(output::now());
+    }
+
+    fn dropped(&self, bundle: &str, why: &stela_loader::Error) {
+        output::arguments(format_args!(
+            "KEXTS {bundle} left out of the auxiliary collection, which the others keep: {why}\n"
+        ));
+    }
+
+    fn linked(&self, bundles: &[&str], bytes: usize) {
+        output::arguments(format_args!(
+            "KEXTS auxiliary collection {} ({bytes} bytes) linked in {} ms\n",
+            bundles.join(", "),
+            output::millis_since(self.started.get())
+        ));
+    }
+}
+
 /// The boot bundle `--preboot` names, built from the installed system on
 /// `partition`: its macOS, its staged update or its recoveryOS.
 fn from_disk(
@@ -115,11 +142,20 @@ fn from_disk(
     } else if let Some(kind) = options.recovery {
         bundle::recovery_from_disk(partition, kind, options.boot_volume, &defaults)
     } else {
-        let kexts = gpu::kexts();
+        let mut kexts = gpu::kexts();
+        kexts.extend(virtio::kexts(options.virtio));
+        if options.virtio && !virtio::EMBEDDED {
+            output::arguments(format_args!(
+                "VIRTIO this stela.efi has no StelaVirtIO kext (the `virtio-kext` feature): \
+                 its devices have no driver\n"
+            ));
+        }
+        let log = KextLog::default();
         let request = installed::Request {
             volume: options.boot_volume,
             kexts: &kexts,
             adopt_ecid,
+            report: Some(&log),
             ..installed::Request::default()
         };
         let mut defaults = defaults;
@@ -1021,6 +1057,13 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         }
         _ => None,
     };
+    // Stela's virtio devices (`--virtio`), placed after the GPU gates and
+    // StelaNet: each takes the next free window and AIC input.
+    let virtio_config = virtio::Config::of(&options.system);
+    let virtio_placed = match assigned.as_mut() {
+        Some(assigned) if options.virtio => virtio::place(&mut assigned.tree, &virtio_config),
+        _ => Vec::new(),
+    };
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
     // The same loader bytes are for every subsequent native CPU and synchronous device writer.
@@ -1158,6 +1201,14 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             offloads == StelaNetOffloads::Coalescing,
             offloads.name()
         ));
+    }
+    if let Some(board) = &board {
+        virtio::add(
+            &mut devices,
+            virtio_placed,
+            u32::from(board.aic.layout.max_irq()),
+            &virtio_config,
+        );
     }
     // Device placement has copied the carried firmware. This function
     // never returns, so release the remaining input buffers here.

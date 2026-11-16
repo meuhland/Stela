@@ -32,6 +32,12 @@ pub const INSTALL_SOURCE: &str = "--install-source";
 pub const VERIFY_ON_READ: &str = "--verify-on-read";
 pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
+pub const VIRTIO: &str = "--virtio";
+pub const VIRTIO_CONSOLE_ECHO: &str = "--virtio-console-echo";
+pub const VIRTIO_SND: &str = "--virtio-snd";
+pub const VIRTIO_SND_CAPTURE: &str = "--virtio-snd-capture";
+/// The most seconds `--virtio-snd-capture` keeps.
+pub const VIRTIO_SND_CAPTURE_MAX: u32 = 60;
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -425,6 +431,25 @@ pub struct System {
     /// consumes, instead of adaptive (`--guest-audio-async`, which also
     /// gives the speaker). Off by default until a boot shows macOS takes it.
     pub guest_audio_async: bool,
+    /// Give the guest Stela's virtio-mmio devices and link Stela's own
+    /// virtio kext, StelaVirtIO, beside StelaGPU (`--virtio`): the entropy
+    /// device at `/arm-io/stela-virtio0` and the console at
+    /// `/arm-io/stela-virtio1`. Without it neither the nodes nor the kext
+    /// are in the boot.
+    pub virtio: bool,
+    /// Feed the virtio console's input from the host's test source
+    /// (`--virtio-console-echo`, with `--virtio`): a greeting when the
+    /// guest's driver starts, then each line the guest writes sent back
+    /// prefixed with `echo: `. Without it the console has no input.
+    pub virtio_console_echo: bool,
+    /// Give the guest the virtio sound device as well (`--virtio-snd`,
+    /// which needs `--virtio`): one 48 kHz stereo output stream, played to
+    /// a counting sink at the host's clock.
+    pub virtio_snd: bool,
+    /// Keep the first seconds of the guest's sound and log their
+    /// fingerprint (`--virtio-snd-capture SECONDS`, 1 to
+    /// [`VIRTIO_SND_CAPTURE_MAX`], implying `--virtio-snd`).
+    pub virtio_snd_capture: Option<u32>,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -528,6 +553,10 @@ impl Default for System {
             guest_audio_trust_quiesced: false,
             guest_audio_hdmi_tone: false,
             guest_audio_async: false,
+            virtio: false,
+            virtio_console_echo: false,
+            virtio_snd: false,
+            virtio_snd_capture: None,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -974,6 +1003,10 @@ impl fmt::Display for System {
         line.flag("--guest-audio-hdmi-trust-quiesced", trust)?;
         line.flag("--guest-audio-hdmi-tone", tone)?;
         line.flag("--guest-audio-async", asynchronous)?;
+        line.flag(VIRTIO, self.virtio)?;
+        line.flag(VIRTIO_CONSOLE_ECHO, self.virtio_console_echo)?;
+        line.flag(VIRTIO_SND, self.virtio_snd)?;
+        line.value(VIRTIO_SND_CAPTURE, self.virtio_snd_capture)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

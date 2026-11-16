@@ -1,0 +1,549 @@
+//! The kernel family classes the StelaVirtIO kext derives from or calls,
+//! whose headers no open-source tree has: Stela declares them by hand in
+//! `guest/stela-virtio/family/<Family>.h`, and keeps beside each header a
+//! slot manifest, `<Family>.slots`, that `cargo xtask guest-family --kc
+//! <kernelcache>` writes from a boot kernel collection
+//! (`stela_loader::aux_kc::manifest`): every vtable slot's method and each
+//! class's instance size, from its `MetaClass` constructor.
+//!
+//! The tests hold the header to the manifest. A probe class deriving from
+//! each family class (`family/tests/slot_probe.cpp`) is compiled as the
+//! kext is, so its vtable, slot by slot, is what the header declares; each
+//! slot must name the manifest's method, or one with the same name, `const`
+//! and parameters ([`stela_loader::aux_kc::itanium`]). The header's
+//! `static_assert`s on each class's size must give the manifest's sizes.
+//!
+//! A pure virtual slot has no name in the collection. Where another class
+//! names the same slots, the manifest records the method expected there
+//! ([`Pure`]), from that evidence.
+use anyhow::{Context, Result, ensure};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+use stela_loader::aux_kc::manifest::{self, Manifest, ManifestClass};
+
+pub mod audio;
+
+/// A family's classes, their header and manifest.
+pub struct Family {
+    /// The header in `guest/stela-virtio/family`, and its manifest there.
+    pub header: &'static str,
+    pub manifest: &'static str,
+    /// The fileset entry that defines the classes, which the kext lists.
+    pub entry: &'static str,
+    pub classes: &'static [&'static str],
+    pub pure: &'static [Pure],
+}
+
+/// Pure virtual slots of `class` whose methods `from` names: `class`'s slot
+/// `first + n` declares `from`'s method of that slot, with `trailing` added
+/// to its parameters. `from` is one of the family's classes or, with
+/// `entry`, a class of that fileset entry: a kernel driver deriving from
+/// `class`, whose overrides name its pure slots.
+pub struct Pure {
+    pub class: &'static str,
+    pub from: &'static str,
+    pub entry: Option<&'static str>,
+    pub first: usize,
+    pub count: usize,
+    pub trailing: &'static str,
+}
+
+/// IOSerialFamily (K2's console): the driver StelaVirtIOConsole derives
+/// from, and the stream nub it publishes. IOSerialStreamSync forwards each
+/// of its twelve stream methods to the driver's pure virtual of the same
+/// slot, adding the `void *refCon` the stream was made with.
+///
+/// IOAudioFamily (K5's sound) is [`audio::FAMILY`], in `family/audio`.
+pub const FAMILIES: &[Family] = &[
+    Family {
+        header: "IOSerialFamily.h",
+        manifest: "IOSerialFamily.slots",
+        entry: "com.apple.iokit.IOSerialFamily",
+        classes: &[
+            "IOSerialDriverSync",
+            "IOSerialStreamSync",
+            "IORS232SerialStreamSync",
+        ],
+        pure: &[Pure {
+            class: "IOSerialDriverSync",
+            from: "IOSerialStreamSync",
+            entry: None,
+            first: 272,
+            count: 12,
+            trailing: "Pv",
+        }],
+    },
+    audio::FAMILY,
+];
+
+/// Where the families' headers and manifests are.
+fn directory() -> PathBuf {
+    crate::tools::root().join("guest/stela-virtio/family")
+}
+
+/// `cargo xtask guest-family --kc <kernelcache>`: writes each family's
+/// manifest from the boot kernel collection `kc`.
+pub fn generate(kc: &Path) -> Result<()> {
+    let boot = fs::read(kc).with_context(|| format!("reading {}", kc.display()))?;
+    for family in FAMILIES {
+        let manifest = manifest(&boot, family)?;
+        let path = directory().join(family.manifest);
+        fs::write(&path, manifest.to_text())?;
+        println!("{}: {} classes", path.display(), manifest.classes.len());
+    }
+    Ok(())
+}
+
+/// `family`'s manifest from the boot collection `boot`.
+pub fn manifest(boot: &[u8], family: &Family) -> Result<Manifest> {
+    let collection = stela_loader::kernel_collection::KernelCollection::parse(boot)?;
+    let uuid = collection.uuid.unwrap_or_else(|| "with no UUID".into());
+    let mut classes = Vec::new();
+    for class in family.classes {
+        let layout = manifest::class_layout(boot, class, &[family.entry])
+            .with_context(|| format!("{class} in the boot collection"))?;
+        classes.push(ManifestClass {
+            layout,
+            expected: BTreeMap::new(),
+        });
+    }
+    for pure in family.pure {
+        let from = match pure.entry {
+            None => classes
+                .iter()
+                .find(|class| class.layout.class == pure.from)
+                .with_context(|| format!("{} is not in the family", pure.from))?
+                .layout
+                .slots
+                .clone(),
+            Some(entry) => {
+                manifest::class_layout(boot, pure.from, &[family.entry, entry])
+                    .with_context(|| format!("{} in {entry}", pure.from))?
+                    .slots
+            }
+        };
+        let class = classes
+            .iter_mut()
+            .find(|class| class.layout.class == pure.class)
+            .with_context(|| format!("{} is not in the family", pure.class))?;
+        let (from_prefix, prefix) = (
+            format!("__ZN{}{}", pure.from.len(), pure.from),
+            format!("__ZN{}{}", pure.class.len(), pure.class),
+        );
+        for slot in pure.first..pure.first + pure.count {
+            ensure!(
+                class.layout.slots.get(slot).map(Vec::as_slice)
+                    == Some(&["___cxa_pure_virtual".to_owned()][..]),
+                "{} slot {slot} is not pure virtual",
+                pure.class
+            );
+            let [named] = from.get(slot).map(Vec::as_slice).unwrap_or_default() else {
+                anyhow::bail!("{} slot {slot} has no one name", pure.from);
+            };
+            let method = named
+                .strip_prefix(&from_prefix)
+                .with_context(|| format!("{} slot {slot} is {named}", pure.from))?;
+            let method = with_parameter(method, pure.trailing)
+                .with_context(|| format!("{} slot {slot}'s {named}", pure.from))?;
+            class.expected.insert(slot, format!("{prefix}{method}"));
+        }
+    }
+    let mut source = vec![
+        format!(
+            "The vtable slots and instance sizes of the classes {} declares,",
+            family.header
+        ),
+        format!("from the boot kernel collection {uuid} (`cargo xtask guest-family --kc <file>`)."),
+        "Each class: name, superclass, size from its MetaClass constructor, slot count;".into(),
+        "each slot: index, vtable offset, the symbols exported at its method (? for none).".into(),
+    ];
+    for pure in family.pure {
+        let slots = if pure.count == 1 {
+            format!("slot {} declares", pure.first)
+        } else {
+            format!(
+                "slots {}-{} declare",
+                pure.first,
+                pure.first + pure.count - 1
+            )
+        };
+        let from = match pure.entry {
+            Some(entry) => format!("{} ({entry})", pure.from),
+            None => pure.from.to_owned(),
+        };
+        let trailing = if pure.trailing.is_empty() {
+            String::new()
+        } else {
+            format!(", plus `{}`", pure.trailing)
+        };
+        source.push(format!(
+            "`= name`: {}'s pure virtual {slots} {from}'s methods there{trailing}.",
+            pure.class,
+        ));
+    }
+    Ok(Manifest { source, classes })
+}
+
+/// A nested method's mangling after its class, `<name>E<parameters>`, with
+/// `parameter` added last: `11releasePortEv` and `Pv` give
+/// `11releasePortEPv`.
+fn with_parameter(method: &str, parameter: &str) -> Option<String> {
+    let digits = method.bytes().take_while(u8::is_ascii_digit).count();
+    let length: usize = method[..digits].parse().ok()?;
+    let name = method.get(..digits + length)?;
+    let parameters = method.get(digits + length..)?.strip_prefix('E')?;
+    let parameters = if parameters == "v" { "" } else { parameters };
+    let all = format!("{parameters}{parameter}");
+    Some(format!(
+        "{name}E{}",
+        if all.is_empty() { "v" } else { &all }
+    ))
+}
+
+/// The `__ZTV<class>` vtables `object` defines, each slot's symbol by
+/// index from the first method (`None` for a slot with no relocation).
+#[cfg(test)]
+pub fn object_vtables(object: &[u8]) -> Result<BTreeMap<String, Vec<Option<String>>>> {
+    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
+    let file = object::File::parse(object)?;
+    let mut vtables = BTreeMap::new();
+    for symbol in file.symbols() {
+        let name = symbol.name()?;
+        let Some(index) = symbol.section_index() else {
+            continue;
+        };
+        if !name.starts_with("__ZTV") {
+            continue;
+        }
+        let section = file.section_by_index(index)?;
+        let start = symbol.address();
+        let end = file
+            .symbols()
+            .filter(|other| other.section_index() == Some(index) && other.address() > start)
+            .map(|other| other.address())
+            .min()
+            .unwrap_or(section.address() + section.size());
+        let mut slots = vec![None; ((end - start).saturating_sub(16) / 8) as usize];
+        for (offset, relocation) in section.relocations() {
+            let at = section.address() + offset;
+            if at < start + 16 || at >= end || (at - start) % 8 != 0 {
+                continue;
+            }
+            let RelocationTarget::Symbol(target) = relocation.target() else {
+                continue;
+            };
+            let target = file.symbol_by_index(target)?.name()?.to_owned();
+            slots[((at - start - 16) / 8) as usize] = Some(target);
+        }
+        // Up to the next symbol may include alignment padding, which no
+        // relocation fills.
+        while slots.last() == Some(&None) {
+            slots.pop();
+        }
+        vtables.insert(name.to_owned(), slots);
+    }
+    Ok(vtables)
+}
+
+/// Whether `symbol`, in a vtable built from the header, is the method the
+/// manifest has in that slot: one of its names, or the same method by
+/// name, `const` and parameters; for a pure slot, the method expected.
+#[cfg(test)]
+pub fn slot_agrees(symbol: &str, names: &[String], expected: Option<&str>) -> bool {
+    use stela_loader::aux_kc::itanium::signature;
+    if names.iter().any(|name| name == symbol) || expected == Some(symbol) {
+        return true;
+    }
+    // A slot the header reserves and the kernel fills (xnu's open headers
+    // reserve OSMetaClassBase's Dispatch slot): the kext calls nothing
+    // there, and the link binds the slot to the kernel's method.
+    if symbol.contains("_RESERVED") && !names.is_empty() && names != ["___cxa_pure_virtual"] {
+        return true;
+    }
+    let pure = names == ["___cxa_pure_virtual"];
+    let theirs: Vec<&str> = match (pure, expected) {
+        (true, Some(expected)) => vec![expected],
+        (true, None) => return false,
+        (false, _) => names.iter().map(String::as_str).collect(),
+    };
+    let Some(own) = signature(symbol) else {
+        return false;
+    };
+    theirs
+        .iter()
+        .any(|their| signature(their).as_ref() == Some(&own))
+}
+
+/// Compares the probe classes' vtables in `object` with `manifest`: the
+/// probe `probe` derives from `class`, so has its slots and no more.
+#[cfg(test)]
+pub fn check_probe(
+    vtables: &BTreeMap<String, Vec<Option<String>>>,
+    manifest: &Manifest,
+    probe: &str,
+    class: &str,
+) -> Result<()> {
+    let vtable = vtables
+        .get(&format!("__ZTV{}{probe}", probe.len()))
+        .with_context(|| format!("the probe object has no {probe} vtable"))?;
+    let expected = manifest
+        .class(class)
+        .with_context(|| format!("the manifest has no {class}"))?;
+    let slots = &expected.layout.slots;
+    ensure!(
+        vtable.len() == slots.len(),
+        "{probe}: the header gives {class} {} slots, the kernel {}",
+        vtable.len(),
+        slots.len()
+    );
+    let mut wrong = Vec::new();
+    for (index, (symbol, names)) in vtable.iter().zip(slots).enumerate() {
+        let symbol = symbol.as_deref().unwrap_or("(none)");
+        if !slot_agrees(
+            symbol,
+            names,
+            expected.expected.get(&index).map(String::as_str),
+        ) {
+            wrong.push(format!(
+                "slot {index}: the header has {symbol}, the kernel {}",
+                if names.is_empty() {
+                    "an unexported method".into()
+                } else {
+                    names.join(" or ")
+                }
+            ));
+        }
+    }
+    ensure!(wrong.is_empty(), "{class}:\n{}", wrong.join("\n"));
+    Ok(())
+}
+
+/// Each `static_assert(sizeof(<class>) == <size>` of `header`, by class.
+#[cfg(test)]
+pub fn header_sizes(header: &str) -> BTreeMap<String, u64> {
+    let mut sizes = BTreeMap::new();
+    for line in header.lines() {
+        let Some(rest) = line.trim().strip_prefix("static_assert(sizeof(") else {
+            continue;
+        };
+        let Some((class, rest)) = rest.split_once(") == ") else {
+            continue;
+        };
+        let size = rest
+            .split([',', ')'])
+            .next()
+            .and_then(|size| size.strip_prefix("0x"))
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+        if let Some(size) = size {
+            sizes.insert(class.to_owned(), size);
+        }
+    }
+    sizes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// The probes of `slot_probe.cpp`, each with the family class it derives from.
+    const PROBES: [(&str, &str); 2] = [
+        ("StelaSlotProbeDriver", "IOSerialDriverSync"),
+        ("StelaSlotProbeRS232", "IORS232SerialStreamSync"),
+    ];
+
+    fn committed(family: &Family) -> Manifest {
+        let text = fs::read_to_string(directory().join(family.manifest)).unwrap();
+        Manifest::parse(&text).unwrap()
+    }
+
+    /// Compiles `source` as the kext's sources are compiled, against the
+    /// family headers in `headers`.
+    fn compile(source: &Path, headers: &Path) -> Vec<u8> {
+        let built = tempfile::tempdir().unwrap();
+        let root = crate::tools::root();
+        let xnu = root.join("third_party/xnu");
+        let include = built.path().join("include");
+        super::super::sdk::generate(&xnu, &include).unwrap();
+        let clang = &crate::clang::toolset().unwrap().clangxx;
+        let object = built.path().join("object.o");
+        let mut command = Command::new(clang);
+        command
+            .args(super::super::KEXT_FLAGS)
+            .arg(format!("--target={}", super::super::TARGET))
+            .arg("-I")
+            .arg(headers);
+        for headers in super::super::XNU_HEADERS {
+            command.arg("-isystem").arg(xnu.join(headers));
+        }
+        command.arg("-isystem").arg(&include);
+        crate::tools::exec(command.arg("-c").arg(source).arg("-o").arg(&object)).unwrap();
+        fs::read(object).unwrap()
+    }
+
+    fn probe_object(headers: &Path) -> Vec<u8> {
+        compile(&directory().join("tests/slot_probe.cpp"), headers)
+    }
+
+    #[test]
+    fn the_family_headers_put_every_method_in_the_kernels_slot() {
+        let vtables = object_vtables(&probe_object(&directory())).unwrap();
+        let manifest = committed(&FAMILIES[0]);
+        for (probe, class) in PROBES {
+            check_probe(&vtables, &manifest, probe, class).unwrap();
+        }
+    }
+
+    /// The kext's own serial driver: every slot, its overrides of the pure
+    /// virtuals included, is the method the manifest has there.
+    #[test]
+    fn the_console_driver_overrides_the_kernels_slots() {
+        let source = crate::tools::root().join("guest/stela-virtio/kext/Console.cpp");
+        let vtables = object_vtables(&compile(&source, &directory())).unwrap();
+        let manifest = committed(&FAMILIES[0]);
+        check_probe(
+            &vtables,
+            &manifest,
+            "StelaVirtIOConsole",
+            "IOSerialDriverSync",
+        )
+        .unwrap();
+        // Its twelve stream methods are its own, in the pure slots.
+        let vtable = &vtables["__ZTV18StelaVirtIOConsole"];
+        let own = vtable[272..284]
+            .iter()
+            .filter(|symbol| {
+                symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.starts_with("__ZN18StelaVirtIOConsole"))
+            })
+            .count();
+        assert_eq!(own, 12);
+    }
+
+    /// Two of the driver's pure virtuals swapped: the probe's vtable shows
+    /// it, slot by slot, where only the kernel's names could not.
+    #[test]
+    fn a_header_with_two_methods_swapped_is_caught() {
+        let family = &FAMILIES[0];
+        let header = fs::read_to_string(directory().join(family.header)).unwrap();
+        let set = "\tvirtual IOReturn setState(UInt32 state, UInt32 mask, void *refCon) = 0;\n";
+        let get = "\tvirtual UInt32 getState(void *refCon) = 0;\n";
+        assert!(header.contains(&format!("{set}{get}")));
+        let swapped = header.replace(&format!("{set}{get}"), &format!("{get}{set}"));
+        let headers = tempfile::tempdir().unwrap();
+        fs::write(headers.path().join(family.header), swapped).unwrap();
+        let vtables = object_vtables(&probe_object(headers.path())).unwrap();
+        let error = check_probe(
+            &vtables,
+            &committed(family),
+            "StelaSlotProbeDriver",
+            "IOSerialDriverSync",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("slot 274: the header has __ZN20StelaSlotProbeDriver8getStateEPv")
+                && error
+                    .contains("slot 275: the header has __ZN20StelaSlotProbeDriver8setStateEjjPv"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_family_headers_assert_the_kernels_sizes() {
+        for family in FAMILIES {
+            let manifest = committed(family);
+            let header = fs::read_to_string(directory().join(family.header)).unwrap();
+            let sizes = header_sizes(&header);
+            for class in family.classes {
+                let layout = &manifest.class(class).unwrap().layout;
+                assert_eq!(
+                    sizes.get(*class),
+                    Some(&layout.size),
+                    "{}'s static_assert on {class}",
+                    family.header
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_slot_agrees_by_name_or_by_method() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect::<Vec<_>>()
+        };
+        let start = names(&["__ZN9IOService5startEPS_"]);
+        assert!(slot_agrees("__ZN9IOService5startEPS_", &start, None));
+        assert!(slot_agrees("__ZN5Probe5startEP9IOService", &start, None));
+        assert!(!slot_agrees("__ZN5Probe4stopEP9IOService", &start, None));
+        let pure = names(&["___cxa_pure_virtual"]);
+        let expected = "__ZN18IOSerialDriverSync11acquirePortEbPv";
+        assert!(slot_agrees(
+            "__ZN20StelaSlotProbeDriver11acquirePortEbPv",
+            &pure,
+            Some(expected)
+        ));
+        // Without the refCon, or with no evidence, a pure slot disagrees.
+        assert!(!slot_agrees(
+            "__ZN20StelaSlotProbeDriver11acquirePortEb",
+            &pure,
+            Some(expected)
+        ));
+        assert!(!slot_agrees("__ZN1A1fEv", &pure, None));
+        assert!(!slot_agrees("__ZN1A1fEv", &[], None));
+        // The header reserves a slot the kernel fills; not the reverse.
+        let dispatch = names(&["__ZN15OSMetaClassBase8DispatchE5IORPC"]);
+        assert!(slot_agrees(
+            "__ZN15OSMetaClassBase25_RESERVEDOSMetaClassBase3Ev",
+            &dispatch,
+            None
+        ));
+        let reserved = names(&["__ZN15OSMetaClassBase25_RESERVEDOSMetaClassBase3Ev"]);
+        assert!(!slot_agrees(
+            "__ZN15OSMetaClassBase8DispatchE5IORPC",
+            &reserved,
+            None
+        ));
+        assert_eq!(
+            with_parameter("11releasePortEv", "Pv").unwrap(),
+            "11releasePortEPv"
+        );
+        assert_eq!(
+            with_parameter("12dequeueEventEPjS0_b", "Pv").unwrap(),
+            "12dequeueEventEPjS0_bPv"
+        );
+        assert_eq!(with_parameter("4initE", "Pv").unwrap(), "4initEPv");
+        assert_eq!(with_parameter("x", "Pv"), None);
+        let header = "static_assert(sizeof(IOSerialDriverSync) == 0x88, \"x\");\n\
+                      static_assert(sizeof(Other) == 136);\n";
+        assert_eq!(
+            header_sizes(header),
+            [("IOSerialDriverSync".to_owned(), 0x88)].into()
+        );
+    }
+
+    /// The committed manifests are what the reference kernelcache gives:
+    /// `STELA_BOOT_KC=<kernelcache> cargo test -p xtask -- --ignored
+    /// the_manifests_are`.
+    #[test]
+    #[ignore = "oracle: STELA_BOOT_KC"]
+    fn the_manifests_are_the_reference_kernelcaches() {
+        let Ok(kc) = std::env::var("STELA_BOOT_KC") else {
+            eprintln!("STELA_BOOT_KC unset: nothing compared");
+            return;
+        };
+        let boot = fs::read(kc).unwrap();
+        for family in FAMILIES {
+            let generated = manifest(&boot, family).unwrap().to_text();
+            let committed = fs::read_to_string(directory().join(family.manifest)).unwrap();
+            assert_eq!(generated, committed, "{}", family.manifest);
+        }
+    }
+}

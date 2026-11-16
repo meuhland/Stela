@@ -54,6 +54,7 @@ mod store_file;
 mod topology;
 pub(crate) mod translations;
 mod usb;
+mod virtio;
 pub(crate) mod xstate;
 
 use crate::{

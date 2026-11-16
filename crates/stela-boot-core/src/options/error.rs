@@ -98,6 +98,8 @@ pub enum Error {
     WifiNetwork,
     DuplicateNativeShared,
     DuplicateNativeBootstrap,
+    VirtioSndCapture,
+    DuplicateVirtioSndCapture,
     Constraint(Constraint),
     Target {
         argument: TargetArgument,
@@ -133,6 +135,7 @@ pub enum Constraint {
     DramAlignment,
     AudioHpetDependency,
     NativePciIoapicExclusive,
+    VirtioSndDependency,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -219,6 +222,8 @@ impl Error {
             Self::WifiNetwork => "--wifi needs a 1 to 32 byte network name, with %XX escapes",
             Self::DuplicateNativeShared => "duplicate native shared check",
             Self::DuplicateNativeBootstrap => "duplicate native bootstrap check",
+            Self::VirtioSndCapture => "--virtio-snd-capture needs 1 to 60 seconds",
+            Self::DuplicateVirtioSndCapture => "duplicate --virtio-snd-capture",
             Self::Constraint(rule) => rule.message(),
             Self::Target { source, .. } | Self::Guid { source, .. } => source,
             Self::BootCommandOrigin { source, .. } => source,
@@ -260,6 +265,7 @@ impl Constraint {
             Self::NativePciIoapicExclusive => {
                 "--native-pci-own-ioapic requires the normal system platform path"
             }
+            Self::VirtioSndDependency => "--virtio-snd and --virtio-snd-capture require --virtio",
         }
     }
 }

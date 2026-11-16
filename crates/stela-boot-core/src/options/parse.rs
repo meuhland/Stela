@@ -240,6 +240,19 @@ impl ParseState<'_> {
                 options.usb4_approved.push(uuid);
             }
             EXTERNAL_DISKS => options.external_disks = true,
+            VIRTIO => options.virtio = true,
+            VIRTIO_CONSOLE_ECHO => options.virtio_console_echo = true,
+            VIRTIO_SND => options.virtio_snd = true,
+            VIRTIO_SND_CAPTURE => {
+                let seconds = value()
+                    .and_then(|word| word.parse::<u32>().ok())
+                    .filter(|seconds| (1..=VIRTIO_SND_CAPTURE_MAX).contains(seconds))
+                    .ok_or(Error::VirtioSndCapture)?;
+                if options.virtio_snd_capture.replace(seconds).is_some() {
+                    return Err(Error::DuplicateVirtioSndCapture);
+                }
+                options.virtio_snd = true;
+            }
             "--audio-check" => {
                 if options.audio_check.is_some() {
                     return Err(Error::DuplicateAudioCheck);

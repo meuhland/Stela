@@ -18,6 +18,9 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     {
         return Err(Error::Constraint(Constraint::NativePciIoapicExclusive));
     }
+    if options.virtio_snd && !options.virtio {
+        return Err(Error::Constraint(Constraint::VirtioSndDependency));
+    }
     Ok(())
 }
 

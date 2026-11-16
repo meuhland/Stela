@@ -14,9 +14,11 @@ pub mod t6000_pmgr;
 mod timekeeping;
 mod transfer_times;
 mod usb;
+mod virtio;
 pub use transfer_times::{
     PageWrites, PartTime, TRANSFER_PARTS, WRITE_PAGES, WRITE_PARTS, WriteTimes,
 };
+pub use virtio::VirtioReport;
 
 use crate::Result;
 pub use crate::pmu::{RtcAnchor, RtcEpoch};
@@ -232,6 +234,8 @@ pub struct AppleDevices {
     /// The StelaNet adapter (`stela_net`), the guest's network in place of
     /// the USB Ethernet adapter when the boot places it.
     stela_net: Option<DeviceId>,
+    /// Stela's virtio-mmio devices (`virtio`), as the boot places them.
+    virtio: Vec<DeviceId>,
     storage_masters: Vec<(DeviceId, DeviceId)>,
     /// The GFX coprocessor's ASC and the `sgx` block whose UAT it masters
     /// memory through.
@@ -705,6 +709,7 @@ impl AppleDevices {
             nor_touch: Default::default(),
             gpu_gates: Vec::new(),
             stela_net: None,
+            virtio: Vec::new(),
             sep_masters: Vec::new(),
             dcp_masters: Vec::new(),
             frame_presented: false,
@@ -1476,6 +1481,9 @@ impl Devices for AppleDevices {
             .chain(self.native_pmp_services_deadline())
             // StelaNet frames to move, now.
             .chain(self.stela_net_due().then_some(0))
+            // Virtio devices' buffers to fill, now, or the sound device's
+            // next completion.
+            .chain(self.virtio_deadline())
             // A SEP passcode derivation runs one bounded slice per step,
             // so it finishes while every PE waits.
             .chain(
@@ -1555,10 +1563,12 @@ impl Devices for AppleDevices {
                 3 => self.transfer_gfx(cpu, memory, now),
                 4 => self.transfer_sep(cpu, memory, now),
                 5 => self.transfer_dcp(cpu, memory, now),
-                // StelaNet moves the guest network's frames beside USB.
+                // StelaNet moves the guest network's frames beside USB, and
+                // the virtio devices their buffers.
                 _ => {
                     let usb = self.transfer_usb(cpu, memory, now);
                     self.transfer_stela_net(cpu, memory, now);
+                    self.transfer_virtio(cpu, memory, now);
                     usb
                 }
             };

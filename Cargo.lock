@@ -3087,6 +3087,7 @@ dependencies = [
  "stela-formats",
  "stela-loader",
  "stela-runtime",
+ "stela-soc",
  "tempfile",
  "zip",
 ]

@@ -33,6 +33,9 @@ diagnostics = ["stela-drivers/irq-diagnostics"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
 # NVK, NIR and NAK in the image, from `cargo xtask gpu nvk`.
 nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
+# The StelaVirtIO kext in the image, from `cargo xtask guest`; a boot links
+# it only with `--virtio`. Independent of `nvk`.
+virtio-kext = []
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }

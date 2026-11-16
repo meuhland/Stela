@@ -188,6 +188,8 @@ impl Service {
     /// Store what the guest committed since the last service, the caller
     /// waiting: at the stop, before the PC restarts or turns off.
     pub(super) fn stop(&mut self) {
+        // The virtio devices' last events and counters.
+        super::virtio::report(&self.devices, true);
         if let Some(nor) = self.nor.as_mut() {
             let repair = super::bundle_repair::change_pending();
             let (mut dirty, anchor, image) = self.devices.with(|devices| {
@@ -361,6 +363,9 @@ impl Service {
             }
         }
         if due(LOGS, true, &mut turn) {
+            // What the virtio devices' drivers did, once there is something,
+            // never waiting for the devices' lock.
+            super::virtio::report(devices, false);
             // The logs' disks are looked at without waiting for the host
             // drivers: a store another processor's driver call holds up
             // goes on at a later turn.
@@ -509,6 +514,7 @@ impl Service {
                 audio.report();
             }
             power.disks().report(*tsc_hz);
+            super::virtio::report(devices, true);
             *reported = stamp;
         }
         lap.end_turn(now);
