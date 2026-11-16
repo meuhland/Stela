@@ -19,6 +19,8 @@ use stela_loader::{aux_kc::TRUSTED_CODE_FILE, trust_cache::CodeHash};
 
 pub mod app;
 pub mod compression;
+#[cfg(test)]
+mod family_tests;
 pub mod sdk;
 pub mod stelanet;
 #[cfg(test)]
@@ -52,6 +54,10 @@ const GPU_KEXT: &str = "StelaGPU";
 /// Sources compiled into every kext: the runtime (`kmod_info`, static
 /// destructors), one copy per kext.
 const COMMON: &str = "guest/common";
+/// A component's hand-written declarations of kernel families
+/// (`<family>/<Class>.h`), on the include path of its kext; each family's
+/// slot manifest beside them is checked against them ([`family_tests`]).
+const FAMILY: &str = "family";
 
 /// Builds every guest component.
 pub fn run() -> Result<()> {
@@ -248,27 +254,47 @@ fn build_kext(
     let info = fs::read_to_string(source.join("Info.plist"))?;
     let (identifier, version) = identity(&info)?;
     fs::write(bundle.join("Info.plist"), &info)?;
-    let clang = &crate::clang::toolset()?.clangxx;
     let sources = kext_sources(&source, common)?;
     for path in &sources {
         let object = bundle.join(path.file_stem().unwrap()).with_extension("o");
-        let mut command = Command::new(clang);
-        command
-            .args(KEXT_FLAGS)
-            .arg(format!("--target={TARGET}"))
-            .arg(format!("-DSTELA_KEXT_IDENTIFIER=\"{identifier}\""))
-            .arg(format!("-DSTELA_KEXT_VERSION=\"{version}\""));
-        let headers = component.join("include");
+        compile_kext_source(
+            component,
+            (identifier.as_str(), version.as_str()),
+            xnu,
+            include,
+            path,
+            &object,
+        )?;
+    }
+    Ok(bundle)
+}
+
+/// Compiles one C++ `source` of `component`'s kext, `identity` its
+/// identifier and version, into the relocatable `object`.
+fn compile_kext_source(
+    component: &Path,
+    (identifier, version): (&str, &str),
+    xnu: &Path,
+    include: &Path,
+    source: &Path,
+    object: &Path,
+) -> Result<()> {
+    let mut command = Command::new(&crate::clang::toolset()?.clangxx);
+    command
+        .args(KEXT_FLAGS)
+        .arg(format!("--target={TARGET}"))
+        .arg(format!("-DSTELA_KEXT_IDENTIFIER=\"{identifier}\""))
+        .arg(format!("-DSTELA_KEXT_VERSION=\"{version}\""));
+    for headers in [component.join("include"), component.join(FAMILY)] {
         if headers.is_dir() {
             command.arg("-I").arg(headers);
         }
-        for headers in XNU_HEADERS {
-            command.arg("-isystem").arg(xnu.join(headers));
-        }
-        command.arg("-isystem").arg(include);
-        exec(command.arg("-c").arg(path).arg("-o").arg(&object))?;
     }
-    Ok(bundle)
+    for headers in XNU_HEADERS {
+        command.arg("-isystem").arg(xnu.join(headers));
+    }
+    command.arg("-isystem").arg(include);
+    exec(command.arg("-c").arg(source).arg("-o").arg(object))
 }
 
 /// The C++ sources of a kext's `source` directory and of `common`, in name
