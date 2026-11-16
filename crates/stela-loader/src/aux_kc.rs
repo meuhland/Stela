@@ -23,6 +23,7 @@ mod boot;
 mod commands;
 mod fixups;
 pub mod itanium;
+pub mod manifest;
 mod plist;
 mod prelink;
 mod receipt;

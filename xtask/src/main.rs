@@ -49,6 +49,14 @@ enum Task {
     /// kext's objects, against `third_party/xnu`, carrying the newest
     /// Stela.app package (or `STELA_APP`'s) when there is one.
     Guest,
+    /// Write the slot manifests of the kernel family classes the StelaVirtIO
+    /// kext declares by hand (`guest/stela-virtio/family/*.slots`) from a
+    /// boot kernel collection.
+    GuestFamily {
+        /// The boot kernel collection (a kernelcache's Mach-O fileset).
+        #[arg(long)]
+        kc: std::path::PathBuf,
+    },
     /// Build Stela.app (`guest/stela-app`) on this Mac or, over ssh, on the
     /// Mac `--mac` or `STELA_MAC` names, into `target/stela-app`, where
     /// `cargo xtask guest` finds it.
@@ -78,6 +86,7 @@ fn main() -> ExitCode {
         Task::Boot(command) => boot::run(command),
         Task::Gpu(command) => gpu::run(command).map(|()| ExitCode::SUCCESS),
         Task::Guest => guest::run().map(|()| ExitCode::SUCCESS),
+        Task::GuestFamily { kc } => guest::family::generate(&kc).map(|()| ExitCode::SUCCESS),
         Task::App { mac } => {
             let mac = mac.or_else(|| std::env::var(tools::MAC_VARIABLE).ok());
             guest::app::build(tools::root(), mac.as_deref().filter(|mac| !mac.is_empty()))

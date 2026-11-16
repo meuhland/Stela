@@ -19,6 +19,7 @@ use stela_loader::{aux_kc::TRUSTED_CODE_FILE, trust_cache::CodeHash};
 
 pub mod app;
 pub mod compression;
+pub mod family;
 pub mod sdk;
 pub mod stelanet;
 #[cfg(test)]
@@ -258,9 +259,12 @@ fn build_kext(
             .arg(format!("--target={TARGET}"))
             .arg(format!("-DSTELA_KEXT_IDENTIFIER=\"{identifier}\""))
             .arg(format!("-DSTELA_KEXT_VERSION=\"{version}\""));
-        let headers = component.join("include");
-        if headers.is_dir() {
-            command.arg("-I").arg(headers);
+        // The component's own headers, and the kernel family classes it
+        // declares by hand ([`family`]).
+        for headers in [component.join("include"), component.join("family")] {
+            if headers.is_dir() {
+                command.arg("-I").arg(headers);
+            }
         }
         for headers in XNU_HEADERS {
             command.arg("-isystem").arg(xnu.join(headers));

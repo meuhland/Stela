@@ -55,6 +55,26 @@ impl<'a> BootCollection<'a> {
         self.collection.fileset_entry(entry).is_some()
     }
 
+    /// The `length` bytes the collection's file holds at `address`.
+    pub fn read(&self, address: u64, length: usize) -> Result<&'a [u8]> {
+        let segment = self
+            .collection
+            .segment_containing(address)
+            .ok_or_else(|| refuse!("{address:#x} lies outside the boot collection", address))?;
+        require!(
+            address + length as u64 <= segment.vm_address + segment.file_size,
+            "{address:#x} has no bytes in the boot collection",
+            address
+        );
+        let offset: usize = fit(
+            segment.file_offset + (address - segment.vm_address),
+            "a boot collection file offset",
+        )?;
+        self.data
+            .get(offset..offset + length)
+            .ok_or_else(|| refuse!("{address:#x} lies past the file", address).into())
+    }
+
     /// The target of the pointer the collection holds at `address`, which
     /// its chained fixups encode, or `None` for a null slot.
     pub fn pointer(&self, address: u64) -> Result<Option<u64>> {
