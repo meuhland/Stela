@@ -572,9 +572,7 @@ const _: () = assert!(ItlbMiss::Cold as usize + 1 == ItlbMiss::COUNT);
 ///   predecessor of the same key had taken (`Machine::refill_pages`);
 /// - of the entries dropped in every context: those of the upper half,
 ///   those a TLBI without an ASID dropped in the lower half, and those of
-///   a global page a TLBI with an ASID dropped there;
-/// - lower-half pages taken in the context every address space shares, as
-///   their walk ended in a global leaf (`Machine::itlb_context`).
+///   a global page a TLBI with an ASID dropped there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ItlbSource {
     FillsLower,
@@ -592,14 +590,13 @@ pub(super) enum ItlbSource {
     DropUpper,
     DropNoAsid,
     DropGlobal,
-    SharedFills,
 }
 
 impl ItlbSource {
-    pub(super) const COUNT: usize = 16;
+    pub(super) const COUNT: usize = 15;
 }
 
-const _: () = assert!(ItlbSource::SharedFills as usize + 1 == ItlbSource::COUNT);
+const _: () = assert!(ItlbSource::DropGlobal as usize + 1 == ItlbSource::COUNT);
 // A fill counts at `FillsLower` plus its half.
 const _: () = assert!(ItlbSource::FillsUpper as usize == ItlbSource::FillsLower as usize + 1);
 

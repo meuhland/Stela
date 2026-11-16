@@ -1943,11 +1943,8 @@ impl Heartbeat {
             // TLBIs of everything that forgot every context (its own, and
             // another PE's or its mail's), ones that reached nothing of the
             // regime it translates in (forgetting other regimes' contexts,
-            // or none), contexts made, TLBIs its mail merged, pages
-            // walked again at once for contexts made anew, entries dropped
-            // in every context by where (the upper half, no ASID, a global
-            // page), and lower-half global pages taken in the shared
-            // context.
+            // or none), contexts made, TLBIs its mail merged, and pages
+            // walked again at once for contexts made anew.
             // Per PE: GENTER completed natively and by the engine, then
             // GEXIT's, SVC's and ERET's.
             let mut transitions =
@@ -1963,7 +1960,7 @@ impl Heartbeat {
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
-                "/drop_upper/drop_no_asid/drop_global/shared_fills",
+                "/drop_upper/drop_no_asid/drop_global",
             ));
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered

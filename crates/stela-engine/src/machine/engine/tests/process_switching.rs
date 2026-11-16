@@ -7,9 +7,6 @@
 //! [`Machine::translate_page`], [`Machine::tlb_maintained`]); only the walk
 //! is left out, as its result is the block key the model names.
 //!
-//! Every turn also fetches hot pages of a shared library at the same VAs and
-//! frames in every process, global as XNU maps the dyld shared cache.
-//!
 //! `cargo test -p stela-engine --release --lib process_switching_miss_rates
 //! -- --ignored --nocapture` prints ITLB misses per switch for each count of
 //! processes, with per-page TLBIs of single ASIDs between turns, and with a
@@ -26,26 +23,20 @@ const USER_PAGES: u64 = 48;
 const KERNEL_PAGES: u64 = 64;
 const USER_BASE: u64 = 0x1_0000_0000;
 const KERNEL_BASE: u64 = 0xffff_fe00_1000_0000;
-/// Hot pages of the shared library each turn runs, at the same VAs and
-/// frames in every process.
-const SHARED_PAGES: u64 = 64;
-const SHARED_BASE: u64 = 0x1_8000_0000;
 
 /// What one run measured.
 #[derive(Debug, Clone, Copy, Default)]
 struct Rates {
     switches: u64,
     user_misses: u64,
-    shared_misses: u64,
     kernel_misses: u64,
 }
 
 impl Rates {
-    fn per_switch(self) -> (f64, f64, f64) {
+    fn per_switch(self) -> (f64, f64) {
         let switches = self.switches.max(1) as f64;
         (
             self.user_misses as f64 / switches,
-            self.shared_misses as f64 / switches,
             self.kernel_misses as f64 / switches,
         )
     }
@@ -72,15 +63,8 @@ impl Picks {
     }
 }
 
-/// Fetch `pc` at `el` in the current contexts, whose page's block key is
-/// `key` through a leaf `global` or not: whether the ITLB held it.
-fn touch(
-    machine: &mut Machine<FakeHost, NoDevices>,
-    el: u8,
-    pc: u64,
-    key: u64,
-    global: bool,
-) -> bool {
+/// Fetch `pc` at `el` in the current contexts: whether the ITLB held it.
+fn touch(machine: &mut Machine<FakeHost, NoDevices>, el: u8, pc: u64, key: u64) -> bool {
     let variant = machine.current_variant(false, false);
     let contexts = machine.contexts(el, variant);
     machine.chain.set_contexts(contexts);
@@ -88,24 +72,12 @@ fn touch(
         return true;
     }
     let half = chain::half(pc);
-    machine.fetched_through(half, pc, FETCH_PAGE, global);
+    machine.fetched_through(half, pc, FETCH_PAGE, half == 1);
     // The walk may have forgotten contexts; the fetch records the page in
-    // the ones it runs in after, as its walk left it in the fetch cache.
+    // the ones it runs in after.
     let contexts = machine.contexts(el, variant);
     machine.chain.set_contexts(contexts);
-    // The fetch runs at `el`, which its cache entry records.
-    let running = core::mem::replace(&mut machine.cpu.pstate.el, el);
-    let page = pc & !(FETCH_PAGE - 1);
-    machine.fetch[(page / FETCH_PAGE) as usize % FETCH_CACHE] = Some(FetchEntry {
-        page,
-        physical: chain::key_frame(key) << 12,
-        guarded: false,
-        global,
-        el: el | u8::from(machine.cpu.pstate.guarded) << 4,
-        epoch: machine.fetch_epoch(half),
-    });
     machine.translate_page(pc, key);
-    machine.cpu.pstate.el = running;
     false
 }
 
@@ -124,14 +96,10 @@ fn run(processes: u64, switches: u64, page_tlbis: bool, all_every: u64) -> Rates
     let ttbr0 = machine.cpu.read(SystemRegister::TTBR0_EL1);
     let mut picks = Picks(processes ^ 0x5eed);
     let mut rates = Rates::default();
-    // Blocks of the one variant the model runs in have key state 2.
-    let variant = machine.current_variant(false, false);
-    assert_eq!(machine.variant_id(variant).0, 0);
     // Process `p`'s user page `n` maps frame `p * USER_PAGES + n`.
     let user_key =
         |process: u64, page: u64| chain::block_key((process * USER_PAGES + page) << 12, 2);
     let kernel_key = |page: u64| chain::block_key((1 << 30 | page) << 12, 2);
-    let shared_key = |page: u64| chain::block_key((1 << 29 | page) << 12, 2);
     for turn in 0..switches {
         let process = picks.next(processes);
         let table = ttbr0 & 0xffff_ffff_ffff & !0xfff_ffff | (process + 1) << 16;
@@ -140,25 +108,19 @@ fn run(processes: u64, switches: u64, page_tlbis: bool, all_every: u64) -> Rates
         rates.switches += 1;
         for page in 0..KERNEL_PAGES / 2 {
             let pc = KERNEL_BASE + page * FETCH_PAGE;
-            if !touch(&mut machine, kernel_el, pc, kernel_key(page), true) {
+            if !touch(&mut machine, kernel_el, pc, kernel_key(page)) {
                 rates.kernel_misses += 1;
             }
         }
         for page in 0..USER_PAGES {
             let pc = USER_BASE + page * FETCH_PAGE;
-            if !touch(&mut machine, 0, pc, user_key(process, page), false) {
+            if !touch(&mut machine, 0, pc, user_key(process, page)) {
                 rates.user_misses += 1;
-            }
-        }
-        for page in 0..SHARED_PAGES {
-            let pc = SHARED_BASE + page * FETCH_PAGE;
-            if !touch(&mut machine, 0, pc, shared_key(page), true) {
-                rates.shared_misses += 1;
             }
         }
         for page in KERNEL_PAGES / 2..KERNEL_PAGES {
             let pc = KERNEL_BASE + page * FETCH_PAGE;
-            if !touch(&mut machine, kernel_el, pc, kernel_key(page), true) {
+            if !touch(&mut machine, kernel_el, pc, kernel_key(page)) {
                 rates.kernel_misses += 1;
             }
         }
@@ -192,13 +154,13 @@ fn run(processes: u64, switches: u64, page_tlbis: bool, all_every: u64) -> Rates
 #[ignore = "manual: opt-in"]
 fn process_switching_miss_rates() {
     const SWITCHES: u64 = 20_000;
-    println!("processes  tlbis  all_every  user/switch  shared/switch  kernel/switch");
+    println!("processes  tlbis  all_every  user/switch  kernel/switch");
     for &processes in &[16, 48, 96, 192, 384] {
         for (page_tlbis, all_every) in [(false, 0), (true, 0), (true, 22), (true, 60)] {
             let rates = run(processes, SWITCHES, page_tlbis, all_every);
-            let (user, shared, kernel) = rates.per_switch();
+            let (user, kernel) = rates.per_switch();
             println!(
-                "{processes:9}  {:5}  {all_every:9}  {user:11.2}  {shared:13.2}  {kernel:13.2}",
+                "{processes:9}  {:5}  {all_every:9}  {user:11.2}  {kernel:13.2}",
                 page_tlbis
             );
             assert_eq!(rates.switches, SWITCHES);
@@ -623,76 +585,4 @@ fn a_tlbi_by_va_and_asid_reaches_other_asids_only_at_their_global_entries() {
     assert_eq!(sources(ItlbSource::DropGlobal), 2);
     assert_eq!(sources(ItlbSource::DropNoAsid), 2);
     assert_eq!(sources(ItlbSource::DropUpper), 0);
-}
-
-/// A lower-half page whose walk ended in a global leaf is kept in the
-/// context every address space shares: another process finds it without a
-/// walk, while a page another process maps privately (nG=1) stays its own.
-/// A TLBI by VA and any ASID reaches the shared entry; a TLBI of an ASID
-/// leaves it, as it leaves every global entry (Arm `TLBIMatch`).
-#[test]
-fn address_spaces_share_their_global_pages_entries() {
-    const RET: u32 = 0xd65f_03c0;
-    const PAGES: u64 = 2;
-    const NG: u64 = 1 << 11;
-    let mut words = vec![0u32; (PAGES * 0x1000 / 4) as usize];
-    for page in 0..PAGES {
-        words[(page * 0x400) as usize] = RET;
-    }
-    let pc = |page: u64| BASE + page * 0x1000;
-    let frames: Vec<u64> = (0..PAGES).map(pc).collect();
-    let mut machine = machine(&words);
-    paged_space(&mut machine, 1, &frames);
-    paged_space(&mut machine, 0, &frames);
-    // Space 1 maps page 1 privately.
-    let [_, _, l3] = SPACES_TABLES[1];
-    write_entry(&mut machine, l3 + 8, page_descriptor(frames[1], false) | NG);
-    let switch = |machine: &mut Machine<FakeHost, NoDevices>, space: usize, asid: u64| {
-        let [l1, _, _] = SPACES_TABLES[space];
-        machine.cpu.state.x[0] = (BASE + l1) | asid << 48;
-        machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
-        let variant = machine.current_variant(false, false);
-        let contexts = machine.contexts(machine.cpu.pstate.el, variant);
-        machine.chain.set_contexts(contexts);
-    };
-    let fetch = |machine: &mut Machine<FakeHost, NoDevices>, page: u64| {
-        assert!(matches!(
-            machine.fetch_block(pc(page), false),
-            Ok(Fetched::Block(_))
-        ));
-    };
-    switch(&mut machine, 0, 5);
-    fetch(&mut machine, 0);
-    let shared = machine.current_key(pc(0)).expect("fetched");
-    let sources = |machine: &Machine<FakeHost, NoDevices>, source: ItlbSource| {
-        machine.statistics.itlb_sources[source as usize]
-    };
-    assert_eq!(sources(&machine, ItlbSource::SharedFills), 1);
-    switch(&mut machine, 1, 6);
-    assert_eq!(machine.current_key(pc(0)), Some(shared));
-    // Process 1's private page is its own.
-    fetch(&mut machine, 1);
-    let private = machine.current_key(pc(1)).expect("fetched");
-    assert_eq!(sources(&machine, ItlbSource::SharedFills), 1);
-    switch(&mut machine, 0, 5);
-    assert_eq!(machine.current_key(pc(1)), None);
-    // A TLBI of ASID 5 leaves the shared entry; one by VA and ASID 6 takes
-    // it in every space.
-    machine.tlb_maintained(Reach::All, Everywhere::NonGlobal(5), Some(5));
-    assert_eq!(machine.current_key(pc(0)), Some(shared));
-    let reach = Reach::Containing(pc(0));
-    machine.tlb_maintained(reach, Everywhere::Addresses(reach), Some(6));
-    assert_eq!(machine.current_key(pc(0)), None);
-    switch(&mut machine, 1, 6);
-    assert_eq!(machine.current_key(pc(0)), None);
-    assert_eq!(machine.current_key(pc(1)), Some(private));
-    // A TLBI of everything takes both.
-    fetch(&mut machine, 0);
-    machine.tlb_maintained(Reach::All, Everywhere::All, None);
-    let variant = machine.current_variant(false, false);
-    let contexts = machine.contexts(machine.cpu.pstate.el, variant);
-    machine.chain.set_contexts(contexts);
-    machine.pending_refills.clear();
-    assert_eq!(machine.current_key(pc(0)), None);
-    assert_eq!(machine.current_key(pc(1)), None);
 }
