@@ -8,8 +8,7 @@
 //! is left out, as its result is the block key the model names.
 //!
 //! Every turn also fetches hot pages of a shared library at the same VAs and
-//! frames in every process, global as XNU maps the dyld shared cache, and
-//! every page is in a 16 KiB leaf, as XNU maps code.
+//! frames in every process, global as XNU maps the dyld shared cache.
 //!
 //! `cargo test -p stela-engine --release --lib process_switching_miss_rates
 //! -- --ignored --nocapture` prints ITLB misses per switch for each count of
@@ -31,8 +30,6 @@ const KERNEL_BASE: u64 = 0xffff_fe00_1000_0000;
 /// frames in every process.
 const SHARED_PAGES: u64 = 64;
 const SHARED_BASE: u64 = 0x1_8000_0000;
-/// The leaf every page is mapped in.
-const LEAF: u64 = 0x4000;
 
 /// What one run measured.
 #[derive(Debug, Clone, Copy, Default)]
@@ -76,7 +73,7 @@ impl Picks {
 }
 
 /// Fetch `pc` at `el` in the current contexts, whose page's block key is
-/// `key` through a [`LEAF`] leaf, `global` or not: whether the ITLB held it.
+/// `key` through a leaf `global` or not: whether the ITLB held it.
 fn touch(
     machine: &mut Machine<FakeHost, NoDevices>,
     el: u8,
@@ -91,7 +88,7 @@ fn touch(
         return true;
     }
     let half = chain::half(pc);
-    machine.fetched_through(half, pc, LEAF, global);
+    machine.fetched_through(half, pc, FETCH_PAGE, global);
     // The walk may have forgotten contexts; the fetch records the page in
     // the ones it runs in after, as its walk left it in the fetch cache.
     let contexts = machine.contexts(el, variant);
@@ -99,17 +96,15 @@ fn touch(
     // The fetch runs at `el`, which its cache entry records.
     let running = core::mem::replace(&mut machine.cpu.pstate.el, el);
     let page = pc & !(FETCH_PAGE - 1);
-    let physical = chain::key_frame(key) << 12;
     machine.fetch[(page / FETCH_PAGE) as usize % FETCH_CACHE] = Some(FetchEntry {
         page,
-        physical,
+        physical: chain::key_frame(key) << 12,
         guarded: false,
         global,
-        size: LEAF,
         el: el | u8::from(machine.cpu.pstate.guarded) << 4,
         epoch: machine.fetch_epoch(half),
     });
-    machine.translate_leaf(pc, key, physical, variant);
+    machine.translate_page(pc, key);
     machine.cpu.pstate.el = running;
     false
 }
@@ -628,75 +623,6 @@ fn a_tlbi_by_va_and_asid_reaches_other_asids_only_at_their_global_entries() {
     assert_eq!(sources(ItlbSource::DropGlobal), 2);
     assert_eq!(sources(ItlbSource::DropNoAsid), 2);
     assert_eq!(sources(ItlbSource::DropUpper), 0);
-}
-
-/// One walk of a page in a leaf larger than a page gives the ITLB every
-/// page of its 16 KiB granule, as a fetch of each would take it, and no
-/// page past the granule; a TLBI by VA of any of them reaches them all,
-/// as the fetch recorded the whole leaf. A 4 KiB leaf gives only its page.
-#[test]
-fn a_fetch_takes_every_page_of_its_leaf_granule() {
-    const RET: u32 = 0xd65f_03c0;
-    const PAGES: u64 = 5;
-    let mut words = vec![0u32; (PAGES * 0x1000 / 4) as usize];
-    for page in 0..PAGES {
-        words[(page * 0x400) as usize] = RET;
-    }
-    let pc = |page: u64| BASE + page * 0x1000;
-    // BASE's GiB as one block.
-    let mut machine = machine(&words);
-    normal_memory(&mut machine, false);
-    assert!(matches!(
-        machine.fetch_block(pc(1), false),
-        Ok(Fetched::Block(_))
-    ));
-    let key = machine.current_key(pc(1)).expect("the fetched page");
-    for page in [0, 2, 3] {
-        assert_eq!(
-            machine.current_key(pc(page)),
-            Some(key - 1 + page),
-            "page {page}"
-        );
-    }
-    assert_eq!(machine.current_key(pc(4)), None);
-    let sources = |machine: &Machine<FakeHost, NoDevices>, source: ItlbSource| {
-        machine.statistics.itlb_sources[source as usize]
-    };
-    assert_eq!(sources(&machine, ItlbSource::LeafFills), 3);
-    // Their fetches need no walk: no ITLB miss.
-    let misses = machine.statistics.itlb[0];
-    for page in [0, 2, 3] {
-        assert!(matches!(
-            machine.fetch_block(pc(page), false),
-            Ok(Fetched::Block(_))
-        ));
-    }
-    assert_eq!(machine.statistics.itlb[0], misses);
-    tlbi_page(&mut machine, pc(3));
-    for page in 0..4 {
-        assert_eq!(machine.current_key(pc(page)), None, "page {page}");
-    }
-    // 4 KiB pages: the fetched page alone.
-    let mut machine = machine_with_pages(&words);
-    assert!(matches!(
-        machine.fetch_block(pc(1), false),
-        Ok(Fetched::Block(_))
-    ));
-    assert!(machine.current_key(pc(1)).is_some());
-    assert_eq!(machine.current_key(pc(0)), None);
-    assert_eq!(machine.current_key(pc(2)), None);
-    assert_eq!(sources(&machine, ItlbSource::LeafFills), 0);
-}
-
-/// A machine running `words` at BASE through 4 KiB pages of address
-/// space 0, page `n` at frame `BASE + n * 4 KiB`.
-fn machine_with_pages(words: &[u32]) -> Machine<FakeHost, NoDevices> {
-    let mut machine = machine(words);
-    let frames: Vec<u64> = (0..words.len() as u64 / 0x400)
-        .map(|page| BASE + page * 0x1000)
-        .collect();
-    paged_space(&mut machine, 0, &frames);
-    machine
 }
 
 /// A lower-half page whose walk ended in a global leaf is kept in the
