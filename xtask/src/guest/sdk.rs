@@ -13,6 +13,8 @@
 //! - `TargetConditionals.h`, which Libc supplies, for macOS on arm64.
 //! - `string.h`, which the kernel SDK takes from xnu's `libsa`.
 //! - `stela/gate.h`: the gate window's layout from [`window`].
+//! - `stela/net.h` and `stela/virtio.h`: StelaNet's and the virtio-mmio
+//!   transport's layouts, from `stela_contracts::net` and `::virtio`.
 use anyhow::{Context, Result, bail};
 use std::{fmt::Write as _, fs, path::Path};
 use stela_contracts::gate::window;
@@ -96,6 +98,7 @@ pub fn generate(xnu: &Path, include: &Path) -> Result<()> {
     fs::create_dir_all(&stela)?;
     fs::write(stela.join("gate.h"), gate_header())?;
     fs::write(stela.join("net.h"), net_header())?;
+    fs::write(stela.join("virtio.h"), virtio_header())?;
     Ok(())
 }
 
@@ -277,9 +280,75 @@ fn net_header() -> String {
     header
 }
 
+/// `stela/virtio.h`: the virtio-mmio register page, status and feature bits,
+/// device IDs and split-ring sizes, from `stela_contracts::virtio`. Plain C,
+/// so the kext's ring code compiles against it in the host's tests too.
+pub fn virtio_header() -> String {
+    use stela_contracts::virtio::{features, ids, mmio, ring, status};
+    let mut header = String::from(
+        "/* The virtio-mmio transport's layout, from stela_contracts::virtio. */\n\
+         #pragma once\n",
+    );
+    for (prefix, layout) in [
+        ("MMIO", mmio::LAYOUT),
+        ("STATUS", status::LAYOUT),
+        ("F", features::LAYOUT),
+        ("ID", ids::LAYOUT),
+    ] {
+        for (name, value) in layout {
+            writeln!(header, "#define STELA_VIRTIO_{prefix}_{name} {value:#x}ULL").unwrap();
+        }
+    }
+    for (name, value) in [
+        ("DESC_F_NEXT", ring::DESC_F_NEXT),
+        ("DESC_F_WRITE", ring::DESC_F_WRITE),
+        ("DESC_F_INDIRECT", ring::DESC_F_INDIRECT),
+        ("AVAIL_F_NO_INTERRUPT", ring::AVAIL_F_NO_INTERRUPT),
+        ("USED_F_NO_NOTIFY", ring::USED_F_NO_NOTIFY),
+    ] {
+        writeln!(header, "#define STELA_VIRTIO_{name} {value:#x}").unwrap();
+    }
+    for (name, value) in [
+        ("DESCRIPTOR_BYTES", ring::DESCRIPTOR_BYTES),
+        ("DESC_ALIGN", ring::DESC_ALIGN),
+        ("AVAIL_ALIGN", ring::AVAIL_ALIGN),
+        ("USED_ALIGN", ring::USED_ALIGN),
+        ("QUEUE_MAX", ring::QUEUE_MAX),
+    ] {
+        writeln!(header, "#define STELA_VIRTIO_{name} {value}ULL").unwrap();
+    }
+    // The same arithmetic as ring::desc_bytes, avail_bytes and used_bytes.
+    header.push_str(
+        "#define STELA_VIRTIO_DESC_BYTES(size) (STELA_VIRTIO_DESCRIPTOR_BYTES * (size))\n\
+         #define STELA_VIRTIO_AVAIL_BYTES(size) (4 + 2 * (size) + 2)\n\
+         #define STELA_VIRTIO_USED_BYTES(size) (4 + 8 * (size) + 2)\n",
+    );
+    header
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_virtio_header_names_registers_bits_and_ring_sizes() {
+        let header = virtio_header();
+        for line in [
+            "#define STELA_VIRTIO_MMIO_MAGIC 0x74726976ULL\n",
+            "#define STELA_VIRTIO_MMIO_QUEUE_READY 0x44ULL\n",
+            "#define STELA_VIRTIO_MMIO_CONFIG 0x100ULL\n",
+            "#define STELA_VIRTIO_MMIO_INT_VRING 0x1ULL\n",
+            "#define STELA_VIRTIO_STATUS_FEATURES_OK 0x8ULL\n",
+            "#define STELA_VIRTIO_F_VERSION_1 0x100000000ULL\n",
+            "#define STELA_VIRTIO_F_EVENT_IDX 0x20000000ULL\n",
+            "#define STELA_VIRTIO_ID_RNG 0x4ULL\n",
+            "#define STELA_VIRTIO_DESC_F_WRITE 0x2\n",
+            "#define STELA_VIRTIO_USED_ALIGN 4ULL\n",
+            "#define STELA_VIRTIO_USED_BYTES(size) (4 + 8 * (size) + 2)\n",
+        ] {
+            assert!(header.contains(line), "{line}");
+        }
+    }
 
     const INTERFACE: &str = r#"#include <DriverKit/OSAction.iig>
 class OSAction;
