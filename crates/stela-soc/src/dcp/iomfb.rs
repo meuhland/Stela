@@ -735,8 +735,14 @@ pub struct Methods {
     /// For each queued completion, in the same order: its swap and the
     /// counter when it was submitted and presented ([`Pacing::complete`]).
     completion_times: VecDeque<(u32, u64, u64)>,
-    /// A callback is out and not answered yet.
+    /// A swap, mode or hot-plug callback is out and not answered yet:
+    /// these leave one at a time, in order.
     in_flight: bool,
+    /// A vsync (`D588`) is out and not answered yet. Vsyncs go out on a
+    /// stream of their own beside the other callbacks, as the link gives
+    /// each coprocessor thread its own stream, so a vblank's tick never
+    /// waits for the AP to answer a swap's completion or frame info.
+    vsync_out: bool,
     /// The AP shut the link down (`link_shutdown_signal`).
     shut_down: bool,
     /// The newest counter value the model was given: a call, notice or
@@ -751,6 +757,7 @@ impl Methods {
             || !self.outgoing.is_empty()
             || !self.completed.is_empty()
             || self.in_flight
+            || self.vsync_out
             || self.display.borrow().hotplug_pending()
         {
             return Err(refuse!(
@@ -861,6 +868,7 @@ impl Methods {
             completed: VecDeque::new(),
             completion_times: VecDeque::new(),
             in_flight: false,
+            vsync_out: false,
             shut_down: false,
             now: 0,
         }
@@ -2165,22 +2173,23 @@ impl Service for Methods {
     }
 
     fn callback_pending(&self) -> bool {
-        !self.in_flight
-            && (!(self.outgoing.is_empty() && self.completed.is_empty())
-                || self.refresh.is_some()
-                || (!self.shut_down && self.display.borrow().hotplug_pending()))
+        let vsync = !self.vsync_out && self.refresh.is_some() && self.outgoing.is_empty();
+        vsync
+            || !self.in_flight
+                && (!(self.outgoing.is_empty() && self.completed.is_empty())
+                    || (!self.shut_down && self.display.borrow().hotplug_pending()))
     }
 
     fn take_callback(&mut self) -> Option<Callback<Self>> {
-        if self.in_flight {
-            return None;
-        }
-        if !self.shut_down && self.display.borrow_mut().take_hotplug_request() {
+        if !self.in_flight && !self.shut_down && self.display.borrow_mut().take_hotplug_request() {
             self.queue_hotplug()
                 .expect("the recorded fixed-monitor HPD callback has a valid size");
         }
-        if let Some(counter) = self.refresh.take_if(|_| self.outgoing.is_empty()) {
-            self.in_flight = true;
+        // A mode the AP has not been told of yet goes before the vblanks.
+        if !self.vsync_out
+            && let Some(counter) = self.refresh.take_if(|_| self.outgoing.is_empty())
+        {
+            self.vsync_out = true;
             let mut input = alloc::vec![0u8; size_of::<[u64; 3]>()];
             input[..8].copy_from_slice(&counter.to_le_bytes());
             input[8..16].copy_from_slice(&counter.to_le_bytes());
@@ -2190,12 +2199,15 @@ impl Service for Methods {
                 input,
                 output: 0,
                 then: Box::new(move |methods, _| {
-                    methods.in_flight = false;
+                    methods.vsync_out = false;
                     let waited = methods.now.saturating_sub(counter);
                     methods.pacing.vsync.add(waited);
                     Ok(())
                 }),
             });
+        }
+        if self.in_flight {
+            return None;
         }
         if let Some(Outgoing { tag, input, output }) = self.outgoing.pop_front() {
             self.in_flight = true;

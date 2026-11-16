@@ -66,18 +66,31 @@ fn started(methods: &mut Methods) {
 }
 
 /// Make every queued callback, answering each with `answer`; returns
-/// their tags and inputs.
+/// their tags and inputs in the order they left. At most a vsync and one
+/// other callback are out at once.
 fn drain(methods: &mut Methods, answer: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
     let mut made = Vec::new();
-    while let Some(callback) = methods.take_callback() {
-        assert!(methods.take_callback().is_none(), "one callback at a time");
-        made.push((callback.tag, callback.input.clone()));
-        let mut output = alloc::vec![0u8; callback.output as usize];
-        let n = output.len().min(answer.len());
-        output[..n].copy_from_slice(&answer[..n]);
-        (callback.then)(methods, &output).unwrap();
+    loop {
+        let mut out = Vec::new();
+        while let Some(callback) = methods.take_callback() {
+            out.push(callback);
+        }
+        if out.is_empty() {
+            return made;
+        }
+        let vsyncs = out.iter().filter(|c| c.tag == SWAP_NOTIFY).count();
+        assert!(
+            vsyncs <= 1 && out.len() - vsyncs <= 1,
+            "one callback of each kind at a time"
+        );
+        for callback in out {
+            made.push((callback.tag, callback.input.clone()));
+            let mut output = alloc::vec![0u8; callback.output as usize];
+            let n = output.len().min(answer.len());
+            output[..n].copy_from_slice(&answer[..n]);
+            (callback.then)(methods, &output).unwrap();
+        }
     }
-    made
 }
 
 #[test]
@@ -2892,4 +2905,51 @@ fn a_locked_vblank_falls_half_a_period_to_a_period_and_a_half_after_the_last() {
     assert_eq!(next_vblank(1000, 1000, period, Some(tick_ns)), 151_000 - 1);
     // Half a period before it: a period on.
     assert_eq!(next_vblank(1000, 1000, period, Some(2_083_334)), 101_000);
+}
+
+#[test]
+fn a_vsync_leaves_beside_an_unanswered_swap_callback_and_vsyncs_keep_their_order() {
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let mut methods = Methods::new(Box::new(screen), interface());
+    methods.set_swap_tracing(false);
+    methods.notified = true;
+    let period = methods.refresh_ticks;
+    methods.refresh(0);
+    let first = methods.take_callback().unwrap();
+    assert_eq!(first.tag, SWAP_NOTIFY);
+    (first.then)(&mut methods, &[]).unwrap();
+
+    // A swap presented at the next vblank: its completion goes out and
+    // stays unanswered.
+    methods.observe(1000);
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods
+        .present(period + 5, |_, bytes: &mut [u8]| {
+            bytes.fill(0x5a);
+            true
+        })
+        .unwrap();
+    let vsync = methods.take_callback().unwrap();
+    assert_eq!(vsync.tag, SWAP_NOTIFY);
+    let swap = methods.take_callback().unwrap();
+    assert_ne!(swap.tag, SWAP_NOTIFY);
+    // The next swap callback waits for that one's answer.
+    assert!(methods.take_callback().is_none());
+
+    // The next vblank's vsync waits for the last vsync's answer only.
+    methods.refresh(2 * period);
+    assert!(!methods.callback_pending() && methods.take_callback().is_none());
+    (vsync.then)(&mut methods, &[]).unwrap();
+    assert!(methods.callback_pending());
+    let next = methods.take_callback().unwrap();
+    assert_eq!(next.tag, SWAP_NOTIFY);
+    assert_eq!(next.input[..8], (2 * period).to_le_bytes());
+    (next.then)(&mut methods, &[]).unwrap();
+    (swap.then)(&mut methods, &[]).unwrap();
+    while let Some(callback) = methods.take_callback() {
+        assert_ne!(callback.tag, SWAP_NOTIFY);
+        (callback.then)(&mut methods, &[]).unwrap();
+    }
+    assert!(methods.check_reset().is_ok());
 }
