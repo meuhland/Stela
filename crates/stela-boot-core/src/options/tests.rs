@@ -279,6 +279,53 @@ fn virtio_snd_needs_virtio_and_its_capture_a_number_of_seconds() {
     }
 }
 
+/// `--virtio-snd` with the HDMI output: the virtio sound device feeds the
+/// route and the USB speaker is left unattached; every other combination
+/// keeps the speaker as it was.
+#[test]
+fn virtio_snd_with_the_hdmi_output_leaves_the_usb_speaker_unattached() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    // The snd-hdmi boot's line.
+    let line = format!(
+        "{preboot} --guest-audio-hdmi-trust-quiesced --virtio --virtio-snd --virtio-snd-capture \
+         10 --page-relative --shared-aliases"
+    );
+    let options = round_trip(&line);
+    assert_eq!(options.to_string(), line);
+    assert!(options.guest_audio && options.guest_audio_hdmi && options.virtio_snd);
+    assert!(options.guest_audio_from_virtio());
+    assert!(!options.guest_audio_usb_speaker());
+    for (words, from_virtio, speaker) in [
+        ("", false, false),
+        ("--guest-audio", false, true),
+        ("--guest-audio-hdmi", false, true),
+        ("--guest-audio-async", false, true),
+        ("--guest-audio --virtio --virtio-snd", false, true),
+        ("--guest-audio-hdmi --virtio", false, true),
+        ("--virtio --virtio-snd", false, false),
+        ("--guest-audio-hdmi --virtio --virtio-snd", true, false),
+        ("--guest-audio-hdmi-tone --virtio --virtio-snd", true, false),
+        (
+            "--guest-audio-hdmi --guest-audio-async --virtio --virtio-snd-capture 5",
+            true,
+            false,
+        ),
+    ] {
+        let options = round_trip(&format!("{preboot} {words}"));
+        assert_eq!(
+            (
+                options.guest_audio_from_virtio(),
+                options.guest_audio_usb_speaker()
+            ),
+            (from_virtio, speaker),
+            "{words}"
+        );
+    }
+    assert!(GUEST_AUDIO_FROM_VIRTIO.starts_with("GUEST AUDIO source: virtio-snd"));
+    assert!(GUEST_AUDIO_FROM_VIRTIO.contains("the USB speaker is left unattached"));
+    assert!(GUEST_AUDIO_FROM_VIRTIO.contains("without --virtio-snd the USB speaker feeds HDMI"));
+}
+
 #[test]
 fn chosen_disk_round_trips_and_the_mount_refuses_it_unreplaced() {
     let line = "--system --storage @disk --nor @disk --preboot @disk";

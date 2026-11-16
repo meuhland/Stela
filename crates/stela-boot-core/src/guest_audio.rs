@@ -750,6 +750,35 @@ pub struct Report {
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let unsent = if self.asynchronous {
+            ""
+        } else {
+            "(unsent:adaptive)"
+        };
+        self.write(f, unsent)
+    }
+}
+
+/// The `GUEST AUDIO` line when the virtio sound device is the source
+/// (`--virtio-snd` with `--guest-audio-hdmi`): [`Report`]'s fields, the
+/// feedback marked unsent because the virtio stream is paced by the host's
+/// side and needs none (`measured=` is then the output's rate against the
+/// host's device clock), and `source=virtio-snd` at the end. `frames=` is
+/// what the virtio sink pushed (the guest's frames and its underruns'
+/// silence), `dropped=` what its full ring dropped plus the cap's trims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioReport(pub Report);
+
+impl fmt::Display for VirtioReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.write(f, "(unsent:virtio)")?;
+        f.write_str(" source=virtio-snd")
+    }
+}
+
+impl Report {
+    /// The line, with `unsent` after the feedback.
+    fn write(&self, f: &mut fmt::Formatter<'_>, unsent: &str) -> fmt::Result {
         let volume = i32::from(self.volume);
         let (sign, magnitude) = if volume < 0 {
             ("-", -volume)
@@ -782,16 +811,7 @@ impl fmt::Display for Report {
             Some(levels) => write!(f, "{levels}")?,
             None => f.write_str("-")?,
         }
-        write!(
-            f,
-            " feedback={}{} measured=",
-            Rate(self.feedback),
-            if self.asynchronous {
-                ""
-            } else {
-                "(unsent:adaptive)"
-            }
-        )?;
+        write!(f, " feedback={}{unsent} measured=", Rate(self.feedback))?;
         match self.measured {
             Some(rate) => write!(f, "{}", Deviation(rate))?,
             None => f.write_str("-")?,
@@ -927,6 +947,30 @@ impl fmt::Display for StreamStatus {
         Ok(())
     }
 }
+
+/// The one-time line naming the route when the virtio sound device feeds
+/// the guest-audio output: on the monitor at `place`, or (`None`) to the
+/// sink at the host's counter when no HDMI playback was set up.
+pub fn virtio_route(place: Option<&str>) -> alloc::string::String {
+    match place {
+        Some(place) => alloc::format!(
+            "GUEST AUDIO route: virtio-snd -> guest-audio ring -> HDMI on {place}: the virtio \
+             stream (48 kHz only; 16- or 32-bit, played as 16-bit) is paced by the HDMI periods \
+             written (clock=hdmi-frames), by the host's device clock while HDMI does not run \
+             (clock=device-ticks); the backlog fills to {} ms, {} ms at most",
+            TARGET_FRAMES * 1000 / RATE as usize,
+            CAP_FRAMES * 1000 / RATE as usize,
+        ),
+        None => alloc::string::String::from(
+            "GUEST AUDIO route: virtio-snd -> guest-audio ring -> a sink at the host's counter: \
+             no HDMI playback was set up, so the virtio stream is paced by the host's device \
+             clock (clock=device-ticks)",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod virtio_tests;
 
 #[cfg(test)]
 mod tests {

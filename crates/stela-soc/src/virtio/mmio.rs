@@ -296,6 +296,12 @@ impl Mmio {
         self.device.counters()
     }
 
+    /// Whether the device handed the host work for a service turn; cleared
+    /// by asking.
+    pub fn take_host_due(&mut self) -> bool {
+        self.device.take_host_due()
+    }
+
     fn raise(&mut self, bits: u32, access: &mut Access<'_>) {
         if self.interrupt_status == 0 {
             self.stats.interrupts += 1;

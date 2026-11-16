@@ -92,6 +92,12 @@ pub trait VirtioDevice {
     fn counters(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
     }
+    /// Whether it handed the host something a host service turn should
+    /// take soon, such as the sound device's frames in the guest-audio
+    /// ring; cleared by asking.
+    fn take_host_due(&mut self) -> bool {
+        false
+    }
     /// Its DMA step on `queues` (`None` where a queue is not ready), the
     /// ones in `notified` (bit per index) told of new buffers, with
     /// `VIRTIO_F_EVENT_IDX` as negotiated, at counter tick `now`. An error

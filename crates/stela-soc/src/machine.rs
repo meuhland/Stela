@@ -1401,6 +1401,8 @@ impl Devices for AppleDevices {
 
     fn take_host_service(&mut self) -> bool {
         let net = self.stela_net_take_service_due();
+        // The virtio sound device's 5 ms of frames in the guest-audio ring.
+        let virtio = self.virtio_take_host_due();
         self.usb_masters.iter_mut().fold(
             core::mem::take(&mut self.frame_presented),
             |due, master| {
@@ -1413,6 +1415,7 @@ impl Devices for AppleDevices {
                 master.session.take_due() | audio | due
             },
         ) | net
+            | virtio
     }
 
     fn device_name(&self, physical: u64) -> Option<&'static str> {

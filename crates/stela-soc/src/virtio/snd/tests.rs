@@ -790,3 +790,82 @@ fn the_transport_steps_the_device_at_its_deadline() {
     assert_eq!(mmio.deadline(), None);
     assert!(!mmio.due_at(u64::MAX));
 }
+
+/// The guest-audio ring as the device's sink: it offers 48 kHz only and
+/// refuses 44.1 kHz at SET_PARAMS (the ring has no resampler), the frames
+/// reach the ring as the clock reaches them, the host is asked to take
+/// them, and the report names the clock's source.
+#[test]
+fn the_ring_sink_offers_48_khz_only_and_plays_the_stream_into_the_ring() {
+    use super::sink::{GuestAudioRing, GuestRing};
+    let ring = GuestRing::new();
+    let mut bench = Bench::with_sink(Box::new(GuestAudioRing::new(ring.clone(), HZ, None)));
+    let (status, pcm) = bench.request(&query(R_PCM_INFO, 0, 1, 32), 4 + 32);
+    assert_eq!(status, S_OK);
+    assert_eq!(
+        u64::from_le_bytes(pcm[16..24].try_into().unwrap()),
+        1 << 7,
+        "48 kHz only"
+    );
+    assert_eq!(
+        u64::from_le_bytes(pcm[8..16].try_into().unwrap()),
+        1 << 5 | 1 << 17,
+        "S16 and S32"
+    );
+    assert_eq!(
+        bench.set_params(8 * 1764, 1764, 2, FMT_S16, RATE_44100),
+        S_NOT_SUPP
+    );
+    assert_eq!(
+        bench.device.take_notes(),
+        [
+            "stream 0 PCM_SET_PARAMS refused (NOT_SUPP): 2ch S16 44100 Hz: its sink plays 48000 \
+             Hz only, with no resampler"
+        ]
+    );
+    assert_eq!(bench.device.state(), State::Initial);
+    assert_eq!(
+        bench.set_params(8 * 3840, 3840, 2, FMT_S32, RATE_48000),
+        S_OK
+    );
+    bench.prepared();
+    let posted: Vec<Posted> = (1..=3)
+        .map(|n| bench.transfer(0, &period(1000 * n)))
+        .collect();
+    assert_eq!(bench.pcm(R_PCM_START, 0), S_OK);
+    assert_eq!(ring.bits(), 16);
+    // The next step plays the first period into the ring, which asks the
+    // host for a service turn.
+    bench.after(1);
+    assert_eq!(ring.queued(), 480);
+    assert!(bench.device.take_host_due());
+    assert!(!bench.device.take_host_due());
+    // The output runs and publishes: the clock follows it from the next
+    // step, and the transfers complete at its pace.
+    ring.publish(0, bench.host.get(), 1920);
+    bench.after(PERIOD_TICKS);
+    assert_eq!(bench.used(2), [(posted[0].head, 8)]);
+    let mut out = [[0; 2]; 960];
+    assert_eq!(ring.take(&mut out), 960);
+    assert_eq!(out[0], [1000 << 16, 1000 << 16]);
+    assert_eq!(out[480], [2000 << 16, 2000 << 16]);
+    let notes = bench.device.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("clock: hdmi-frames from frame ")),
+        "{notes:?}"
+    );
+    // The output consumed a period: the second transfer completes.
+    ring.publish(480, bench.host.get() + PERIOD_TICKS, 1920);
+    bench.after(PERIOD_TICKS);
+    assert_eq!(bench.used(2), [(posted[1].head, 8)]);
+    assert_eq!(bench.pcm(R_PCM_STOP, 0), S_OK);
+    let notes = bench.device.take_notes();
+    assert!(notes[0].starts_with("frames=1440 "), "{notes:?}");
+    assert!(notes[0].ends_with(" clock=hdmi-frames"), "{notes:?}");
+    assert_eq!(ring.bits(), 0);
+    let counters = bench.device.counters();
+    assert!(counters.contains(&("ring_pushed", 1440)), "{counters:?}");
+    assert!(counters.contains(&("clock_handoffs", 1)), "{counters:?}");
+}

@@ -272,13 +272,17 @@ impl Snd {
                 .millis(self.latency_bytes() / u64::from(params.format.frame_bytes()))
         });
         let line = format!(
-            "frames={} peak={} rms={} underruns={} silent={} latency_ms={}",
+            "frames={} peak={} rms={} underruns={} silent={} latency_ms={}{}",
             played.frames,
             meter.peak_dbfs(),
             meter.rms_dbfs(),
             self.counters.underruns,
             played.silent,
             latency,
+            self.sink
+                .clock_source()
+                .map(|source| format!(" clock={source}"))
+                .unwrap_or_default(),
         );
         self.note(line);
     }
@@ -360,6 +364,22 @@ impl Snd {
             sample_bytes: bytes as u8,
             rate: hz as u32,
         };
+        let rates = self.sink.rates();
+        if rates & 1 << rate == 0 {
+            // A rate the device offers but its sink does not play: the
+            // guest-audio ring is 48 kHz and has no resampler.
+            let plays: Vec<String> = (0..64)
+                .filter(|code| rates & 1 << code != 0)
+                .filter_map(|code| rate_hz(code as u8))
+                .map(|hz| format!("{hz} Hz"))
+                .collect();
+            self.note(format!(
+                "stream 0 PCM_SET_PARAMS refused (NOT_SUPP): {format}: its sink plays {} only, \
+                 with no resampler",
+                plays.join(", ")
+            ));
+            return S_NOT_SUPP;
+        }
         let frame = format.frame_bytes();
         if period_bytes == 0
             || !period_bytes.is_multiple_of(frame)
@@ -422,11 +442,13 @@ impl Snd {
         slot[16] = 1;
     }
 
-    fn pcm_info(_: u32, slot: &mut [u8]) {
+    /// The stream's info, offering the `rates` its sink plays.
+    fn pcm_info(rates: u64, slot: &mut [u8]) {
         let at = |offset: u64| offset as usize;
         slot[at(PCM_INFO_FORMATS)..at(PCM_INFO_FORMATS) + 8]
             .copy_from_slice(&FORMATS.to_le_bytes());
-        slot[at(PCM_INFO_RATES)..at(PCM_INFO_RATES) + 8].copy_from_slice(&RATES.to_le_bytes());
+        slot[at(PCM_INFO_RATES)..at(PCM_INFO_RATES) + 8]
+            .copy_from_slice(&(RATES & rates).to_le_bytes());
         slot[at(PCM_INFO_DIRECTION)] = D_OUTPUT as u8;
         slot[at(PCM_INFO_CHANNELS_MIN)] = CHANNELS;
         slot[at(PCM_INFO_CHANNELS_MAX)] = CHANNELS;
@@ -448,7 +470,12 @@ impl Snd {
         let code = u64::from(word(request, 0));
         match code {
             R_JACK_INFO => Self::info(request, JACKS, JACK_INFO_BYTES, Self::jack_info),
-            R_PCM_INFO => Self::info(request, STREAMS, PCM_INFO_BYTES, Self::pcm_info),
+            R_PCM_INFO => {
+                let rates = self.sink.rates();
+                Self::info(request, STREAMS, PCM_INFO_BYTES, |_, slot| {
+                    Self::pcm_info(rates, slot)
+                })
+            }
             R_CHMAP_INFO => Self::info(request, CHMAPS, CHMAP_INFO_BYTES, Self::chmap_info),
             R_PCM_SET_PARAMS | R_PCM_PREPARE | R_PCM_RELEASE | R_PCM_START | R_PCM_STOP => {
                 let needed = if code == R_PCM_SET_PARAMS {
@@ -764,7 +791,7 @@ impl VirtioDevice for Snd {
 
     fn counters(&self) -> Vec<(&'static str, u64)> {
         let played = self.sink.played();
-        vec![
+        let mut counters = vec![
             ("frames", played.frames),
             ("silent", played.silent),
             ("underruns", self.counters.underruns),
@@ -772,7 +799,13 @@ impl VirtioDevice for Snd {
             ("bad_transfers", self.counters.bad_transfers),
             ("requests", self.counters.requests),
             ("refused", self.counters.refused),
-        ]
+        ];
+        counters.extend(self.sink.counters());
+        counters
+    }
+
+    fn take_host_due(&mut self) -> bool {
+        self.sink.take_due()
     }
 
     fn step(
@@ -785,6 +818,8 @@ impl VirtioDevice for Snd {
     ) -> Result<Served, &'static str> {
         let host = self.host(now);
         self.last = Some((now, host));
+        // A sink whose clock follows its output looks at it first.
+        self.sink.advance(host);
         let mut served = Served::default();
         let [control, _event, tx, ..] = queues else {
             return Ok(served);

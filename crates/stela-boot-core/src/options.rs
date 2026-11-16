@@ -38,6 +38,13 @@ pub const VIRTIO_SND: &str = "--virtio-snd";
 pub const VIRTIO_SND_CAPTURE: &str = "--virtio-snd-capture";
 /// The most seconds `--virtio-snd-capture` keeps.
 pub const VIRTIO_SND_CAPTURE_MAX: u32 = 60;
+/// The boot's line when the virtio sound device feeds the HDMI route
+/// ([`System::guest_audio_from_virtio`]): the rule, and how to undo it.
+pub const GUEST_AUDIO_FROM_VIRTIO: &str = "GUEST AUDIO source: virtio-snd (--virtio-snd with \
+     --guest-audio-hdmi): the virtio sound device feeds the HDMI route and the USB speaker is \
+     left unattached, so macOS has one output (\"Stela virtio sound\"); without --virtio-snd the \
+     USB speaker feeds HDMI as before, and with --guest-audio alone (no HDMI) both devices are \
+     given, each to its own sink";
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -736,6 +743,21 @@ impl System {
     /// start is all they have of a GPU.
     pub fn hides_agx(&self, metal_device: bool) -> bool {
         metal_device || self.starts_metal_clients()
+    }
+
+    /// Whether the HDMI route's guest sound comes from the virtio sound
+    /// device instead of the USB speaker: `--virtio-snd` with
+    /// `--guest-audio-hdmi` (or an option implying it). The USB speaker is
+    /// then left unattached, so macOS has one output to pick
+    /// ([`Self::guest_audio_usb_speaker`], [`GUEST_AUDIO_FROM_VIRTIO`]).
+    pub fn guest_audio_from_virtio(&self) -> bool {
+        self.virtio && self.virtio_snd && self.guest_audio && self.guest_audio_hdmi
+    }
+
+    /// Whether the guest gets the USB speaker: `--guest-audio`, unless the
+    /// virtio sound device feeds the HDMI route.
+    pub fn guest_audio_usb_speaker(&self) -> bool {
+        self.guest_audio && !self.guest_audio_from_virtio()
     }
 
     /// Select the exact number of host processors the loader reserves.

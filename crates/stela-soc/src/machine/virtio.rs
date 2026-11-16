@@ -103,6 +103,21 @@ impl AppleDevices {
             .min()
     }
 
+    /// Whether a virtio device handed the host work for a service turn,
+    /// such as the sound device's frames in the guest-audio ring; each
+    /// device's flag is cleared by asking.
+    pub(super) fn virtio_take_host_due(&mut self) -> bool {
+        let mut due = false;
+        for index in 0..self.virtio.len() {
+            let device = self.virtio[index];
+            due |= self
+                .bus
+                .device_mut::<Mmio>(device)
+                .is_some_and(Mmio::take_host_due);
+        }
+        due
+    }
+
     /// Each device's DMA step, in a transfer of the home machine's own,
     /// after a write that reached it, or when it has work ([`takes_step`]).
     pub(super) fn transfer_virtio(&mut self, cpu: usize, memory: &mut dyn Memory, now: u64) {

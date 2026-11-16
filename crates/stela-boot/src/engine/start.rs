@@ -1202,14 +1202,30 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             offloads.name()
         ));
     }
-    if let Some(board) = &board {
-        virtio::add(
+    // The guest-audio ring the virtio sound device plays into, when it
+    // feeds the HDMI route (`--virtio-snd` with `--guest-audio-hdmi`): the
+    // rule, logged once; the USB speaker was left off the hub.
+    if options.guest_audio_from_virtio() {
+        output::arguments(format_args!(
+            "{}\n",
+            stela_boot_core::options::GUEST_AUDIO_FROM_VIRTIO
+        ));
+        if options.guest_audio_async {
+            output::arguments(format_args!(
+                "GUEST AUDIO --guest-audio-async ignored: it is the USB speaker's, and no USB \
+                 speaker is attached\n"
+            ));
+        }
+    }
+    let virtio_audio = match &board {
+        Some(board) => virtio::add(
             &mut devices,
             virtio_placed,
             u32::from(board.aic.layout.max_irq()),
             &virtio_config,
-        );
-    }
+        ),
+        None => None,
+    };
     // Device placement has copied the carried firmware. This function
     // never returns, so release the remaining input buffers here.
     drop(built);
@@ -1271,12 +1287,18 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_usb,
                 host_bluetooth,
                 guest_audio: options.guest_audio.then(|| {
+                    let source = if options.guest_audio_from_virtio() {
+                        guest_audio::Source::Virtio(virtio_audio)
+                    } else {
+                        guest_audio::Source::Usb
+                    };
                     guest_audio::GuestAudio::new(
                         display_audio,
                         handoff.root,
                         options.guest_audio_hdmi_tone,
                         options.guest_audio_async,
                         handoff.tsc_hz,
+                        source,
                     )
                 }),
                 guest_network,
@@ -1834,8 +1856,10 @@ fn place_devices(
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
-                audio: options.guest_audio,
-                audio_async: options.guest_audio && options.guest_audio_async,
+                // Without the speaker when the virtio sound device feeds
+                // the HDMI route (`System::guest_audio_from_virtio`).
+                audio: options.guest_audio_usb_speaker(),
+                audio_async: options.guest_audio_usb_speaker() && options.guest_audio_async,
             },
             scanout,
             firmware: &firmware,
@@ -3104,7 +3128,7 @@ fn start_devices(
                 stela_soc::machine::UsbCables::disk_ports(
                     options.guest_network,
                     options.input,
-                    options.guest_audio,
+                    options.guest_audio_usb_speaker(),
                 )
                 .saturating_sub(owned_usb.len())
             });

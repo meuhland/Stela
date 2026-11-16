@@ -15,9 +15,19 @@
 //!   the guest's sound in host memory, from its first sample that is not
 //!   silence, and logs once their SHA-256, peak and RMS: a boot can show
 //!   that the guest's samples arrived intact without anyone listening.
-//! - The guest-audio ring of `audio-main` (the HDMI output) is the third,
-//!   once that branch is on this one: a sink whose clock is what the ring
-//!   accepts, and whose `play` pushes into it. See `virtio-k5.md`.
+//! - [`GuestAudioRing`] plays the stream on the host's guest-audio output
+//!   (the HDMI route of `--guest-audio-hdmi`): its `play` pushes the frames
+//!   into a ring the boot's guest-audio service takes from, and its clock
+//!   follows the frames that output consumed, on the host's counter while
+//!   the output does not run (`ring`).
+mod ring;
+
+pub use ring::{
+    BACKLOG_TARGET_FRAMES, ClockChange, ClockSource, FollowClock, GuestAudioRing, GuestRing,
+    LEVEL_STEP_FRAMES, MAX_SLEW_PPM, Published, RESYNC_FRAMES, RING_FRAMES, RingStats,
+    SLEW_HORIZON_FRAMES, STALE_MILLIS, ring_frames,
+};
+
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -234,6 +244,28 @@ pub trait Sink {
     fn release(&mut self) {}
     /// Lines of its own for the log since the last call.
     fn take_notes(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Looks at its output at host tick `now`, at the start of each device
+    /// step, before the step reads its clock: a sink whose clock follows
+    /// another one moves it here.
+    fn advance(&mut self, _now: u64) {}
+    /// The rates it plays, as `virtio_snd` `RATE_*` bits: the device offers
+    /// only these and refuses the others at `SET_PARAMS`.
+    fn rates(&self) -> u64 {
+        super::RATES
+    }
+    /// What its clock runs on, for the report line, when it can change.
+    fn clock_source(&self) -> Option<&'static str> {
+        None
+    }
+    /// Whether frames wait for a host service that takes them; cleared by
+    /// asking.
+    fn take_due(&mut self) -> bool {
+        false
+    }
+    /// Counters of its own, by name, for the device's report.
+    fn counters(&self) -> Vec<(&'static str, u64)> {
         Vec::new()
     }
 }

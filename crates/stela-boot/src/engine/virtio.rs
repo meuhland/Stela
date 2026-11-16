@@ -13,7 +13,13 @@
 //!   counter (`stela_soc::virtio::snd`), which paces the guest's engine;
 //!   with `--virtio-snd-capture SECONDS` the sink also keeps the first
 //!   seconds of sound and logs their fingerprint. Its stream's requests,
-//!   state changes and level are logged as `VIRTIO snd <note>`.
+//!   state changes and level are logged as `VIRTIO snd <note>`. With
+//!   `--guest-audio-hdmi` as well, the sink is the guest-audio ring
+//!   (`sink::GuestAudioRing`) that the guest-audio service plays on the
+//!   HDMI route in place of the USB speaker, its clock following the HDMI
+//!   periods written ([`add`] hands the service the ring). The device's
+//!   clock is the host's device clock (`host::device_ticks`), which never
+//!   goes back whichever core steps it.
 //!
 //! The devices' node indices are [`DEVICES`]' order, kept in this one
 //! place: a device a boot leaves out keeps its index free.
@@ -28,7 +34,7 @@
 //! console's lines, and the devices' counters at each service report while
 //! they move.
 use super::{host, output, parallel};
-use alloc::{boxed::Box, format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use stela_boot_core::options::System;
 use stela_contracts::interrupt::AicInput;
@@ -40,7 +46,10 @@ use stela_soc::virtio::{
     console::{Console, Echo, Input, Silent},
     mmio::Event,
     rng::Rng,
-    snd::{Snd, sink},
+    snd::{
+        Snd,
+        sink::{self, GuestAudioRing, GuestRing},
+    },
 };
 
 // The sound device's clock is the host's counter, which ticks as the
@@ -95,6 +104,9 @@ pub(super) struct Config {
     console_echo: bool,
     /// The sound device, and the seconds its capture keeps, if any.
     sound: Option<Option<u32>>,
+    /// The sound device plays into the guest-audio ring of the HDMI route
+    /// (`System::guest_audio_from_virtio`).
+    hdmi_ring: bool,
 }
 
 impl Config {
@@ -102,6 +114,7 @@ impl Config {
         Self {
             console_echo: options.virtio_console_echo,
             sound: options.virtio_snd.then_some(options.virtio_snd_capture),
+            hdmi_ring: options.guest_audio_from_virtio(),
         }
     }
 
@@ -166,8 +179,16 @@ pub(super) fn place(tree: &mut DeviceTree, config: &Config) -> Vec<Placed> {
 }
 
 /// Puts each placed device where its node says, its AIC input split into
-/// die and input by the board's `per_die`, as `config` asks.
-pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32, config: &Config) {
+/// die and input by the board's `per_die`, as `config` asks. The
+/// guest-audio ring the sound device plays into, when it feeds the HDMI
+/// route, for the guest-audio service.
+pub(super) fn add(
+    devices: &mut AppleDevices,
+    placed: Vec<Placed>,
+    per_die: u32,
+    config: &Config,
+) -> Option<Arc<GuestRing>> {
+    let mut audio = None;
     for Placed {
         index,
         kind,
@@ -192,12 +213,24 @@ pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32,
                 (Box::new(Console::new(input)), detail.into())
             }
             Kind::Sound => {
-                let sink = sink::boxed(host::COUNTER_HZ, config.sound.flatten());
+                let capture = config.sound.flatten();
+                let (sink, rates): (Box<dyn sink::Sink>, &str) = if config.hdmi_ring {
+                    let ring = GuestRing::new();
+                    audio = Some(ring.clone());
+                    (
+                        Box::new(GuestAudioRing::new(ring, host::COUNTER_HZ, capture)),
+                        "48 kHz; 44.1 kHz refused, the ring has no resampler",
+                    )
+                } else {
+                    (sink::boxed(host::COUNTER_HZ, capture), "48/44.1 kHz")
+                };
                 let detail = format!(
-                    ", one output stream (2ch S16/S32, 48/44.1 kHz) played to {}",
+                    ", one output stream (2ch S16/S32, {rates}) played to {}",
                     sink.describe()
                 );
-                let clock = Box::new(host::fresh_counter);
+                // The device clock: a step on a core whose counter trails
+                // the last step's would otherwise see the clock go back.
+                let clock = Box::new(host::device_ticks);
                 (
                     Box::new(Snd::new(sink, Some(clock), host::COUNTER_HZ)),
                     detail,
@@ -220,6 +253,7 @@ pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32,
             }
         ));
     }
+    audio
 }
 
 /// Logs what the devices' drivers did since the last call, and the

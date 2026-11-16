@@ -42,13 +42,24 @@
 //! `HDMI_RESETS` times a boot, 10 s apart. Each turn reads the route back
 //! once. With `--guest-audio-hdmi-tone` the route plays a 1 kHz test tone
 //! instead of the guest's frames.
+//!
+//! With `--virtio-snd` as well (`System::guest_audio_from_virtio`) the
+//! frames come from the virtio sound device instead of the USB speaker,
+//! which is not attached ([`Source::Virtio`]): its sink pushes them into a
+//! `GuestRing`, which each turn takes from as it takes the speaker's. After
+//! each HDMI turn the ring is told the frames the output consumed, the
+//! backlog, and whether the route ran through the turn
+//! (`GuestRing::publish`); the virtio stream's clock follows that, so the
+//! guest is paced by the HDA link (`clock=hdmi-frames`), and goes back to
+//! the host's device clock while the route does not run
+//! (`clock=device-ticks`).
 use super::{host, output, storage::RestoreRoot};
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_boot_core::guest_audio::{
-    self, Backlog, CAP_FRAMES, Counters, Dbfs, Feedback, FifoCorrelation, Level, MAX_STEP_FRAMES,
-    Pacer, Report, RestartReason, Restarts, Sample, Step, Tone, Uploads, crossed, logged,
-    s16_period,
+    self, Backlog, CAP_FRAMES, Counters, Dbfs, FEEDBACK_NOMINAL, Feedback, FifoCorrelation, Level,
+    MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts, Sample, Step, Tone, Uploads,
+    VirtioReport, crossed, logged, s16_period, virtio_route,
 };
 use stela_drivers::{
     audio::{
@@ -65,6 +76,7 @@ use stela_drivers::{
     },
 };
 use stela_soc::machine::{AppleDevices, USB_AUDIO_CHANNELS, UsbAudioMode, UsbAudioStatus};
+use stela_soc::virtio::snd::sink::GuestRing;
 
 type Frame = [i32; USB_AUDIO_CHANNELS];
 
@@ -120,7 +132,75 @@ const HDMI_RETRY_TICKS: u64 = host::COUNTER_HZ;
 /// How often a paused route looks for its monitor again: one pin sense.
 const HDMI_PAUSED_TICKS: u64 = host::COUNTER_HZ / 4;
 
+/// Where the guest's frames come from.
+pub(super) enum Source {
+    /// The USB speaker on the native hub (`--guest-audio`).
+    Usb,
+    /// The virtio sound device's guest-audio ring (`--virtio-snd` with
+    /// `--guest-audio-hdmi`); `None` when the device was not placed.
+    Virtio(Option<Arc<GuestRing>>),
+}
+
+/// The input's state at a turn: the speaker's status, or the ring's.
+#[derive(Clone, Copy, Debug)]
+struct Input {
+    /// The samples' bits while the guest streams, 0 while idle.
+    bits: u8,
+    muted: bool,
+    volume: i16,
+    /// Frames the guest sent, and those dropped at the input's full ring.
+    received: u64,
+    overflowed: u64,
+    split: u64,
+    packets: u64,
+    feedback_reads: u64,
+    asynchronous: bool,
+    /// The time the output's rate is measured against: the guest's (the
+    /// speaker's last service), or the host's device clock for the ring.
+    time: u64,
+}
+
+impl From<UsbAudioStatus> for Input {
+    fn from(status: UsbAudioStatus) -> Self {
+        Self {
+            bits: status.bits,
+            muted: status.muted,
+            volume: status.volume,
+            received: status.counters.received,
+            overflowed: status.counters.overflowed,
+            split: status.counters.split,
+            packets: status.counters.packets,
+            feedback_reads: status.counters.feedback_reads,
+            asynchronous: status.mode == UsbAudioMode::Asynchronous,
+            time: status.time,
+        }
+    }
+}
+
+impl Input {
+    /// The virtio ring at device-clock tick `now`: the guest's volume and
+    /// mute are applied in the guest (the kext's clip), so neither is the
+    /// host's.
+    fn of_ring(ring: &GuestRing, now: u64) -> Self {
+        let stats = ring.stats();
+        Self {
+            bits: ring.bits(),
+            muted: false,
+            volume: 0,
+            received: stats.pushed,
+            overflowed: stats.dropped,
+            split: 0,
+            packets: 0,
+            feedback_reads: 0,
+            asynchronous: false,
+            time: now,
+        }
+    }
+}
+
 pub(super) struct GuestAudio {
+    /// The USB speaker, or the virtio sound device's ring.
+    source: Source,
     pacer: Pacer,
     counters: Counters,
     /// Whether the backlog fills or plays.
@@ -139,8 +219,8 @@ pub(super) struct GuestAudio {
     left: usize,
     /// The frames a turn takes, before they leave the devices' lock.
     frames: Vec<Frame>,
-    /// The function's last status and queue, from the last turn.
-    status: Option<(UsbAudioStatus, usize)>,
+    /// The input's last state and queue, from the last turn.
+    status: Option<(Input, usize)>,
     /// The bit resolution last reported, 0 while idle.
     streaming: u8,
     reported: Option<Report>,
@@ -154,18 +234,28 @@ impl GuestAudio {
     /// `tone`: the HDMI route plays the built-in test tone instead of the
     /// guest's sound (`--guest-audio-hdmi-tone`). `asynchronous`: the
     /// speaker sends the feedback (`--guest-audio-async`). `tsc_hz` times
-    /// the FIFO correlation's window.
+    /// the FIFO correlation's window. `source`: the USB speaker, or the
+    /// virtio sound device's ring.
     pub(super) fn new(
         display: Option<DisplayAudio>,
         root: u64,
         tone: bool,
         asynchronous: bool,
         tsc_hz: u64,
+        source: Source,
     ) -> Self {
-        output::arguments(format_args!(
-            "{}\n",
-            guest_audio::endpoint_mode(asynchronous)
-        ));
+        let virtio = matches!(source, Source::Virtio(_));
+        match &source {
+            Source::Usb => output::arguments(format_args!(
+                "{}\n",
+                guest_audio::endpoint_mode(asynchronous)
+            )),
+            Source::Virtio(Some(_)) => {}
+            Source::Virtio(None) => output::arguments(format_args!(
+                "GUEST AUDIO route: virtio-snd was not placed, so no guest sound reaches the \
+                 output (and the USB speaker is not attached)\n"
+            )),
+        }
         let (hdmi, display) = match display {
             Some(DisplayAudio {
                 hosts,
@@ -173,10 +263,14 @@ impl GuestAudio {
             }) => {
                 let mut hosts = hosts;
                 let host = hosts.remove(index);
-                output::arguments(format_args!(
-                    "GUEST AUDIO speaker on the native hub: 48 kHz stereo, played on the \
-                     monitor: {place}\n"
-                ));
+                if virtio {
+                    output::arguments(format_args!("{}\n", virtio_route(Some(place.as_str()))));
+                } else {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO speaker on the native hub: 48 kHz stereo, played on the \
+                         monitor: {place}\n"
+                    ));
+                }
                 let ring_ms = HDMI_PERIODS * HDMI_PERIOD_MS;
                 output::arguments(format_args!(
                     "GUEST AUDIO HDMI ring: {HDMI_PERIODS} periods of {HDMI_PERIOD_MS} ms \
@@ -248,15 +342,23 @@ impl GuestAudio {
                         "GUEST AUDIO HDMI test tone not played: no HDMI playback was set up\n"
                     ));
                 }
-                output::arguments(format_args!(
-                    "GUEST AUDIO speaker on the native hub: 48 kHz stereo, played to a sink at \
-                     the host's counter; HDMI audio functions claimed: {}\n",
-                    display.as_ref().map_or(0, |display| display.hosts.len())
-                ));
+                let claimed = display.as_ref().map_or(0, |display| display.hosts.len());
+                if virtio {
+                    output::arguments(format_args!(
+                        "{}; HDMI audio functions claimed: {claimed}\n",
+                        virtio_route(None)
+                    ));
+                } else {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO speaker on the native hub: 48 kHz stereo, played to a sink \
+                         at the host's counter; HDMI audio functions claimed: {claimed}\n",
+                    ));
+                }
                 (None, display)
             }
         };
         Self {
+            source,
             pacer: Pacer::new(host::COUNTER_HZ),
             counters: Counters::default(),
             backlog: Backlog::default(),
@@ -281,32 +383,56 @@ impl GuestAudio {
     /// guest does not stream, what it left waiting is discarded and the
     /// sink's clock stops.
     pub(super) fn serve(&mut self, devices: &mut AppleDevices, now: u64) {
-        let Some((status, queued)) = devices.guest_audio_status() else {
-            return;
+        let (status, queued) = match &self.source {
+            Source::Usb => {
+                let Some((status, queued)) = devices.guest_audio_status() else {
+                    return;
+                };
+                // The feedback the last turn computed (unsent by an
+                // adaptive speaker).
+                devices.guest_audio_feedback(self.feedback.value());
+                (Input::from(status), queued)
+            }
+            Source::Virtio(Some(ring)) => (Input::of_ring(ring, now), ring.queued()),
+            Source::Virtio(None) => return,
         };
-        // The feedback the last turn computed (unsent by an adaptive
-        // speaker).
-        devices.guest_audio_feedback(self.feedback.value());
         self.status = Some((status, queued));
         let taken = queued.min(self.frames.len());
-        if status.bits == 0 {
+        // The virtio stream's last frames, pushed before its STOP, still
+        // play out on the monitor; a speaker that stopped streaming has its
+        // leftovers discarded.
+        let plays_out = matches!(self.source, Source::Virtio(_)) && self.hdmi.is_some();
+        if status.bits == 0 && !plays_out {
             self.pacer.stop();
-            devices.guest_audio_take(&mut self.frames[..taken]);
+            self.take(devices, taken);
             return;
         }
-        if let Some(hdmi) = self.hdmi.as_mut() {
-            let moved = devices.guest_audio_take(&mut self.frames[..taken]);
-            hdmi.pending.extend(&self.frames[..moved]);
+        if self.hdmi.is_some() {
+            let moved = self.take(devices, taken);
+            if let Some(hdmi) = self.hdmi.as_mut() {
+                hdmi.pending.extend(&self.frames[..moved]);
+            }
             return;
         }
         let due = self.pacer.due(now);
         let step = self.backlog.step(due, queued, true);
-        devices.guest_audio_take(&mut self.frames[..step.dropped.min(MAX_STEP_FRAMES as usize)]);
-        devices.guest_audio_take(&mut self.frames[..step.take]);
+        self.take(devices, step.dropped.min(MAX_STEP_FRAMES as usize));
+        self.take(devices, step.take);
         self.counters.add(step);
         self.output_frames += due;
         self.left = queued - step.take - step.dropped;
         self.level.observe(self.left);
+    }
+
+    /// Moves up to `count` of the input's frames into `frames`: the number
+    /// moved.
+    fn take(&mut self, devices: &mut AppleDevices, count: usize) -> usize {
+        let out = &mut self.frames[..count];
+        match &self.source {
+            Source::Usb => devices.guest_audio_take(out),
+            Source::Virtio(Some(ring)) => ring.take(out),
+            Source::Virtio(None) => 0,
+        }
     }
 
     /// The monitor's turn, outside the devices' lock, at counter `now`:
@@ -329,6 +455,20 @@ impl GuestAudio {
                 );
                 if streaming {
                     self.level.observe(hdmi.pending.len());
+                }
+                // The virtio stream's clock follows a route that ran through
+                // the turn, and goes back to the device clock when it did
+                // not; a turn that could not look tells it nothing.
+                if let Source::Virtio(Some(ring)) = &self.source {
+                    match turn {
+                        Some(true) => ring.publish(
+                            self.output_frames,
+                            now,
+                            (hdmi.pending.len() + ring.queued()) as u64,
+                        ),
+                        Some(false) => ring.publish_stopped(),
+                        None => {}
+                    }
                 }
                 // A turn that wrote nothing (the loader root was busy)
                 // measures nothing: the DMA ran on unseen.
@@ -357,9 +497,13 @@ impl GuestAudio {
         if bits != self.streaming {
             self.streaming = bits;
             match bits {
-                0 => output::arguments(format_args!("GUEST AUDIO stream stopped\n")),
+                0 => output::arguments(format_args!(
+                    "GUEST AUDIO stream stopped{}\n",
+                    self.source_tag()
+                )),
                 bits => output::arguments(format_args!(
-                    "GUEST AUDIO stream started: {bits}-bit stereo at 48 kHz\n"
+                    "GUEST AUDIO stream started: {bits}-bit stereo at 48 kHz{}\n",
+                    self.source_tag()
                 )),
             }
         }
@@ -376,14 +520,15 @@ impl GuestAudio {
         };
         let totals = (
             self.counters.silent,
-            status.counters.overflowed + self.counters.trimmed,
+            status.overflowed + self.counters.trimmed,
         );
         let last = core::mem::replace(&mut self.last_totals, totals);
+        let virtio = matches!(self.source, Source::Virtio(_));
         let report = Report {
             bits: status.bits,
-            received: status.counters.received,
-            overflowed: status.counters.overflowed,
-            split: status.counters.split,
+            received: status.received,
+            overflowed: status.overflowed,
+            split: status.split,
             queued: queued + self.hdmi.as_ref().map_or(0, |hdmi| hdmi.pending.len()),
             muted: status.muted,
             volume: status.volume,
@@ -391,15 +536,31 @@ impl GuestAudio {
             interval_silent: totals.0.saturating_sub(last.0),
             interval_dropped: totals.1.saturating_sub(last.1),
             backlog: self.level.take(),
-            asynchronous: status.mode == UsbAudioMode::Asynchronous,
-            feedback: self.feedback.value(),
+            asynchronous: status.asynchronous,
+            feedback: if virtio {
+                FEEDBACK_NOMINAL
+            } else {
+                self.feedback.value()
+            },
             measured: self.feedback.estimate(),
-            packets: status.counters.packets,
-            feedback_reads: status.counters.feedback_reads,
+            packets: status.packets,
+            feedback_reads: status.feedback_reads,
         };
         if self.reported != Some(report) {
             self.reported = Some(report);
-            output::arguments(format_args!("{report}\n"));
+            if virtio {
+                output::arguments(format_args!("{}\n", VirtioReport(report)));
+            } else {
+                output::arguments(format_args!("{report}\n"));
+            }
+        }
+    }
+
+    /// What the stream lines add for the virtio source.
+    fn source_tag(&self) -> &'static str {
+        match self.source {
+            Source::Usb => "",
+            Source::Virtio(_) => " (virtio-snd)",
         }
     }
 }
