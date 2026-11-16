@@ -505,6 +505,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             return Err(error);
         }
         let base = stream_base(id.index);
+        // Stale BCIS, FIFOE and DESE from the last run are cleared before
+        // the stream is armed: none of them can fault the new run.
         self.registers.write8(base + SD_STS, SD_STATUS);
         fence(Ordering::SeqCst);
         self.registers.write8(base + SD_CTL, SD_RUN); // Polling; all IRQ enables remain zero.
@@ -559,19 +561,19 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         let running = self.stream(id)?.running;
         let base = stream_base(id.index);
         let status = self.registers.read8(base + SD_STS);
-        if status & (SD_FIFO_ERROR | SD_DESC_ERROR) != 0 {
+        let hdmi = self.hdmi_stream_port(id).is_some();
+        // A FIFO error alone on an HDMI route's stream: its DMA fell behind
+        // the FIFO for a moment (a memory read stall; audio8a saw one about
+        // every 10 s while the display was busy). Linux's azx_interrupt
+        // acknowledges it and plays on, and so does this: FIFOE is cleared
+        // below and counted (`Stats::fifo_errors`), the stream keeps
+        // running, and only `Progress` (a position that stops advancing or
+        // falls behind the refill) or DESE stops it. The first status read
+        // after a start is no exception: `start` cleared the stale bits
+        // before arming, so a FIFOE there is the new FIFO's own.
+        let fifo_error = hdmi && status & (SD_FIFO_ERROR | SD_DESC_ERROR) == SD_FIFO_ERROR;
+        if !fifo_error && status & (SD_FIFO_ERROR | SD_DESC_ERROR) != 0 {
             let error = Error::StreamDma { status };
-            // A FIFO error alone on an HDMI route's stream: its DMA fell
-            // behind the FIFO (a memory read stall), which Linux's
-            // azx_interrupt acknowledges and plays on. Stop the stream
-            // only, as an underrun; the route stays prepared for
-            // `restart_hdmi`. A stop that is not acknowledged still
-            // poisons the stream and fails routing (`hdmi_stop_stream`).
-            if status & SD_DESC_ERROR == 0
-                && let Some(index) = self.hdmi_stream_port(id)
-            {
-                return Err(self.hdmi_stream_fault(index, error));
-            }
             // A descriptor error (a BDL or buffer fetch failed), or a
             // FIFO error elsewhere: a controller reset condition.
             let _ = self.stop_descriptor(id.index);
@@ -583,8 +585,14 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             return Err(error);
         }
+        if fifo_error {
+            self.stats.fifo_errors += 1;
+            self.stats.fifo_status = status;
+        }
         let position = self.position_info(id)?;
-        self.registers.write8(base + SD_STS, status & SD_COMPLETE);
+        // Write-1-to-clear: BCIS, and FIFOE when it was acknowledged.
+        self.registers
+            .write8(base + SD_STS, status & (SD_COMPLETE | SD_FIFO_ERROR));
         if running {
             self.hdmi_progress(id, position.transport_bytes, status & SD_COMPLETE != 0)?;
         }

@@ -167,6 +167,9 @@ pub enum Error {
     SinkUnavailable,
     SinkChanged,
     PlaybackUnderrun,
+    /// A running HDMI stream's position did not advance for as long as its
+    /// ring plays: its DMA stalled (a FIFO error no longer stops it).
+    PlaybackStalled,
     InvalidConnectionList,
     InvalidFormat,
     InvalidBuffer,

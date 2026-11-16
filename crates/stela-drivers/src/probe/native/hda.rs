@@ -566,6 +566,21 @@ impl Host {
         controller.take_rejection()
     }
 
+    /// The last HDMI readback or pin sense a second read contradicted,
+    /// once (`hda::Controller::take_misread`): for the log only.
+    pub fn take_hdmi_misread(&mut self) -> Option<hda::hdmi::Misread> {
+        let (controller, _) = self.owner.controller().ok()?;
+        controller.take_misread()
+    }
+
+    /// What the controller absorbed without failing a verb or the route
+    /// (`hda::Controller::stats`): RIRB entries waited for, spurious and
+    /// unsolicited responses, misreads, FIFO errors acknowledged.
+    pub fn hdmi_stats(&mut self) -> Option<hda::Stats> {
+        let (controller, _) = self.owner.controller().ok()?;
+        Some(controller.stats())
+    }
+
     /// Stop the stream and close its route, if it runs.
     pub fn stop_hdmi(&mut self, playback: &mut HdmiPlayback) -> Result<(), RetirementError> {
         let (controller, _) = self.owner.controller()?;

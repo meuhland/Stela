@@ -46,8 +46,9 @@ pub enum RestartReason {
     CodecFault,
     /// The stream's DMA reported a FIFO error alone (SDnSTS FIFOE, no
     /// descriptor error): its memory reads fell behind the link, as on a
-    /// congested PCIe link. The stream alone restarts, as after an
-    /// underrun; Linux acknowledges it and plays on.
+    /// congested PCIe link. Since M9 the driver acknowledges it and the
+    /// stream plays on, as Linux does (`fifo_errors=` counts them), so no
+    /// HDMI stop has this reason any more; the count stays in the report.
     DmaFault,
     /// The route itself was lost (another ELD, a failed access, the bound
     /// of codec faults, a DMA descriptor error). It is prepared again, the
@@ -70,8 +71,8 @@ impl RestartReason {
     pub const fn action(self) -> &'static str {
         match self {
             Self::Underrun => {
-                "the DMA ran past the refilled periods (a service gap longer than the ring); \
-                 restarting the stream only"
+                "the DMA ran past the refilled periods (a service gap longer than the ring), or \
+                 its position stopped for as long as the ring plays; restarting the stream only"
             }
             Self::SinkAway => {
                 "the pin senses no monitor with a valid ELD (asleep or unplugged); paused, \
@@ -88,6 +89,18 @@ impl RestartReason {
             Self::RouteLost => "the route was lost; preparing it again",
         }
     }
+}
+
+/// Whether the `count`th event of a kind gets lines of its own: the first
+/// four, then each power of two; the report's counts cover the rest.
+pub const fn logged(count: u64) -> bool {
+    count <= 4 || count.is_power_of_two()
+}
+
+/// Whether a count that went from `last` to `now` (it may grow by more
+/// than one between two looks) passed one that is [`logged`].
+pub const fn crossed(last: u64, now: u64) -> bool {
+    now > last && (last < 4 || now.ilog2() > last.ilog2())
 }
 
 /// The HDMI playback's restarts, by reason.
@@ -764,6 +777,23 @@ mod tests {
                 .action()
                 .ends_with("restarting the stream only")
         );
+    }
+
+    #[test]
+    fn a_count_is_logged_at_its_first_four_then_each_power_of_two_however_it_grows() {
+        let logged_counts: alloc::vec::Vec<u64> = (1..=40).filter(|&n| logged(n)).collect();
+        assert_eq!(logged_counts, [1, 2, 3, 4, 8, 16, 32]);
+        // One at a time, `crossed` is `logged` of the new count.
+        for n in 1..=1000 {
+            assert_eq!(crossed(n - 1, n), logged(n), "{n}");
+        }
+        // Several at once: a logged count passed in between still prints.
+        assert!(crossed(5, 9));
+        assert!(crossed(2, 7));
+        assert!(!crossed(9, 15));
+        assert!(crossed(9, 40));
+        assert!(!crossed(7, 7));
+        assert!(!crossed(8, 3));
     }
 
     #[test]

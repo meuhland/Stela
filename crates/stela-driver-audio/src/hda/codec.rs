@@ -58,6 +58,10 @@ impl Verb {
     pub fn codec(self) -> u8 {
         (self.0 >> 28) as u8
     }
+    /// The node the verb addresses (bits 26:20).
+    pub fn node(self) -> u8 {
+        ((self.0 >> 20) & 0x7f) as u8
+    }
     pub fn raw(self) -> u32 {
         self.0
     }

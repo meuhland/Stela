@@ -73,6 +73,26 @@ struct Hardware {
     device: u8,
     /// The other device entries sense nothing, for a survey of them all.
     other_entries_empty: bool,
+    /// audio8a's late RIRB write, once: the next answer to this verb whose
+    /// slot held another answer one ring lap earlier has its write pointer
+    /// published at once and its entry written only this many register
+    /// reads later.
+    rirb_lag: Option<(u16, usize)>,
+    /// The late entry: slot, value, upper word, register reads left.
+    late: Option<(usize, u32, u32, usize)>,
+    /// What the model last wrote into each RIRB slot, and responses so far.
+    last_lap: Vec<u32>,
+    responses: usize,
+    /// Each lagged answer: its verb, what its slot held from the last lap
+    /// (what a reader that does not wait takes), and the answer itself.
+    stale: Vec<(u16, u32, u32)>,
+    /// The next pin senses answered as audio8a's misread did: 0x10.
+    sense_glitch: usize,
+    /// A FIFO error (FIFOE | FIFORDY) raised as the stream starts.
+    fifo_on_start: bool,
+    /// Responses emitted before each command's own, in order:
+    /// (value, upper word), as an unsolicited event or another codec's.
+    inject: Vec<(u32, u32)>,
 }
 impl Hardware {
     fn new(clock: Clock, dp: bool) -> Self {
@@ -123,6 +143,14 @@ impl Hardware {
             selected: 0,
             device: 0,
             other_entries_empty: false,
+            rirb_lag: None,
+            late: None,
+            last_lap: vec![0; 256],
+            responses: 0,
+            stale: vec![],
+            sense_glitch: 0,
+            fifo_on_start: false,
+            inject: vec![],
         };
         h.set(0, 0x1001, 2);
         h.set(2, 0, 1);
@@ -271,6 +299,10 @@ impl Hardware {
             0x705 => 0,
             0xf05 => 0,
             0xf09 if self.other_entries_empty && byte != self.device => 0,
+            0xf09 if self.sense_glitch > 0 => {
+                self.sense_glitch -= 1;
+                0x10
+            }
             0xf09 => {
                 assert_eq!(byte, self.device);
                 self.sense
@@ -362,20 +394,43 @@ impl Hardware {
         self.set(0x4a, wp, 2);
         self.commands.push(command);
         let reply = self.reply(command);
-        if self.drop_reply == Some(((command >> 8) & 0xfff) as u16) {
+        let verb = ((command >> 8) & 0xfff) as u16;
+        if self.drop_reply == Some(verb) {
             return;
         }
-        let next = (self.get(0x58, 2) + 1) % 256;
-        let address = self.address(0x50);
-        // SAFETY: address names the fixture RIRB. next is modulo 256 and each
-        // kept, aligned entry contains two u32 words.
-        unsafe {
-            ((address as *mut u32).add(next as usize * 2)).write_volatile(reply.to_le());
-            ((address as *mut u32).add(next as usize * 2 + 1))
-                .write_volatile((command >> 28).to_le());
+        for (value, extra) in core::mem::take(&mut self.inject) {
+            self.respond(value, extra, None);
         }
-        self.set(0x58, next, 2);
+        let lag = self.rirb_lag.filter(|(lagged, _)| *lagged == verb);
+        self.respond(reply, command >> 28, lag.map(|(_, reads)| (verb, reads)));
+    }
+    /// One RIRB entry and the write pointer over it; with `lag`, the entry
+    /// is written that many register reads after the pointer, when the
+    /// slot held another answer one lap earlier.
+    fn respond(&mut self, value: u32, extra: u32, lag: Option<(u16, usize)>) {
+        let next = ((self.get(0x58, 2) + 1) % 256) as usize;
+        let previous = self.last_lap[next];
+        self.last_lap[next] = value;
+        self.responses += 1;
+        match lag {
+            Some((verb, reads)) if self.responses > 256 && previous != value => {
+                self.rirb_lag = None;
+                self.stale.push((verb, previous, value));
+                self.late = Some((next, value, extra, reads));
+            }
+            _ => self.land(next, value, extra),
+        }
+        self.set(0x58, next as u32, 2);
         self.bar[0x5d] |= 1;
+    }
+    fn land(&mut self, slot: usize, value: u32, extra: u32) {
+        let address = self.address(0x50);
+        // SAFETY: address names the fixture RIRB. slot is modulo 256 and
+        // each kept, aligned entry contains two u32 words.
+        unsafe {
+            ((address as *mut u32).add(slot * 2)).write_volatile(value.to_le());
+            ((address as *mut u32).add(slot * 2 + 1)).write_volatile(extra.to_le());
+        }
     }
     fn write(&mut self, offset: usize, value: u32, bytes: usize) {
         self.tick();
@@ -414,7 +469,12 @@ impl Hardware {
                     assert_eq!(self.pin, 0x40);
                     assert_ne!(self.binding, 0);
                     assert_eq!(self.transmit, 0xc0);
+                    // Stale status from the last run was cleared first.
+                    assert_eq!(self.bar[0x83] & 0x1c, 0, "armed over stale status");
                     self.starts += 1;
+                    if self.fifo_on_start {
+                        self.bar[0x83] |= 0x28;
+                    }
                 }
                 if old & 2 != 0 && value & 2 == 0 {
                     self.stops += 1;
@@ -426,6 +486,13 @@ impl Hardware {
     }
     fn read(&mut self, offset: usize, bytes: usize) -> u32 {
         self.tick();
+        if let Some((slot, value, extra, reads)) = self.late.take() {
+            if reads <= 1 {
+                self.land(slot, value, extra);
+            } else {
+                self.late = Some((slot, value, extra, reads - 1));
+            }
+        }
         if offset == 0x84 {
             self.position_reads += 1;
             if let Some((at, pos, elapsed)) = self.late_position
