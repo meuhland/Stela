@@ -373,7 +373,7 @@ impl Service {
         if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, &mut turn)) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
-            let (frames, status, room, stela_net) = devices.with(|devices| {
+            let (frames, status, room, stela_net, virtio_net) = devices.with(|devices| {
                 let frames = network.queued(devices);
                 (
                     frames,
@@ -386,17 +386,22 @@ impl Service {
                             devices.stela_net_stats(),
                         )
                     }),
+                    devices.has_virtio_net(),
                 )
             });
             network.status(status);
-            // StelaNet's link follows the host adapter's carrier; the USB
-            // adapter's does not.
-            let carrier = stela_net.and_then(|(fault, address, stats)| {
-                network.stela_net_stats(stats);
-                network.fault(fault);
-                network.address(address);
-                network.carrier_now(now, *tsc_hz)
-            });
+            // StelaNet's link, and the virtio network device's, follow the
+            // host adapter's carrier; the USB adapter's does not.
+            let carrier = match stela_net {
+                Some((fault, address, stats)) => {
+                    network.stela_net_stats(stats);
+                    network.fault(fault);
+                    network.address(address);
+                    network.carrier_now(now, *tsc_hz)
+                }
+                None if virtio_net => network.carrier_now(now, *tsc_hz),
+                None => None,
+            };
             let reusable = network.transmit(frames);
             network.receive(room);
             devices.serve(|devices| {
@@ -406,6 +411,7 @@ impl Service {
                 network.deliver(devices);
                 if let Some(up) = carrier {
                     devices.stela_net_set_link(up);
+                    devices.virtio_net_set_link(up);
                 }
             });
             lap.part(Part::Network);

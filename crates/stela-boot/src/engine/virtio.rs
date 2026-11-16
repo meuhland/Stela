@@ -1,10 +1,18 @@
 //! Stela's virtio devices and its own virtio kext, StelaVirtIO, which a
 //! `--virtio` boot gives the guest: the entropy device at
 //! `/arm-io/stela-virtio0` on the virtio-mmio transport
-//! (`stela_soc::virtio`), fed from the boot's seeded random stream, and the
-//! kext linked into the auxiliary collection beside StelaGPU. The kext is in
-//! the image only with the `virtio-kext` feature, as `include_bytes!` needs
-//! `xtask guest`'s output; unlike StelaGPU it needs no `nvk`.
+//! (`stela_soc::virtio`), fed from the boot's seeded random stream, with
+//! `--virtio-net` the network device at the next node, and the kext linked
+//! into the auxiliary collection beside StelaGPU. The kext is in the image
+//! only with the `virtio-kext` feature, as `include_bytes!` needs `xtask
+//! guest`'s output; unlike StelaGPU it needs no `nvk`.
+//!
+//! The network device is the guest's second interface on the guest
+//! network's host adapter (`--guest-network`), beside StelaNet or the USB
+//! Ethernet adapter, with a station address of its own that derives from
+//! the board's ECID: the board switches frames from the host between the
+//! two by destination (`stela_soc::machine::route`). Its link follows the
+//! host adapter's carrier; without a guest network it is down.
 //!
 //! The boot log has a `VIRTIO` line for the device's placement, each thing
 //! its driver does (status changes, the features agreed, the queues'
@@ -17,7 +25,7 @@ use stela_contracts::interrupt::AicInput;
 use stela_contracts::virtio::status;
 use stela_loader::{apple_device_tree::DeviceTree, aux_kc::Kext, stela_gpu::Placement};
 use stela_soc::machine::{AppleDevices, VirtioReport};
-use stela_soc::virtio::{mmio::Event, rng::Rng};
+use stela_soc::virtio::{mmio::Event, net::OFFLOADS, rng::Rng};
 
 /// `xtask guest`'s objects of the StelaVirtIO kext.
 #[cfg(feature = "virtio-kext")]
@@ -36,8 +44,44 @@ const BUNDLE_PATH: &str = "/Library/Extensions/StelaVirtIO.kext";
 /// Whether this image carries the kext.
 pub(super) const EMBEDDED: bool = cfg!(feature = "virtio-kext");
 
-/// The entropy device's node index.
-const RNG: usize = 0;
+/// A device a `--virtio` boot gives the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Device {
+    /// The entropy device.
+    Rng,
+    /// The network device (`--virtio-net`).
+    Net,
+}
+
+impl Device {
+    /// Its name in the log.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rng => "rng",
+            Self::Net => "net",
+        }
+    }
+}
+
+/// The devices a boot's options ask for, in node order: each takes the node
+/// its place in the list numbers, `/arm-io/stela-virtio<n>`.
+pub(super) fn devices(net: bool) -> Vec<Device> {
+    let mut devices = alloc::vec![Device::Rng];
+    if net {
+        devices.push(Device::Net);
+    }
+    devices
+}
+
+/// What the network device takes from the boot's guest network.
+pub(super) struct NetSetup {
+    /// The StelaNet offloads the boot offers (`--guest-network-stelanet-*`),
+    /// in virtio-net numbering; the device offers those it can.
+    pub offloads: u64,
+    /// The host adapter's station address, the guest's first interface's,
+    /// if the boot has a guest network.
+    pub host: Option<[u8; 6]>,
+}
 
 /// Set when a device has events for the log.
 static EVENTS: AtomicBool = AtomicBool::new(false);
@@ -59,45 +103,92 @@ pub(super) fn kexts(wanted: bool) -> Vec<Kext<'static>> {
     Vec::new()
 }
 
-/// Places the entropy device's node, after the GPU gates and StelaNet: it
-/// takes the next free window and AIC input. A tree with no room has none.
-pub(super) fn place(tree: &mut DeviceTree) -> Option<Placement> {
-    match stela_loader::virtio::place_virtio(tree, RNG) {
-        Ok(placement) => Some(placement),
-        Err(error) => {
-            output::arguments(format_args!("VIRTIO rng not placed: {error}\n"));
-            None
+/// Places each device's node, after the GPU gates and StelaNet: each takes
+/// the next free window and AIC input. A device the tree has no room for is
+/// left out.
+pub(super) fn place(tree: &mut DeviceTree, devices: &[Device]) -> Vec<(Device, usize, Placement)> {
+    let mut placed = Vec::new();
+    for (index, &device) in devices.iter().enumerate() {
+        match stela_loader::virtio::place_virtio(tree, index) {
+            Ok(placement) => placed.push((device, index, placement)),
+            Err(error) => output::arguments(format_args!(
+                "VIRTIO {} not placed: {error}\n",
+                device.name()
+            )),
         }
+    }
+    placed
+}
+
+/// Puts each device where its node says, its AIC input split into die and
+/// input by the board's `per_die`.
+pub(super) fn add(
+    devices: &mut AppleDevices,
+    placed: Vec<(Device, usize, Placement)>,
+    per_die: u32,
+    net: &NetSetup,
+) {
+    for (device, index, placement) in placed {
+        let irq = AicInput::new(
+            (placement.irq / per_die) as u8,
+            (placement.irq % per_die) as u16,
+        );
+        let detail = match device {
+            Device::Rng => {
+                let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
+                devices
+                    .add_virtio_mmio(
+                        placement.physical,
+                        irq,
+                        Box::new(Rng::new(source)),
+                        Some(&EVENTS),
+                    )
+                    .unwrap_or_else(|error| output::fatal(&error));
+                String::new()
+            }
+            Device::Net => {
+                let mac = devices
+                    .add_virtio_net(
+                        placement.physical,
+                        irq,
+                        net.offloads,
+                        net.host,
+                        Some(&EVENTS),
+                    )
+                    .unwrap_or_else(|error| output::fatal(&error));
+                if net.host.is_none() {
+                    devices.virtio_net_set_link(false);
+                }
+                alloc::format!(
+                    " mac={} offloads={:#x} host adapter {}",
+                    colons(mac),
+                    net.offloads & OFFLOADS,
+                    net.host.map_or_else(
+                        || String::from("none: link down"),
+                        |host| alloc::format!("{} shared with the first interface", colons(host))
+                    )
+                )
+            }
+        };
+        output::arguments(format_args!(
+            "VIRTIO {} /arm-io/{} at {:#x} aic input {:#x}{detail}{}\n",
+            device.name(),
+            stela_loader::virtio::name(index),
+            placement.physical,
+            placement.irq,
+            if EMBEDDED {
+                ""
+            } else {
+                " (no StelaVirtIO kext in this image)"
+            }
+        ));
     }
 }
 
-/// Puts the entropy device where its node says, its AIC input split into
-/// die and input by the board's `per_die`.
-pub(super) fn add(devices: &mut AppleDevices, placement: Placement, per_die: u32) {
-    let irq = AicInput::new(
-        (placement.irq / per_die) as u8,
-        (placement.irq % per_die) as u16,
-    );
-    let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
-    devices
-        .add_virtio_mmio(
-            placement.physical,
-            irq,
-            Box::new(Rng::new(source)),
-            Some(&EVENTS),
-        )
-        .unwrap_or_else(|error| output::fatal(&error));
-    output::arguments(format_args!(
-        "VIRTIO rng /arm-io/{} at {:#x} aic input {:#x}{}\n",
-        stela_loader::virtio::name(RNG),
-        placement.physical,
-        placement.irq,
-        if EMBEDDED {
-            ""
-        } else {
-            " (no StelaVirtIO kext in this image)"
-        }
-    ));
+/// A station address as `aa:bb:cc:dd:ee:ff`.
+fn colons(mac: [u8; 6]) -> String {
+    let [a, b, c, d, e, f] = mac;
+    alloc::format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
 
 /// Logs what the devices' drivers did since the last call; `counters` adds
@@ -183,6 +274,9 @@ fn log(report: &VirtioReport) {
                 .map(|why| alloc::format!(" error={why}"))
                 .unwrap_or_default()
         ));
+        if let Some(summary) = &report.summary {
+            output::arguments(format_args!("VIRTIO {name} {summary}\n"));
+        }
     }
 }
 

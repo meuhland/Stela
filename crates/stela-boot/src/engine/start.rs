@@ -1059,8 +1059,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     // Stela's virtio devices (`--virtio`), placed after the GPU gates and
     // StelaNet: each takes the next free window and AIC input.
     let virtio_placement = match assigned.as_mut() {
-        Some(assigned) if options.virtio => virtio::place(&mut assigned.tree),
-        _ => None,
+        Some(assigned) if options.virtio => {
+            virtio::place(&mut assigned.tree, &virtio::devices(options.virtio_net))
+        }
+        _ => Vec::new(),
     };
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
@@ -1200,11 +1202,15 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             offloads.name()
         ));
     }
-    if let (Some(placement), Some(board)) = (virtio_placement, &board) {
+    if let Some(board) = &board {
         virtio::add(
             &mut devices,
-            placement,
+            virtio_placement,
             u32::from(board.aic.layout.max_irq()),
+            &virtio::NetSetup {
+                offloads: options.guest_network_stelanet_offloads.features(),
+                host: guest_network.as_ref().map(|network| network.mac().0),
+            },
         );
     }
     // Device placement has copied the carried firmware. This function
