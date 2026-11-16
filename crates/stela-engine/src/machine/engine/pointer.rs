@@ -31,6 +31,21 @@ static EMPTY_MEMO: [core::sync::atomic::AtomicU64; pointer::MEMO_ENTRIES * 4] =
 /// use are found in the first few entries.
 pub(super) const POINTER_INPUTS_SEEN: usize = 256;
 
+/// Put `entry` first in the most-recent-first list `list` of at most
+/// `capacity` entries, dropping the last when full: the same list as
+/// `insert(0)` then `truncate`, without moving the whole list twice when a
+/// known entry is found (callers rotate only the entries before it).
+fn move_to_front<T>(list: &mut Vec<T>, entry: T, capacity: usize) {
+    if list.len() < capacity {
+        list.push(entry);
+    } else if let Some(last) = list.last_mut() {
+        *last = entry;
+    } else {
+        return;
+    }
+    list.rotate_right(1);
+}
+
 /// What a PAC result depends on besides its operands: the five keys, the
 /// chip's PAC version and the regime's TCR (Arm `AddPAC`, `Auth`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,14 +314,20 @@ impl PointerService {
                 .iter()
                 .position(|&(known, generations, _)| known == inputs && generations == keys)
             {
-                Some(index) => self.seen_inputs.remove(index).2,
+                Some(index) => {
+                    self.seen_inputs[..=index].rotate_right(1);
+                    self.seen_inputs[0].2
+                }
                 None => {
                     self.generations += 1;
+                    move_to_front(
+                        &mut self.seen_inputs,
+                        (inputs, keys, self.generations),
+                        POINTER_INPUTS_SEEN,
+                    );
                     self.generations
                 }
             };
-            self.seen_inputs.insert(0, (inputs, keys, self.generation));
-            self.seen_inputs.truncate(POINTER_INPUTS_SEEN);
             self.inputs = Some(inputs);
         }
         let [ia, ib, da, db, generic] = inputs.keys;
@@ -452,16 +473,17 @@ impl PointerService {
     /// inputs, else a new one. A result depends only on its key's inputs
     /// and its operands, so an entry of a reused generation is still exact.
     fn generation_of(&mut self, inputs: KeyInputs) -> u64 {
-        let generation = match self.seen.iter().position(|&(known, _)| known == inputs) {
-            Some(index) => self.seen.remove(index).1,
+        match self.seen.iter().position(|&(known, _)| known == inputs) {
+            Some(index) => {
+                self.seen[..=index].rotate_right(1);
+                self.seen[0].1
+            }
             None => {
                 self.generations += 1;
+                move_to_front(&mut self.seen, (inputs, self.generations), POINTER_INPUTS_SEEN);
                 self.generations
             }
-        };
-        self.seen.insert(0, (inputs, generation));
-        self.seen.truncate(POINTER_INPUTS_SEEN);
-        generation
+        }
     }
 
     /// The current memo's result of `operation` with `key` on these
