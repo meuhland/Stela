@@ -217,6 +217,16 @@ fn setup_lines_parse_and_serialize_identically() {
 }
 
 #[test]
+fn virtio_is_off_unless_asked_and_round_trips() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    assert!(!round_trip(&preboot).virtio);
+    let line = format!("{preboot} --external-disks --virtio --page-relative --shared-aliases");
+    let options = round_trip(&line);
+    assert!(options.virtio && options.page_relative && options.shared_aliases);
+    assert_eq!(options.to_string(), line);
+}
+
+#[test]
 fn chosen_disk_round_trips_and_the_mount_refuses_it_unreplaced() {
     let line = "--system --storage @disk --nor @disk --preboot @disk";
     let options = round_trip(line);

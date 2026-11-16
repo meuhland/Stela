@@ -115,7 +115,14 @@ fn from_disk(
     } else if let Some(kind) = options.recovery {
         bundle::recovery_from_disk(partition, kind, options.boot_volume, &defaults)
     } else {
-        let kexts = gpu::kexts();
+        let mut kexts = gpu::kexts();
+        kexts.extend(virtio::kexts(options.virtio));
+        if options.virtio && !virtio::EMBEDDED {
+            output::arguments(format_args!(
+                "VIRTIO this stela.efi has no StelaVirtIO kext (the `virtio-kext` feature): \
+                 its devices have no driver\n"
+            ));
+        }
         let request = installed::Request {
             volume: options.boot_volume,
             kexts: &kexts,

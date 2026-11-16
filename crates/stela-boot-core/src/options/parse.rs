@@ -221,6 +221,7 @@ impl ParseState<'_> {
                 options.usb4_approved.push(uuid);
             }
             EXTERNAL_DISKS => options.external_disks = true,
+            VIRTIO => options.virtio = true,
             "--audio-check" => {
                 if options.audio_check.is_some() {
                     return Err(Error::DuplicateAudioCheck);

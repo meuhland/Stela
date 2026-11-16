@@ -32,6 +32,7 @@ pub const INSTALL_SOURCE: &str = "--install-source";
 pub const VERIFY_ON_READ: &str = "--verify-on-read";
 pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
+pub const VIRTIO: &str = "--virtio";
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -403,6 +404,11 @@ pub struct System {
     /// compare (`--guest-network-stelanet-no-lro`,
     /// `--guest-network-stelanet-no-offload`, each implying the adapter).
     pub guest_network_stelanet_offloads: StelaNetOffloads,
+    /// Give the guest Stela's virtio-mmio devices and link Stela's own
+    /// virtio kext, StelaVirtIO, beside StelaGPU (`--virtio`): the entropy
+    /// device at `/arm-io/stela-virtio0`. Without it neither the nodes nor
+    /// the kext are in the boot.
+    pub virtio: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -501,6 +507,7 @@ impl Default for System {
             guest_network: false,
             guest_network_stelanet: false,
             guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
+            virtio: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -935,6 +942,7 @@ impl fmt::Display for System {
                 stelanet && self.guest_network_stelanet_offloads == offloads,
             )?;
         }
+        line.flag(VIRTIO, self.virtio)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

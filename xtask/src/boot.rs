@@ -121,6 +121,10 @@ pub enum Command {
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
+        /// Embed the StelaVirtIO kext `cargo xtask guest` built (the
+        /// `virtio-kext` feature), which a `--virtio` boot links.
+        #[arg(long)]
+        virtio_kext: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -492,10 +496,16 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::Build {
             release,
             diagnostics,
+            virtio_kext,
         } => {
             crate::gpu::fetch::fetch(false)?;
             crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-            println!("{}", build_for_boot(release, diagnostics, true)?.display());
+            let features = Features {
+                diagnostics,
+                nvk: true,
+                virtio_kext,
+            };
+            println!("{}", build_for_boot(release, features)?.display());
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(arguments) => launch(*arguments),
@@ -504,11 +514,27 @@ pub fn run(command: Command) -> Result<ExitCode> {
 
 pub fn build(release: bool) -> Result<PathBuf> {
     crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-    build_with_diagnostics(release, false, true)
+    build_with_features(release, Features::NVK)
 }
 
-fn build_for_boot(release: bool, diagnostics: bool, nvk: bool) -> Result<PathBuf> {
-    let built = build_with_diagnostics(release, diagnostics, nvk)?;
+/// The `stela-boot` features a build turns on.
+#[derive(Clone, Copy)]
+struct Features {
+    diagnostics: bool,
+    nvk: bool,
+    virtio_kext: bool,
+}
+
+impl Features {
+    const NVK: Self = Self {
+        diagnostics: false,
+        nvk: true,
+        virtio_kext: false,
+    };
+}
+
+fn build_for_boot(release: bool, features: Features) -> Result<PathBuf> {
+    let built = build_with_features(release, features)?;
     if !release {
         return Ok(built);
     }
@@ -536,15 +562,18 @@ pub(crate) fn deploy_image(built: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_with_diagnostics(release: bool, diagnostics: bool, nvk: bool) -> Result<PathBuf> {
+fn build_with_features(release: bool, features: Features) -> Result<PathBuf> {
     let mut command = cargo();
     command.args(["build", "--locked", "--manifest-path", BOOT_MANIFEST]);
     command.args(["--target", BOOT_TARGET, "--target-dir", BOOT_TARGET_DIR]);
-    if diagnostics {
+    if features.diagnostics {
         command.args(["--features", "diagnostics"]);
     }
-    if nvk {
+    if features.nvk {
         command.args(["--features", "nvk"]);
+    }
+    if features.virtio_kext {
+        command.args(["--features", "virtio-kext"]);
     }
     if release {
         command.arg("--release");
@@ -713,7 +742,14 @@ fn launch(arguments: Run) -> Result<ExitCode> {
     let attached = storage_disks(&arguments.storage_disk, &arguments.storage_serial)?;
     let image = match &arguments.image {
         Some(image) => image.clone(),
-        None => build_for_boot(true, true, false)?,
+        None => build_for_boot(
+            true,
+            Features {
+                diagnostics: true,
+                nvk: false,
+                virtio_kext: false,
+            },
+        )?,
     };
     let paths = storage::Paths::new(arguments.output.clone());
     if paths.output.exists() {
