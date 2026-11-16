@@ -213,7 +213,7 @@ fn snoop_failure_stops_at_the_failed_control() {
             _ => function.config().failed_snoop_read = true,
         }
         assert_eq!(
-            prepare_model(&mut function, &timer, bar).unwrap_err(),
+            plain(prepare_model(&mut function, &timer, bar).unwrap_err()),
             AttachError::ConfigurationRejected
         );
         let config = function.config();

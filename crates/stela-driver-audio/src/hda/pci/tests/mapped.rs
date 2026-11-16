@@ -224,7 +224,7 @@ fn failed_interrupt_reads_rejected() {
                 )
             };
             assert_eq!(
-                result.as_ref().err().copied(),
+                result.as_ref().err().copied().map(plain),
                 Some(if after_preflight {
                     AttachError::ConfigurationRejected
                 } else if offset == 0x60 {

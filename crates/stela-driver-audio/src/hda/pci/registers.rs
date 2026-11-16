@@ -197,7 +197,12 @@ impl<R, C: ConfigSpace, F: DerefMut<Target = Function<C>>> PciRegisters<R, F> {
             || old & (regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE)
                 != regs::COMMAND_MEMORY | regs::COMMAND_INTX_DISABLE
         {
-            return Err(AttachError::ConfigurationRejected);
+            return Err(super::rejected(
+                super::ConfigField::Command,
+                regs::COMMAND,
+                None,
+                u32::from(old),
+            ));
         }
         let wanted = if enabled {
             old | regs::COMMAND_MASTER
@@ -205,8 +210,14 @@ impl<R, C: ConfigSpace, F: DerefMut<Target = Function<C>>> PciRegisters<R, F> {
             old & !regs::COMMAND_MASTER
         };
         config.write16(regs::COMMAND, wanted)?;
-        if config.read16(regs::COMMAND)? != wanted {
-            return Err(AttachError::ConfigurationRejected);
+        let observed = config.read16(regs::COMMAND)?;
+        if observed != wanted {
+            return Err(super::rejected(
+                super::ConfigField::BusMaster,
+                regs::COMMAND,
+                Some(u32::from(wanted)),
+                u32::from(observed),
+            ));
         }
         Ok(())
     }

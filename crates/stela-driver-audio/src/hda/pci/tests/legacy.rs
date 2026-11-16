@@ -236,7 +236,7 @@ fn final_enable_failure_keeps_the_published_prefix_without_cleanup() {
     let (mut function, timer, bar) = fixture(0);
     function.config().fail_after_enable = true;
     assert_eq!(
-        prepare_model(&mut function, &timer, bar).unwrap_err(),
+        plain(prepare_model(&mut function, &timer, bar).unwrap_err()),
         AttachError::ConfigurationRejected
     );
     let config = function.config();
@@ -279,7 +279,7 @@ fn rejected_decode_stops_preparation() {
     let (mut function, timer, bar) = fixture(3);
     function.config().reject_command = true;
     assert_eq!(
-        prepare_model(&mut function, &timer, bar).unwrap_err(),
+        plain(prepare_model(&mut function, &timer, bar).unwrap_err()),
         AttachError::ConfigurationRejected
     );
     assert!(
@@ -306,7 +306,7 @@ fn rejected_controls_disable_mastering() {
                 function.config().reject_command = true;
             }
         }
-        let result = prepare_model(&mut function, &timer, bar).unwrap_err();
+        let result = plain(prepare_model(&mut function, &timer, bar).unwrap_err());
         assert_eq!(
             result,
             if failure == 0 {

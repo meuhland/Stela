@@ -590,6 +590,9 @@ unsafe fn attach_with(
         // masks or polled operation do not construct one; without it Native
         // retains/refuses before root drain/bind.
         original_users,
+        // Only a function vouched for by its quiesced state, by the owner's
+        // explicit choice, takes NVIDIA's coherence bytes as Linux does.
+        gpu_audio: vouch == Vouch::Quiesced,
     };
     let mut owner = match Native::new(inputs) {
         Ok(owner) => owner,

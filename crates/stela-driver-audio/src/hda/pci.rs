@@ -108,6 +108,17 @@ impl Control {
         usize::from(offset)..usize::from(offset + bytes)
     }
     fn apply(self, config: &mut impl ConfigSpace) -> Result<(), AttachError> {
+        self.apply_with(config, false).map(|_| ())
+    }
+    /// Apply the control; with `dropped_ok`, a byte whose write left it as
+    /// it was is accepted, as Linux `update_pci_byte` never reads back.
+    /// Whether the register took the value.
+    fn apply_with(
+        self,
+        config: &mut impl ConfigSpace,
+        dropped_ok: bool,
+    ) -> Result<bool, AttachError> {
+        let field = ConfigField::VendorControl;
         match self {
             Self::Byte {
                 offset,
@@ -116,13 +127,23 @@ impl Control {
             } => {
                 let previous = config.read8(offset)?;
                 if previous == u8::MAX {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(rejected(field, offset, None, u32::from(previous)));
                 }
                 let next = previous & !mask | value;
                 config.write8(offset, next)?;
-                if config.read8(offset)? != next {
-                    return Err(AttachError::ConfigurationRejected);
+                let observed = config.read8(offset)?;
+                if observed == next {
+                    return Ok(true);
                 }
+                if dropped_ok && observed == previous {
+                    return Ok(false);
+                }
+                return Err(rejected(
+                    field,
+                    offset,
+                    Some(u32::from(next)),
+                    u32::from(observed),
+                ));
             }
             Self::Word {
                 offset,
@@ -131,20 +152,25 @@ impl Control {
             } => {
                 let previous = config.read16(offset)?;
                 if previous == u16::MAX {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(rejected(field, offset, None, u32::from(previous)));
                 }
                 let next = previous & !mask | value;
                 if next == previous {
-                    return Ok(());
+                    return Ok(true);
                 }
                 config.write16(offset, next)?;
                 let observed = config.read16(offset)?;
                 if observed == u16::MAX || observed != next {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(rejected(
+                        field,
+                        offset,
+                        Some(u32::from(next)),
+                        u32::from(observed),
+                    ));
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 impl Setup {
@@ -230,11 +256,72 @@ pub enum AttachError {
     InvalidCapabilities(CapabilityRefusal),
     MappedPreflightRequired,
     PowerNotReady,
-    ActiveDma { offset: usize },
+    ActiveDma {
+        offset: usize,
+    },
     MmioPreflight(crate::Error),
     UnsupportedPowerManagement,
     PowerTransition,
     ConfigurationRejected,
+    /// A configuration register read all ones, or did not take a write:
+    /// which one, where, and the values ([`Rejection`]).
+    Rejected(Rejection),
+}
+
+/// The configuration register a preparation found unusable, for the log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Rejection {
+    pub field: ConfigField,
+    /// The register's configuration offset.
+    pub offset: u16,
+    /// The value written, when a write's readback differed; `None` for a
+    /// read that refused before any write.
+    pub wrote: Option<u32>,
+    /// The value read (back).
+    pub read: u32,
+}
+
+/// Offsets and values in hex, as configuration space is read.
+impl core::fmt::Debug for Rejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Rejection {{ field: {:?}, offset: {:#x}, wrote: ",
+            self.field, self.offset
+        )?;
+        match self.wrote {
+            Some(value) => write!(f, "Some({value:#x})")?,
+            None => f.write_str("None")?,
+        }
+        write!(f, ", read: {:#x} }}", self.read)
+    }
+}
+
+/// Which configuration register a [`Rejection`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigField {
+    /// Base Address Register `n`.
+    Bar(u8),
+    /// The Command register: decode, mastering, INTx disable.
+    Command,
+    /// An identity-selected vendor control byte or word (NVIDIA's
+    /// coherence bytes 0x4c..0x4e, Intel TCSEL/DEVC, ATI snoop).
+    VendorControl,
+    /// Message Control of the MSI capability (ID 0x05) at `capability`.
+    MsiControl { capability: u16 },
+    /// Message Control of the MSI-X capability (ID 0x11) at `capability`.
+    MsixControl { capability: u16 },
+    /// The Command register's Bus Master Enable, set or cleared alone.
+    BusMaster,
+}
+
+fn rejected(field: ConfigField, offset: u16, wrote: Option<u32>, read: u32) -> AttachError {
+    AttachError::Rejected(Rejection {
+        field,
+        offset,
+        wrote,
+        read,
+    })
 }
 
 /// Which capability check refused the function, with the offsets and IDs
@@ -666,13 +753,47 @@ pub unsafe fn prepare_cold_with_registers<'a, C: ConfigSpace, R: Registers>(
     unsafe { prepare_mapped(function, bar0, timer, ownership, registers, false) }
 }
 
+/// [`prepare_cold_with_registers`] for a GPU's HDMI/DP audio function whose
+/// owner vouches for it on its observed quiesced state: NVIDIA's coherence
+/// bytes 0x4c..0x4e are written as Linux `azx_init_pci` writes them, without
+/// a readback, so a function that drops those writes is started anyway.
+/// They are the nForce chipset function's registers, which a GPU's audio
+/// function does not implement, and VFIO drops writes to configuration
+/// bytes no capability owns. Every other check and write is unchanged.
+///
+/// # Safety
+/// As [`prepare_cold_with_registers`].
+pub unsafe fn prepare_cold_gpu_audio_with_registers<'a, C: ConfigSpace, R: Registers>(
+    function: &'a mut Function<C>,
+    bar0: Bar,
+    timer: &impl Timer,
+    ownership: Ownership,
+    registers: R,
+) -> Result<PciRegisters<R, &'a mut Function<C>>, AttachError> {
+    // SAFETY: forwarded original-owner cold containment prerequisites.
+    unsafe { prepare_mapped_as(function, bar0, timer, ownership, registers, false, true) }
+}
+
 unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(
+    function: &'a mut Function<C>,
+    bar0: Bar,
+    timer: &impl Timer,
+    ownership: Ownership,
+    registers: R,
+    stopped: bool,
+) -> Result<PciRegisters<R, &'a mut Function<C>>, AttachError> {
+    // SAFETY: forwarded.
+    unsafe { prepare_mapped_as(function, bar0, timer, ownership, registers, stopped, false) }
+}
+
+unsafe fn prepare_mapped_as<'a, C: ConfigSpace, R: Registers>(
     function: &'a mut Function<C>,
     bar0: Bar,
     timer: &impl Timer,
     ownership: Ownership,
     mut registers: R,
     stopped: bool,
+    gpu_audio: bool,
 ) -> Result<PciRegisters<R, &'a mut Function<C>>, AttachError> {
     use super::registers::{
         COMMAND_RUN, CORBCTL, GCAP, RIRBCTL, SD_CTL, SD_RUN, VMAJ, VMIN, stream_base,
@@ -765,6 +886,8 @@ unsafe fn prepare_mapped<'a, C: ConfigSpace, R: Registers>(
             BoardIdentity::Unknown,
             if stopped {
                 Preparation::Mapped
+            } else if gpu_audio {
+                Preparation::ColdMappedGpuAudio
             } else {
                 Preparation::ColdMapped
             },
@@ -839,6 +962,8 @@ enum Preparation {
     Unmapped,
     Mapped,
     ColdMapped,
+    /// [`prepare_cold_gpu_audio_with_registers`].
+    ColdMappedGpuAudio,
 }
 
 unsafe fn prepare_inner<C: ConfigSpace>(
@@ -889,18 +1014,34 @@ unsafe fn prepare_inner<C: ConfigSpace>(
     for (index, bar) in bars.iter_mut().enumerate() {
         *bar = config.read32(regs::BASE_ADDRESS_0 + index as u16 * 4)?;
     }
-    if bars.contains(&u32::MAX) {
-        return Err(AttachError::ConfigurationRejected);
+    if let Some(index) = bars.iter().position(|&bar| bar == u32::MAX) {
+        return Err(rejected(
+            ConfigField::Bar(index as u8),
+            regs::BASE_ADDRESS_0 + index as u16 * 4,
+            None,
+            u32::MAX,
+        ));
     }
     let command = config.read16(regs::COMMAND)?;
     if command == u16::MAX {
-        return Err(AttachError::ConfigurationRejected);
+        return Err(rejected(
+            ConfigField::Command,
+            regs::COMMAND,
+            None,
+            u32::from(command),
+        ));
     }
     let command = command & !(regs::COMMAND_MEMORY | regs::COMMAND_MASTER);
     config.write16(regs::COMMAND, command | regs::COMMAND_INTX_DISABLE)?;
     let result = (|| {
-        if config.read16(regs::COMMAND)? & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
-            return Err(AttachError::ConfigurationRejected);
+        let observed = config.read16(regs::COMMAND)?;
+        if observed & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER) != 0 {
+            return Err(rejected(
+                ConfigField::Command,
+                regs::COMMAND,
+                Some(u32::from(command | regs::COMMAND_INTX_DISABLE)),
+                u32::from(observed),
+            ));
         }
         if let Some((offset, _, value)) = pmcsr {
             let state = value & PM_STATE;
@@ -929,25 +1070,43 @@ unsafe fn prepare_inner<C: ConfigSpace>(
         }
         // The exact identity selects ICH TCSEL, PCH TCSEL+word snoop, or
         // ATI/AMD byte snoop. These fields and access widths are not interchangeable.
+        // A GPU audio function vouched for by its quiesced state takes
+        // NVIDIA's coherence bytes as Linux does: a dropped write is kept.
+        let dropped_ok = matches!(preparation, Preparation::ColdMappedGpuAudio)
+            && selected.setup == Setup::Nvidia;
         for control in controls {
-            control.apply(config)?;
+            control.apply_with(config, dropped_ok)?;
         }
-        for (offset, enable) in [(caps.msi, 1), (caps.msix, 1 << 15)] {
-            if let Some(offset) = offset {
-                let previous = config.read16(offset + 2)?;
+        for (capability, enable, msix) in [(caps.msi, 1, false), (caps.msix, 1 << 15, true)] {
+            if let Some(capability) = capability {
+                let field = if msix {
+                    ConfigField::MsixControl { capability }
+                } else {
+                    ConfigField::MsiControl { capability }
+                };
+                let previous = config.read16(capability + 2)?;
                 if previous == u16::MAX {
-                    return Err(AttachError::ConfigurationRejected);
+                    return Err(rejected(field, capability + 2, None, u32::from(previous)));
                 }
-                config.write16(offset + 2, previous & !enable)?;
-                if config.read16(offset + 2)? & enable != 0 {
-                    return Err(AttachError::ConfigurationRejected);
+                config.write16(capability + 2, previous & !enable)?;
+                let observed = config.read16(capability + 2)?;
+                if observed & enable != 0 {
+                    return Err(rejected(
+                        field,
+                        capability + 2,
+                        Some(u32::from(previous & !enable)),
+                        u32::from(observed),
+                    ));
                 }
             }
         }
         let enabled = command
             | regs::COMMAND_MEMORY
             | regs::COMMAND_INTX_DISABLE
-            | if matches!(preparation, Preparation::ColdMapped) {
+            | if matches!(
+                preparation,
+                Preparation::ColdMapped | Preparation::ColdMappedGpuAudio
+            ) {
                 0
             } else {
                 regs::COMMAND_MASTER
@@ -959,7 +1118,12 @@ unsafe fn prepare_inner<C: ConfigSpace>(
                 != enabled
                     & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE)
         {
-            return Err(AttachError::ConfigurationRejected);
+            return Err(rejected(
+                ConfigField::Command,
+                regs::COMMAND,
+                Some(u32::from(enabled)),
+                u32::from(readback),
+            ));
         }
         Ok(Prepared {
             identity: selected,
