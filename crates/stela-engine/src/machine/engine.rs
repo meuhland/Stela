@@ -726,10 +726,8 @@ const CONTEXT_FRAMES: usize = 64;
 
 /// The fills a PE remembers for [`Machine::refill_after`]: more than the
 /// pages a kernel and the processes it switches between take between two
-/// TLBIs of everything (about 300 kernel pages, then each process's; about
-/// 1500 a PE in run 20261115-112116, before leaf fills logged each page
-/// of a granule).
-const FILL_LOG: usize = 8192;
+/// TLBIs of everything (about 300 kernel pages, then each process's).
+const FILL_LOG: usize = 4096;
 
 /// Whether the context `space` translates `asid`.
 /// ASIDs compare by the eight bits every TCR.AS gives them.

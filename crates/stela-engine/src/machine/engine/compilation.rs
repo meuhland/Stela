@@ -2324,11 +2324,8 @@ enum Taken {
 const LEAF_FILL: u64 = 1 << 14;
 
 /// The most pages one forgotten context leaves to walk again
-/// ([`Machine::refill_after`]). At 512 the cap bound: after each local TLBI
-/// of everything a PE refilled about 510 pages and then missed about 600
-/// more one exit at a time (run 20261115-112116, beat 40: 880 such TLBIs
-/// per PE, `refilled` 427-495 K, `context` misses 430-566 K).
-const REFILLS_PER_CONTEXT: usize = 2048;
+/// ([`Machine::refill_after`]).
+const REFILLS_PER_CONTEXT: usize = 512;
 /// The contexts whose pages TLBIs by VA dropped that a PE keeps for refill
 /// ([`Machine::keep_dropped`]).
 const DROPPED_CONTEXTS: usize = 64;
