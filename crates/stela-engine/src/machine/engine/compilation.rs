@@ -184,7 +184,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let aliases = !single && self.aliases_at(pc);
         if !single && let Some(id) = self.known_variant(variant) {
             let key = self.block_key(physical, id);
-            self.translate_leaf(pc, key, physical, current);
+            self.translate_page(pc, key);
             let table = &self.code.table;
             let target = table.find(table.slot(pc, key), pc, key);
             // Every release of a block forgets its entries; the block is
@@ -263,7 +263,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         });
         if !single {
             let key = self.block_key(physical, self.code.blocks[index].variant);
-            self.translate_leaf(pc, key, physical, current);
+            self.translate_page(pc, key);
         }
         self.remember_or_link(pc, index);
         self.entered(index);
@@ -344,69 +344,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let walk = self.cached_fetch(pc);
         let global = walk.is_none_or(|walk| walk.global);
         let shared = walk.is_some_and(|walk| walk.global);
-        self.take_page(pc, key, Taken::Fetch, global, shared);
+        self.take_page(pc, key, true, global, shared);
     }
 
-    /// [`Self::translate_page`] for the fetch at `pc` of the frame
-    /// `physical` in `current` (its variant before the page's own:
-    /// `page_variant`), then the other pages of its leaf
-    /// ([`Self::take_leaf_pages`]).
-    pub(super) fn translate_leaf(&mut self, pc: u64, key: u64, physical: u64, current: Variant) {
-        self.translate_page(pc, key);
-        if let Some(walk) = self.cached_fetch(pc) {
-            self.take_leaf_pages(pc, physical, walk.size, current, walk.global);
-        }
-    }
-
-    /// Give the ITLB the other 4 KiB pages of the [`LEAF_FILL`] granule
-    /// around `pc` that the leaf of `size` bytes holding `pc` maps, whose
-    /// page is in the frame of `physical`, as a fetch of each would take
-    /// them: the walk that translated `pc` translated them all, through
-    /// the same descriptors (the same output block, permissions, guarded
-    /// and global bits), so a TLB may cache each at once. Pages the host
-    /// refuses to fetch, whose blocks' variant has no number yet, or that
-    /// the ITLB holds already are left to their own fetch. A TLBI by VA of
-    /// any of them reaches all: the fetch recorded the whole leaf
-    /// (`fetched_through`). `current` is the fetch's variant before each
-    /// page's own (`page_variant`).
-    fn take_leaf_pages(
-        &mut self,
-        pc: u64,
-        physical: u64,
-        size: u64,
-        current: Variant,
-        global: bool,
-    ) {
-        let span = size.min(LEAF_FILL);
-        if span <= FETCH_PAGE {
-            return;
-        }
-        let page = pc & !(FETCH_PAGE - 1);
-        let frame = physical & !(FETCH_PAGE - 1);
-        let first = pc & !(span - 1);
-        for other in (first..first + span).step_by(FETCH_PAGE as usize) {
-            if other == page || self.current_key(other).is_some() {
-                continue;
-            }
-            if !self.host.fetch_permitted(other) {
-                continue;
-            }
-            let other_frame = frame.wrapping_add(other).wrapping_sub(page);
-            let variant = self.page_variant(current, other_frame);
-            let Some(id) = self.known_variant(variant) else {
-                continue;
-            };
-            let key = self.block_key(other_frame, id);
-            self.take_page(other, key, Taken::Leaf, global, global);
-        }
-    }
-
-    /// [`Self::translate_page`], counting a page the ITLB lacked by how it
-    /// was `taken` ([`Taken`]). `global` marks a page whose walk ended in
+    /// [`Self::translate_page`], counting a page the ITLB lacked as a miss
+    /// when `missed` (a fetch's) and as a refill when not
+    /// ([`Self::refill_pages`]). `global` marks a page whose walk ended in
     /// a global leaf ([`chain::LookupEntry::global_page`]), or may have;
     /// `shared` puts a lower-half page whose walk did in the context every
     /// address space shares ([`Self::itlb_context`]).
-    fn take_page(&mut self, pc: u64, key: u64, taken: Taken, global: bool, shared: bool) {
+    fn take_page(&mut self, pc: u64, key: u64, missed: bool, global: bool, shared: bool) {
         debug_assert!(global || !shared, "only a global page is shared");
         let half = chain::half(pc);
         let context = self.itlb_context(pc, shared);
@@ -427,23 +374,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
             }
         }
-        match taken {
-            Taken::Refill if !held_page => {
+        if !missed {
+            if !held_page {
                 self.statistics.itlb_sources[ItlbSource::Refilled as usize] += 1;
             }
-            Taken::Leaf if !held_page => {
-                self.statistics.itlb_sources[ItlbSource::LeafFills as usize] += 1;
-            }
-            Taken::Refill | Taken::Leaf => {}
-            Taken::Fetch if held_page => self.statistics.itlb[1] += 1,
-            Taken::Fetch => {
-                self.statistics.itlb[0] += 1;
-                let miss = self.itlb_miss(slot, page, context);
-                self.statistics.itlb_misses[miss as usize] += 1;
-                self.statistics.itlb_sources[ItlbSource::FillsLower as usize + half] += 1;
-                if self.note_itlb_seen(half, page, context) && miss == ItlbMiss::Cold {
-                    self.statistics.itlb_sources[ItlbSource::ColdSeen as usize] += 1;
-                }
+        } else if held_page {
+            self.statistics.itlb[1] += 1;
+        } else {
+            self.statistics.itlb[0] += 1;
+            let miss = self.itlb_miss(slot, page, context);
+            self.statistics.itlb_misses[miss as usize] += 1;
+            self.statistics.itlb_sources[ItlbSource::FillsLower as usize + half] += 1;
+            if self.note_itlb_seen(half, page, context) && miss == ItlbMiss::Cold {
+                self.statistics.itlb_sources[ItlbSource::ColdSeen as usize] += 1;
             }
         }
         let resident = self.itlb.entry(slot);
@@ -758,11 +701,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn refill_pages(&mut self, el: u8, context: Variant) {
         let generation = self.translation_generation;
         for pc in core::mem::take(&mut self.refills) {
-            // Taken already, with its leaf's other pages.
-            if self.current_key(pc).is_some() {
-                continue;
-            }
-            let Some(walk) = self.quiet_fetch_physical(pc) else {
+            let Some((physical, guarded, global)) = self.quiet_fetch_physical(pc) else {
                 continue;
             };
             if self.translation_generation != generation {
@@ -771,15 +710,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return;
             }
             let current = Variant {
-                guarded_page: walk.guarded,
+                guarded_page: guarded,
                 ..context
             };
-            let variant = self.page_variant(current, walk.physical);
+            let variant = self.page_variant(current, physical);
             if let Some(id) = self.known_variant(variant) {
-                let key = self.block_key(walk.physical, id);
-                self.take_page(pc, key, Taken::Refill, walk.global, walk.global);
+                let key = self.block_key(physical, id);
+                self.take_page(pc, key, false, global, global);
             }
-            self.take_leaf_pages(pc, walk.physical, walk.size, current, walk.global);
         }
     }
 
@@ -2307,21 +2245,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 }
-
-/// How [`Machine::take_page`] came to a page: counted as a fetch's ITLB
-/// hit or miss, a batch refill ([`Machine::refill_pages`]) or a page of a
-/// walked leaf ([`Machine::take_leaf_pages`]).
-#[derive(Clone, Copy)]
-enum Taken {
-    Fetch,
-    Refill,
-    Leaf,
-}
-
-/// The span around a fetched page whose other pages one walk gives the
-/// ITLB, when its leaf maps them all ([`Machine::take_leaf_pages`]): a
-/// 16 KiB page, the granule XNU maps code with, in 4 KiB ITLB pages.
-const LEAF_FILL: u64 = 1 << 14;
 
 /// The most pages one forgotten context leaves to walk again
 /// ([`Machine::refill_after`]). At 512 the cap bound: after each local TLBI

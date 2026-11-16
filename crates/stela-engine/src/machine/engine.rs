@@ -657,21 +657,8 @@ struct FetchEntry {
     guarded: bool,
     /// The walk ended in a global leaf (nG=0).
     global: bool,
-    /// Bytes the leaf maps over both stages (`mmu::Translation::size`).
-    size: u64,
     el: u8,
     epoch: FetchEpoch,
-}
-
-/// A walk no instruction asked for ([`Machine::quiet_fetch_physical`]):
-/// the page's frame, its leaf's guarded and global bits, and the bytes the
-/// leaf maps over both stages.
-#[derive(Clone, Copy)]
-struct QuietFetch {
-    physical: u64,
-    guarded: bool,
-    global: bool,
-    size: u64,
 }
 
 /// What a half's cached fetches and lookup contexts last as long as: the

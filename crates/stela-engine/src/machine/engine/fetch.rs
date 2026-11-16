@@ -411,7 +411,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     physical,
                     guarded: translation.guarded,
                     global: translation.global,
-                    size: translation.size,
                     el,
                     epoch: self.fetch_epoch(half),
                 });
@@ -456,15 +455,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// The page frame of `pc` for execution at the current EL, whether it
-    /// is guarded and global, and the bytes its leaf maps, when its walk
-    /// translates and the host permits the fetch: [`Self::fetch_physical`]
-    /// without a fault or report, for a walk no instruction asked for
-    /// ([`Self::refill_pages`]). The walker makes no descriptor updates (no
-    /// FEAT_HAFDBS), so the walk has no effect on memory. A global lower
-    /// page that widens what the PE may hold is left to its fetch, which
-    /// walks again.
-    pub(super) fn quiet_fetch_physical(&mut self, pc: u64) -> Option<QuietFetch> {
+    /// The page frame of `pc` for execution at the current EL and whether
+    /// it is guarded, when its walk translates and the host permits the
+    /// fetch: [`Self::fetch_physical`] without a fault or report, for a walk
+    /// no instruction asked for ([`Self::refill_pages`]). The walker makes
+    /// no descriptor updates (no FEAT_HAFDBS), so the walk has no effect on
+    /// memory. A global lower page that widens what the PE may hold is
+    /// left to its fetch, which walks again.
+    pub(super) fn quiet_fetch_physical(&mut self, pc: u64) -> Option<(u64, bool, bool)> {
         let requester = self.cpu.requester();
         let controls = self.cpu.controls(self.cpu.regime());
         let mut tables = RamTables(&mut self.host);
@@ -481,12 +479,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return None;
         }
         self.fetched_through(half, pc, translation.size, translation.global);
-        Some(QuietFetch {
-            physical: translation.physical & !(FETCH_PAGE - 1),
-            guarded: translation.guarded,
-            global: translation.global,
-            size: translation.size,
-        })
+        Some((
+            translation.physical & !(FETCH_PAGE - 1),
+            translation.guarded,
+            translation.global,
+        ))
     }
 
     /// The walk of the page of `pc` the fetch cache holds for the current
