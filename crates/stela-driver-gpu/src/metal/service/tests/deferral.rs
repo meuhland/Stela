@@ -58,6 +58,7 @@ const fn host(served: fn(Served)) -> ServiceHost {
         served,
         wake: || {},
         bundle: |_| {},
+        job_waiting: || {},
     }
 }
 
@@ -639,4 +640,61 @@ fn a_call_whose_host_call_no_task_took_runs_again_instead_of_failing() {
     assert_eq!(status(&mut memory, buffer), Status::OutOfMemory);
     assert!(!shared.jobs_waiting());
     *WITHDRAWING.lock().unwrap() = None;
+}
+
+/// Calls of `job_waiting` the next test's host saw.
+static JOB_WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// A call that parks on a job no processor started tells the platform, and
+/// so does each run of it while the job stays queued, so that an idle
+/// processor can be called to start it; once a processor took the job,
+/// nobody is told.
+#[test]
+fn a_call_waiting_for_an_unstarted_job_tells_the_platform() {
+    use crate::metal::service::wire::TextureResponse;
+    let mut service = service_on(MockBackend::new());
+    let a = connect(&mut service);
+    let gate = Arc::new(AtomicBool::new(false));
+    service.device().backend().image_gate = Some(gate.clone());
+    let shared = Arc::new(SharedService::new(
+        service,
+        ServiceHost {
+            job_waiting: || {
+                JOB_WAITING.fetch_add(1, Ordering::SeqCst);
+            },
+            ..host(|_| {})
+        },
+    ));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let texture = gate_call(
+        &mut memory,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Private),
+        size_of::<TextureResponse>(),
+    );
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    assert!(shared.job_queued());
+    assert_eq!(JOB_WAITING.load(Ordering::SeqCst), 1, "told when it parks");
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    assert_eq!(JOB_WAITING.load(Ordering::SeqCst), 2, "and when made again");
+    // A processor took the job: made again, the call waits without a word.
+    let runner = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.run_job(0, 0).is_some())
+    };
+    while shared.job_queued() {
+        std::thread::yield_now();
+    }
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    gate.store(true, Ordering::Release);
+    assert!(runner.join().unwrap());
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Ok);
+    assert_eq!(JOB_WAITING.load(Ordering::SeqCst), 2);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.deferred, report.repeated), (1, 1, 2));
 }

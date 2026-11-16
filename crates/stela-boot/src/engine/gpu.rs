@@ -144,6 +144,19 @@ pub(super) fn set_hub(hub: Arc<Hub>, pe: usize) {
     HUB.store(Arc::into_raw(hub).cast_mut(), Ordering::Release);
 }
 
+/// Calls a PE whose guest sleeps waiting for an interrupt, never the boot
+/// PE, to run a deferred job a guest call waits for at once
+/// (`gate::run_job` with `Taker::Waiting` in its idle service). A sleeping
+/// PE wakes only for its guest or the host's service, so a job otherwise
+/// waits for the next PE that stops to wait, or for a busy one 20 ms on.
+/// Whether one was called.
+#[cfg(feature = "nvk")]
+pub(super) fn call_job_taker() -> bool {
+    // SAFETY: a published hub is leaked, so it lives for the boot.
+    unsafe { HUB.load(Ordering::Acquire).as_ref() }
+        .is_some_and(|hub| hub.call_sleeping_server(BOOT_PE.load(Ordering::Relaxed)))
+}
+
 /// What wakes the service: a raised line or a call.
 struct Events {
     clock: crate::native_clock::ClockServices,

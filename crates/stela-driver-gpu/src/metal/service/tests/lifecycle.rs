@@ -146,6 +146,7 @@ fn shared_quiesce_uses_the_serialized_service_stack() {
             served: |_| {},
             wake: || {},
             bundle: |_| {},
+            job_waiting: || {},
         },
     );
     let connection = shared.connect().unwrap();

@@ -1117,6 +1117,20 @@ impl Hub {
         self.wake(pe);
     }
 
+    /// The host has work for an idle core, such as a job a guest call waits
+    /// for: a PE other than `skip` that sleeps waiting for an interrupt is
+    /// called ([`Self::call_host`]), so its wait ends and it serves the host
+    /// at once. A sleeping PE wakes only for its guest or the host's
+    /// service, so without this the work waits for the next PE that stops
+    /// to wait. Whether one was called; with none asleep, the work waits.
+    pub fn call_sleeping_server(&self, skip: usize) -> bool {
+        let Some(pe) = self.sleeping_server(skip) else {
+            return false;
+        };
+        self.call_host(pe);
+        true
+    }
+
     /// Whether the host needs PE `pe`'s core; once for each call.
     pub(super) fn take_host_call(&self, pe: usize) -> bool {
         let call = &self.inboxes[pe].host_call;
