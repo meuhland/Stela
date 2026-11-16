@@ -1178,22 +1178,28 @@ fn claim(
     let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
     let reset = ready.reset().is_some();
     match ready.reset() {
-        None => output::arguments(format_args!(
-            "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
-        )),
+        None => {
+            note_reset(address, GpuReset::None);
+            output::arguments(format_args!(
+                "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
+            ));
+        }
         Some(gpu::cold::Reset::SecondaryBus) => {
-            note_bus_reset(address);
+            note_reset(address, GpuReset::SecondaryBus);
             output::arguments(format_args!(
                 "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
             ));
         }
         Some(gpu::cold::Reset::Function(method)) => {
-            let name = match method {
-                stela_drivers::bus::pci::ResetMethod::FunctionLevel => "Function Level Reset",
+            let (name, reset) = match method {
+                stela_drivers::bus::pci::ResetMethod::FunctionLevel => {
+                    ("Function Level Reset", GpuReset::FunctionLevel)
+                }
                 stela_drivers::bus::pci::ResetMethod::PowerManagement => {
-                    "a D3hot to D0 power state reset"
+                    ("a D3hot to D0 power state reset", GpuReset::PowerManagement)
                 }
             };
+            note_reset(address, reset);
             output::arguments(format_args!(
                 "GPU {address}: reset by {name}; kept {sizes}\n"
             ));
@@ -1465,33 +1471,74 @@ pub(super) struct Refused {
     pub(super) why: String,
 }
 
-/// The GPUs whose cold start reset their own bus in this boot, each as
-/// one plus its segment, bus and device; 0 is a free slot. The reset reset
-/// their other functions too, which probe left parked for it.
-static BUS_RESET: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// How a GPU's cold start reset it in this boot (`gpu::cold::Reset`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GpuReset {
+    /// A Secondary Bus Reset of its own bus, which reset its other
+    /// functions too.
+    SecondaryBus,
+    /// Function Level Reset of function 0 alone.
+    FunctionLevel,
+    /// A D3hot to D0 reset of function 0 alone.
+    PowerManagement,
+    /// None: it started as firmware left it, its DMA translated.
+    None,
+}
 
-fn note_bus_reset(address: stela_drivers::bus::pci::Address) {
-    let word = 1 << 32
+impl GpuReset {
+    const ALL: [Self; 4] = [
+        Self::SecondaryBus,
+        Self::FunctionLevel,
+        Self::PowerManagement,
+        Self::None,
+    ];
+
+    /// For the log: what reset the GPU, and so whether its other functions.
+    pub(super) fn describe(self) -> &'static str {
+        match self {
+            Self::SecondaryBus => "a Secondary Bus Reset of its bus",
+            Self::FunctionLevel => "a Function Level Reset of function 0 alone",
+            Self::PowerManagement => "a D3hot to D0 reset of function 0 alone",
+            Self::None => "no reset (started as firmware left it, DMA translated)",
+        }
+    }
+}
+
+/// The GPUs claimed in this boot and how their cold start reset them, each
+/// as its reset's index plus one at bit 32, then its segment, bus and
+/// device; 0 is a free slot.
+static STARTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn note_reset(address: stela_drivers::bus::pci::Address, reset: GpuReset) {
+    let kind = GpuReset::ALL
+        .iter()
+        .position(|&each| each == reset)
+        .expect("a listed reset") as u64;
+    let word = (kind + 1) << 32
         | u64::from(address.segment) << 16
         | u64::from(address.bus) << 8
         | u64::from(address.device);
-    let _ = BUS_RESET.iter().find(|slot| {
+    let _ = STARTED.iter().find(|slot| {
         slot.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     });
 }
 
-/// Function 0 of each GPU whose cold start reset its bus in this boot.
-pub(super) fn reset_their_bus() -> Vec<stela_drivers::bus::pci::Address> {
-    BUS_RESET
+/// Function 0 of each GPU claimed in this boot, with how its cold start
+/// reset it.
+pub(super) fn claimed_resets() -> Vec<(stela_drivers::bus::pci::Address, GpuReset)> {
+    STARTED
         .iter()
         .map(|slot| slot.load(Ordering::Acquire))
         .filter(|&word| word != 0)
-        .map(|word| stela_drivers::bus::pci::Address {
-            segment: (word >> 16) as u16,
-            bus: (word >> 8) as u8,
-            device: word as u8,
-            function: 0,
+        .map(|word| {
+            let address = stela_drivers::bus::pci::Address {
+                segment: (word >> 16) as u16,
+                bus: (word >> 8) as u8,
+                device: word as u8,
+                function: 0,
+            };
+            (address, GpuReset::ALL[(word >> 32) as usize - 1])
         })
         .collect()
 }

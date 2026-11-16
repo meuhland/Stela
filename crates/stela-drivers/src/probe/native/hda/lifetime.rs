@@ -68,6 +68,23 @@ impl OriginalUsers {
     pub(super) unsafe fn after_bus_reset(retained: ConfigRetention) -> Self {
         Self { retained }
     }
+
+    /// The function's original users, found stopped: a GPU's HDMI/DP audio
+    /// function that no bus reset reset, claimed on the state its
+    /// configuration and controller were observed in (`hda::Quiescence`),
+    /// after its own function-local reset when that state was not quiet.
+    ///
+    /// # Safety
+    /// `retained` is the function's own current configuration epoch. The
+    /// owner (the user, by explicit option) vouches that no firmware, SMM,
+    /// ACPI or other driver drives the function or can deliver, EOI or
+    /// service an interrupt of it: its configuration showed bus mastering,
+    /// MSI, MSI-X and INTx disabled, and its controller was in reset or ran
+    /// no DMA engine with its interrupts disabled. The function stayed parked
+    /// in the contained fabric until this claim.
+    pub(super) unsafe fn after_quiescence(retained: ConfigRetention) -> Self {
+        Self { retained }
+    }
 }
 
 #[cfg(test)]

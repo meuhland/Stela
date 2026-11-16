@@ -173,6 +173,11 @@ impl ParseState<'_> {
                 options.guest_audio = true;
                 options.guest_audio_hdmi = true;
             }
+            "--guest-audio-hdmi-trust-quiesced" => {
+                options.guest_audio = true;
+                options.guest_audio_hdmi = true;
+                options.guest_audio_trust_quiesced = true;
+            }
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {

@@ -3201,6 +3201,7 @@ fn start_devices(
                         handoff,
                         host_clock,
                         options.guest_audio_hdmi,
+                        options.guest_audio_trust_quiesced,
                     );
                 }
             }
