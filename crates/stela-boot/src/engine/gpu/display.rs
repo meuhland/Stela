@@ -96,6 +96,9 @@ struct KmsScanout {
     reported: bool,
     /// The display's flips as last seen ([`note_flips`]).
     flips_seen: u64,
+    /// The counter at the display's last vertical blank as the last look
+    /// read it, when it could ([`Display::last_vblank_ns`]).
+    vblank_tsc: Option<u64>,
 }
 
 impl Scanout for KmsScanout {
@@ -145,6 +148,14 @@ impl Scanout for KmsScanout {
         self.blank &= presented.is_err();
         finish_present(display, presented)?;
         Ok(true)
+    }
+
+    /// The display's vertical blanks run on from the one the last look
+    /// read; the model takes the age past whole periods.
+    fn vblank_age_ns(&self) -> Option<u64> {
+        let tsc = self.vblank_tsc?;
+        let elapsed = host::rdtsc().saturating_sub(tsc);
+        u64::try_from(u128::from(elapsed) * 1_000_000_000 / u128::from(self.tsc_hz.max(1))).ok()
     }
 
     fn queued(&self) -> bool {
@@ -207,6 +218,7 @@ impl KmsScanout {
             tsc_hz,
             reported: false,
             flips_seen: 0,
+            vblank_tsc: None,
         }
     }
 
@@ -221,6 +233,14 @@ impl KmsScanout {
         self.looks = self.looks.wrapping_add(1);
         match &mut self.display {
             Some((name, display)) => {
+                // Linux's clock and the counter read together date the
+                // blank on the counter.
+                self.vblank_tsc = display.last_vblank_ns().and_then(|blank| {
+                    let (tsc, now) = (host::rdtsc(), client::now_ns());
+                    let age = u128::from(now.checked_sub(blank)?);
+                    let ticks = age * u128::from(self.tsc_hz) / 1_000_000_000;
+                    Some(tsc.saturating_sub(u64::try_from(ticks).ok()?))
+                });
                 let watched = display.watch();
                 report_watched(name, display, watched);
                 if let Some(error) = watched.error

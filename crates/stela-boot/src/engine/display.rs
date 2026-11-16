@@ -384,6 +384,10 @@ impl Scanout for MirroredScanout {
         })
     }
 
+    fn vblank_age_ns(&self) -> Option<u64> {
+        self.scanout.vblank_age_ns()
+    }
+
     fn queued(&self) -> bool {
         self.scanout.queued()
     }

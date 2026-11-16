@@ -83,6 +83,10 @@ struct Card {
     set_error: Option<i64>,
     /// Mappings to refuse.
     map_refusals: u32,
+    /// What a sequence request answers: whether the controller is on and
+    /// its last vertical blank's time; and the controllers asked.
+    vblank: Option<(u32, i64)>,
+    sequences: Vec<u32>,
     /// Dumb buffers and framebuffers given back, and mappings removed.
     destroyed: Vec<u32>,
     removed: Vec<u32>,
@@ -120,6 +124,8 @@ impl Card {
             mode_sets: 0,
             set_error: None,
             map_refusals: 0,
+            vblank: None,
+            sequences: Vec::new(),
             destroyed: Vec::new(),
             removed: Vec::new(),
             unmapped: 0,
@@ -250,6 +256,17 @@ unsafe impl Drm for &mut Card {
                         return BUSY;
                     }
                     flips.push(flip.framebuffer);
+                }
+                CRTC_GET_SEQUENCE => {
+                    assert!(self.immediate, "a sequence asked where it must wait");
+                    let sequence = &mut *argument.cast::<CrtcSequence>();
+                    self.sequences.push(sequence.crtc);
+                    let Some((active, ns)) = self.vblank else {
+                        return -22;
+                    };
+                    sequence.active = active;
+                    sequence.sequence = 7;
+                    sequence.sequence_ns = ns;
                 }
                 REMOVE_FB => self.removed.push(*argument.cast::<u32>()),
                 DESTROY_DUMB => self

@@ -468,6 +468,32 @@ fn refresh_ticks(refresh: u32) -> u64 {
     let refresh = u64::from(refresh.max(1));
     (COUNTER_HZ * 1000 + refresh / 2) / refresh
 }
+/// The vblank after the one at `due`, of a `period`: a period on, or,
+/// when the monitor's last vertical blank began `age_ns` before `now`, the
+/// first point after half a period past `due` of the monitor's grid moved
+/// on by half a period. Vblanks then follow the monitor's whatever the two
+/// clocks' drift, and the flip a present queues, which the next vblank's
+/// flush requests, is asked for mid-period, never racing the monitor's
+/// blank. A grid moved this way gives one vblank between half a period and
+/// a period and a half after the last.
+fn next_vblank(due: u64, now: u64, period: u64, age_ns: Option<u64>) -> u64 {
+    let Some(age_ns) = age_ns else {
+        return due + period;
+    };
+    let period = period.max(1);
+    let age = u64::try_from(u128::from(age_ns) * u128::from(COUNTER_HZ) / 1_000_000_000)
+        .unwrap_or(u64::MAX)
+        % period;
+    // A point of the moved grid, a period on so it cannot fall below zero.
+    let base = now + period - age + period / 2;
+    let earliest = due + period / 2;
+    if base > earliest {
+        base - (base - earliest - 1) / period * period
+    } else {
+        base + ((earliest - base) / period + 1) * period
+    }
+}
+
 /// Original T6000 `D594_callback__` (container file 0x3daec14) reads this
 /// flag at VA 0xfffffe000adb2cec and passes nullptr for bit0=1. The AP
 /// skips absent statistics at 0xfffffe000ad9cb68 and still completes the
@@ -1050,7 +1076,11 @@ impl Methods {
             let behind = (now - self.next_refresh) / self.refresh_ticks;
             self.next_refresh + behind * self.refresh_ticks
         };
-        self.next_refresh = due + self.refresh_ticks;
+        let age = self
+            .scanout
+            .as_ref()
+            .and_then(|scanout| scanout.vblank_age_ns());
+        self.next_refresh = next_vblank(due, now, self.refresh_ticks, age);
         // The latch takes only what is ready at its vblank.
         self.latched = Some(due);
         self.swap_ready(now);

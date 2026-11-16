@@ -149,3 +149,27 @@ fn unstable_resource_or_mode_lists_stop_without_modesetting() {
         assert!(card.set.is_none());
     }
 }
+
+#[test]
+fn the_last_vblank_is_the_first_outputs_on_linuxs_clock() {
+    let mut card = Card::new(vec![mode(2, 2, PREFERRED)]);
+    card.vblank = Some((1, 5_000_000_123));
+    let mut display = Display::take(&mut card, (2, 2)).unwrap();
+    assert_eq!(display.last_vblank_ns(), Some(5_000_000_123));
+    assert_eq!(display.drm.sequences, [41]);
+    // A controller that is off, a refusal, or no time: none.
+    display.drm.vblank = Some((0, 5_000_000_123));
+    assert_eq!(display.last_vblank_ns(), None);
+    display.drm.vblank = Some((1, 0));
+    assert_eq!(display.last_vblank_ns(), None);
+    display.drm.vblank = None;
+    assert_eq!(display.last_vblank_ns(), None);
+    // Not asked where a request must wait, nor while the outputs are dark.
+    display.drm.vblank = Some((1, 9));
+    display.drm.immediate = false;
+    assert_eq!(display.last_vblank_ns(), None);
+    display.drm.immediate = true;
+    display.dark = true;
+    assert_eq!(display.last_vblank_ns(), None);
+    assert_eq!(display.drm.sequences.len(), 4);
+}

@@ -59,6 +59,7 @@ const MAP_DUMB: u32 = request::<MapDumb>(0xb3);
 const ADD_FB2: u32 = request::<FramebufferCommand>(0xb8);
 const REMOVE_FB: u32 = request::<u32>(0xaf);
 const DESTROY_DUMB: u32 = request::<DestroyDumb>(0xb4);
+const CRTC_GET_SEQUENCE: u32 = request::<CrtcSequence>(0x3b);
 
 /// `DRM_MODE_CONNECTED`.
 const CONNECTED: u32 = 1;
@@ -202,6 +203,17 @@ struct PageFlip {
     flags: u32,
     reserved: u32,
     user_data: u64,
+}
+
+/// `struct drm_crtc_get_sequence`: a controller's vertical blank count and
+/// when its last one began, on Linux's monotonic clock.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct CrtcSequence {
+    crtc: u32,
+    active: u32,
+    sequence: u64,
+    sequence_ns: i64,
 }
 
 /// What stops the display.
@@ -1241,6 +1253,29 @@ impl<D: Drm> Display<D> {
     /// The mode's refresh in millihertz.
     pub fn refresh_millihertz(&self) -> u32 {
         self.refresh
+    }
+
+    /// When the first output's last vertical blank began, in nanoseconds
+    /// of Linux's monotonic clock: what the picture's flips land on. `None`
+    /// where a request must wait for another processor, while the outputs
+    /// are dark, or when the controller is off or the driver gives no time.
+    pub fn last_vblank_ns(&mut self) -> Option<u64> {
+        if self.dark || !self.drm.immediate() {
+            return None;
+        }
+        let mut sequence = CrtcSequence {
+            crtc: self.heads.first()?.crtc,
+            ..CrtcSequence::default()
+        };
+        let result = self
+            .drm
+            .control(CRTC_GET_SEQUENCE, ptr::from_mut(&mut sequence).cast());
+        if result != 0 || sequence.active == 0 {
+            return None;
+        }
+        u64::try_from(sequence.sequence_ns)
+            .ok()
+            .filter(|&ns| ns != 0)
     }
 
     /// The monitor's image size in millimetres, when its EDID gave one.

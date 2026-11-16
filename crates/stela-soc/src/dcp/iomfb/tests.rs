@@ -2825,3 +2825,71 @@ fn a_frame_on_screen_that_cannot_be_read_again_waits_for_the_next_swap() {
     state.borrow_mut().0 = true;
     assert!(methods.frame_ready(2 * period + 1));
 }
+
+/// A 240 Hz screen that reads its monitor's last vertical blank as
+/// `age`'s nanoseconds ago, or none at `u64::MAX`.
+struct TimedScreen(alloc::sync::Arc<core::sync::atomic::AtomicU64>);
+impl Scanout for TimedScreen {
+    fn mode(&self) -> Mode {
+        FULL_HD
+    }
+    fn refresh_millihertz(&self) -> u32 {
+        240_000
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn vblank_age_ns(&self) -> Option<u64> {
+        let age = self.0.load(core::sync::atomic::Ordering::Relaxed);
+        (age != u64::MAX).then_some(age)
+    }
+}
+
+#[test]
+fn vblanks_follow_the_monitors_half_a_period_after_its_own() {
+    use core::sync::atomic::Ordering::Relaxed;
+    // 240 Hz: 100_000 ticks of the 24 MHz counter, 4_166_667 ns.
+    let period = 100_000;
+    // Rounded up, so the model's truncation reads the same ticks back.
+    let ns = |ticks: u64| (ticks * 1_000_000_000).div_ceil(24_000_000);
+    let age = alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(u64::MAX));
+    let mut methods = Methods::new(Box::new(TimedScreen(age.clone())), interface());
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    // The monitor's last blank 30_000 ticks before the first look: its grid
+    // is -29_000 + k periods, so the model's is 21_000 + k periods.
+    age.store(ns(30_000), Relaxed);
+    methods.refresh(1000);
+    assert_eq!(methods.refresh_deadline(), Some(121_000));
+    age.store(ns(50_000), Relaxed);
+    methods.refresh(121_000);
+    assert_eq!(methods.refresh_deadline(), Some(221_000));
+    // The monitor's clock ran 10_000 ticks slow against the counter: the
+    // grid moves with it, the gap within a period and a half.
+    age.store(ns(40_000), Relaxed);
+    methods.refresh(221_000);
+    assert_eq!(methods.refresh_deadline(), Some(331_000));
+    // An age past many periods is the same blank's.
+    age.store(ns(30 * period + 50_000), Relaxed);
+    methods.refresh(331_000);
+    assert_eq!(methods.refresh_deadline(), Some(431_000));
+    // The display unread again: the model's own grid from there.
+    age.store(u64::MAX, Relaxed);
+    methods.refresh(431_000);
+    assert_eq!(methods.refresh_deadline(), Some(531_000));
+}
+
+#[test]
+fn a_locked_vblank_falls_half_a_period_to_a_period_and_a_half_after_the_last() {
+    let period = 100_000;
+    assert_eq!(next_vblank(1000, 50_000, period, None), 101_000);
+    // A late look with the monitor's blank just now: half a period on.
+    assert_eq!(next_vblank(1000, 90_000, period, Some(0)), 140_000);
+    // The monitor's blank just after the model's: the next falls a period
+    // and a half on, never closer than half a period.
+    let tick_ns = 1_000_000_000 / 24_000_000 + 1;
+    assert_eq!(next_vblank(1000, 1000, period, Some(tick_ns)), 151_000 - 1);
+    // Half a period before it: a period on.
+    assert_eq!(next_vblank(1000, 1000, period, Some(2_083_334)), 101_000);
+}

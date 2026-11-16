@@ -194,6 +194,15 @@ pub trait Scanout {
         Ok(false)
     }
 
+    /// How long ago, in nanoseconds, the monitor's last vertical blank
+    /// began, when the sink knows its real scanout's timing: the model then
+    /// keeps its vblanks on the monitor's, at a fixed offset. `None` (a
+    /// mirrored or headless sink, a display not yet read) leaves the model's
+    /// own grid, which keeps its phase on the counter.
+    fn vblank_age_ns(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether an earlier present left work only [`Self::flush`] finishes,
     /// such as a page flip whose request must wait for another processor.
     fn queued(&self) -> bool {
