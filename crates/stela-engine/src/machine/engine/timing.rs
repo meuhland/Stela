@@ -8,7 +8,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// time, so a serialized count does not advance across it. A parallel
     /// PE's count is the host's: stopped in the kernel, where it may hold a
     /// lock another PE times, the count waits for it only once it has been
-    /// stopped `clock::STALL_MILLIS`; at EL0 it holds no such lock.
+    /// stopped `clock::STALL_MILLIS` (`clock::LEASE_MILLIS` while a kernel
+    /// spin is old); at EL0 it holds no such lock.
     pub fn exclude_host_time<T>(&mut self, work: impl FnOnce(&mut D) -> T) -> T {
         let progress = self.work();
         let at_el0 = self.cpu.pstate.el == 0;
