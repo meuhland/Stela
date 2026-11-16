@@ -18,7 +18,7 @@ mod virtio;
 pub use transfer_times::{
     PageWrites, PartTime, TRANSFER_PARTS, WRITE_PAGES, WRITE_PARTS, WriteTimes,
 };
-pub use virtio::VirtioReport;
+pub use virtio::{Route, VirtioReport, route};
 
 use crate::Result;
 pub use crate::pmu::{RtcAnchor, RtcEpoch};
@@ -231,6 +231,9 @@ pub struct AppleDevices {
     stela_net: Option<DeviceId>,
     /// Stela's virtio-mmio devices (`virtio`), as the boot places them.
     virtio: Vec<DeviceId>,
+    /// The one among them that is a network device: the guest's second
+    /// network interface, beside StelaNet or the USB Ethernet adapter.
+    virtio_net: Option<DeviceId>,
     storage_masters: Vec<(DeviceId, DeviceId)>,
     /// The GFX coprocessor's ASC and the `sgx` block whose UAT it masters
     /// memory through.
@@ -686,6 +689,7 @@ impl AppleDevices {
             gpu_gates: Vec::new(),
             stela_net: None,
             virtio: Vec::new(),
+            virtio_net: None,
             sep_masters: Vec::new(),
             dcp_masters: Vec::new(),
             frame_presented: false,
@@ -1376,7 +1380,7 @@ impl Devices for AppleDevices {
     }
 
     fn take_host_service(&mut self) -> bool {
-        let net = self.stela_net_take_service_due();
+        let net = self.stela_net_take_service_due() | self.virtio_net_take_service_due();
         self.usb_masters
             .iter_mut()
             .fold(core::mem::take(&mut self.frame_presented), |due, master| {
