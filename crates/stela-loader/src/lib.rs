@@ -57,6 +57,7 @@ pub mod stela_net;
 mod thread_state;
 pub mod trust_cache;
 pub mod upgrade;
+pub mod virtio;
 #[cfg(feature = "std")]
 use object::{Object, ObjectSection};
 #[cfg(feature = "std")]

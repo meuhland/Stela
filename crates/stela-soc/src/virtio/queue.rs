@@ -1,7 +1,9 @@
-//! The device side of one split virtqueue (virtio 1.2, 2.7) in guest RAM, as
-//! `stela_contracts::net::ring` lays it out: chains taken from the available
-//! ring, completions put on the used ring, and `VIRTIO_F_EVENT_IDX`
-//! notification suppression both ways.
+//! The device side of one split virtqueue (virtio 1.2, 2.7) in guest RAM:
+//! chains taken from the available ring, completions put on the used ring,
+//! and `VIRTIO_F_EVENT_IDX` notification suppression both ways. StelaNet's
+//! queues lie in one block as `stela_contracts::net::ring` lays it out
+//! ([`Queue::new`]); a virtio-mmio queue's three areas are wherever the
+//! driver puts them ([`Queue::split`]).
 //!
 //! Every access goes through [`Memory`] by guest physical address. A ring
 //! whose indices or descriptors break the format is the driver's bug: the
@@ -13,6 +15,7 @@ use stela_contracts::net::{
     ring::{self, DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE},
     window::QUEUE_MAX,
 };
+use stela_contracts::virtio::ring as areas;
 
 /// Why a ring could not be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +120,13 @@ pub fn need_event(event: u16, new: u16, old: u16) -> bool {
 /// One virtqueue: where it is and how far the device has gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queue {
+    /// The descriptor table, the available ring and the used ring.
     base: u64,
+    avail_at: u64,
+    used_at: u64,
+    /// The one block [`Self::new`] laid the areas out in, its bytes;
+    /// `None` for [`Self::split`]'s areas.
+    block: Option<u64>,
     size: u16,
     /// The next available entry the device takes.
     last_avail: u16,
@@ -144,6 +153,54 @@ impl Queue {
             .ok_or("a queue's block wraps the address space")?;
         Ok(Self {
             base,
+            avail_at: base + ring::avail(size),
+            used_at: base + ring::used(size),
+            block: Some(ring::bytes(size)),
+            size: size as u16,
+            last_avail: 0,
+            used: 0,
+            shown: 0,
+            seen: 0,
+        })
+    }
+
+    /// A queue of `size` entries, a power of two up to `most`, whose
+    /// descriptor table, available ring and used ring are at `desc`,
+    /// `avail` and `used`, each aligned as virtio 1.2 2.7 requires (16, 2
+    /// and 4 bytes): the three addresses virtio-mmio's driver programs.
+    pub fn split(
+        desc: u64,
+        avail: u64,
+        used: u64,
+        size: u64,
+        most: u64,
+    ) -> Result<Self, &'static str> {
+        if size == 0 || !size.is_power_of_two() || size > most.min(areas::QUEUE_MAX) {
+            return Err("a queue's size is not a power of two up to QUEUE_NUM_MAX");
+        }
+        if desc == 0 || !desc.is_multiple_of(areas::DESC_ALIGN) {
+            return Err("a descriptor table is not 16-byte aligned");
+        }
+        if avail == 0 || !avail.is_multiple_of(areas::AVAIL_ALIGN) {
+            return Err("an available ring is not 2-byte aligned");
+        }
+        if used == 0 || !used.is_multiple_of(areas::USED_ALIGN) {
+            return Err("a used ring is not 4-byte aligned");
+        }
+        for (start, bytes) in [
+            (desc, areas::desc_bytes(size)),
+            (avail, areas::avail_bytes(size)),
+            (used, areas::used_bytes(size)),
+        ] {
+            start
+                .checked_add(bytes)
+                .ok_or("a queue's area wraps the address space")?;
+        }
+        Ok(Self {
+            base: desc,
+            avail_at: avail,
+            used_at: used,
+            block: None,
             size: size as u16,
             last_avail: 0,
             used: 0,
@@ -156,19 +213,35 @@ impl Queue {
         self.size
     }
 
-    /// Checks the whole block is RAM the device may write.
+    /// Checks the queue is RAM the device may use: [`Self::new`]'s whole
+    /// block, which it may write, or [`Self::split`]'s three areas, the
+    /// used ring the one it writes.
     pub fn check(&self, memory: &mut dyn Memory) -> Result<(), RingError> {
-        memory
-            .check_range(self.base, ring::bytes(u64::from(self.size)) as usize, true)
-            .map_err(|_| RingError::Memory)
+        let size = u64::from(self.size);
+        let ranges = match self.block {
+            Some(bytes) => [(self.base, bytes, true), (0, 0, false), (0, 0, false)],
+            None => [
+                (self.base, areas::desc_bytes(size), false),
+                (self.avail_at, areas::avail_bytes(size), false),
+                (self.used_at, areas::used_bytes(size), true),
+            ],
+        };
+        for (start, bytes, write) in ranges {
+            if bytes != 0 {
+                memory
+                    .check_range(start, bytes as usize, write)
+                    .map_err(|_| RingError::Memory)?;
+            }
+        }
+        Ok(())
     }
 
     fn avail(&self) -> u64 {
-        self.base + ring::avail(u64::from(self.size))
+        self.avail_at
     }
 
     fn used_ring(&self) -> u64 {
-        self.base + ring::used(u64::from(self.size))
+        self.used_at
     }
 
     fn read16(memory: &mut dyn Memory, address: u64) -> Result<u16, RingError> {

@@ -21,7 +21,8 @@
 //! into one frame ([`offload::Coalesced`]), so the guest's stack handles one
 //! segment where the wire carried dozens.
 pub mod offload;
-pub mod queue;
+/// The device side of its virtqueues, shared with the virtio devices.
+pub use crate::virtio::queue;
 #[cfg(test)]
 mod tests;
 

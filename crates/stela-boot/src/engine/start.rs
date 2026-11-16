@@ -1056,6 +1056,12 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         }
         _ => None,
     };
+    // Stela's virtio devices (`--virtio`), placed after the GPU gates and
+    // StelaNet: each takes the next free window and AIC input.
+    let virtio_placement = match assigned.as_mut() {
+        Some(assigned) if options.virtio => virtio::place(&mut assigned.tree),
+        _ => None,
+    };
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
     // The same loader bytes are for every subsequent native CPU and synchronous device writer.
@@ -1193,6 +1199,13 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             offloads == StelaNetOffloads::Coalescing,
             offloads.name()
         ));
+    }
+    if let (Some(placement), Some(board)) = (virtio_placement, &board) {
+        virtio::add(
+            &mut devices,
+            placement,
+            u32::from(board.aic.layout.max_irq()),
+        );
     }
     // Device placement has copied the carried firmware. This function
     // never returns, so release the remaining input buffers here.
