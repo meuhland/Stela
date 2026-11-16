@@ -47,7 +47,7 @@ use stela_contracts::gate::MemoryRange;
 mod aligned_copies;
 mod extended_planes;
 mod read_back;
-pub use aligned_copies::RowCopy;
+pub use aligned_copies::{RowCopy, SurfaceNote};
 pub(super) use extended_planes::PlaneActions;
 pub use extended_planes::PlaneChanges;
 pub use read_back::ReadBack;
@@ -1004,7 +1004,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 },
                 texel_bytes: u64::from(descriptor.pixel_format.describe().block.bytes),
             };
-            let (image, copy) = self.plane_image(&plan, rows)?;
+            let (image, copy) = self.plane_image(&plan, rows, false)?;
             let (id, views) = match self.shader_views(image, &plan.views) {
                 Ok(created) => created,
                 Err(error) => {
@@ -1146,6 +1146,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             buffer.length,
         );
         let plans = resource::two_plane_texture(&self.capabilities, descriptor, length, planes)?;
+        // A large surface the GPU only samples is read from device memory
+        // (`aligned_copies`): sampled from guest RAM, every texel cache miss
+        // crosses the bus.
+        let sampled = !renders
+            && descriptor.width.saturating_mul(descriptor.height)
+                >= aligned_copies::DEVICE_COPY_TEXELS;
         let formats = descriptor
             .pixel_format
             .plane_formats()
@@ -1162,7 +1168,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     layout,
                     texel_bytes: u64::from(format.describe().block.bytes),
                 };
-                let (image, copy) = self.plane_image(plan, rows)?;
+                let (image, copy) = self.plane_image(plan, rows, sampled)?;
                 images.push(image);
                 copies.extend(copy);
                 let info = plan

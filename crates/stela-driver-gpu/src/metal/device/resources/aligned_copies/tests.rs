@@ -339,3 +339,112 @@ fn rows_another_connections_work_refreshes_from_outlive_it() {
     assert_eq!(device.poll(), Ok(other));
     assert!(device.backend().destroyed.contains(&Object::Memory(memory)));
 }
+
+/// A video wallpaper's 10-bit 4:2:0 surface, whose rows the GPU could
+/// address in place, is sampled from device memory: both planes' copies are
+/// refreshed only by a command buffer that uses the texture, only when the
+/// surface's seed changed since the last copy, and again after a command
+/// buffer wrote the surface through another object. Before, it was sampled
+/// from guest RAM: 10.6 ms for one 1280x896 quad over a 3840x2160 surface.
+#[test]
+fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
+    let mut device = device();
+    let buffer = buffer(&mut device, 8 << 20);
+    let surface = descriptor(
+        PixelFormat::Ycbcr10_420_2p,
+        1920,
+        1080,
+        TextureUsage::SHADER_READ,
+    );
+    let planes = [
+        PlaneLayout {
+            offset: 0,
+            bytes_per_row: 3840,
+        },
+        PlaneLayout {
+            offset: 4 << 20,
+            bytes_per_row: 3840,
+        },
+    ];
+    let texture = device
+        .new_two_plane_texture(buffer, &surface, planes, 0)
+        .unwrap();
+    assert!(device.has_aligned_copy(texture));
+    let both = [
+        (true, 0, 1920, [1920, 1080, 1]),
+        (true, 4 << 20, 960, [960, 540, 1]),
+    ];
+    let note = |texture, seed| SurfaceNote {
+        texture,
+        surface: 42,
+        seed,
+    };
+    let commit = |device: &mut TestDevice, notes: &[SurfaceNote], written: &[TextureId]| {
+        let mut commands = device.new_command_buffer();
+        commands.surfaces.extend_from_slice(notes);
+        commands.written.extend_from_slice(written);
+        device.commit(commands).unwrap();
+        row_copies(device)
+    };
+    // Not used: nothing is copied.
+    assert_eq!(commit(&mut device, &[], &[]), []);
+    // Used at seed 7: copied once, then not again while the seed holds.
+    assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), []);
+    // The CPU wrote it: a new seed.
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    // Another texture over the same surface (another connection's, as the
+    // surface's ID says) written by a command buffer: the next use copies.
+    let other = device
+        .new_texture_from_buffer(
+            buffer,
+            &descriptor(
+                PixelFormat::R16Unorm,
+                1920,
+                1080,
+                TextureUsage::RENDER_TARGET,
+            ),
+            0,
+            3840,
+        )
+        .unwrap();
+    assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[other]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    // Read, not written, it changes nothing.
+    assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), []);
+    // A buffer over the surface may be written by any shader.
+    assert_eq!(commit(&mut device, &[note(None, 8)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    device.destroy_texture(other).unwrap();
+    device.destroy_texture(texture).unwrap();
+}
+
+/// A surface below a 1920x1080 frame keeps sampling its rows in
+/// place: no copy at all.
+#[test]
+fn small_surfaces_stay_in_their_rows() {
+    let mut device = device();
+    let buffer = buffer(&mut device, 8 << 20);
+    let planes = [
+        PlaneLayout {
+            offset: 0,
+            bytes_per_row: 1280,
+        },
+        PlaneLayout {
+            offset: 4 << 20,
+            bytes_per_row: 1280,
+        },
+    ];
+    let small = descriptor(
+        PixelFormat::Ycbcr10_420_2p,
+        640,
+        360,
+        TextureUsage::SHADER_READ,
+    );
+    let texture = device
+        .new_two_plane_texture(buffer, &small, planes, 0)
+        .unwrap();
+    assert!(!device.has_aligned_copy(texture));
+    device.destroy_texture(texture).unwrap();
+}
