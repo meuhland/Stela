@@ -7,7 +7,8 @@
  *    └─ StelaVirtIOMMIOTransport   maps the page, takes the interrupt
  *        └─ StelaVirtIODevice      the nub, VirtIODeviceID = n
  *            ├─ StelaVirtIOEntropy (n = 4)
- *            └─ StelaVirtIOConsole (n = 3, Console.h)
+ *            ├─ StelaVirtIOConsole (n = 3, Console.h)
+ *            └─ StelaVirtIONet     (n = 1, Net.h)
  *
  * The transport resets the device and acknowledges it, then publishes one
  * nub; a driver matches the nub by its personality's VirtIODeviceID
@@ -102,6 +103,12 @@ public:
 	void kick(StelaVirtIOQueue *queue);
 	bool reset();
 	void setHandler(OSObject *owner, StelaVirtIOHandler handler);
+	/*
+	 * `count` 32-bit words of the configuration space from `offset`, a
+	 * multiple of 4, read again until CONFIG_GENERATION holds still across
+	 * them. Answers false when it never does.
+	 */
+	bool readConfig(uint32_t offset, uint32_t *words, unsigned count);
 
 private:
 	StelaVirtIOMMIOTransport *transport = nullptr;
