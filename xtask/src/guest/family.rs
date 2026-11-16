@@ -24,6 +24,8 @@ use std::{
 };
 use stela_loader::aux_kc::manifest::{self, Manifest, ManifestClass};
 
+pub mod audio;
+
 /// A family's classes, their header and manifest.
 pub struct Family {
     /// The header in `guest/stela-virtio/family`, and its manifest there.
@@ -37,10 +39,13 @@ pub struct Family {
 
 /// Pure virtual slots of `class` whose methods `from` names: `class`'s slot
 /// `first + n` declares `from`'s method of that slot, with `trailing` added
-/// to its parameters.
+/// to its parameters. `from` is one of the family's classes or, with
+/// `entry`, a class of that fileset entry: a kernel driver deriving from
+/// `class`, whose overrides name its pure slots.
 pub struct Pure {
     pub class: &'static str,
     pub from: &'static str,
+    pub entry: Option<&'static str>,
     pub first: usize,
     pub count: usize,
     pub trailing: &'static str,
@@ -50,23 +55,29 @@ pub struct Pure {
 /// from, and the stream nub it publishes. IOSerialStreamSync forwards each
 /// of its twelve stream methods to the driver's pure virtual of the same
 /// slot, adding the `void *refCon` the stream was made with.
-pub const FAMILIES: &[Family] = &[Family {
-    header: "IOSerialFamily.h",
-    manifest: "IOSerialFamily.slots",
-    entry: "com.apple.iokit.IOSerialFamily",
-    classes: &[
-        "IOSerialDriverSync",
-        "IOSerialStreamSync",
-        "IORS232SerialStreamSync",
-    ],
-    pure: &[Pure {
-        class: "IOSerialDriverSync",
-        from: "IOSerialStreamSync",
-        first: 272,
-        count: 12,
-        trailing: "Pv",
-    }],
-}];
+///
+/// IOAudioFamily (K5's sound) is [`audio::FAMILY`], in `family/audio`.
+pub const FAMILIES: &[Family] = &[
+    Family {
+        header: "IOSerialFamily.h",
+        manifest: "IOSerialFamily.slots",
+        entry: "com.apple.iokit.IOSerialFamily",
+        classes: &[
+            "IOSerialDriverSync",
+            "IOSerialStreamSync",
+            "IORS232SerialStreamSync",
+        ],
+        pure: &[Pure {
+            class: "IOSerialDriverSync",
+            from: "IOSerialStreamSync",
+            entry: None,
+            first: 272,
+            count: 12,
+            trailing: "Pv",
+        }],
+    },
+    audio::FAMILY,
+];
 
 /// Where the families' headers and manifests are.
 fn directory() -> PathBuf {
@@ -100,13 +111,20 @@ pub fn manifest(boot: &[u8], family: &Family) -> Result<Manifest> {
         });
     }
     for pure in family.pure {
-        let from = classes
-            .iter()
-            .find(|class| class.layout.class == pure.from)
-            .with_context(|| format!("{} is not in the family", pure.from))?
-            .layout
-            .slots
-            .clone();
+        let from = match pure.entry {
+            None => classes
+                .iter()
+                .find(|class| class.layout.class == pure.from)
+                .with_context(|| format!("{} is not in the family", pure.from))?
+                .layout
+                .slots
+                .clone(),
+            Some(entry) => {
+                manifest::class_layout(boot, pure.from, &[family.entry, entry])
+                    .with_context(|| format!("{} in {entry}", pure.from))?
+                    .slots
+            }
+        };
         let class = classes
             .iter_mut()
             .find(|class| class.layout.class == pure.class)
@@ -143,13 +161,27 @@ pub fn manifest(boot: &[u8], family: &Family) -> Result<Manifest> {
         "each slot: index, vtable offset, the symbols exported at its method (? for none).".into(),
     ];
     for pure in family.pure {
+        let slots = if pure.count == 1 {
+            format!("slot {} declares", pure.first)
+        } else {
+            format!(
+                "slots {}-{} declare",
+                pure.first,
+                pure.first + pure.count - 1
+            )
+        };
+        let from = match pure.entry {
+            Some(entry) => format!("{} ({entry})", pure.from),
+            None => pure.from.to_owned(),
+        };
+        let trailing = if pure.trailing.is_empty() {
+            String::new()
+        } else {
+            format!(", plus `{}`", pure.trailing)
+        };
         source.push(format!(
-            "`= name`: {}'s pure virtual slots {}-{} declare {}'s methods there, plus `{}`.",
+            "`= name`: {}'s pure virtual {slots} {from}'s methods there{trailing}.",
             pure.class,
-            pure.first,
-            pure.first + pure.count - 1,
-            pure.from,
-            pure.trailing
         ));
     }
     Ok(Manifest { source, classes })
@@ -164,7 +196,11 @@ fn with_parameter(method: &str, parameter: &str) -> Option<String> {
     let name = method.get(..digits + length)?;
     let parameters = method.get(digits + length..)?.strip_prefix('E')?;
     let parameters = if parameters == "v" { "" } else { parameters };
-    Some(format!("{name}E{parameters}{parameter}"))
+    let all = format!("{parameters}{parameter}");
+    Some(format!(
+        "{name}E{}",
+        if all.is_empty() { "v" } else { &all }
+    ))
 }
 
 /// The `__ZTV<class>` vtables `object` defines, each slot's symbol by
@@ -355,11 +391,9 @@ mod tests {
     #[test]
     fn the_family_headers_put_every_method_in_the_kernels_slot() {
         let vtables = object_vtables(&probe_object(&directory())).unwrap();
-        for family in FAMILIES {
-            let manifest = committed(family);
-            for (probe, class) in PROBES {
-                check_probe(&vtables, &manifest, probe, class).unwrap();
-            }
+        let manifest = committed(&FAMILIES[0]);
+        for (probe, class) in PROBES {
+            check_probe(&vtables, &manifest, probe, class).unwrap();
         }
     }
 
