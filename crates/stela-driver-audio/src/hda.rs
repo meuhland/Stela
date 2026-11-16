@@ -115,6 +115,38 @@ impl Default for Config {
     }
 }
 
+/// What the controller absorbed without failing a verb or a route
+/// ([`Controller::stats`]): command transport events, HDMI route readbacks
+/// that a second read contradicted, and HDMI stream FIFO errors that were
+/// acknowledged while the stream played on. Counts since construction,
+/// kept through [`Controller::reinitialize`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// RIRB entries the write pointer covered before their DMA write had
+    /// landed: the entry still held the mark the last read left. Waited
+    /// for, never taken from the ring's previous lap.
+    pub rirb_late: u64,
+    /// Of those, entries that had still not landed when their verb timed
+    /// out: skipped.
+    pub rirb_lost: u64,
+    /// Solicited responses no command of their codec awaited, or from no
+    /// valid codec address (15): dropped, never taken as an answer.
+    pub spurious: u64,
+    /// Unsolicited responses: queued as events, never taken as an answer.
+    pub unsolicited: u64,
+    /// HDMI route readbacks that answered wrong and, read again at once,
+    /// as set: a transport misread, not a route fault.
+    pub misreads: u64,
+    /// HDMI pin senses without presence and ELD valid that a second sense
+    /// at once contradicted: not a sink away.
+    pub sense_misreads: u64,
+    /// HDMI stream FIFO errors (FIFOE without DESE) acknowledged while the
+    /// stream played on.
+    pub fifo_errors: u64,
+    /// The stream status (SDnSTS) of the last of them.
+    pub fifo_status: u8,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities {
     pub input_streams: u8,
@@ -174,6 +206,17 @@ pub struct Controller<R, T> {
     rirb_entries: u16,
     corb_wp: u16,
     rirb_rp: u16,
+    /// The RIRB entry the write pointer covers whose DMA write has not
+    /// landed yet (counted once in `stats.rirb_late`).
+    rirb_unlanded: Option<u16>,
+    /// The audio8a transport, for the test that reproduces its misread:
+    /// a zero-filled RIRB, no landing check and no mark after a read.
+    #[cfg(test)]
+    legacy_rirb: bool,
+    stats: Stats,
+    /// The last HDMI readback a second read contradicted, for the owner's
+    /// log (`take_misread`).
+    misread: Option<hdmi::Misread>,
     command_poisoned: bool,
     /// `rirb.cmds` and `rirb.res`: commands each codec has yet to answer, and
     /// its latest answer.
@@ -429,6 +472,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 rirb_entries: 0,
                 corb_wp: 0,
                 rirb_rp: 0,
+                rirb_unlanded: None,
+                #[cfg(test)]
+                legacy_rirb: false,
+                stats: Stats::default(),
+                misread: None,
                 command_poisoned: false,
                 outstanding: [0; 15],
                 answers: [0; 15],
@@ -760,7 +808,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             return Err(Error::UnsupportedRingSize);
         }
         self.corb.bytes_mut().fill(0);
-        self.rirb.bytes_mut().fill(0);
+        // Every RIRB entry starts marked unlanded (`update_rirb`).
+        let fill = if self.rirb_marks() { 0xff } else { 0 };
+        self.rirb.bytes_mut().fill(fill);
+        self.rirb_unlanded = None;
         self.registers
             .write32(CORBLBASE, self.corb.bus_address() as u32);
         self.registers
@@ -877,8 +928,34 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
     }
 
+    /// Whether RIRB entries are marked unlanded: always, but in the test
+    /// that reproduces the audio8a transport.
+    fn rirb_marks(&self) -> bool {
+        #[cfg(test)]
+        if self.legacy_rirb {
+            return false;
+        }
+        true
+    }
+
+    /// What the controller absorbed without failing a verb or a route.
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
     /// `snd_hdac_bus_update_rirb`: unsolicited responses queue; a solicited
-    /// one from a codec with nothing outstanding is spurious and dropped.
+    /// one from a codec with nothing outstanding, or from no valid codec
+    /// address, is spurious and dropped. Each is counted ([`Stats`]).
+    ///
+    /// An entry is taken only once its DMA write has landed. Every entry
+    /// read is marked unlanded again ([`RIRB_UNLANDED`] in its upper word,
+    /// whose bits 31:5 a codec response keeps zero), as the ring starts. A
+    /// write pointer can cover an entry whose write has not landed yet; the
+    /// entry then still holds the mark, and is read once it lands. Without
+    /// the mark it held the answer of the verb one ring lap earlier, which
+    /// was taken as this verb's answer: audio8a's readbacks that answered
+    /// another verb's value (pin control answering the infoframe transmit
+    /// 0xc0, DIG1 the stream tag 0x10, a channel count the pin sense).
     fn update_rirb(&mut self) -> Result<(), Error> {
         self.minimum_guard()?;
         self.command_fault()?;
@@ -891,23 +968,53 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             return Err(Error::InvalidRingPointer);
         }
         fence(Ordering::Acquire);
+        let marks = self.rirb_marks();
         while self.rirb_rp != wp {
-            self.rirb_rp = (self.rirb_rp + 1) % self.rirb_entries;
-            let offset = usize::from(self.rirb_rp) * 8;
+            let slot = (self.rirb_rp + 1) % self.rirb_entries;
+            let offset = usize::from(slot) * 8;
             let extra = u32::from_le(self.rirb.read::<u32>(offset + 4));
+            if marks && extra == RIRB_UNLANDED {
+                // Covered by the write pointer, not yet written: wait.
+                if self.rirb_unlanded != Some(slot) {
+                    self.rirb_unlanded = Some(slot);
+                    self.stats.rirb_late += 1;
+                }
+                break;
+            }
+            fence(Ordering::Acquire);
             let value = u32::from_le(self.rirb.read::<u32>(offset));
+            if marks {
+                self.rirb.write::<u32>(offset + 4, RIRB_UNLANDED.to_le());
+                self.rirb.write::<u32>(offset, RIRB_UNLANDED.to_le());
+            }
+            self.rirb_rp = slot;
+            self.rirb_unlanded = None;
             let codec = usize::from((extra & 15) as u8);
             if extra & RESPONSE_UNSOL != 0 {
+                self.stats.unsolicited += 1;
                 self.unsolicited.receive(self.token, value, extra);
             } else if codec < 15 && self.outstanding[codec] != 0 {
                 self.answers[codec] = value;
                 self.outstanding[codec] -= 1;
+            } else {
+                self.stats.spurious += 1;
             }
         }
         // azx_interrupt acknowledges both the response and overrun status;
         // responses an overrun lost time their commands out.
         self.registers.write8(RIRBSTS, RIRB_RESPONSE | RIRB_OVERRUN);
         Ok(())
+    }
+
+    /// The verb on `codec` timed out while the next RIRB entry was still
+    /// unlanded: that entry is taken as its lost answer and skipped, so
+    /// that later entries are read, and the codec's verb no longer waits.
+    fn skip_unlanded(&mut self, codec: usize) {
+        if let Some(slot) = self.rirb_unlanded.take() {
+            self.rirb_rp = slot;
+            self.stats.rirb_lost += 1;
+            self.outstanding[codec] = self.outstanding[codec].saturating_sub(1);
+        }
     }
 
     /// `snd_hdac_bus_send_cmd` then `snd_hdac_bus_get_response_rirb`. Answers
@@ -936,6 +1043,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Ok(self.answers[codec]);
             }
             if self.timer.now_us().wrapping_sub(start) >= u64::from(self.config.verb_timeout_us) {
+                self.skip_unlanded(codec);
                 return Err(Error::Timeout(Phase::Verb));
             }
             self.timer.relax();

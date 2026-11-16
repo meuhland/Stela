@@ -23,6 +23,10 @@ pub(super) struct Progress {
     refilled: u64,
     position: u32,
     time: u64,
+    /// When the position last advanced, and how long it may stand still
+    /// while the stream runs: as long as the ring plays.
+    moved: u64,
+    stall: u64,
 }
 impl Progress {
     fn new(period: usize, ring: usize, guard: u64, rate: u64, now: u64) -> Result<Self, Error> {
@@ -44,6 +48,8 @@ impl Progress {
             refilled: 0,
             position: 0,
             time: now,
+            moved: now,
+            stall: (ring as u64 * 1_000_000).div_ceil(rate.max(1)),
         })
     }
     fn observe(&mut self, position: u32, ioc: bool, now: u64) -> Result<(), Error> {
@@ -64,6 +70,13 @@ impl Progress {
             (u64::from(position) + self.ring as u64 - u64::from(self.position)) % self.ring as u64;
         if delta > possible {
             return Err(Error::PlaybackUnderrun);
+        }
+        // A DMA that stopped: a FIFO error no longer stops the stream, so
+        // a position that stands still for a ring's duration does.
+        if delta != 0 {
+            self.moved = now;
+        } else if now.wrapping_sub(self.moved) >= self.stall {
+            return Err(Error::PlaybackStalled);
         }
         self.played = self
             .played
@@ -164,7 +177,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .as_mut()
             .map_or(Ok(()), |p| p.observe(position, ioc, now));
         if let Err(error) = result {
-            // The DMA's timing, not the route: stop the stream only.
+            // The DMA's timing (late refills, or a position that stopped),
+            // not the route: stop the stream only.
             return Err(self.hdmi_stream_fault(index, error));
         }
         Ok(())

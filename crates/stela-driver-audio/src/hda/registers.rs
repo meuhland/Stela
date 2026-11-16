@@ -49,6 +49,10 @@ pub(super) const CORB_MEMORY: u8 = 1;
 pub(super) const RIRB_RESPONSE: u8 = 1;
 pub(super) const RIRB_OVERRUN: u8 = 1 << 2;
 pub(super) const RESPONSE_UNSOL: u32 = 1 << 4;
+/// The mark of a RIRB entry whose response has not landed: a codec
+/// response's upper word keeps bits 31:5 zero (HDA 4.4.1.10, its codec
+/// address in 3:0 and the unsolicited flag in 4), so none equals it.
+pub(super) const RIRB_UNLANDED: u32 = u32::MAX;
 pub(super) const CODEC_MASK: u16 = 0x7fff;
 pub(super) const SD_CTL: usize = 0;
 pub(super) const SD_STS: usize = 3;

@@ -288,6 +288,34 @@ pub enum Expected {
     /// Any answer but all ones.
     Answered,
 }
+impl Expected {
+    /// Whether `read` is what was expected.
+    pub fn accepts(self, read: u32) -> bool {
+        match self {
+            Self::Value(value) => read == value,
+            Self::Masked { mask, value } => read != u32::MAX && read & mask == value,
+            Self::Within { low, high } => (low..=high).contains(&read),
+            Self::Answered => read != u32::MAX,
+        }
+    }
+}
+/// An HDMI runtime readback that answered wrong, then, read again at
+/// once, as set ([`Controller::take_misread`]): a misread of the command
+/// transport, which neither stopped the stream nor rejected the route.
+/// For a pin sense (0xf09), `first` lacked presence or ELD valid and the
+/// second sense had both: the route did not pause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Misread {
+    /// The first answer, against what the route expected.
+    pub first: VerbRejection,
+    /// The second answer, which the route accepted.
+    pub again: u32,
+}
+impl core::fmt::Display for Misread {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}; read again: {:#010x}", self.first, self.again)
+    }
+}
 impl core::fmt::Display for Expected {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
@@ -495,8 +523,9 @@ pub const HDMI_TRANSIENT_FAULTS: u8 = 8;
 /// read again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HdmiRestart {
-    /// The stream alone, after a stream-level stop (an underrun, a DMA
-    /// FIFO error, a transient codec fault).
+    /// The stream alone, after a stream-level stop (an underrun, a stalled
+    /// DMA position, a transient codec fault). A DMA FIFO error alone no
+    /// longer stops the stream.
     Stream,
     /// The route's verbs set again ([`Controller::hdmi_program`], no graph
     /// walk), then the stream, after a readback rejected the route.
@@ -1109,6 +1138,47 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// control or HDMI route check, once: diagnostics for the owner's log.
     pub fn take_rejection(&mut self) -> Option<VerbRejection> {
         self.rejection.take()
+    }
+    /// The last HDMI runtime readback a second read contradicted
+    /// ([`Misread`]), once: diagnostics for the owner's log.
+    pub fn take_misread(&mut self) -> Option<Misread> {
+        self.misread.take()
+    }
+    /// A runtime readback of `verb` (a get verb or the long format get on
+    /// `node`): its answer, read again at once when `expected` refuses it.
+    /// A second answer as expected was a transport misread: counted
+    /// ([`super::Stats::misreads`]) and kept ([`Self::take_misread`]), and
+    /// the route stands. A second answer still wrong rejects the route with
+    /// it ([`Self::rejected`]): the codec holds what the route did not set.
+    fn hdmi_confirm(
+        &mut self,
+        verb: Verb,
+        (get, payload): (u16, u16),
+        expected: Expected,
+    ) -> Result<(), Error> {
+        let first = self.verb(verb)?;
+        if expected.accepts(first) {
+            return Ok(());
+        }
+        let again = self.verb(verb)?;
+        let (codec, node) = (verb.codec(), verb.node());
+        if !expected.accepts(again) {
+            return Err(self.rejected(codec, node, get, payload, expected, again));
+        }
+        self.stats.misreads += 1;
+        self.misread = Some(Misread {
+            first: VerbRejection {
+                codec,
+                node,
+                verb: get,
+                payload,
+                expected,
+                read: first,
+                single_command: self.single_command,
+            },
+            again,
+        });
+        Ok(())
     }
     fn hdmi_get(&mut self, codec: u8, node: u8, verb: u16, payload: u8) -> Result<u32, Error> {
         self.verb(Verb::short(codec, node, verb, payload)?)
@@ -1977,7 +2047,34 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Err(Error::SinkChanged);
             }
             self.hdmi_select_port(index)?;
-            let sense = self.hdmi_pin_sense(index)?;
+            let mut sense = self.hdmi_pin_sense(index)?;
+            if sense != u32::MAX && !eld_ready(sense) {
+                // Sensed again at once before pausing: audio8a's misread
+                // senses (another verb's answer, without presence) paused
+                // a playing route for one poll. A sink that went away
+                // senses so twice; one that is there, once at most.
+                let again = self.hdmi_pin_sense(index)?;
+                if eld_ready(again) {
+                    let first = sense;
+                    self.stats.sense_misreads += 1;
+                    self.misread = Some(Misread {
+                        first: VerbRejection {
+                            codec,
+                            node: pin,
+                            verb: PIN_SENSE,
+                            payload: 0,
+                            expected: Expected::Masked {
+                                mask: PRESENT | ELD_VALID,
+                                value: PRESENT | ELD_VALID,
+                            },
+                            read: first,
+                            single_command: self.single_command,
+                        },
+                        again,
+                    });
+                }
+                sense = again;
+            }
             if sense == u32::MAX {
                 // Unanswered: a transient codec fault, not a sink change.
                 return Err(Error::InvalidEld);
@@ -1990,6 +2087,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             if !full {
                 return Ok(());
             }
+            // Each readback is read again once before it rejects the route
+            // (`hdmi_confirm`): only a codec that holds another value twice
+            // in a row stops the stream.
             for (node, get, expected) in [
                 (pin, 0xf01, u32::from(mux)),
                 (pin, 0xf07, 0x40),
@@ -1997,20 +2097,14 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 (cvt, 0xf2d, u32::from(format.channels - 1)),
                 (pin, 0xf32, 0xc0),
             ] {
-                let read = self.verb(Verb::short(codec, node, get, 0)?)?;
-                if read != expected {
-                    let expected = Expected::Value(expected);
-                    return Err(self.rejected(codec, node, get, 0, expected, read));
-                }
+                let verb = Verb::short(codec, node, get, 0)?;
+                self.hdmi_confirm(verb, (get, 0), Expected::Value(expected))?;
             }
-            let observed_digital = self.verb(Verb::short(codec, cvt, 0xf0d, 0)?)?;
-            if observed_digital == u32::MAX || observed_digital & 255 != u32::from(digital) {
-                let expected = Expected::Masked {
-                    mask: 0xff,
-                    value: u32::from(digital),
-                };
-                return Err(self.rejected(codec, cvt, 0xf0d, 0, expected, observed_digital));
-            }
+            let expected = Expected::Masked {
+                mask: 0xff,
+                value: u32::from(digital),
+            };
+            self.hdmi_confirm(Verb::short(codec, cvt, 0xf0d, 0)?, (0xf0d, 0), expected)?;
             let map = self.hdmi_ports[index]
                 .as_ref()
                 .unwrap()
@@ -2021,24 +2115,17 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 .clone();
             if format.channels > 2 {
                 for slot in map.slots {
-                    let observed = self.verb(Verb::short(codec, pin, 0xf34, slot & 15)?)?;
-                    if observed == u32::MAX || observed & 0xf0 != u32::from(slot & 0xf0) {
-                        let expected = Expected::Masked {
-                            mask: 0xf0,
-                            value: u32::from(slot & 0xf0),
-                        };
-                        let payload = u16::from(slot & 15);
-                        return Err(self.rejected(codec, pin, 0xf34, payload, expected, observed));
-                    }
+                    let expected = Expected::Masked {
+                        mask: 0xf0,
+                        value: u32::from(slot & 0xf0),
+                    };
+                    let verb = Verb::short(codec, pin, 0xf34, slot & 15)?;
+                    self.hdmi_confirm(verb, (0xf34, u16::from(slot & 15)), expected)?;
                 }
             }
             let encoded = u32::from(format.encode()?);
-            let read = self.verb(Verb::long(codec, cvt, 0xa, 0)?)?;
-            if read != encoded {
-                let expected = Expected::Value(encoded);
-                return Err(self.rejected(codec, cvt, 0xa, 0, expected, read));
-            }
-            Ok(())
+            let verb = Verb::long(codec, cvt, 0xa, 0)?;
+            self.hdmi_confirm(verb, (0xa, 0), Expected::Value(encoded))
         })();
         if let Err(error) = result {
             let kind = if absent {

@@ -411,8 +411,8 @@ fn a_transient_bad_answer_does_not_end_playback() {
     let mut f = Fixture::new(false);
     let (mut c, port, s, p) = playing(&mut f);
     let fmt = c.stream_format(s).unwrap();
-    // One wrong pin-control readback at the turn's readback.
-    f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+    // A wrong pin-control readback, wrong again when read again.
+    f.hardware.lock().unwrap().glitch = Some((0xf07, 2));
     c.schedule_hdmi_readback(port).unwrap();
     f.advance(p, fmt);
     assert_eq!(
@@ -433,7 +433,7 @@ fn a_transient_bad_answer_does_not_end_playback() {
     assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
     // Faults spread out by played periods never add up.
     for _ in 0..2 * HDMI_TRANSIENT_FAULTS {
-        f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+        f.hardware.lock().unwrap().glitch = Some((0xf07, 2));
         c.schedule_hdmi_readback(port).unwrap();
         f.advance(p, fmt);
         assert_eq!(
@@ -482,8 +482,8 @@ fn the_route_state_reads_back_and_a_rejection_names_its_answer() {
         // Reading it set nothing the route checks: playback goes on.
         f.advance(p, fmt);
         assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
-        // One wrong pin-control readback is named, once.
-        f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+        // A pin-control readback wrong twice in a row is named, once.
+        f.hardware.lock().unwrap().glitch = Some((0xf07, 2));
         c.schedule_hdmi_readback(port).unwrap();
         f.advance(p, fmt);
         assert_eq!(
@@ -665,39 +665,274 @@ fn count(f: &Fixture, before: usize, verb: u32) -> usize {
 }
 
 #[test]
-fn a_fifo_error_restarts_only_the_stream() {
+fn a_fifo_error_is_cleared_and_the_stream_plays_on() {
     let mut f = Fixture::new(false);
     let (mut c, port, s, p) = playing(&mut f);
     let fmt = c.stream_format(s).unwrap();
-    for n in 0..2 * HDMI_TRANSIENT_FAULTS {
-        // audio7's SDnSTS 0x28: FIFOE and FIFORDY, no descriptor error.
+    let before = f.hardware.lock().unwrap().commands.len();
+    for n in 1..=2 * u64::from(HDMI_TRANSIENT_FAULTS) {
+        // audio8a's SDnSTS 0x28 and 0x2c: FIFOE and FIFORDY (and BCIS), no
+        // descriptor error.
         f.advance(p, fmt);
         f.hardware.lock().unwrap().bar[0x83] |= 0x28;
-        let error = c.refill_hdmi_period(s, &vec![2; p]).unwrap_err();
-        assert!(
-            matches!(error, Error::StreamDma { status } if status & 0x18 == 0x08),
-            "{error:?}"
-        );
-        only_the_stream_stopped(&f, &c, port);
-        // The stop acknowledged it: FIFOE, DESE and BCIS are clear.
-        assert_eq!(f.hardware.lock().unwrap().bar[0x83] & 0x1c, 0);
-        if n == 0 {
-            assert_eq!(c.hdmi_first_error(port).unwrap(), Some(error));
-        }
-        let before = f.hardware.lock().unwrap().commands.len();
-        // Never a reset, however often: the stream alone restarts.
-        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+        // Not a fault: the period is refilled on the running stream.
+        assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
         {
             let h = f.hardware.lock().unwrap();
-            let restart = &h.commands[before..];
-            assert!(restart.iter().all(|c| !walks(*c) && !sets(*c)));
-            assert_eq!(h.starts, 2 + n as usize);
-            assert_eq!(h.get(0x84, 4), 0);
+            // FIFOE was written 1 to clear; the stream runs, never restarted.
+            assert_eq!(h.bar[0x83] & 0x18, 0);
+            assert_eq!(h.bar[0x80] & 2, 2);
+            assert_eq!((h.starts, h.stops), (1, 0));
         }
-        f.advance(p, fmt);
-        assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
+        let stats = c.stats();
+        assert_eq!(stats.fifo_errors, n);
+        // FIFOE and FIFORDY, BCIS as the period completed, no DESE.
+        assert_eq!(stats.fifo_status & 0x38, 0x28);
     }
+    // No stop, no restart, nothing set, the route never closed.
+    assert!(
+        f.hardware.lock().unwrap().commands[before..]
+            .iter()
+            .all(|c| !walks(*c) && !sets(*c))
+    );
+    assert_eq!(c.hdmi_first_error(port).unwrap(), None);
     assert_eq!(f.owner.state.lock().unwrap().disable, 0);
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_stale_status_is_cleared_at_start_and_a_fifo_error_on_the_first_read_is_not_a_fault() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    // An underrun stops the stream; its descriptor then holds every stale
+    // bit, a descriptor error among them.
+    f.clock.0.fetch_add(100_000, Ordering::SeqCst);
+    assert_eq!(
+        c.refill_hdmi_period(s, &vec![2; p]),
+        Err(Error::PlaybackUnderrun)
+    );
+    {
+        let mut h = f.hardware.lock().unwrap();
+        h.bar[0x83] |= 0x1c;
+        // And the new FIFO underruns as it first fills.
+        h.fifo_on_start = true;
+    }
+    // The model refuses to arm over stale status: cleared before RUN.
+    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+    {
+        let h = f.hardware.lock().unwrap();
+        assert_eq!(h.starts, 2);
+        // The first status read (inside the start) took the new FIFOE.
+        assert_eq!(h.bar[0x83] & 0x18, 0);
+    }
+    assert_eq!(c.stats().fifo_errors, 1);
+    f.hardware.lock().unwrap().fifo_on_start = false;
+    f.advance(p, fmt);
+    assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
+    assert_eq!(f.hardware.lock().unwrap().stops, 1);
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_stalled_position_stops_the_stream_only() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    // A FIFO error, then a DMA that no longer moves: status reads 10 ms
+    // apart (each well inside the ring) until the ring's duration passed.
+    f.hardware.lock().unwrap().bar[0x83] |= 0x28;
+    let mut stalled = None;
+    for _ in 0..20 {
+        f.clock.0.fetch_add(10_000, Ordering::SeqCst);
+        if let Err(error) = c.status(s) {
+            stalled = Some(error);
+            break;
+        }
+    }
+    assert_eq!(stalled, Some(Error::PlaybackStalled));
+    assert_eq!(c.stats().fifo_errors, 1);
+    only_the_stream_stopped(&f, &c, port);
+    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+    f.advance(p, fmt);
+    assert!(c.refill_hdmi_period(s, &vec![3; p]).unwrap().is_some());
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+/// One service turn: the readback scheduled, one period played and
+/// refilled.
+fn turn(f: &Fixture, c: &mut Controller<Regs, Clock>, port: HdmiPortId, s: StreamId, p: usize) {
+    let fmt = c.stream_format(s).unwrap();
+    c.schedule_hdmi_readback(port).unwrap();
+    f.advance(p, fmt);
+    assert!(c.refill_hdmi_period(s, &vec![1; p]).unwrap().is_some());
+}
+
+#[test]
+fn the_audio8a_misread_is_reproduced_and_fixed() {
+    for legacy in [true, false] {
+        let mut f = Fixture::new(false);
+        let (mut c, port, s, p) = playing(&mut f);
+        // The transport as at baf62aad: no landing check.
+        c.legacy_rirb = legacy;
+        // More than a ring lap of responses, so that every slot holds an
+        // answer from the lap before (written while the legacy reader ran).
+        let start = f.hardware.lock().unwrap().responses;
+        while f.hardware.lock().unwrap().responses < start + 300 {
+            turn(&f, &mut c, port, s, p);
+        }
+        // The write pointer covers pin control's answer before its entry
+        // lands, as audio8a's controller did under display traffic.
+        f.hardware.lock().unwrap().rirb_lag = Some((0xf07, 4));
+        for _ in 0..64 {
+            turn(&f, &mut c, port, s, p);
+            if !f.hardware.lock().unwrap().stale.is_empty() {
+                break;
+            }
+        }
+        let (verb, stale, answer) = f.hardware.lock().unwrap().stale[0];
+        assert_eq!((verb, answer), (0xf07, 0x40));
+        // The slot still held another verb's answer from one lap earlier:
+        // the pin sense, the infoframe transmit, the stream tag, a format.
+        assert_ne!(stale, 0x40);
+        assert_eq!(c.take_rejection(), None);
+        let stats = c.stats();
+        let misread = c.take_misread();
+        if legacy {
+            // audio8a: pin control "answered" another verb's value. The
+            // landing check was off; the readback's second read saw 0x40
+            // and kept the route, but the first answer was the stale one.
+            let misread = misread.unwrap();
+            assert_eq!((misread.first.verb, misread.first.read), (0xf07, stale));
+            assert_eq!(misread.again, 0x40);
+            assert_eq!(stats.misreads, 1);
+            assert_eq!(stats.rirb_late, 0);
+        } else {
+            // Fixed: the reader waited for the entry to land; no misread.
+            assert_eq!(misread, None);
+            assert_eq!(stats.misreads, 0);
+            assert_eq!(stats.rirb_late, 1);
+            assert_eq!(stats.rirb_lost, 0);
+        }
+        assert_eq!(f.hardware.lock().unwrap().starts, 1);
+        c.close_hdmi(port).unwrap();
+        c.detach_hdmi_port(port).unwrap();
+        c.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn unsolicited_and_other_codecs_responses_are_never_an_answer() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    // Ahead of the turn's first answer (codec 0's pin sense), each time:
+    // an unsolicited event (bit 4) carrying the infoframe transmit's
+    // value, a response from codec 1 (nothing outstanding) carrying pin
+    // control's, and one from address 15 (no codec) carrying a channel
+    // count. Taken as answers, each would read as a wrong value or a
+    // sink away.
+    for _ in 0..4 {
+        c.schedule_hdmi_readback(port).unwrap();
+        f.advance(p, fmt);
+        let before = c.stats();
+        f.hardware.lock().unwrap().inject = vec![(0xc0, 0x10), (0x40, 1), (0x1, 15)];
+        assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
+        let after = c.stats();
+        assert_eq!(after.unsolicited - before.unsolicited, 1);
+        assert_eq!(after.spurious - before.spurious, 2);
+    }
+    let stats = c.stats();
+    assert_eq!((stats.misreads, stats.sense_misreads), (0, 0));
+    assert_eq!(c.take_rejection(), None);
+    assert_eq!(f.hardware.lock().unwrap().starts, 1);
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_response_landing_after_its_verb_timed_out_is_skipped() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let start = f.hardware.lock().unwrap().responses;
+    while f.hardware.lock().unwrap().responses < start + 300 {
+        turn(&f, &mut c, port, s, p);
+    }
+    // Pin control's entry lands far past the verb timeout (1 ms here).
+    f.hardware.lock().unwrap().rirb_lag = Some((0xf07, 100_000));
+    c.schedule_hdmi_readback(port).unwrap();
+    let error = c.status(s).unwrap_err();
+    assert_eq!(error, Error::Timeout(Phase::Verb));
+    let stats = c.stats();
+    assert_eq!((stats.rirb_late, stats.rirb_lost), (1, 1));
+    // The reader moved past the entry, and the timeout took the usual
+    // path: the immediate command interface from here on.
+    assert_eq!(c.rirb_unlanded, None);
+    assert!(c.single_command);
+}
+
+#[test]
+fn a_readback_misread_once_neither_stops_nor_rejects() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    // The model's glitch answers zero, which a mux of 0 would accept.
+    for (n, verb) in [0xf07u16, 0xf06, 0xf2d, 0xf32, 0xf0d]
+        .into_iter()
+        .enumerate()
+    {
+        f.hardware.lock().unwrap().glitch = Some((verb, 1));
+        c.schedule_hdmi_readback(port).unwrap();
+        f.advance(p, fmt);
+        assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
+        let misread = c.take_misread().unwrap();
+        assert_eq!((misread.first.verb, misread.first.read), (verb, 0));
+        assert!(misread.first.expected.accepts(misread.again));
+        assert!(alloc::format!("{misread}").contains("; read again: 0x"));
+        assert_eq!(c.stats().misreads, n as u64 + 1);
+    }
+    assert_eq!(c.take_rejection(), None);
+    let h = f.hardware.lock().unwrap();
+    assert_eq!((h.starts, h.stops), (1, 0));
+    drop(h);
+    c.close_hdmi(port).unwrap();
+    c.detach_hdmi_port(port).unwrap();
+    c.shutdown().unwrap();
+}
+
+#[test]
+fn a_single_sense_without_presence_does_not_pause() {
+    let mut f = Fixture::new(false);
+    let (mut c, port, s, p) = playing(&mut f);
+    let fmt = c.stream_format(s).unwrap();
+    // audio8a: a pin sense answered 0x10 (another verb's answer) once.
+    for n in 1..=4 {
+        f.hardware.lock().unwrap().sense_glitch = 1;
+        f.advance(p, fmt);
+        assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
+        assert!(!c.hdmi_paused(port).unwrap());
+        assert_eq!(c.stats().sense_misreads, n);
+        let misread = c.take_misread().unwrap();
+        assert_eq!((misread.first.verb, misread.first.read), (0xf09, 0x10));
+        assert_eq!(misread.again, 0xc000_0000);
+    }
+    // Two in a row: the monitor is away; paused at once, as before.
+    f.hardware.lock().unwrap().sense_glitch = 2;
+    f.advance(p, fmt);
+    assert_eq!(
+        c.refill_hdmi_period(s, &vec![3; p]),
+        Err(Error::SinkUnavailable)
+    );
+    assert!(c.hdmi_paused(port).unwrap());
+    assert_eq!(c.stats().sense_misreads, 4);
+    assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Resumed));
     c.close_hdmi(port).unwrap();
     c.detach_hdmi_port(port).unwrap();
     c.shutdown().unwrap();
@@ -712,14 +947,10 @@ fn a_descriptor_error_or_an_unacknowledged_stop_needs_a_reset() {
         f.advance(p, fmt);
         {
             let mut h = f.hardware.lock().unwrap();
-            if unacknowledged {
-                // A FIFO error whose stop the DMA never acknowledges.
-                h.bar[0x83] |= 0x08;
-                h.stop_stuck = true;
-            } else {
-                // DESE: a BDL or buffer fetch failed.
-                h.bar[0x83] |= 0x10;
-            }
+            // DESE: a BDL or buffer fetch failed, with FIFOE; or with a
+            // stop the DMA never acknowledges.
+            h.bar[0x83] |= if unacknowledged { 0x10 } else { 0x18 };
+            h.stop_stuck = unacknowledged;
         }
         let error = c.refill_hdmi_period(s, &vec![2; p]).unwrap_err();
         assert!(matches!(error, Error::StreamDma { .. }), "{error:?}");

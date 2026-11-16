@@ -19,8 +19,10 @@
 //! in the loader's root without waiting for the host drivers' lock, writes
 //! each period the DMA completed: the queue's oldest frames, silence for
 //! any it lacks. More than 20 ms left queued after that is dropped, oldest
-//! first. A stream an underrun, a DMA FIFO error or a transient codec fault
-//! stopped restarts alone at the next turn, on its route as prepared (after
+//! first. A DMA FIFO error is acknowledged and the stream plays on. A stream
+//! an underrun, a stalled position or a transient codec fault (a readback
+//! still wrong when read again at once) stopped restarts alone at the next
+//! turn, on its route as prepared (after
 //! a rejected readback, with the route's verbs set again); a monitor that
 //! went away pauses the route until it returns, and its verbs are set again
 //! when it does; a route that was lost is prepared again, at most once a
@@ -32,7 +34,7 @@ use super::{host, output, storage::RestoreRoot};
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use stela_boot_core::guest_audio::{
     self, BACKLOG_FRAMES, Counters, Dbfs, MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts,
-    Step, Tone, s16_period,
+    Step, Tone, crossed, logged, s16_period,
 };
 use stela_drivers::{
     audio::{
@@ -153,6 +155,7 @@ impl GuestAudio {
                         reset_cause: None,
                         reset_waiting: false,
                         gave_up: false,
+                        stats: hd_audio::hda::Stats::default(),
                     }),
                     Some(DisplayAudio {
                         hosts,
@@ -292,7 +295,7 @@ struct Hdmi {
     retry_at: u64,
     /// The last error, reported once.
     error: Option<RetirementError>,
-    reported: Option<(bool, bool, u64, Restarts, u8)>,
+    reported: Option<(bool, bool, u64, Restarts, u8, hd_audio::hda::Stats)>,
     /// Route state dumps printed (`HDMI_STATE_DUMPS` at most), and whether
     /// one followed a resume yet.
     dumps: u8,
@@ -313,29 +316,26 @@ struct Hdmi {
     reset_waiting: bool,
     /// Every reset was taken and the route still needs one: given up.
     gave_up: bool,
+    /// The controller's counts as last logged (`Hdmi::absorbed`).
+    stats: hd_audio::hda::Stats,
 }
 
 /// Route state dumps per boot: each preparation of the route, and the
 /// first resume after the monitor slept, up to this many.
 const HDMI_STATE_DUMPS: u8 = 4;
 
-/// Whether restart `count` (of one reason) gets lines of its own: the
-/// first four, then each power of two; the report's counts cover the rest.
-fn logged(count: u64) -> bool {
-    count <= 4 || count.is_power_of_two()
-}
-
 /// Why the playback stopped, from the error the refill returned; the
-/// driver stops the same way (`hda::hdmi`): an underrun, a DMA FIFO error
-/// or a codec fault stops the stream only, a sink away pauses the route,
+/// driver stops the same way (`hda::hdmi`): an underrun, a stalled DMA
+/// position or a codec fault stops the stream only (a FIFO error alone no
+/// longer stops it, `dma_fault` stays for one), a sink away pauses the route,
 /// anything else closes it (a DMA descriptor error needs a controller
 /// reset).
 fn restart_reason(error: &RetirementError) -> RestartReason {
     use hd_audio::Error;
     match error {
-        RetirementError::Controller(Error::PlaybackUnderrun | Error::InvalidPosition(_)) => {
-            RestartReason::Underrun
-        }
+        RetirementError::Controller(
+            Error::PlaybackUnderrun | Error::PlaybackStalled | Error::InvalidPosition(_),
+        ) => RestartReason::Underrun,
         RetirementError::Controller(Error::StreamDma { status })
             if guest_audio::StreamStatus(*status).fifo_error_only() =>
         {
@@ -742,6 +742,54 @@ impl Hdmi {
                 }
             }
         }
+        self.absorbed();
+    }
+
+    /// What the controller absorbed since the last turn without stopping
+    /// the stream, logged: FIFO errors acknowledged, route readbacks and
+    /// pin senses a second read contradicted, RIRB entries waited for or
+    /// lost, and responses that were never taken as an answer. Each kind's
+    /// first four, then at each power of two; the report counts them all.
+    fn absorbed(&mut self) {
+        let Some(now) = self.host.hdmi_stats() else {
+            return;
+        };
+        let last = core::mem::replace(&mut self.stats, now);
+        // The misread is taken in any case, so that a later line never
+        // shows a stale one.
+        let misread = self.host.take_hdmi_misread();
+        if crossed(last.fifo_errors, now.fifo_errors) {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI FIFO error on {} (fifo_errors {}): SDnSTS {}; acknowledged \
+                 (FIFOE written 1 to clear), the stream plays on: no stop, no restart\n",
+                self.place,
+                now.fifo_errors,
+                guest_audio::StreamStatus(now.fifo_status)
+            ));
+        }
+        if let Some(misread) = misread
+            && (crossed(last.misreads, now.misreads)
+                || crossed(last.sense_misreads, now.sense_misreads))
+        {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI misread on {} (misreads {}, sense_misreads {}): {misread}, as \
+                 set: a command-transport misread, not a route fault; the stream plays on\n",
+                self.place, now.misreads, now.sense_misreads
+            ));
+        }
+        if crossed(last.rirb_late, now.rirb_late)
+            || crossed(last.rirb_lost, now.rirb_lost)
+            || crossed(last.spurious, now.spurious)
+            || crossed(last.unsolicited, now.unsolicited)
+        {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI command responses on {}: rirb_late={} rirb_lost={} spurious={} \
+                 unsolicited={} (late: the RIRB write pointer covered an entry before its write \
+                 landed; waited for it, never taking the ring's previous lap; spurious and \
+                 unsolicited: dropped, never an answer)\n",
+                self.place, now.rirb_late, now.rirb_lost, now.spurious, now.unsolicited
+            ));
+        }
     }
 
     fn report(&mut self) {
@@ -751,18 +799,27 @@ impl Hdmi {
             self.refills,
             self.restarts,
             self.playback.resets(),
+            self.stats,
         );
         if self.reported != Some(state) {
             self.reported = Some(state);
+            let stats = state.5;
             // The peak: the largest sample written since the last report.
             output::arguments(format_args!(
                 "GUEST AUDIO HDMI running={} paused={} periods={} {} resets={}/{HDMI_RESETS} \
-                 pending={} peak={}{}\n",
+                 fifo_errors={} misreads={} sense_misreads={} rirb_late={} rirb_lost={} \
+                 spurious={} pending={} peak={}{}\n",
                 state.0,
                 state.1,
                 state.2,
                 state.3,
                 state.4,
+                stats.fifo_errors,
+                stats.misreads,
+                stats.sense_misreads,
+                stats.rirb_late,
+                stats.rirb_lost,
+                stats.spurious,
                 self.pending.len(),
                 Dbfs(core::mem::take(&mut self.peak)),
                 if self.tone.is_some() {
