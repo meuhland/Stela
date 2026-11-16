@@ -1,10 +1,10 @@
 //! The PAC results the engine computes, remembers and lets native code
 //! complete (`x86_64::pointer`).
 //!
-//! A signing or authentication is a pure function of its key, the chip's
-//! PAC version, the regime's TCR (Arm `AddPAC`, `Auth`) and its operands,
-//! so [`PointerService`] remembers results in a memo tagged with the
-//! generation of that key's inputs. It lives at a fixed host address: PAC
+//! A signing or authentication is a pure function of the five keys, the
+//! chip's PAC version, the regime's TCR (Arm `AddPAC`, `Auth`) and its
+//! operands, so [`PointerService`] remembers results in a memo tagged with
+//! the generation of those inputs. It lives at a fixed host address: PAC
 //! thunks read its memo and its tag words, and on a memo miss call
 //! [`complete`] with it, which computes the result exactly as the engine's
 //! exit would ([`PointerService::result`]) without leaving native code.
@@ -25,11 +25,8 @@ use stela_compiler::{Anchor, Place, block::PointerAuthenticationKey, x86_64::poi
 static EMPTY_MEMO: [core::sync::atomic::AtomicU64; pointer::MEMO_ENTRIES * 4] =
     [const { core::sync::atomic::AtomicU64::new(0) }; pointer::MEMO_ENTRIES * 4];
 
-/// The distinct keys (each with the version and TCR) whose memo
-/// generations are kept: two per process (its IB and DB keys) for over a
-/// hundred processes. The lists are kept most recent first, so the keys in
-/// use are found in the first few entries.
-pub(super) const POINTER_INPUTS_SEEN: usize = 256;
+/// The distinct PAC inputs whose memo generations are kept.
+pub(super) const POINTER_INPUTS_SEEN: usize = 16;
 
 /// What a PAC result depends on besides its operands: the five keys, the
 /// chip's PAC version and the regime's TCR (Arm `AddPAC`, `Auth`).
@@ -38,18 +35,6 @@ pub(super) struct PointerInputs {
     pub(super) keys: [Option<[u64; 2]>; 5],
     pub(super) version: pauth::Version,
     pub(super) tcr: u64,
-}
-
-/// What the results of one key depend on: its tag word's index, its value,
-/// the chip's PAC version and the regime's TCR. Another key's value does
-/// not change them, so a key's entries outlive changes of the others (a
-/// process's own keys beside the kernel's, which stay).
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct KeyInputs {
-    index: u8,
-    key: Option<[u64; 2]>,
-    version: pauth::Version,
-    tcr: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,25 +89,16 @@ fn key_of(key: PointerAuthenticationKey) -> stela_contracts::pauth::Key {
 pub(super) struct PointerService {
     /// The keys, version and layout, while open.
     context: Option<pauth::Context>,
-    /// Results, each tagged with the generation of its key's inputs when it
-    /// was computed; `generations[index]` is that of each key in `inputs`.
-    /// Allocated before the first usable native tag and kept at that
-    /// address for the owner.
+    /// Results, each tagged with the generation of the inputs it was
+    /// computed under; `generation` is that of `inputs`. Allocated before
+    /// the first usable native tag and kept at that address for the owner.
     memo: Option<Box<[pointer::MemoEntry]>>,
     inputs: Option<PointerInputs>,
-    pub(super) key_generations: [u64; pointer::TAG_WORDS],
-    /// The generation of the whole `inputs`, which native transitions
-    /// compare (`transition::check_pointer`): equal exactly when the key
-    /// generations, and so the tag words the engine reopens, are equal.
     pub(super) generation: u64,
-    /// The whole inputs most recently seen, each with its key generations
-    /// and its generation, most recent first.
-    seen_inputs: Vec<(PointerInputs, [u64; pointer::TAG_WORDS], u64)>,
-    /// The generations of the most recent distinct key inputs, most recent
-    /// first, so entries stay valid across a return to an earlier key (EL0
-    /// and EL1 keys, guarded levels, PE switches) and across changes of the
-    /// other keys.
-    seen: Vec<(KeyInputs, u64)>,
+    /// The generations of the most recent distinct inputs, most recent
+    /// first, so entries stay valid across a return to earlier inputs (EL0
+    /// and EL1 keys, guarded levels, PE switches).
+    seen: Vec<(PointerInputs, u64)>,
     /// The last generation handed out; an evicted one is never reused.
     generations: u64,
     /// Each key's tag word for native code: zero until a PAC exit finds the
@@ -166,9 +142,7 @@ impl PointerService {
             context: None,
             memo: None,
             inputs: None,
-            key_generations: [0; pointer::TAG_WORDS],
             generation: 0,
-            seen_inputs: Vec::new(),
             seen: Vec::new(),
             generations: 0,
             tags: [0; pointer::TAG_WORDS],
@@ -285,28 +259,7 @@ impl PointerService {
     /// Open the service with the current `inputs`.
     pub(super) fn open(&mut self, inputs: PointerInputs) {
         if self.inputs != Some(inputs) {
-            for (index, key) in inputs.keys.into_iter().enumerate() {
-                self.key_generations[index] = self.generation_of(KeyInputs {
-                    index: index as u8,
-                    key,
-                    version: inputs.version,
-                    tcr: inputs.tcr,
-                });
-            }
-            let keys = self.key_generations;
-            self.generation = match self
-                .seen_inputs
-                .iter()
-                .position(|&(known, generations, _)| known == inputs && generations == keys)
-            {
-                Some(index) => self.seen_inputs.remove(index).2,
-                None => {
-                    self.generations += 1;
-                    self.generations
-                }
-            };
-            self.seen_inputs.insert(0, (inputs, keys, self.generation));
-            self.seen_inputs.truncate(POINTER_INPUTS_SEEN);
+            self.generation = self.generation_of(inputs);
             self.inputs = Some(inputs);
         }
         let [ia, ib, da, db, generic] = inputs.keys;
@@ -327,7 +280,7 @@ impl PointerService {
         if self.memo.is_none() {
             self.allocate_memo();
         }
-        pointer::tag(self.key_generations[usize::from(key)], key, 0)
+        pointer::tag(self.generation, key, 0)
     }
 
     #[cold]
@@ -360,15 +313,12 @@ impl PointerService {
             pointer::SIGNED
         };
         let memo = self.memo.as_mut().expect("memo allocated");
-        pointer::insert(
-            memo,
-            pointer::MemoEntry {
-                pointer,
-                modifier,
-                tag: pointer::DISABLED | kind,
-                value: pointer,
-            },
-        );
+        memo[pointer::slot(pointer, modifier)] = pointer::MemoEntry {
+            pointer,
+            modifier,
+            tag: pointer::DISABLED | kind,
+            value: pointer,
+        };
         pointer
     }
 
@@ -434,24 +384,21 @@ impl PointerService {
         self.fills += 1;
         let tag = self.native_tag(key);
         let memo = self.memo.as_mut().expect("memo for open tag");
-        pointer::insert(
-            memo,
-            pointer::MemoEntry {
-                pointer: data,
-                modifier,
-                tag: tag | pointer::SIGNED,
-                value: code,
-            },
-        );
+        memo[pointer::slot(data, modifier)] = pointer::MemoEntry {
+            pointer: data,
+            modifier,
+            tag: tag | pointer::SIGNED,
+            value: code,
+        };
         self.tags[usize::from(key)] = tag;
         Some(code)
     }
 
-    /// The memo generation of a key's `inputs`: the one they had if they
-    /// are among the [`POINTER_INPUTS_SEEN`] most recent distinct key
-    /// inputs, else a new one. A result depends only on its key's inputs
-    /// and its operands, so an entry of a reused generation is still exact.
-    fn generation_of(&mut self, inputs: KeyInputs) -> u64 {
+    /// The memo generation of `inputs`: the one they had if they are among
+    /// the [`POINTER_INPUTS_SEEN`] most recent distinct inputs, else a new
+    /// one. A result depends only on its inputs and operands, so an entry
+    /// of a reused generation is still exact.
+    fn generation_of(&mut self, inputs: PointerInputs) -> u64 {
         let generation = match self.seen.iter().position(|&(known, _)| known == inputs) {
             Some(index) => self.seen.remove(index).1,
             None => {
@@ -473,14 +420,11 @@ impl PointerService {
         pointer: u64,
         modifier: u64,
     ) -> Option<PointerResult> {
-        let index = memo_key(key);
-        let tag = pointer::tag(self.key_generations[usize::from(index)], index, 0);
-        let first = pointer::slot(pointer, modifier);
-        let entry = *self.memo.as_ref()?[first..first + pointer::MEMO_WAYS]
-            .iter()
-            .find(|entry| {
-                entry.pointer == pointer && entry.modifier == modifier && entry.tag & !KIND == tag
-            })?;
+        let entry = self.memo.as_ref()?[pointer::slot(pointer, modifier)];
+        let tag = pointer::tag(self.generation, memo_key(key), 0);
+        if entry.pointer != pointer || entry.modifier != modifier || entry.tag & !KIND != tag {
+            return None;
+        }
         let kind = entry.tag & KIND;
         let combined = u64::from(operation == PointerOperation::Authenticate { combined: true });
         match operation {
@@ -504,19 +448,12 @@ impl PointerService {
     ) {
         let (kind, value) = memo_result(operation, result);
         let memo = self.memo.as_mut().expect("memo for open tag");
-        pointer::insert(
-            memo,
-            pointer::MemoEntry {
-                pointer,
-                modifier,
-                tag: pointer::tag(
-                    self.key_generations[usize::from(memo_key(key))],
-                    memo_key(key),
-                    kind,
-                ),
-                value,
-            },
-        );
+        memo[pointer::slot(pointer, modifier)] = pointer::MemoEntry {
+            pointer,
+            modifier,
+            tag: pointer::tag(self.generation, memo_key(key), kind),
+            value,
+        };
     }
 }
 
@@ -725,11 +662,7 @@ mod tests {
             pointer::Completion::default()
         );
         let code = service.generic_code(data, modifier).unwrap();
-        let tag = pointer::tag(
-            service.key_generations[usize::from(pointer::GENERIC_KEY)],
-            pointer::GENERIC_KEY,
-            0,
-        );
+        let tag = pointer::tag(service.generation, pointer::GENERIC_KEY, 0);
         assert_eq!(service.tags[usize::from(pointer::GENERIC_KEY)], tag);
         assert_eq!(service.tags[..4], [0; 4]);
         assert_eq!(
@@ -943,132 +876,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Memo misses of a modelled workload, run by hand: processes that each
-    /// have their own IB and DB keys (IA, DA and the generic key shared),
-    /// each running a call tree whose frames sign their return address
-    /// with IB and SP and authenticate it on return, with system calls into
-    /// a kernel whose frames use the kernel's IA and IB keys on the
-    /// thread's kernel stack while the process's DB key stays loaded; the
-    /// PE switches to the next process after each time slice. Prints the
-    /// cipher runs per PAC operation for each number of processes.
-    #[test]
-    #[ignore = "manual: opt-in"]
-    fn memo_replay_of_a_process_mix() {
-        extern crate std;
-        use stela_contracts::pauth::Key;
-        let tcr = 25 | 25 << 16;
-        let shared = |word: u64| Some([word, word.rotate_left(17)]);
-        let user = |process: u64| PointerInputs {
-            keys: [
-                shared(1),
-                shared(0x100 + process),
-                shared(3),
-                shared(0x200 + process),
-                shared(5),
-            ],
-            version: pauth::Version::Classic,
-            tcr,
-        };
-        let kernel = |process: u64| PointerInputs {
-            keys: [
-                shared(9),
-                shared(10),
-                shared(3),
-                shared(0x200 + process),
-                shared(5),
-            ],
-            version: pauth::Version::Classic,
-            tcr,
-        };
-        for processes in [2u64, 4, 8, 16, 32] {
-            let mut service = PointerService::new();
-            let mut operations = 0u64;
-            // A frame: sign on entry, authenticate on return.
-            let mut frame = |service: &mut PointerService, key: Key, lr: u64, sp: u64| {
-                let signed = match service.result(PointerOperation::Sign, key, lr, sp) {
-                    Some(Ok((signed, _))) => signed,
-                    other => panic!("{other:?}"),
-                };
-                service.result(
-                    PointerOperation::Authenticate { combined: true },
-                    key,
-                    signed,
-                    sp,
-                );
-                operations += 2;
-            };
-            for slice in 0..4000u64 {
-                let process = slice % processes;
-                service.close();
-                service.open(user(process));
-                let code = 0x1_0000_0000 + process * 0x100_0000;
-                let stack = 0x16f_0000_0000 - process * 0x10_0000;
-                for call in 0..64u64 {
-                    // A call tree: depth from the call number's low bits.
-                    let depth = (call % 7) + 1;
-                    for level in 0..depth {
-                        let site = code + 0x40 * ((call * 7 + level * 13) % 97);
-                        frame(&mut service, Key::Ib, site, stack - 0x60 * level);
-                    }
-                    if call % 16 == 15 {
-                        service.close();
-                        service.open(kernel(process));
-                        let kernel_stack = 0xffff_fe10_0000_0000 + process * 0x4000;
-                        for level in 0..5u64 {
-                            let site = 0xffff_fe00_0800_0000 + 0x40 * (level * 11 + call % 3);
-                            frame(&mut service, Key::Ib, site, kernel_stack - 0x80 * level);
-                            frame(
-                                &mut service,
-                                Key::Ia,
-                                site + 0x20,
-                                kernel_stack - 0x80 * level,
-                            );
-                        }
-                        service.close();
-                        service.open(user(process));
-                    }
-                }
-            }
-            std::println!(
-                "REPLAY processes={processes} operations={operations} fills={} per_operation={:.4}",
-                service.fills,
-                service.fills as f64 / operations as f64
-            );
-        }
-    }
-
-    /// A key's entries outlive changes of the other keys: a process's keys
-    /// change on every switch while the kernel's stay, and the kernel's
-    /// results must still be found.
-    #[test]
-    fn a_keys_entries_outlive_changes_of_the_other_keys() {
-        use stela_contracts::pauth::Key;
-        let mut service = PointerService::new();
-        let mut input = inputs(pauth::Version::Classic, 25 | 25 << 16);
-        service.open(input);
-        let fills = service.fills;
-        let signed = service.result(PointerOperation::Sign, Key::Ia, 0x4000, 0x8000);
-        assert_eq!(service.fills, fills + 1);
-        for process in 0..2 * POINTER_INPUTS_SEEN as u64 {
-            input.keys[1] = Some([process, !process]);
-            input.keys[2] = Some([process << 1, process]);
-            service.close();
-            service.open(input);
-            assert_eq!(
-                service.result(PointerOperation::Sign, Key::Ia, 0x4000, 0x8000),
-                signed
-            );
-        }
-        // Every signing was found again: the cipher ran once.
-        assert_eq!(service.fills, fills + 1);
-        // A key that changed has a new generation; its old entries miss.
-        let ib = service.key_generations[1];
-        input.keys[1] = Some([7, 7]);
-        service.close();
-        service.open(input);
-        assert_ne!(service.key_generations[1], ib);
     }
 
     /// A return to earlier inputs finds their generation again; other inputs
