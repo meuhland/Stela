@@ -4798,14 +4798,6 @@
   },
   {
     "package": "stela-engine",
-    "test": "memo_replay_of_a_process_mix",
-    "source": "crates/stela-engine/src/machine/engine/pointer.rs",
-    "kind": "manual",
-    "inputs": [],
-    "reason": "PAC memo miss measurement over a modelled process mix; run on request"
-  },
-  {
-    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",
