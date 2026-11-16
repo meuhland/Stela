@@ -1,27 +1,33 @@
 //! The Metal device's pipeline store: `stela/store/pipeline.bin`, a file `stela`
 //! preallocates beside the translation packs.
 //!
-//! The file is a journal (`stela_formats::journal`) of the driver's pipeline
-//! cache and the compiler's NIR: an update writes only into space the newest
-//! commit does not use and then commits, so a write cut by a power loss, a
-//! panic or a forced stop leaves the previous content whole. Before boot
-//! services end, [`read`] reads the newest whole commit from the store's
-//! volume (the first with `store.cfg`). [`install`] hands its content to the
-//! Metal device, which seeds its compiled pipelines' cache from it when it is
-//! its compiler build's and GPU's.
+//! The file is a journal (`stela_formats::journal`) of groups of the
+//! driver's pipeline objects, each with what compiling it cost, and of the
+//! compiler's NIR. Every update is one commit of blobs written beside the
+//! committed ones (`journal::plan_beside`), so a write cut by a power loss, a
+//! panic or a forced stop leaves the previous content whole, never less.
+//! Before boot services end, [`read`] reads the newest whole commit from the
+//! store's volume (the first with `store.cfg`). [`install`] hands its content
+//! to the Metal device, which seeds its compiled pipelines' cache from it
+//! when it is its compiler build's and GPU's, and chooses what to keep by
+//! cost within a budget the file and the heap allow.
 //!
-//! While the guest runs, [`step`] writes what the device added (new NIR and
-//! newer cache snapshots) through the store's staged partition, a piece at a
-//! time: the processor that steps only queues commands and takes results,
-//! and processors step the disk in bounded steps. When the guest restarts or
-//! powers off, [`write`] finishes that work and writes what is left. A file
-//! of an older layout reads as empty and is replaced by the first write.
-//! Every failure leaves the boot running: its pipelines compile again.
+//! While the guest runs, [`step`] writes what the device chose (groups of
+//! objects to add or remove, new NIR) through the store's staged partition, a
+//! piece at a time: the processor that steps only queues commands and takes
+//! results, and processors step the disk in bounded steps. When the guest
+//! restarts or powers off, [`write`] finishes that work and writes what is
+//! left. A cache blob of the earlier layout is read as a group of objects of
+//! unknown cost. Every failure leaves the boot running: its pipelines compile
+//! again.
 use super::store_file::{Direct, Held, Queued, Staged};
 use super::translations;
 use crate::{firmware, handoff::Region, output, paging::PAGE};
 use alloc::{format, string::String, vec, vec::Vec};
-use stela_drivers::gpu::metal::native::pipeline_store::{self, Key, MAX_BYTES};
+use stela_drivers::gpu::metal::native::pipeline_store::{
+    self, Key, MAX_BYTES,
+    kinds::{GROUP, NIR},
+};
 use stela_formats::journal::{self, Blob, Change, Commit, DATA_START, Execution, SLOT_BYTES};
 use stela_formats::payload::pieces::Extent;
 use uefi::{
@@ -42,13 +48,15 @@ const NAME: &str = "pipeline.bin";
 /// device's store follow.
 const PLACEMENT_MAGIC: [u8; 8] = *b"STLGPLC2";
 const PLACEMENT_BYTES: usize = 16;
-/// The journal's domain, and the kinds of its blobs: the driver's pipeline
-/// cache, which a newer one replaces, and pieces of NIR entries, appended.
+/// The journal's domain; its kinds are `pipeline_store::kinds`.
 const DOMAIN: [u8; 8] = *b"PIPELINE";
-const CACHE: u32 = 1;
-const NIR: u32 = 2;
 /// NIR pieces past which an update rewrites the NIR as one.
-const NIR_PIECES: usize = 64;
+const NIR_PIECES: usize = 512;
+/// The heap's share the stored pipelines may take, within bounds: the
+/// driver holds a copy of each for the whole boot.
+const BUDGET_SHARE: u64 = 64;
+const BUDGET_LEAST: u64 = 24 << 20;
+const BUDGET_MOST: u64 = 64 << 20;
 /// The bytes one write command carries, and the most a step queues.
 const PIECE_BYTES: u64 = 1 << 20;
 /// How long after an update the next may start: new pipelines come in
@@ -130,19 +138,14 @@ pub fn read() -> Option<Region> {
     None
 }
 
-/// The device's store layout of `commit`'s `blobs`: header, cache, NIR.
+/// The device's store layout of `commit`'s `blobs` ([`pipeline_store::assemble`]).
 fn linear(commit: &Commit, blobs: &[journal::Found]) -> Vec<u8> {
-    let part = |kind| -> Vec<u8> {
-        blobs
-            .iter()
-            .filter(|(blob, _)| *blob == kind)
-            .flat_map(|(_, bytes)| bytes.iter().copied())
-            .collect()
-    };
-    let (cache, nir) = (part(CACHE), part(NIR));
-    let mut store = pipeline_store::header_with_nir(&Key(commit.key), &cache, &nir).to_vec();
-    store.extend_from_slice(&cache);
-    store.extend_from_slice(&nir);
+    let found = commit
+        .entries
+        .iter()
+        .zip(blobs)
+        .map(|(entry, (kind, bytes))| (*kind, entry.offset, &bytes[..]));
+    let store = pipeline_store::assemble(&Key(commit.key), found);
     if store.len() as u64 > MAX_BYTES {
         return Vec::new();
     }
@@ -190,11 +193,20 @@ pub fn install(contents: &'static [u8]) {
     let size = u64::from_le_bytes(contents[8..16].try_into().expect("a size"));
     let slot = &contents[PLACEMENT_BYTES..head];
     let committed = (0..2).find_map(|index| Commit::decode(slot, index, DOMAIN, size));
-    pipeline_store::provide(
+    pipeline_store::set_heap_meter(super::gpu::gate::job_heap_rise);
+    let heap = crate::ALLOCATOR.total() as u64;
+    let budget = (heap / BUDGET_SHARE).clamp(BUDGET_LEAST, BUDGET_MOST);
+    let budget = pipeline_store::provide(
         &contents[head..],
         stela_mesa::COMPILER_SHA256.as_bytes(),
         size.saturating_sub(DATA_START),
+        budget,
     );
+    output::arguments(format_args!(
+        "PIPELINES keeps up to {}M of compiled pipelines, by cost, in a file of {}M\n",
+        budget >> 20,
+        size >> 20
+    ));
     let writer = Writer {
         file_bytes: size,
         committed,
@@ -219,13 +231,17 @@ pub fn prepare() {
     });
 }
 
-/// The journal change that writes `update` after `committed`.
+/// The journal change that writes `update` after `committed`: its group
+/// and NIR added, its groups removed. NIR pieces past [`NIR_PIECES`] are
+/// written again as one.
 fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change<'static> {
-    let mut change = Change::default();
-    if let Some(cache) = &update.cache {
-        change.replace.push(CACHE);
-        // Shared with the store's snapshot, not copied.
-        change.blobs.push(Blob::new(CACHE, cache.clone()));
+    let mut change = Change {
+        remove: update.remove.clone(),
+        ..Change::default()
+    };
+    if let Some(group) = &update.group {
+        // Shared with the store, not copied.
+        change.blobs.push(Blob::new(GROUP, group.clone()));
     }
     if !update.nir.is_empty() {
         let pieces = committed
@@ -249,21 +265,8 @@ fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change
     change
 }
 
-/// The journal change that writes the store's content whole: all its NIR as
-/// one blob and `update`'s cache, each replacing every committed blob of its
-/// kind.
-fn whole(update: &pipeline_store::Update) -> Change<'static> {
-    let mut change = Change::default();
-    change.replace.push(NIR);
-    change
-        .blobs
-        .push(Blob::new(NIR, pipeline_store::all_nir(&update.key)));
-    if let Some(cache) = &update.cache {
-        change.replace.push(CACHE);
-        change.blobs.push(Blob::new(CACHE, cache.clone()));
-    }
-    change
-}
+/// Whether the store's file was found full this boot: said once.
+static FULL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 impl Writer {
     /// The next update to write, planned, unless one runs or nothing is new.
@@ -274,20 +277,18 @@ impl Writer {
         let Some(update) = pipeline_store::update() else {
             return false;
         };
-        // NIR pieces appended between the cache's earlier places can leave
-        // no run the newer cache fits in: then the cache and all the NIR are
-        // written again, each whole, in the space the old blobs leave.
-        let plan = journal::plan_or_rewrite(
+        // One commit beside what is committed: a cut write leaves it all.
+        let plan = journal::plan_beside(
             self.committed.as_ref(),
             DOMAIN,
             update.key.0,
             self.file_bytes,
             change(&update, self.committed.as_ref()),
-            || whole(&update),
         );
-        if !plan.dropped.is_empty() {
+        if !plan.dropped.is_empty() && !FULL.swap(true, core::sync::atomic::Ordering::Relaxed) {
             output::arguments(format_args!(
-                "PIPELINES full: {} of {} pieces not kept in a file of {} bytes\n",
+                "PIPELINES full: {} of {} pieces not kept in a file of {} bytes; what is \
+                 kept stays whole\n",
                 plan.dropped.len(),
                 plan.blobs.len(),
                 self.file_bytes
@@ -301,13 +302,31 @@ impl Writer {
         true
     }
 
-    /// The update finished: its commit is the file's newest.
+    /// The update finished: its commit is the file's newest. The store
+    /// learns where its group went, and whether its removals and NIR were
+    /// written: a dropped blob keeps every committed one.
     fn finish(&mut self) {
         if let Some(running) = self.running.take() {
             if let Some(last) = running.execution.last() {
                 self.committed = Some(last);
             }
-            pipeline_store::written(&running.update);
+            let plan = running.execution.plan();
+            let placed = |kind: u32| {
+                plan.steps.iter().find_map(|step| match *step {
+                    journal::Step::Data { blob, offset } if plan.blobs[blob].kind == kind => {
+                        Some(offset)
+                    }
+                    _ => None,
+                })
+            };
+            pipeline_store::written(
+                &running.update,
+                pipeline_store::Written {
+                    group: placed(GROUP),
+                    removed: plan.dropped.is_empty(),
+                    nir: placed(NIR).is_some(),
+                },
+            );
         }
     }
 
@@ -367,8 +386,10 @@ pub fn write() {
                 return Ok(bytes);
             }
             let running = writer.running.as_mut().expect("started");
-            // A dropped blob is not written ("PIPELINES full" names it).
+            // A dropped blob is not written ("PIPELINES full" names it), and
+            // the next update would ask for it again: stop after this one.
             bytes += running.execution.plan().placed_bytes();
+            let last = !running.execution.plan().dropped.is_empty();
             let done = translations::with_store_file(NAME, |device, extents| {
                 let mut target = Direct { device, extents };
                 while !running.execution.advance(&mut target, PIECE_BYTES)? {}
@@ -382,6 +403,9 @@ pub fn write() {
                     return Err(());
                 }
             }
+            if last {
+                return Ok(bytes);
+            }
         }
     });
     if let Some(Ok(bytes)) = written
@@ -390,6 +414,17 @@ pub fn write() {
         output::arguments(format_args!(
             "PIPELINES written bytes={bytes} ms={}\n",
             output::millis_since(started)
+        ));
+    }
+    if let Some(summary) = pipeline_store::summary() {
+        output::arguments(format_args!(
+            "PIPELINES kept compiles={}/{} bytes={}M of {}M heavy={} groups={}\n",
+            summary.kept,
+            summary.units,
+            summary.kept_bytes >> 20,
+            summary.budget >> 20,
+            summary.heavy,
+            summary.groups
         ));
     }
 }

@@ -1664,9 +1664,9 @@ impl NativeBackend {
     }
 
     /// Creates a pipeline of `source` with `create`, which builds it from
-    /// the source it is given and fills the feedback. A compiled pipeline
-    /// goes through the pipeline store's cache: found there or added, and
-    /// once the store is full, found there or compiled without it.
+    /// the source it is given and fills the feedback. A compiled pipeline is
+    /// looked up in the pipeline store's cache; one it lacks compiles into a
+    /// scratch cache whose objects the store keeps by their cost.
     fn through_store<T>(
         &mut self,
         source: PipelineSource,
@@ -1677,35 +1677,40 @@ impl NativeBackend {
         ) -> Result<T>,
     ) -> Result<T> {
         let mut feedback = vk::PipelineCreationFeedback::default();
-        let (PipelineSource::Compiled, Some((cache, grows))) = (source, self.store.cache()) else {
+        let (PipelineSource::Compiled, Some(cache)) = (source, self.store.cache()) else {
             return create(self, source, &mut feedback);
         };
-        let cache = PipelineCache(raw(cache));
-        let hit = |feedback: &vk::PipelineCreationFeedback| {
-            feedback.flags.contains(
-                vk::PipelineCreationFeedbackFlags::VALID
-                    | vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
-            )
-        };
-        if !grows {
-            return match create(self, PipelineSource::Archived(cache), &mut feedback) {
-                Err(Error::NotArchived) => {
-                    let created = create(self, PipelineSource::Compiled, &mut feedback)?;
-                    pipeline_store::note_lookup(false, feedback.duration);
-                    Ok(created)
-                }
-                created => {
-                    let created = created?;
-                    pipeline_store::note_lookup(true, feedback.duration);
-                    Ok(created)
-                }
-            };
+        match create(
+            self,
+            PipelineSource::Archived(PipelineCache(raw(cache))),
+            &mut feedback,
+        ) {
+            Err(Error::NotArchived) => {}
+            created => {
+                let created = created?;
+                pipeline_store::note_lookup(true, feedback.duration);
+                return Ok(created);
+            }
         }
-        let created = create(self, PipelineSource::Cached(cache), &mut feedback)?;
-        let hit = hit(&feedback);
-        pipeline_store::note_lookup(hit, feedback.duration);
-        self.store.created(&self.device, hit);
-        Ok(created)
+        let Some(scratch) = self.store.scratch(&self.device) else {
+            let created = create(self, PipelineSource::Compiled, &mut feedback)?;
+            pipeline_store::note_lookup(false, feedback.duration);
+            return Ok(created);
+        };
+        let created = create(
+            self,
+            PipelineSource::Cached(PipelineCache(raw(scratch))),
+            &mut feedback,
+        );
+        pipeline_store::note_lookup(false, feedback.duration);
+        let cost = pipeline_store::Cost {
+            ns: feedback.duration,
+            heap: 0,
+        };
+        // SAFETY: the scratch cache was made on this device just above, and
+        // the creation that used it returned.
+        unsafe { self.store.adopt(&self.device, scratch, None, cost) };
+        created
     }
 
     /// Logs each of `pipeline`'s shaders that spills or runs past
@@ -1923,7 +1928,6 @@ impl Drop for NativeBackend {
                 }
             }
         }
-        self.store.idle(&self.device);
         // Images jobs made that no call took; the device is idle.
         for image in self.premade.drain() {
             premade::destroy(&self.device, premade::Kind::Image(image));
@@ -2466,7 +2470,6 @@ impl Backend for NativeBackend {
             vk::Result::TIMEOUT => Error::DeviceLost,
             error => failure(error),
         })?;
-        self.store.idle(&self.device);
         Ok(())
     }
 

@@ -348,6 +348,16 @@ static MEASURED_BETWEEN: AtomicBool = AtomicBool::new(false);
 /// The carved bytes the measured job started from.
 static MEASURED_FROM: AtomicU64 = AtomicU64::new(0);
 
+/// How far the heap's carved bytes rose above where the measured job began,
+/// while one is measured: the heap a compile in that job cost, which the
+/// pipeline store keeps with what it compiled. Zero outside a measured job.
+pub(in crate::engine) fn job_heap_rise() -> u64 {
+    if !MEASURING.load(Ordering::Acquire) {
+        return 0;
+    }
+    (crate::ALLOCATOR.marked_peak() as u64).saturating_sub(MEASURED_FROM.load(Ordering::Relaxed))
+}
+
 /// Runs `run`, and for a job it began, keeps how far the heap's carved
 /// bytes rose above where they were until the job ended: a compile's own
 /// peak, as jobs run one at a time, with what other processors carved

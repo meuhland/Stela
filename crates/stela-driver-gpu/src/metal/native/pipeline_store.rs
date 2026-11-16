@@ -2,28 +2,37 @@
 //!
 //! The boot reads the store's file before the device opens and hands its
 //! bytes here ([`provide`]). The first backend to open claims it and, when
-//! the key matches, seeds the pipeline cache its compiled pipelines read and
-//! fill; its snapshots of that cache replace the kept bytes. The boot writes
-//! what was added ([`update`]) back to the file while the guest runs and as
-//! it stops, each piece once ([`written`]), in a journal a cut write cannot
-//! damage (`stela_formats::journal`), and hands the next boot's device the
-//! store it reads from that journal in the layout below.
+//! the key matches, seeds the pipeline cache its compiled pipelines read
+//! from it. A pipeline that cache lacks compiles into an empty cache of its
+//! own ([`Persisted::scratch`]), so the objects it made are known, and the
+//! store keeps them with what the compile cost: the driver's time and the
+//! heap's rise ([`Cost`]). The store's cache then takes them for the rest of
+//! the boot.
 //!
-//! A store is a header, the driver's `vkGetPipelineCacheData` bytes, then
-//! the AIR compiler's NIR by the digest of what each compilation read
-//! ([`NirEntries`]), which a warm boot deserializes instead of lowering AIR
-//! again; the header gives the NIR's length and digest after the cache's,
-//! zero for none. The cache's snapshots take at most half the file, and the
-//! NIR the rest, so a newer snapshot always has room in it. The
-//! header names a [`Key`]: the build identity of the compiler that turns NIR
-//! into machine code, and the GPU's vendor, device, driver and pipeline cache
-//! UUID. NVK's pipeline cache UUID is the same for every Stela build
-//! (`compat/mesa/build_id.c`), so only the build identity tells builds
-//! apart. Inside the cache NVK keys each shader by a digest of its
-//! serialized NIR, the pipeline state and the layout, so a function's AIR,
-//! constants, formats and linked functions select their own entries. A store
-//! of another key, a damaged one or one past the bound is reported once and
-//! ignored: its pipelines compile again.
+//! What is kept is a choice by cost ([`Store::kept_units`]): the objects of
+//! one compile (a unit) are kept or dropped together, heavy compiles first,
+//! then by cost per byte, within a budget of bytes the file and the heap can
+//! hold. A unit is never dropped for one that costs less per byte. The boot
+//! writes what to keep ([`update`]) while the guest runs and as it stops: a
+//! group of objects at a time ([`entries::group`]), and groups that hold
+//! nothing kept removed, each update in one commit beside what is committed
+//! (`stela_formats::journal::plan_beside`), so a cut write leaves the store
+//! as it was.
+//!
+//! A store is a header, a payload, then the AIR compiler's NIR by the
+//! digest of what each compilation read ([`NirEntries`]), which a warm boot
+//! deserializes instead of lowering AIR again; the header gives the NIR's
+//! length and digest after the payload's, zero for none. The payload is the
+//! driver's cache data of every kept object and a table of their groups,
+//! units and costs ([`entries::seal`]). The header names a [`Key`]: the build
+//! identity of the compiler that turns NIR into machine code, and the GPU's
+//! vendor, device, driver and pipeline cache UUID. NVK's pipeline cache UUID
+//! is the same for every Stela build (`compat/mesa/build_id.c`), so only the
+//! build identity tells builds apart. Inside the cache NVK keys each shader
+//! by a digest of its serialized NIR, the pipeline state and the layout, so
+//! a function's AIR, constants, formats and linked functions select their
+//! own entries. A store of another key, a damaged one or one past the bound
+//! is reported once and ignored: its pipelines compile again.
 use crate::metal::vulkan::physical::Identity;
 use alloc::{sync::Arc, vec::Vec};
 use ash::vk;
@@ -32,6 +41,10 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_crypto::{Sha256, digest::Digest};
+
+pub mod entries;
+pub use entries::Cost;
+use entries::{Kept, Object, Placed, Unit};
 
 /// A store's first bytes.
 pub const MAGIC: [u8; 8] = *b"STLGPIPE";
@@ -53,9 +66,74 @@ pub const MAX_NIR_BYTES: u64 = 96 << 20;
 /// The largest store kept, header included, whatever the file allows: the
 /// boot holds its bytes and the driver a cache of them for the whole boot.
 pub const MAX_BYTES: u64 = 256 << 20;
-/// A backend snapshots its cache after this many pipelines it did not find
-/// there, and when the device goes idle with any.
-pub const SNAPSHOT_COMPILES: u32 = 16;
+
+/// The kinds of the blobs of the boot's journal file.
+pub mod kinds {
+    /// A driver's cache data whole: the earlier layout, read only.
+    pub const CACHE: u32 = 1;
+    /// A piece of NIR entries ([`super::NirEntries`]).
+    pub const NIR: u32 = 2;
+    /// A group of pipeline objects ([`super::entries::group`]).
+    pub const GROUP: u32 = 3;
+}
+
+/// The store a device reads, for `key`, from the blobs of the boot's file:
+/// each its kind, its offset in the file and its bytes. Header, the payload
+/// of every group's objects with their groups and costs ([`entries::seal`]),
+/// NIR. A cache of the earlier layout counts as a group of objects of
+/// unknown cost; an object in two groups is held from the first.
+pub fn assemble<'a>(key: &Key, blobs: impl IntoIterator<Item = (u32, u64, &'a [u8])>) -> Vec<u8> {
+    let mut header: Option<&[u8]> = None;
+    let mut placed: Vec<Placed<'_>> = Vec::new();
+    let mut seen = alloc::collections::BTreeSet::new();
+    let mut nir = Vec::new();
+    for (kind, offset, bytes) in blobs {
+        let (found, kept) = match kind {
+            kinds::NIR => {
+                nir.extend_from_slice(bytes);
+                continue;
+            }
+            kinds::GROUP => match entries::read_group(bytes) {
+                Some(group) => group,
+                None => continue,
+            },
+            kinds::CACHE => match entries::objects(bytes) {
+                Some((found, objects)) => (
+                    found,
+                    objects
+                        .into_iter()
+                        .map(|object| Kept {
+                            object,
+                            unit: entries::unit_of(object.key),
+                            cost: Cost::default(),
+                        })
+                        .collect(),
+                ),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if *header.get_or_insert(found) != found {
+            continue;
+        }
+        for kept in kept {
+            if seen.insert((kept.object.kind, kept.object.key)) {
+                placed.push(Placed {
+                    kept,
+                    group: offset,
+                });
+            }
+        }
+    }
+    let payload = match header {
+        Some(header) => entries::seal(header, &placed),
+        None => Vec::new(),
+    };
+    let mut store = header_with_nir(key, &payload, &nir).to_vec();
+    store.extend_from_slice(&payload);
+    store.extend_from_slice(&nir);
+    store
+}
 
 /// What a store's pipelines are valid for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,66 +299,21 @@ pub fn payload<'a>(stored: &'a [u8], key: &Key, bound: u64) -> Result<&'a [u8], 
     Ok(payload)
 }
 
-/// When a backend snapshots its cache, and whether the cache still grows.
-#[derive(Debug)]
-pub struct Policy {
-    bound: u64,
-    unsaved: u32,
-    grows: bool,
-}
-
-impl Policy {
-    pub fn new(bound: u64) -> Self {
-        Self {
-            bound: bound.min(MAX_BYTES),
-            unsaved: 0,
-            grows: true,
-        }
-    }
-
-    /// Whether compiled pipelines are added to the cache. Once a snapshot
-    /// passes the bound they are only looked up there.
-    pub fn grows(&self) -> bool {
-        self.grows
-    }
-
-    /// A pipeline was created through the cache, `hit` when it was found
-    /// there: whether to snapshot now.
-    pub fn created(&mut self, hit: bool) -> bool {
-        if self.grows && !hit {
-            self.unsaved += 1;
-        }
-        self.grows && self.unsaved >= SNAPSHOT_COMPILES
-    }
-
-    /// Whether an idle device has pipelines to snapshot.
-    pub fn unsaved(&self) -> bool {
-        self.grows && self.unsaved > 0
-    }
-
-    /// A snapshot of `payload` bytes was taken: whether it is kept. One past
-    /// the bound stops the cache growing.
-    pub fn snapshotted(&mut self, payload: usize) -> bool {
-        self.unsaved = 0;
-        let fits = (HEADER_BYTES as u64).saturating_add(payload as u64) <= self.bound;
-        self.grows &= fits;
-        fits
-    }
-
-    /// Snapshots failed: the cache stops growing.
-    pub fn stop(&mut self) {
-        self.unsaved = 0;
-        self.grows = false;
-    }
-}
+/// The bytes of objects one update writes as a group, unless a single
+/// compile's objects take more. Every group fits beside the kept ones:
+/// the file keeps room for two beside the objects' budget and the NIR.
+pub const GROUP_BYTES: u64 = 4 << 20;
+/// Groups past which an update merges the smallest: each is a blob of the
+/// journal, whose commits name a bounded number.
+const MAX_GROUPS: usize = 128;
 
 /// The bytes a backend seeds its cache with.
 #[derive(Clone, Debug)]
 pub enum Seed {
     Empty,
-    /// The payload the boot read.
+    /// The driver cache data the boot read.
     Stored(&'static [u8]),
-    /// A previous backend's newest snapshot, for a reopened device.
+    /// Every object the store holds, for a reopened device.
     Kept(Arc<Vec<u8>>),
 }
 
@@ -299,27 +332,85 @@ impl Seed {
 pub struct Claim {
     generation: u64,
     pub key: Key,
-    /// The most bytes its cache's snapshots take, header included
-    /// ([`Store::cache_bound`]).
-    pub bound: u64,
     pub seed: Seed,
     /// Why the stored bytes seed nothing, unless they are blank.
     pub refused: Option<Rejection>,
 }
 
-/// The boot's store: what it read, the newest snapshot, and what of both
-/// the boot wrote back since ([`Store::update`]).
+/// An object's type and key: what the driver finds it by.
+type ObjectKey = (u32, Vec<u8>);
+
+/// An object's data: the boot's bytes, or compiled this boot.
+#[derive(Debug)]
+enum Data {
+    Stored(&'static [u8]),
+    New(Vec<u8>),
+}
+
+impl Data {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Stored(bytes) => bytes,
+            Self::New(bytes) => bytes,
+        }
+    }
+}
+
+/// An object the store holds.
+#[derive(Debug)]
+struct Held {
+    data: Data,
+    unit: Unit,
+    cost: Cost,
+    /// The offset of the group on the file that holds it.
+    group: Option<u64>,
+}
+
+/// A group on the file: its bytes and objects.
+#[derive(Debug)]
+struct Group {
+    bytes: u64,
+    objects: Vec<ObjectKey>,
+}
+
+/// A unit's rank: heavy first, then by cost per byte, then by unit.
+#[derive(Clone, Copy, Debug)]
+struct Rank {
+    unit: Unit,
+    cost: Cost,
+    bytes: u64,
+}
+
+impl Rank {
+    /// Whether `self` comes before `other`: kept first.
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        other
+            .cost
+            .heavy()
+            .cmp(&self.cost.heavy())
+            .then_with(|| {
+                // Cost per byte, compared without a division.
+                let ours = self.cost.value() * u128::from(other.bytes.max(1));
+                let theirs = other.cost.value() * u128::from(self.bytes.max(1));
+                theirs.cmp(&ours)
+            })
+            .then(self.unit.cmp(&other.unit))
+    }
+}
+
+/// The boot's store: what it read, what was compiled since, and what of both
+/// the boot wrote back ([`Store::update`]).
 #[derive(Debug)]
 pub struct Store {
     compiler: Vec<u8>,
+    /// The file's data area, which bounds the stored bytes.
     bound: u64,
+    /// The most bytes of objects kept: the file holds them, and the driver
+    /// a copy in the heap for the whole boot.
+    budget: u64,
     stored: &'static [u8],
     owner: Option<(u64, Key)>,
     claims: u64,
-    kept: Option<(Key, Arc<Vec<u8>>)>,
-    /// Snapshots kept so far, and the newest of them written.
-    kept_version: u64,
-    written_version: u64,
     /// Keys of the NIR added this boot that is written.
     written_nir: alloc::collections::BTreeSet<[u8; 32]>,
     /// The key the stored bytes matched at a claim, and their NIR.
@@ -330,28 +421,42 @@ pub struct Store {
     /// NIR compiled this boot, by key, and its bytes.
     nir: alloc::collections::BTreeMap<[u8; 32], Vec<u8>>,
     nir_bytes: u64,
+    /// The driver's cache header for the claimed GPU.
+    header: Option<Vec<u8>>,
+    objects: alloc::collections::BTreeMap<ObjectKey, Held>,
+    groups: alloc::collections::BTreeMap<u64, Group>,
+    /// New objects since a reopened device's seed was made.
+    added: bool,
 }
 
 impl Store {
     /// A store of `stored`, its file's bytes (empty for a blank one), for
-    /// the compiler of build identity `compiler`, holding up to `bound`
-    /// bytes.
-    pub fn new(stored: &'static [u8], compiler: &[u8], bound: u64) -> Self {
+    /// the compiler of build identity `compiler`, in a file whose data area
+    /// is `bound` bytes, keeping at most `budget` bytes of objects.
+    pub fn new(stored: &'static [u8], compiler: &[u8], bound: u64, budget: u64) -> Self {
+        let bound = bound.min(MAX_BYTES);
         Self {
             compiler: compiler.to_vec(),
-            bound: bound.min(MAX_BYTES),
+            bound,
+            budget: budget.min(bound.saturating_sub(2 * GROUP_BYTES) / 2),
             stored,
             owner: None,
             claims: 0,
-            kept: None,
-            kept_version: 0,
-            written_version: 0,
             written_nir: alloc::collections::BTreeSet::new(),
             matched: None,
             stored_keys: alloc::collections::BTreeSet::new(),
             nir: alloc::collections::BTreeMap::new(),
             nir_bytes: 0,
+            header: None,
+            objects: alloc::collections::BTreeMap::new(),
+            groups: alloc::collections::BTreeMap::new(),
+            added: false,
         }
+    }
+
+    /// The most bytes of objects kept.
+    pub fn budget(&self) -> u64 {
+        self.budget
     }
 
     /// The stored NIR, for the device whose claim matched the store.
@@ -377,22 +482,14 @@ impl Store {
         }
     }
 
-    /// The most bytes the cache's snapshots take, header included: half the
-    /// bound. The cache grows all boot and each snapshot replaces the
-    /// written one, so its room is kept from the NIR ([`Self::nir_room`]):
-    /// NIR budgeted against the cache of its moment filled the file, and
-    /// every later, larger snapshot found no room and was not kept.
-    pub fn cache_bound(&self) -> u64 {
-        self.bound / 2
-    }
-
-    /// The bytes of NIR added this boot that the file can still hold: the
-    /// bound less the cache's ([`Self::cache_bound`]), the stored NIR and
-    /// the file's alignment of the two blobs, and at most
-    /// [`MAX_NIR_BYTES`]. NIR past it could never be written beside a cache
-    /// of the cache's bound, and would only be held in the heap.
+    /// The bytes of NIR added this boot that the file can still hold: its
+    /// data area less the objects' budget, room for two groups beside them
+    /// and the stored NIR, and at most [`MAX_NIR_BYTES`]. NIR past it could
+    /// never be written beside the objects, and would only be held in the
+    /// heap.
     fn nir_room(&self) -> u64 {
-        let held = self.cache_bound() + 2 * BLOB_ALIGN + self.stored_nir().0.len() as u64;
+        let held =
+            self.budget + 2 * GROUP_BYTES + 2 * BLOB_ALIGN + self.stored_nir().0.len() as u64;
         self.bound.saturating_sub(held).min(MAX_NIR_BYTES)
     }
 
@@ -411,33 +508,132 @@ impl Store {
         }
         self.claims += 1;
         self.owner = Some((self.claims, key));
-        let matched = payload(self.stored, &key, self.bound).is_ok();
-        if matched && self.matched != Some(key) {
+        let stored = payload(self.stored, &key, self.bound);
+        if stored.is_ok() && self.matched != Some(key) {
             self.matched = Some(key);
             self.stored_keys = self.stored_nir().map(|(stored, _)| stored).collect();
+            if let Ok(payload) = stored {
+                self.hold_stored(payload);
+            }
         }
-        let (seed, refused) = match &self.kept {
-            Some((kept, payload)) if *kept == key => (Seed::Kept(payload.clone()), None),
-            _ => match payload(self.stored, &key, self.bound) {
-                Ok(payload) => (Seed::Stored(payload), None),
-                Err(Rejection::Blank) => (Seed::Empty, None),
-                Err(rejection) => (Seed::Empty, Some(rejection)),
-            },
+        let (seed, refused) = match stored {
+            _ if self.added && self.header.is_some() => {
+                (Seed::Kept(Arc::new(self.cache_data())), None)
+            }
+            Ok(payload) => (
+                Seed::Stored(entries::open(payload).map_or(payload, |(data, _)| data)),
+                None,
+            ),
+            Err(Rejection::Blank) => (Seed::Empty, None),
+            Err(rejection) => (Seed::Empty, Some(rejection)),
         };
         Some(Claim {
             generation: self.claims,
             key,
-            bound: self.cache_bound(),
             seed,
             refused,
         })
     }
 
-    /// Keep `payload`, the holder's newest snapshot.
-    pub fn keep(&mut self, claim: &Claim, payload: Vec<u8>) {
-        if self.holds(claim) {
-            self.kept = Some((claim.key, Arc::new(payload)));
-            self.kept_version += 1;
+    /// Holds the objects of the stored payload, each in its group; driver
+    /// cache data without the store's table holds objects of no group and
+    /// no known cost.
+    fn hold_stored(&mut self, payload: &'static [u8]) {
+        let (header, placed) = match entries::open(payload) {
+            Some((data, placed)) => (data.get(..entries::CACHE_HEADER_BYTES), placed),
+            None => match entries::objects(payload) {
+                Some((header, objects)) => (
+                    Some(header),
+                    objects
+                        .into_iter()
+                        .map(|object| Placed {
+                            kept: Kept {
+                                object,
+                                unit: entries::unit_of(object.key),
+                                cost: Cost::default(),
+                            },
+                            group: u64::MAX,
+                        })
+                        .collect(),
+                ),
+                None => (None, Vec::new()),
+            },
+        };
+        self.header = header.map(<[u8]>::to_vec);
+        for Placed { kept, group } in placed {
+            let key = (kept.object.kind, kept.object.key.to_vec());
+            if self.objects.contains_key(&key) {
+                continue;
+            }
+            let group = (group != u64::MAX).then_some(group);
+            if let Some(offset) = group {
+                let entry = self.groups.entry(offset).or_insert(Group {
+                    bytes: 0,
+                    objects: Vec::new(),
+                });
+                entry.bytes += kept.object.bytes() as u64;
+                entry.objects.push(key.clone());
+            }
+            self.objects.insert(
+                key,
+                Held {
+                    data: Data::Stored(kept.object.data),
+                    unit: kept.unit,
+                    cost: kept.cost,
+                    group,
+                },
+            );
+        }
+    }
+
+    /// Driver cache data of every object held.
+    fn cache_data(&self) -> Vec<u8> {
+        entries::cache_data(
+            self.header.as_deref().unwrap_or(&[]),
+            self.objects.iter().map(|((kind, key), held)| Object {
+                kind: *kind,
+                key,
+                data: held.data.bytes(),
+            }),
+        )
+    }
+
+    /// Keeps the objects of `data`, the driver cache data of one compile
+    /// that cost `cost`, its cost shared out by their bytes. An object held
+    /// already gains its share: more compiles need it.
+    pub fn compiled(&mut self, claim: &Claim, data: &[u8], cost: Cost) {
+        if !self.holds(claim) {
+            return;
+        }
+        let Some((header, objects)) = entries::objects(data) else {
+            return;
+        };
+        if objects.is_empty() {
+            return;
+        }
+        if self.header.is_none() {
+            self.header = Some(header.to_vec());
+        }
+        let whole: usize = objects.iter().map(Object::bytes).sum();
+        let unit = entries::unit_of(objects[0].key);
+        for object in objects {
+            let share = cost.share(object.bytes(), whole);
+            let key = (object.kind, object.key.to_vec());
+            match self.objects.get_mut(&key) {
+                Some(held) => held.cost.add(share),
+                None => {
+                    self.objects.insert(
+                        key,
+                        Held {
+                            data: Data::New(object.data.to_vec()),
+                            unit,
+                            cost: share,
+                            group: None,
+                        },
+                    );
+                    self.added = true;
+                }
+            }
         }
     }
 
@@ -453,22 +649,228 @@ impl Store {
             .is_some_and(|(generation, _)| generation == claim.generation)
     }
 
-    /// What was added since the last [`Self::written`]: the newest snapshot
-    /// when newer than the one written, and the NIR not written, for the key
-    /// the store is held for. `None` when nothing is new.
-    pub fn update(&self) -> Option<Update> {
-        let key = self
-            .kept
-            .as_ref()
-            .map(|(key, _)| *key)
-            .or(self.owner.map(|(_, key)| key))
-            .or(self.matched)?;
-        let cache = match &self.kept {
-            Some((kept, payload)) if *kept == key && self.kept_version > self.written_version => {
-                Some(payload.clone())
-            }
-            _ => None,
+    /// Each unit's rank, kept ones first.
+    fn ranks(&self) -> Vec<Rank> {
+        let mut units: alloc::collections::BTreeMap<Unit, Rank> =
+            alloc::collections::BTreeMap::new();
+        for ((_, key), held) in &self.objects {
+            let rank = units.entry(held.unit).or_insert(Rank {
+                unit: held.unit,
+                cost: Cost::default(),
+                bytes: 0,
+            });
+            rank.cost.add(held.cost);
+            rank.bytes += (40 + key.len() + held.data.bytes().len()) as u64;
+        }
+        let mut ranks: Vec<Rank> = units.into_values().collect();
+        ranks.sort_by(Rank::cmp);
+        ranks
+    }
+
+    /// The units kept: whole units by rank while they fit the budget; a
+    /// unit that does not fit is passed over, never one before it.
+    pub fn kept_units(&self) -> alloc::collections::BTreeSet<Unit> {
+        let mut used = 0;
+        self.ranks()
+            .into_iter()
+            .filter(|rank| {
+                let fits = used + rank.bytes <= self.budget;
+                if fits {
+                    used += rank.bytes;
+                }
+                fits
+            })
+            .map(|rank| rank.unit)
+            .collect()
+    }
+
+    /// The bytes of `key`'s object in a group.
+    fn object_bytes(&self, key: &ObjectKey) -> u64 {
+        self.objects.get(key).map_or(0, |held| {
+            (40 + key.1.len() + held.data.bytes().len()) as u64
+        })
+    }
+
+    /// The file's bytes in use, as the store knows them: its groups and the
+    /// NIR, each blob rounded to its alignment.
+    fn used(&self) -> u64 {
+        let aligned = |bytes: u64| bytes.div_ceil(BLOB_ALIGN) * BLOB_ALIGN;
+        let groups: u64 = self
+            .groups
+            .values()
+            .map(|group| aligned(entries::group_bytes(group.bytes as usize) as u64))
+            .sum();
+        let written: u64 = self
+            .nir
+            .iter()
+            .filter(|(key, _)| self.written_nir.contains(*key))
+            .map(|(_, blob)| blob.len() as u64 + 36)
+            .sum();
+        groups + aligned(self.stored_nir().0.len() as u64) + written
+    }
+
+    /// What to write next, unless nothing is new, for the key the store is
+    /// held for:
+    /// - groups that hold no kept object, or that are too large to write
+    ///   again and hold one that is not kept, are removed, in an update of
+    ///   their removal alone;
+    /// - else kept objects on no group, by rank, become a new group of at
+    ///   most [`GROUP_BYTES`], with a group that holds objects not kept, or
+    ///   the smallest groups when there are many, written into it and
+    ///   removed in the same commit;
+    /// - when the file lacks room for the new group, the group of the
+    ///   lowest rank is removed first, if it ranks below the new one: an
+    ///   object is never dropped for one of a lower rank;
+    /// - NIR compiled this boot is appended.
+    pub fn update(&mut self) -> Option<Update> {
+        let key = self.owner.map(|(_, key)| key).or(self.matched)?;
+        let ranks = self.ranks();
+        let kept = self.kept_units();
+        let position: alloc::collections::BTreeMap<Unit, usize> = ranks
+            .iter()
+            .enumerate()
+            .map(|(index, rank)| (rank.unit, index))
+            .collect();
+        // What is kept nowhere and wanted nowhere is only the driver's now.
+        self.objects
+            .retain(|_, held| held.group.is_some() || kept.contains(&held.unit));
+        let wanted = |store: &Self, object: &ObjectKey| {
+            store
+                .objects
+                .get(object)
+                .is_some_and(|held| kept.contains(&held.unit))
         };
+        let wanted_bytes = |store: &Self, group: &Group| -> u64 {
+            group
+                .objects
+                .iter()
+                .filter(|object| wanted(store, object))
+                .map(|object| store.object_bytes(object))
+                .sum()
+        };
+        let dead: Vec<u64> = self
+            .groups
+            .iter()
+            .filter(|(_, group)| {
+                let bytes = wanted_bytes(self, group);
+                bytes == 0 || bytes > GROUP_BYTES && bytes < group.bytes
+            })
+            .map(|(&offset, _)| offset)
+            .collect();
+        if !dead.is_empty() {
+            return Some(Update::removing(key, dead));
+        }
+        // Kept objects on no group, by their unit's rank.
+        let mut pending: Vec<ObjectKey> = self
+            .objects
+            .iter()
+            .filter(|(_, held)| held.group.is_none() && kept.contains(&held.unit))
+            .map(|(object, _)| object.clone())
+            .collect();
+        pending.sort_by_key(|object| position[&self.objects[object].unit]);
+        let mut chosen: Vec<ObjectKey> = Vec::new();
+        let mut bytes = 0;
+        let mut last_unit = None;
+        for object in pending {
+            let unit = self.objects[&object].unit;
+            let size = self.object_bytes(&object);
+            if bytes + size > GROUP_BYTES && last_unit != Some(unit) && !chosen.is_empty() {
+                break;
+            }
+            bytes += size;
+            last_unit = Some(unit);
+            chosen.push(object);
+        }
+        // A group partly kept, then the smallest when there are many, is
+        // written again into this one. Merging the smallest must join two or
+        // more, or the count of groups would not fall.
+        let partial: Vec<u64> = self
+            .groups
+            .iter()
+            .filter(|(_, group)| wanted_bytes(self, group) < group.bytes)
+            .map(|(&offset, _)| offset)
+            .collect();
+        let mut smallest: Vec<u64> = Vec::new();
+        if self.groups.len() > MAX_GROUPS {
+            let mut by_size: Vec<(u64, u64)> = self
+                .groups
+                .iter()
+                .filter(|(offset, _)| !partial.contains(offset))
+                .map(|(&offset, group)| (group.bytes, offset))
+                .collect();
+            by_size.sort_unstable();
+            smallest = by_size.into_iter().map(|(_, offset)| offset).collect();
+        }
+        let mut compacted = Vec::new();
+        let mut merged = 0;
+        for (offset, is_small) in partial
+            .iter()
+            .map(|&offset| (offset, false))
+            .chain(smallest.iter().map(|&offset| (offset, true)))
+        {
+            let size = wanted_bytes(self, &self.groups[&offset]);
+            if bytes + size > GROUP_BYTES {
+                if is_small {
+                    break;
+                }
+                continue;
+            }
+            bytes += size;
+            compacted.push((offset, is_small));
+            merged += usize::from(is_small);
+        }
+        if merged == 1 && chosen.is_empty() && compacted.len() == 1 {
+            compacted.clear();
+            bytes = 0;
+        }
+        let mut compacted: Vec<u64> = compacted.into_iter().map(|(offset, _)| offset).collect();
+        for offset in &compacted {
+            chosen.extend(
+                self.groups[offset]
+                    .objects
+                    .iter()
+                    .filter(|object| wanted(self, object))
+                    .cloned(),
+            );
+        }
+        // Room beside what is committed, short of what the update frees
+        // only once it commits.
+        let aligned = |bytes: u64| bytes.div_ceil(BLOB_ALIGN) * BLOB_ALIGN;
+        let needed = aligned(entries::group_bytes(bytes as usize) as u64);
+        if !chosen.is_empty() && self.used() + needed > self.bound {
+            let best = chosen
+                .iter()
+                .map(|object| position[&self.objects[object].unit])
+                .min()
+                .unwrap_or(usize::MAX);
+            let victim = self
+                .groups
+                .iter()
+                .filter(|(offset, _)| !compacted.contains(offset))
+                .map(|(&offset, group)| {
+                    let top = group
+                        .objects
+                        .iter()
+                        .filter_map(|object| self.objects.get(object))
+                        .map(|held| position.get(&held.unit).copied().unwrap_or(usize::MAX))
+                        .min()
+                        .unwrap_or(usize::MAX);
+                    (top, offset)
+                })
+                .max();
+            if let Some((top, offset)) = victim
+                && top > best
+            {
+                return Some(Update::removing(key, alloc::vec![offset]));
+            }
+            // No room, and nothing ranked lower to make it: NIR alone.
+            chosen.clear();
+            compacted.clear();
+        }
+        if self.header.is_none() {
+            chosen.clear();
+            compacted.clear();
+        }
         let mut nir = Vec::new();
         let mut nir_keys = Vec::new();
         for (entry, blob) in &self.nir {
@@ -477,21 +879,89 @@ impl Store {
                 nir_keys.push(*entry);
             }
         }
-        (cache.is_some() || !nir.is_empty()).then_some(Update {
+        if chosen.is_empty() && nir.is_empty() {
+            return None;
+        }
+        let group = (!chosen.is_empty()).then(|| {
+            let header = self.header.as_deref().unwrap_or(&[]);
+            Arc::new(entries::group(
+                header,
+                chosen.iter().map(|object| {
+                    let held = &self.objects[object];
+                    Kept {
+                        object: Object {
+                            kind: object.0,
+                            key: &object.1,
+                            data: held.data.bytes(),
+                        },
+                        unit: held.unit,
+                        cost: held.cost,
+                    }
+                }),
+            ))
+        });
+        Some(Update {
             key,
-            cache,
+            remove: compacted,
+            group,
+            group_objects: chosen,
             nir: Arc::new(nir),
-            cache_version: self.kept_version,
             nir_keys,
         })
     }
 
-    /// `update` is durable: what it holds is not offered again.
-    pub fn written(&mut self, update: &Update) {
-        if update.cache.is_some() {
-            self.written_version = self.written_version.max(update.cache_version);
+    /// `update` was written as `written` says: its removed groups are gone,
+    /// its group is where it went, and its NIR is not offered again.
+    pub fn written(&mut self, update: &Update, written: Written) {
+        let removed = if written.removed {
+            &update.remove[..]
+        } else {
+            &[]
+        };
+        for offset in removed {
+            if let Some(group) = self.groups.remove(offset) {
+                for object in group.objects {
+                    if let Some(held) = self.objects.get_mut(&object)
+                        && held.group == Some(*offset)
+                    {
+                        held.group = None;
+                    }
+                }
+            }
         }
-        self.written_nir.extend(update.nir_keys.iter().copied());
+        if let (Some(at), Some(group)) = (written.group, &update.group) {
+            for object in &update.group_objects {
+                if let Some(held) = self.objects.get_mut(object) {
+                    held.group = Some(at);
+                }
+            }
+            self.groups.insert(
+                at,
+                Group {
+                    bytes: group.len().saturating_sub(entries::group_bytes(0)) as u64,
+                    objects: update.group_objects.clone(),
+                },
+            );
+        }
+        if written.nir {
+            self.written_nir.extend(update.nir_keys.iter().copied());
+        }
+    }
+
+    /// What the store keeps: its units and theirs bytes, the heavy ones
+    /// among them, and its groups on the file.
+    pub fn summary(&self) -> Summary {
+        let kept = self.kept_units();
+        let ranks = self.ranks();
+        let kept_ranks = ranks.iter().filter(|rank| kept.contains(&rank.unit));
+        Summary {
+            units: ranks.len(),
+            kept: kept.len(),
+            kept_bytes: kept_ranks.clone().map(|rank| rank.bytes).sum(),
+            heavy: kept_ranks.filter(|rank| rank.cost.heavy()).count(),
+            groups: self.groups.len(),
+            budget: self.budget,
+        }
     }
 
     /// Every NIR entry the store holds for `key`, stored and added, as one
@@ -509,17 +979,57 @@ impl Store {
     }
 }
 
-/// What a store added since it was last written ([`Store::update`]).
+/// What the boot writes next for the store ([`Store::update`]), in one
+/// commit beside what is committed.
 #[derive(Debug)]
 pub struct Update {
     pub key: Key,
-    /// The newest cache snapshot, which replaces the written one.
-    pub cache: Option<Arc<Vec<u8>>>,
-    /// NIR entries ([`NirEntries`]) added to the written ones, shared with
-    /// the write rather than copied.
+    /// Groups removed, by offset in the file.
+    pub remove: Vec<u64>,
+    /// A group of objects added ([`entries::group`]), shared with the write
+    /// rather than copied.
+    pub group: Option<Arc<Vec<u8>>>,
+    /// NIR entries ([`NirEntries`]) added to the written ones.
     pub nir: Arc<Vec<u8>>,
-    cache_version: u64,
+    group_objects: Vec<ObjectKey>,
     nir_keys: Vec<[u8; 32]>,
+}
+
+/// How an [`Update`] was written: where its group went, whether its
+/// removals were made (a dropped blob keeps every committed one), and
+/// whether its NIR was written.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Written {
+    pub group: Option<u64>,
+    pub removed: bool,
+    pub nir: bool,
+}
+
+/// What a store keeps ([`Store::summary`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Summary {
+    /// Compiles it knows of, and those it keeps.
+    pub units: usize,
+    pub kept: usize,
+    pub kept_bytes: u64,
+    /// Kept compiles that are heavy ([`Cost::heavy`]).
+    pub heavy: usize,
+    /// Groups on the file.
+    pub groups: usize,
+    pub budget: u64,
+}
+
+impl Update {
+    fn removing(key: Key, remove: Vec<u64>) -> Self {
+        Self {
+            key,
+            remove,
+            group: None,
+            nir: Arc::new(Vec::new()),
+            group_objects: Vec::new(),
+            nir_keys: Vec::new(),
+        }
+    }
 }
 
 /// Pipelines created through the store's cache since the last
@@ -634,26 +1144,55 @@ fn with_store<R>(f: impl FnOnce(&mut Option<Store>) -> R) -> R {
 }
 
 /// Give the devices that open later the store the boot read: `stored`, the
-/// file's bytes, for the compiler of build identity `compiler`, holding up
-/// to `bound` bytes. Without it compiled pipelines keep no cache.
-pub fn provide(stored: &'static [u8], compiler: &[u8], bound: u64) {
-    let store = Store::new(stored, compiler, bound);
+/// file's bytes, for the compiler of build identity `compiler`, in a file
+/// whose data area is `bound` bytes, keeping at most `budget` bytes of
+/// objects. Without it compiled pipelines keep no cache. Answers the
+/// objects' budget the file leaves.
+pub fn provide(stored: &'static [u8], compiler: &[u8], bound: u64, budget: u64) -> u64 {
+    let store = Store::new(stored, compiler, bound, budget);
+    let budget = store.budget();
     with_store(|slot| *slot = Some(store));
+    budget
 }
 
-/// What the boot's store added since it was last written, for the boot to
-/// write while the guest runs and as it stops ([`Store::update`]).
+/// What the boot writes next for its store, while the guest runs and as it
+/// stops ([`Store::update`]).
 pub fn update() -> Option<Update> {
-    with_store(|slot| slot.as_ref()?.update())
+    with_store(|slot| slot.as_mut()?.update())
 }
 
-/// `update` is durable on the file.
-pub fn written(update: &Update) {
+/// `update` was written as `written` says.
+pub fn written(update: &Update, written: Written) {
     with_store(|slot| {
         if let Some(store) = slot {
-            store.written(update);
+            store.written(update, written);
         }
     });
+}
+
+/// What the boot's store keeps ([`Store::summary`]).
+pub fn summary() -> Option<Summary> {
+    with_store(|slot| slot.as_ref().map(Store::summary))
+}
+
+/// Measures how far the heap rose during the job that runs a compile: the
+/// platform's, answering zero outside a measured job.
+static HEAP_METER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the meter a compile's heap rise is read from.
+pub fn set_heap_meter(meter: fn() -> u64) {
+    HEAP_METER.store(meter as usize, Ordering::Release);
+}
+
+/// The heap's rise during the running job so far, or zero.
+pub(super) fn heap_rise() -> u64 {
+    let meter = HEAP_METER.load(Ordering::Acquire);
+    if meter == 0 {
+        return 0;
+    }
+    // SAFETY: only `set_heap_meter` stores a nonzero value, a `fn() -> u64`.
+    let meter: fn() -> u64 = unsafe { core::mem::transmute(meter) };
+    meter()
 }
 
 /// Every NIR entry the boot's store holds for `key` ([`Store::all_nir`]).
@@ -689,11 +1228,10 @@ pub fn recall_nir(key: &[u8; 32]) -> Option<Vec<u8>> {
 }
 
 /// The cache a backend's compiled pipelines read and fill, seeded from the
-/// store, and when it is snapshotted.
+/// store.
 pub(super) struct Persisted {
     claim: Option<Claim>,
     cache: vk::PipelineCache,
-    policy: Policy,
     log: fn(&str),
 }
 
@@ -703,7 +1241,6 @@ impl Persisted {
         Self {
             claim: None,
             cache: vk::PipelineCache::null(),
-            policy: Policy::new(0),
             log,
         }
     }
@@ -743,7 +1280,6 @@ impl Persisted {
         });
         match cache {
             Ok(cache) => Self {
-                policy: Policy::new(claim.bound),
                 claim: Some(claim),
                 cache,
                 log,
@@ -763,60 +1299,59 @@ impl Persisted {
         }
     }
 
-    /// The cache a compiled pipeline is looked up in, and whether it is
-    /// added there when it is missing.
-    pub(super) fn cache(&self) -> Option<(vk::PipelineCache, bool)> {
-        self.claim
-            .is_some()
-            .then_some((self.cache, self.policy.grows()))
+    /// The cache a compiled pipeline is looked up in, holding every
+    /// pipeline the store keeps and every one compiled this boot.
+    pub(super) fn cache(&self) -> Option<vk::PipelineCache> {
+        self.claim.is_some().then_some(self.cache)
     }
 
-    /// A compiled pipeline was created through [`Self::cache`], `hit` when
-    /// the cache held it.
-    pub(super) fn created(&mut self, device: &ash::Device, hit: bool) {
-        if self.claim.is_some() && self.policy.created(hit) {
-            self.snapshot(device);
-        }
+    /// An empty cache a pipeline the store's cache lacks compiles into, so
+    /// that what it compiled can be told apart and kept with its cost
+    /// ([`Self::adopt`]). `None` without a store or a cache.
+    pub(super) fn scratch(&self, device: &ash::Device) -> Option<vk::PipelineCache> {
+        self.claim.as_ref()?;
+        let info = vk::PipelineCacheCreateInfo::default();
+        // SAFETY: the create info outlives the call.
+        unsafe { device.create_pipeline_cache(&info, None) }.ok()
     }
 
-    /// The device is idle: snapshot the pipelines added since the last.
-    pub(super) fn idle(&mut self, device: &ash::Device) {
-        if self.claim.is_some() && self.policy.unsaved() {
-            self.snapshot(device);
-        }
-    }
-
-    fn snapshot(&mut self, device: &ash::Device) {
-        let Some(claim) = &self.claim else {
-            return;
-        };
-        // SAFETY: the cache is this device's and alive; the backend creates
-        // no pipeline meanwhile.
-        match unsafe { device.get_pipeline_cache_data(self.cache) } {
-            Ok(payload) => {
-                let bytes = payload.len();
-                if self.policy.snapshotted(bytes) {
-                    with_store(|slot| {
-                        if let Some(store) = slot {
-                            store.keep(claim, payload);
-                        }
-                    });
-                } else {
-                    (self.log)(&alloc::format!(
-                        "pipeline store full: {bytes} bytes pass its bound of {}; newer \
-                         pipelines compile every boot",
-                        claim.bound
-                    ));
+    /// Keeps what a compile into `scratch` made, whose driver cache data is
+    /// `data` (read now when `None`) and which cost `cost`: the store keeps
+    /// its objects by their cost, and the store's cache takes them for the
+    /// rest of the boot. Destroys `scratch`.
+    ///
+    /// # Safety
+    ///
+    /// `device` is the live device `scratch` was made on by
+    /// [`Self::scratch`], and no pipeline creation uses `scratch`.
+    pub(super) unsafe fn adopt(
+        &mut self,
+        device: &ash::Device,
+        scratch: vk::PipelineCache,
+        data: Option<Vec<u8>>,
+        cost: Cost,
+    ) {
+        // SAFETY: the caller's live, unused cache.
+        let data = data.or_else(|| unsafe { device.get_pipeline_cache_data(scratch) }.ok());
+        if let (Some(claim), Some(data)) = (&self.claim, &data) {
+            with_store(|slot| {
+                if let Some(store) = slot {
+                    store.compiled(claim, data, cost);
                 }
-            }
-            Err(error) => {
-                self.policy.stop();
+            });
+        }
+        if self.claim.is_some() {
+            // SAFETY: both caches are this device's and alive; the store's
+            // cache is merged into only here, on the backend's own turn.
+            if let Err(error) = unsafe { device.merge_pipeline_caches(self.cache, &[scratch]) } {
                 (self.log)(&alloc::format!(
-                    "pipeline store not snapshotted ({error:?}); newer pipelines compile \
-                     every boot"
+                    "pipeline store: a compiled pipeline was not merged ({error:?}); it \
+                     compiles again when asked again"
                 ));
             }
         }
+        // SAFETY: the caller's cache, which nothing uses any more.
+        unsafe { device.destroy_pipeline_cache(scratch, None) };
     }
 
     /// Releases the store and destroys the cache.

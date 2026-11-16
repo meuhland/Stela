@@ -5,9 +5,10 @@
 //! a cache, a creation serializes and hashes each stage's NIR and loads the
 //! shaders, which took a large shader 45-55 ms. The call fails with
 //! `DEFERRED` and leaves a job that creates the pipeline from its stages'
-//! NIR, through the pipeline store's cache while that grows, else the full
-//! store's and then the backend's own: NIR to machine code, when no cache
-//! holds it, runs in the job too. A creation through a binary archive's
+//! NIR: looked up in the pipeline store's cache and, when it lacks the
+//! pipeline, compiled into a scratch cache whose objects the store keeps
+//! with the compile's cost (the backend's own cache without a store). NIR
+//! to machine code, when no cache holds it, runs in the job too. A creation through a binary archive's
 //! cache that adds what it lacks (`PipelineSource::Cached`, as an archived
 //! pipeline's variants are) runs in a job through that same cache, which the
 //! archive's destruction then leaves to the job ([`SharedCache`]). A lookup
@@ -170,14 +171,14 @@ impl MadePipeline {
 const GENERATION: u64 = 0;
 
 /// What a pipeline job made, for the backend whose `gone` it holds: the
-/// pipeline, and whether the growing store's cache held it. Dropped
-/// unadopted, it destroys the pipeline unless the device is gone.
+/// pipeline, and for one the store's cache lacked, the scratch cache it
+/// compiled into with that cache's data and the compile's cost. Dropped
+/// unadopted, it destroys both unless the device is gone.
 struct Ran {
     pipeline: Option<vk::Pipeline>,
     /// A lookup that failed on a miss: the archive lacks the pipeline.
     not_archived: bool,
-    into_store: bool,
-    hit: bool,
+    compiled: Option<Compiled>,
     pins: Vec<PinnedNir>,
     /// The archive's cache it created through, kept until it is adopted.
     _cache: Option<Arc<SharedCache>>,
@@ -204,13 +205,27 @@ impl Drop for SharedCache {
     }
 }
 
+/// A compile into a scratch cache, for the store to keep
+/// ([`super::pipeline_store::Persisted::adopt`]).
+struct Compiled {
+    scratch: vk::PipelineCache,
+    /// The scratch cache's data, read in the job.
+    data: Option<Vec<u8>>,
+    cost: super::pipeline_store::Cost,
+}
+
 impl Drop for Ran {
     fn drop(&mut self) {
-        if let Some(pipeline) = self.pipeline.take()
-            && !self.gone.load(Ordering::Acquire)
-        {
+        if self.gone.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(pipeline) = self.pipeline.take() {
             // SAFETY: the job's pipeline, which nothing uses.
             unsafe { self.device.destroy_pipeline(pipeline, None) };
+        }
+        if let Some(compiled) = self.compiled.take() {
+            // SAFETY: the job's scratch cache, which nothing uses.
+            unsafe { self.device.destroy_pipeline_cache(compiled.scratch, None) };
         }
     }
 }
@@ -391,8 +406,13 @@ impl NativeBackend {
                 return;
             }
         };
-        if ran.into_store {
-            self.store.created(&self.device, ran.hit);
+        if let Some(compiled) = ran.compiled.take() {
+            // SAFETY: the job made the scratch cache on this device and is
+            // done with it.
+            unsafe {
+                self.store
+                    .adopt(&self.device, compiled.scratch, compiled.data, compiled.cost)
+            };
         }
         let made = MadePipeline {
             made,
@@ -409,7 +429,7 @@ impl NativeBackend {
         }
     }
 
-    /// The cache jobs fill while the store's does not grow, made at first use.
+    /// The cache jobs fill without a store, made at first use.
     fn own_cache(&mut self) -> Option<vk::PipelineCache> {
         if self.deferral.own == vk::PipelineCache::null() {
             let info = vk::PipelineCacheCreateInfo::default();
@@ -454,34 +474,26 @@ impl NativeBackend {
     /// A job that creates `wanted` from its stages' NIR, pinned, and keeps
     /// the pipeline, or `None` when no cache can be made.
     fn pipeline_job(&mut self, wanted: Wanted<'_>, key: [u8; 32]) -> Option<Job> {
-        // A growing store's cache takes what the job compiles; a full one is
-        // looked in, and the backend's own takes what it lacks. An archive's
-        // creation or lookup goes through the archive's cache alone, as in
-        // its turn: a lookup's miss is its answer.
+        // The store's cache is looked in, and what it lacks compiles into a
+        // scratch cache the store keeps from; without a store, the backend's
+        // own cache takes it. An archive's creation or lookup goes through
+        // the archive's cache alone, as in its turn: a lookup's miss is its
+        // answer.
         let archive = match wanted.source() {
             PipelineSource::Cached(cache) | PipelineSource::Archived(cache) => {
                 Some(self.share_cache(super::handle(cache.0)))
             }
             PipelineSource::Compiled => None,
         };
-        let (first, into_store, then) = match self.store.cache() {
-            _ if archive.is_some() => (wanted.source(), false, None),
-            Some((store, true)) => (
-                PipelineSource::Cached(PipelineCache(raw(store))),
-                true,
-                None,
-            ),
-            Some((store, false)) => (
-                PipelineSource::Archived(PipelineCache(raw(store))),
-                false,
-                Some(self.own_cache()?),
-            ),
+        let (first, into_store) = match self.store.cache() {
+            _ if archive.is_some() => (wanted.source(), false),
+            Some(store) => (PipelineSource::Archived(PipelineCache(raw(store))), true),
             None => (
                 PipelineSource::Cached(PipelineCache(raw(self.own_cache()?))),
                 false,
-                None,
             ),
         };
+
         let source = first;
         let (owned, pins) = match wanted {
             Wanted::Compute(info) => (
@@ -503,22 +515,53 @@ impl NativeBackend {
         Some(Job::new(key, Owner::Backend, move || {
             let wanted = owned.wanted();
             let mut feedback = vk::PipelineCreationFeedback::default();
-            let mut hit = false;
             let mut not_archived = false;
+            let mut compiled = None;
             let pipeline = (!gone.load(Ordering::Acquire))
                 .then(|| {
                     let created = create(&device, layout, wanted, source, &mut feedback);
-                    let created = match (created, then) {
-                        (Err(Error::NotArchived), Some(own)) => {
-                            let own = PipelineSource::Cached(PipelineCache(raw(own)));
-                            create(&device, layout, wanted, own, &mut feedback)
-                        }
-                        (created, _) => created,
+                    let scratch = || {
+                        let info = vk::PipelineCacheCreateInfo::default();
+                        // SAFETY: the create info outlives the call.
+                        unsafe { device.create_pipeline_cache(&info, None) }.ok()
                     };
-                    hit = feedback.flags.contains(
-                        vk::PipelineCreationFeedbackFlags::VALID
-                            | vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
-                    );
+                    let missed = into_store && matches!(created, Err(Error::NotArchived));
+                    let (created, hit) = match missed.then(scratch).flatten() {
+                        Some(scratch) => {
+                            let into = PipelineSource::Cached(PipelineCache(raw(scratch)));
+                            let created = create(&device, layout, wanted, into, &mut feedback);
+                            let cost = super::pipeline_store::Cost {
+                                ns: feedback.duration,
+                                heap: super::pipeline_store::heap_rise(),
+                            };
+                            // SAFETY: the job's own cache, which no
+                            // creation uses now.
+                            let data = unsafe { device.get_pipeline_cache_data(scratch) }.ok();
+                            compiled = Some(Compiled {
+                                scratch,
+                                data,
+                                cost,
+                            });
+                            (created, false)
+                        }
+                        // The store held it, or no scratch cache could be
+                        // made: compiled without one, kept nowhere.
+                        None if missed => {
+                            let compiled = PipelineSource::Compiled;
+                            (create(&device, layout, wanted, compiled, &mut feedback), false)
+                        }
+                        None => {
+                            let hit = if into_store {
+                                created.is_ok()
+                            } else {
+                                feedback.flags.contains(
+                                    vk::PipelineCreationFeedbackFlags::VALID
+                                        | vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
+                                )
+                            };
+                            (created, hit)
+                        }
+                    };
                     // The store's lookups, not an archive's, as in a turn.
                     if !from_archive {
                         super::pipeline_store::note_lookup(hit, feedback.duration);
@@ -531,8 +574,7 @@ impl NativeBackend {
             Box::new(Ran {
                 pipeline,
                 not_archived,
-                into_store,
-                hit,
+                compiled,
                 pins,
                 _cache: archive,
                 gone,
