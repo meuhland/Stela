@@ -403,6 +403,8 @@ const SWAP_COMPLETE_DISPLAYED: usize = 4;
 const PROP_START: [u8; 4] = *b"D126";
 const PROP_CHUNK: [u8; 4] = *b"D127";
 const PROP_END: [u8; 4] = *b"D128";
+/// The property `setDisplayRefreshProperties` publishes (the kernel's key).
+const DISPLAY_REFRESH: &str = "IOMFBDisplayRefresh";
 /// `D127`'s chunk: `data[0x1000]` then `u32 offset`, `u32 length`.
 const CHUNK_BYTES: usize = 0x1000;
 /// `D128`'s key: `char[0x40]`, NUL-terminated by the AP.
@@ -1463,32 +1465,38 @@ impl Methods {
             ("IOMFBUUID", Advertised::uuid()),
         ];
         for (key, xml) in properties {
-            // setDCPAVPropEnd NUL-terminates the buffer's last byte and
-            // hands the whole buffer to OSUnserializeXML.
-            let mut bytes = xml.into_bytes();
-            bytes.push(0);
-            let length =
-                u32::try_from(bytes.len()).map_err(|_| refuse!("DCP property is too long"))?;
-            self.queue(PROP_START, Packed::new().u32(length))?;
-            for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
-                let mut data = [0u8; CHUNK_BYTES];
-                data[..chunk.len()].copy_from_slice(chunk);
-                self.queue(
-                    PROP_CHUNK,
-                    Packed::new()
-                        .bytes(&data)
-                        .u32((index * CHUNK_BYTES) as u32)
-                        .u32(chunk.len() as u32),
-                )?;
-            }
-            let mut name = [0u8; KEY_BYTES];
-            name[..key.len()].copy_from_slice(key.as_bytes());
-            self.queue(PROP_END, Packed::new().bytes(&name))?;
+            self.publish_property(key, xml)?;
         }
         // A single, untiled display: a zero IOMFB_TiledDisplayInfo, present
         // (its null flag clear); the trailing bool is not read by
         // IOMobileFramebufferShim::hotPlug_notify_gated.
         self.queue_hotplug()
+    }
+
+    /// Queue the publication of property `key` on the IOMFB service:
+    /// `D126` with the document's length, its `D127` chunks, then `D128`
+    /// with the key.
+    fn publish_property(&mut self, key: &str, xml: String) -> Result<()> {
+        // setDCPAVPropEnd NUL-terminates the buffer's last byte and
+        // hands the whole buffer to OSUnserializeXML.
+        let mut bytes = xml.into_bytes();
+        bytes.push(0);
+        let length = u32::try_from(bytes.len()).map_err(|_| refuse!("DCP property is too long"))?;
+        self.queue(PROP_START, Packed::new().u32(length))?;
+        for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+            let mut data = [0u8; CHUNK_BYTES];
+            data[..chunk.len()].copy_from_slice(chunk);
+            self.queue(
+                PROP_CHUNK,
+                Packed::new()
+                    .bytes(&data)
+                    .u32((index * CHUNK_BYTES) as u32)
+                    .u32(chunk.len() as u32),
+            )?;
+        }
+        let mut name = [0u8; KEY_BYTES];
+        name[..key.len()].copy_from_slice(key.as_bytes());
+        self.queue(PROP_END, Packed::new().bytes(&name))
     }
 
     fn queue_hotplug(&mut self) -> Result<()> {
@@ -1578,6 +1586,22 @@ impl Service for Methods {
             (H13P, "update_notify_clients_dcp") => {
                 self.notified = input.iter().any(|&byte| byte != 0);
                 Ok(Step::Return(Vec::new()))
+            }
+            // setDisplayRefreshProperties() -> bool: the AP's method
+            // (IOMobileFramebufferAP 0xfffffe000ad7e48c) only makes the call
+            // and returns its bool; nothing on the AP builds the dictionary,
+            // so the coprocessor publishes IOMFBDisplayRefresh itself, and
+            // D126..D128 is its one way to publish a dictionary (inferred:
+            // the firmware is not available). The keys, order and units are
+            // the kernel's own builder's ([`modes::display_refresh`]), for
+            // the refresh the vblank grid runs at.
+            (AP, "setDisplayRefreshProperties") => {
+                let xml = modes::display_refresh(self.refresh_ticks, COUNTER_HZ);
+                if let Err(reason) = self.publish_property(DISPLAY_REFRESH, xml) {
+                    return self.refuse(tag, reason);
+                }
+                let packed = Packed::new().bool(true).finish(output);
+                self.reply(tag, packed)
             }
             // setup_video_limits(): the fixed mode has no limits to set up.
             (H13P, "setup_video_limits") => Ok(Step::Return(Vec::new())),
@@ -2296,8 +2320,6 @@ pub fn answer(row: &Method, input: &[u8], output: u32, mode: Mode) -> Result<Opt
         (UP, "set_create_DFB") | (AP, "stop_signal") | (AP, "free_signal") => sized(Vec::new()),
         // flush_supportsPower(bool): no output.
         (AP, "flush_supportsPower") => sized(Vec::new()),
-        // setDisplayRefreshProperties: success (out=4).
-        (AP, "setDisplayRefreshProperties") => sized(bool_reply(true)),
         // apt_supported (UPPipeAP_H13P::late_init 0x2a4e98c): false. The
         // firmware answers pipe word +0x42c == 1 (restore 0x2bcad0, normal
         // 0x2bf884), which its init sets only to 3 or 0 (0x2c84b0, 0x2c8724).

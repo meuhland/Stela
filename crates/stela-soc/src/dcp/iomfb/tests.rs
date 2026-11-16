@@ -182,10 +182,10 @@ fn the_boot_framebuffer_is_inherited_not_recreated() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        answer(row(b"A475"), &[], 4, FULL_HD).unwrap().unwrap(),
-        1u32.to_le_bytes()
-    );
+    // setDisplayRefreshProperties publishes, so the display answers it.
+    assert!(answer(row(b"A475"), &[], 4, FULL_HD).unwrap().is_none());
+    let mut methods = methods();
+    assert_eq!(returned(methods.call(*b"A475", &[], 4)), [1, 0, 0, 0]);
 }
 
 #[test]
@@ -663,6 +663,35 @@ fn the_display_is_described_once_before_the_hotplug_and_the_same_after_a_reset()
     let again = drain(&mut methods, &[1, 0, 0, 0]);
     assert_eq!(published(&again), properties);
     assert_eq!(again, first);
+}
+
+#[test]
+fn set_display_refresh_properties_publishes_the_refresh_of_the_vblank_grid() {
+    struct Screen(u32);
+    impl Scanout for Screen {
+        fn mode(&self) -> Mode {
+            FULL_HD
+        }
+        fn refresh_millihertz(&self) -> u32 {
+            self.0
+        }
+        fn present(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+    for (refresh, ticks) in [(60_000u32, 400_000u64), (144_000, 166_667)] {
+        let mut methods = Methods::new(Box::new(Screen(refresh)), interface());
+        assert_eq!(returned(methods.call(*b"A475", &[], 4)), [1, 0, 0, 0]);
+        let made = drain(&mut methods, &[1, 0, 0, 0]);
+        let properties = published(&made);
+        assert_eq!(properties.len(), 1);
+        let (key, text) = &properties[0];
+        assert_eq!(key, "IOMFBDisplayRefresh");
+        assert_eq!(*text, modes::display_refresh(ticks, COUNTER_HZ));
+        assert!(text.contains(&format!(
+            "<key>displayMinRefreshIntervalMachTime</key><integer size=\"64\">{ticks}</integer>"
+        )));
+    }
 }
 
 #[test]
