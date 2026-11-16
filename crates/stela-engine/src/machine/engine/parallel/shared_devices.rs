@@ -1368,14 +1368,22 @@ impl<D: Devices> Devices for SharedDevices<D> {
         register_bit(encoding)
             .is_none_or(|bit| self.board.registers[bit / 64] & 1 << (bit % 64) != 0)
     }
-    /// Only the home machine moves devices' asynchronous DMA, through its
-    /// host's canonical RAM owner.
+    /// Only the home machine keeps the deadline its last advance gave
+    /// across calls; another PE asks every time.
     fn generation(&self) -> Option<u64> {
         self.home
             .then(|| self.board.generation.load(Ordering::Acquire))
     }
+    /// The home machine moves devices' asynchronous DMA, through its host's
+    /// canonical RAM owner, at every step. While it is outside its run loop
+    /// at work of its own (serving the host can take milliseconds), any
+    /// other PE that steps or waits takes the DMA instead, as each PE's own
+    /// device writes already move the DMA they leave due
+    /// ([`Self::settle_write`]): a host disk's completion then reaches the
+    /// guest at once, not when home comes back. A home that sleeps is woken
+    /// for its DMA ([`Held`]'s drop), so the others leave it then.
     fn dma_deadline(&self) -> Option<u64> {
-        if !self.home {
+        if !self.home && !self.board.hub.home_busy_outside() {
             return None;
         }
         let dma = self.board.dma.load(Ordering::Acquire);
