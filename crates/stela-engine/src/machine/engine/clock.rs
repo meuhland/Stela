@@ -33,6 +33,14 @@
 //!   returns, until it marks progress: short stops with a few blocks
 //!   between them add up as one long stop.
 //!   Normal host work takes a few milliseconds and never reaches it.
+//! - A PE whose WFE spins on its Exclusives monitor (`Machine::polls_monitor`)
+//!   runs, as a core spinning on a lock does, and is the next owner once a
+//!   ticket lock's holder hands it the turn: XNU's ticket waiters spin so
+//!   (`hw_lck_ticket_contended`). It has guest work, and each pass of its
+//!   wait marks progress (`Clock::spin`), so a spinner the host keeps from
+//!   its passes holds the count as a stopped holder does. Counted as a
+//!   waiting PE, the count ran on while the host kept the next owner away,
+//!   and the waiters behind it timed out with no owner recorded.
 //! - A PE whose guest waits holds nothing, unless guest work comes for it
 //!   while it is out of its run loop serving the host (`Machine::serve_host`):
 //!   an interrupt or fast IPI another PE sends it, or its own timer coming
@@ -744,6 +752,17 @@ struct Progress {
     due: u64,
 }
 
+/// What a progress mark stands for ([`Clock::mark_ending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// A running PE's step: progress if it retired instructions.
+    Run,
+    /// Its guest work ends (its guest waits): the gap is reported anyway.
+    Ends,
+    /// A pass of a WFE that spins on the Exclusives monitor: progress.
+    Spin,
+}
+
 /// The profile clock and the step loop's phase totals at one moment.
 pub(super) type Phases = (u64, [u64; super::step_timing::Phase::COUNT]);
 
@@ -951,7 +970,8 @@ impl Clock {
         }
     }
 
-    /// The running PE's guest waits (WFI or WFE) or its PE is off, with
+    /// The running PE's guest waits (WFI, or a WFE that does not spin on
+    /// its monitor: [`Self::spin`]) or its PE is off, with
     /// `retired` instructions retired: until [`Self::busy`] the host keeps
     /// no guest work from it, so it neither holds the count nor reports a
     /// stall. A guest wait is the guest's choice; were it a stall, a wait
@@ -962,7 +982,7 @@ impl Clock {
             .as_ref()
             .is_some_and(|attachment| !attachment.idle)
         {
-            self.mark_ending(&mut counter, retired, phases, true);
+            self.mark_ending(&mut counter, retired, phases, Mark::Ends);
         }
         if let Some(attachment) = &mut self.shared {
             attachment.idle = true;
@@ -972,6 +992,14 @@ impl Clock {
                 clock.look(&mut counter);
             }
         }
+    }
+
+    /// Whether the running PE, attached, has guest work: it is not idle
+    /// ([`Self::idle`]).
+    pub(super) fn has_guest_work(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|attachment| !attachment.idle)
     }
 
     /// The running PE has guest work again, from host counter now.
@@ -1007,17 +1035,27 @@ impl Clock {
     /// its last mark, publishes its count every part of the stall limit,
     /// and then looks at the others ([`SharedClock::look`]).
     pub(super) fn mark(&mut self, counter: impl Counter, retired: u64, phases: Option<Phases>) {
-        self.mark_ending(counter, retired, phases, false);
+        self.mark_ending(counter, retired, phases, Mark::Run);
     }
 
-    /// [`Self::mark`], with the gap reported even without progress when
-    /// the PE's guest work `ends` (its guest waits).
+    /// The running PE's WFE spins on its Exclusives monitor, a pass of its
+    /// wait at `retired` instructions: it has guest work, and the pass is
+    /// progress as a block it ran would be, though it retires nothing
+    /// (`clock`). A PE that was idle has guest work from now on.
+    pub(super) fn spin(&mut self, mut counter: impl Counter, retired: u64, phases: Option<Phases>) {
+        self.busy(&mut counter, retired, phases);
+        self.mark_ending(counter, retired, phases, Mark::Spin);
+    }
+
+    /// [`Self::mark`] for what `mark` stands for: with the gap reported even
+    /// without progress when the PE's guest work ends (its guest waits), or
+    /// progress without retired instructions for a pass of a spinning WFE.
     fn mark_ending(
         &mut self,
         mut counter: impl Counter,
         retired: u64,
         phases: Option<Phases>,
-        ends: bool,
+        mark: Mark,
     ) {
         let Some(attachment) = &mut self.shared else {
             return;
@@ -1029,8 +1067,8 @@ impl Clock {
         if attachment.idle {
             return;
         }
-        let ran = retired != progress.retired;
-        if ran || ends {
+        let ran = mark == Mark::Spin || retired != progress.retired;
+        if ran || mark == Mark::Ends {
             // Its first mark since it attached starts the first gap.
             if progress.host != 0 {
                 let gap = host.saturating_sub(progress.host);

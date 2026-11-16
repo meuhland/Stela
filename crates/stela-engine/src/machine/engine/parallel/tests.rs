@@ -3320,6 +3320,49 @@ fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
     assert_eq!(machine.statistics.short_waits, 0);
 }
 
+/// A WFE that spins on its Exclusives monitor, as XNU's ticket waiters do,
+/// keeps its PE's guest work through the wait passes, so the shared count
+/// waits for it if the host keeps it from them; a store to its granule ends
+/// the wait. A WFE with no monitor armed holds nothing.
+#[test]
+fn a_wfe_spinning_on_its_monitor_keeps_guest_work_through_its_wait() {
+    use super::super::tests::{BASE, machine};
+    use crate::machine::cpu::{RESERVATION_GRANULE, Reservation};
+    const WFE: u32 = 0xd503_205f;
+    const GRANULE: u64 = BASE + 0x800;
+    let wait = |monitor: bool| {
+        let (hub, _) = hub(2);
+        let mut machine = machine(&[]);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        hub.home.store(1, Ordering::Relaxed);
+        machine.host.counter_step = 1;
+        if monitor {
+            let mut bytes = [0; RESERVATION_GRANULE as usize];
+            assert!(machine.host.read_ram(GRANULE, &mut bytes));
+            machine.cpu.monitor = Some(Reservation {
+                granule: GRANULE,
+                bytes,
+            });
+        }
+        machine.cpu.pc = BASE;
+        machine.system_instruction(WFE).unwrap();
+        let _ = machine.schedule();
+        (hub, machine)
+    };
+    let (_hub, mut machine) = wait(true);
+    assert!(machine.waiting.is_some(), "nothing woke it");
+    assert!(machine.clock.has_guest_work(), "a spinner has guest work");
+    // Another core's store to the granule (the ticket's turn) wakes it.
+    assert!(machine.host.write_ram(GRANULE, &[1]));
+    let _ = machine.schedule();
+    assert!(machine.waiting.is_none());
+    assert_eq!(machine.cpu.pc, BASE + 4);
+    assert!(machine.clock.has_guest_work());
+    let (_hub, machine) = wait(false);
+    assert!(machine.waiting.is_some());
+    assert!(!machine.clock.has_guest_work(), "a plain WFE holds nothing");
+}
+
 /// A device whose IRQ rises at `irq_at`, which a write sets; counts its
 /// advances where reading the count takes no lock.
 struct Armed {

@@ -330,6 +330,59 @@ fn a_waiting_pe_sets_the_limit_of_a_stalled_one() {
     assert_eq!(shared.take_stalled(), 2800);
 }
 
+/// A WFE that spins on its Exclusives monitor is a ticket waiter, the next
+/// owner once the holder hands it the turn: kept from its passes past the
+/// stall limit, it holds the count as a stopped holder does. Its passes
+/// retire nothing yet are its progress, so while it spins nothing holds.
+#[test]
+fn a_spinning_wfe_the_host_keeps_from_its_passes_holds_the_count() {
+    let (shared, mut first, mut second) = pair();
+    // It ran, then waited; its WFE now spins, though it retires nothing.
+    first.idle(|| 1000, 7, None);
+    assert!(!first.has_guest_work());
+    let limit_after = |host: u64| host + FREQUENCY * STALL_MILLIS / 1000;
+    // A pass every 100 counts publishes each time.
+    let mut retired = 0;
+    for host in (1000..1000 + LONG_STALL).step_by(100) {
+        first.spin(|| host, 7, None);
+        retired += 100;
+        second.mark(|| host, retired, None);
+        assert_eq!(
+            second.read(|| host),
+            host,
+            "spinning holds nothing at {host}"
+        );
+    }
+    assert!(first.has_guest_work());
+    assert_eq!(shared.take_stalled(), 0);
+    // The host keeps it from its passes for 200 ms: the count holds a stall
+    // limit after its last pass.
+    let last = 1000 + LONG_STALL - 100;
+    let end = last + LONG_STALL;
+    for host in (last + 100..end).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+        assert_eq!(
+            second.read(|| host),
+            host.min(limit_after(last)),
+            "at {host}"
+        );
+    }
+    // Its next pass lifts the hold; only the excess became lag.
+    first.spin(|| end, 7, None);
+    assert_eq!(shared.take_stalled(), end - limit_after(last));
+    assert_eq!(second.read(|| end + 100), limit_after(last) + 100);
+    // Waiting without the spin, it holds nothing again.
+    first.idle(|| end + 100, 7, None);
+    assert!(!first.has_guest_work());
+    for host in (end + 100..end + 100 + LONG_STALL).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+    }
+    assert_eq!(shared.take_stalled(), 0);
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
+}
+
 #[test]
 fn waiting_pes_hold_nothing() {
     let (shared, mut first, mut second) = pair();
