@@ -66,7 +66,17 @@
 //! kept submitting behind a fenced frame, 19 deep at most, until it
 //! cleared. The vsync callback
 //! `D588` carries the vblank's own counter value, not the time the model
-//! looked.
+//! looked, as its first value and as its timestamp, the second. The AP's
+//! library turns that timestamp from the coprocessor's clock, continuous
+//! time (the counter), into absolute time for its clients
+//! (libIOMobileFramebuffer's vsync handler converts it through fb+0xe70,
+//! `t - mach_continuous_time() + mach_absolute_time()`, and the swap
+//! record's times go the other way through fb+0xe68), and Core Animation's
+//! vsync callback takes it as the vblank's time. Sent as zero, the kernel
+//! puts a value of its own there (`swap_notify_dispatch_gated`, from a
+//! virtual method; inference: its clock at the dispatch), which the library
+//! then shifts as if it were the coprocessor's: Core Animation's display
+//! timeline sat 5.2 ms after the model's vblanks in the run measured.
 //!
 //! Composition (Inferred: the coprocessor's compositor is undocumented):
 //! layers 0..3 stack bottom to top over opaque black, each a source
@@ -141,8 +151,10 @@ const FENCE_TIMEOUT: u64 = 2 * COUNTER_HZ;
 /// +0x72d..+0x72f is padding in the complete 0x730-byte record.
 const SWAP_COMPLETE: [u8; 4] = *b"D594";
 /// `swap_notify_gated(u64, u64, u64)`: the refresh tick the AP forwards to every
-/// registered client, with no reply. It fills in the other two values itself
-/// when they are zero, and Core Animation stops presenting without it.
+/// registered client, with no reply: the vblank's counter value, its
+/// timestamp in the coprocessor's clock and a third value. The AP fills in the
+/// second and third itself when they are zero, and Core Animation stops
+/// presenting without the tick.
 const SWAP_NOTIFY: [u8; 4] = *b"D588";
 /// The ticks per second of the counter refreshes are timed by.
 const COUNTER_HZ: u64 = crate::counter::FREQUENCY_HZ;
@@ -1962,6 +1974,7 @@ impl Service for Methods {
             self.in_flight = true;
             let mut input = alloc::vec![0u8; size_of::<[u64; 3]>()];
             input[..8].copy_from_slice(&counter.to_le_bytes());
+            input[8..16].copy_from_slice(&counter.to_le_bytes());
             return Some(Callback {
                 tag: SWAP_NOTIFY,
                 input,

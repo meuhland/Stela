@@ -989,6 +989,30 @@ fn a_display_asleep_or_powered_off_sends_no_vsync_and_its_wake_resumes_the_grid(
 }
 
 #[test]
+fn a_vsync_carries_its_vblanks_time_as_the_coprocessor_timestamp_the_ap_converts() {
+    const REFRESH_TICKS: u64 = 400_000;
+    // 3 ms of the 24 MHz counter.
+    const LATE: u64 = 72_000;
+    let mut methods = methods();
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    methods.refresh(1000);
+    let first = methods.take_callback().unwrap();
+    (first.then)(&mut methods, &[]).unwrap();
+    // A late look still stamps the vblank, not the look: a zero timestamp
+    // would leave the AP to put its own dispatch time there.
+    methods.refresh(1000 + REFRESH_TICKS + LATE);
+    let callback = methods.take_callback().unwrap();
+    assert_eq!(callback.tag, SWAP_NOTIFY);
+    let vblank = (1000 + REFRESH_TICKS).to_le_bytes();
+    assert_eq!(callback.input[..8], vblank);
+    assert_eq!(callback.input[8..16], vblank);
+    // The third value stays the AP's to fill.
+    assert_eq!(callback.input[16..], [0; 8]);
+}
+
+#[test]
 fn a_late_look_sends_the_vblanks_own_time_and_keeps_the_grid() {
     const REFRESH_TICKS: u64 = 400_000;
     // 5 ms of the 24 MHz counter.
