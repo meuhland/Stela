@@ -49,6 +49,7 @@ pub mod pins;
 pub mod pipelines;
 pub mod queue;
 pub mod resources;
+pub use resources::SurfaceNote;
 
 /// A slab of objects addressed by index; freed slots are reused.
 #[derive(Debug)]

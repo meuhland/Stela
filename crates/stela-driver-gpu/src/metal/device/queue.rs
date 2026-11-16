@@ -874,7 +874,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // wrote copied back into them last.
         if finished.is_ok() {
             let written = core::mem::take(&mut commands.aligned_writes);
-            let (lead, tail) = self.aligned_copy_commands(&written);
+            let surfaces = core::mem::take(&mut commands.surfaces);
+            let writes = core::mem::take(&mut commands.written);
+            let (lead, tail) = self.aligned_copy_commands(&written, &surfaces, &writes);
             commands.surround(lead, tail);
         }
         // Applied once the recording reaches the queue.

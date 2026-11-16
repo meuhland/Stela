@@ -238,7 +238,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     layout,
                     texel_bytes: u64::from(format.describe().block.bytes),
                 };
-                let (image, copy) = self.plane_image(plan, rows)?;
+                let (image, copy) = self.plane_image(plan, rows, false)?;
                 images.push(image);
                 copies.extend(copy);
                 let info = plan

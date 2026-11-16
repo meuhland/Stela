@@ -8,6 +8,7 @@ use super::{
         commands::{
             BufferLayoutRecord, CommandBufferCode, CommandCode, CommandHeader, CommitRequest,
             DepthStencilRecord, EventCommand, PatchSourceRecord, SampleCounters, StencilRecord,
+            SurfaceUse,
         },
     },
 };
@@ -21,7 +22,7 @@ use crate::metal::{
         render::PatchSource,
     },
     compiler::DEFERRED,
-    device::{BufferId, SamplerId, TextureId},
+    device::{BufferId, SamplerId, SurfaceNote, TextureId},
     pipeline::{DepthStencilDescriptor, DepthStencilState, StencilDescriptor, depth_stencil},
     shader::Compiler,
     timing::{Detail, Phase, Timed},
@@ -258,6 +259,30 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             CommandBufferCode::LogBuffer => {
                 let Handle { handle } = payload.record()?;
                 commands.set_log_buffer(self.buffer_ref(connection, handle)?);
+            }
+            CommandBufferCode::SurfaceUse => {
+                let SurfaceUse {
+                    object,
+                    surface,
+                    seed,
+                    buffer,
+                    reserved: _,
+                } = payload.record()?;
+                let texture = match buffer {
+                    0 => Some(self.object::<TextureId>(connection, object)?),
+                    1 => {
+                        self.buffer_ref(connection, object)?;
+                        None
+                    }
+                    kind => {
+                        return Err(Fault::malformed("surface use kind").value(u64::from(kind)));
+                    }
+                };
+                commands.surfaces.push(SurfaceNote {
+                    texture,
+                    surface,
+                    seed,
+                });
             }
             CommandBufferCode::SampleCounters => {
                 let SampleCounters {

@@ -792,6 +792,11 @@ pub struct CommandBuffer {
     /// The textures with aligned copies it writes, which its end copies
     /// back into their rows.
     pub(crate) aligned_writes: Vec<super::device::TextureId>,
+    /// Every texture it writes: an attachment, a blit destination, one
+    /// shaders may write.
+    pub(crate) written: Vec<super::device::TextureId>,
+    /// The IOSurface objects it uses, as the guest reported them.
+    pub(crate) surfaces: Vec<super::device::SurfaceNote>,
 }
 
 impl CommandBuffer {
@@ -805,6 +810,8 @@ impl CommandBuffer {
             workload: Workload::default(),
             planes: Default::default(),
             aligned_writes: Vec::new(),
+            written: Vec::new(),
+            surfaces: Vec::new(),
         }
     }
 

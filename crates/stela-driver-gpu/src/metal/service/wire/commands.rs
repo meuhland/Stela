@@ -40,6 +40,21 @@ records! {
         pub reserved: u32,
     }
 
+    /// An IOSurface object the command buffer uses: a texture or buffer
+    /// handle over the surface (`buffer` 1 for a buffer, 0 for a texture),
+    /// the surface's ID and its seed as the command buffer was committed
+    /// (`IOSurfaceGetID`, `IOSurfaceGetSeed`). Sent once for each such
+    /// object, after the encoders: the service refreshes its device-memory
+    /// copies of sampled surfaces only when their seed changed, and takes a
+    /// surface written by the command buffer as changed for later ones.
+    pub struct SurfaceUse {
+        pub object: u64,
+        pub surface: u32,
+        pub seed: u32,
+        pub buffer: u32,
+        pub reserved: u32,
+    }
+
     /// `computeCommandEncoderWithDispatchType:`.
     pub struct BeginCompute {
         pub dispatch_type: u64,
@@ -662,6 +677,8 @@ raw_enum! {
         SampleCounters = 0x0004,
         /// `Handle`: the log state's buffer, before any encoder.
         LogBuffer = 0x0005,
+        /// `SurfaceUse`, outside any encoder.
+        SurfaceUse = 0x0006,
     }
 }
 

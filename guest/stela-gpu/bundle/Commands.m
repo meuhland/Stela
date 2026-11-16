@@ -309,12 +309,67 @@ static void name_functions(id object, NSMutableSet *seen, NSMutableString *names
 	stela_report(what.UTF8String, failure);
 }
 
+/* The IOSurface a texture or buffer lies in, a view's its parent's, or NULL. */
+static IOSurfaceRef surface_of(id object, BOOL *buffer)
+{
+	*buffer = NO;
+	if ([object isKindOfClass:[StelaGPUBuffer class]]) {
+		*buffer = YES;
+		return ((StelaGPUBuffer *)object)->_surface;
+	}
+	for (int depth = 0; depth < 8 && [object isKindOfClass:[StelaGPUTexture class]]; depth++) {
+		StelaGPUTexture *texture = object;
+		if (texture->_surface) {
+			return texture->_surface;
+		}
+		if ([texture->_buffer isKindOfClass:[StelaGPUBuffer class]] && ((StelaGPUBuffer *)texture->_buffer)->_surface) {
+			return ((StelaGPUBuffer *)texture->_buffer)->_surface;
+		}
+		object = texture->_parent;
+	}
+	return NULL;
+}
+
+/* Each IOSurface object the command buffer used, once, with its surface's ID
+ * and seed now, at its commit: the service refreshes its device-memory copy of
+ * a sampled surface only when the seed changed, which the CPU's writes do. */
+- (void)reportSurfaces
+{
+	os_unfair_lock_lock(&_referencesLock);
+	NSMutableSet *seen = nil;
+	for (NSUInteger i = 0; i < _retained.count; i++) {
+		id object = [_retained objectAtIndex:i];
+		BOOL buffer;
+		IOSurfaceRef surface = surface_of(object, &buffer);
+		if (!surface) {
+			continue;
+		}
+		if (!seen) {
+			seen = [NSMutableSet setWithCapacity:8];
+		}
+		/* By identity: the driver's objects keep NSObject's equality. */
+		if ([seen containsObject:object]) {
+			continue;
+		}
+		[seen addObject:object];
+		StelaSurfaceUse use = {
+			.object = ((StelaGPUObject *)object)->_handle,
+			.surface = IOSurfaceGetID(surface),
+			.seed = IOSurfaceGetSeed(surface),
+			.buffer = buffer ? 1 : 0,
+		};
+		stela_stream_entry(&_stream, StelaCommandBufferCodeSurfaceUse, &use, sizeof(use), NULL, 0);
+	}
+	os_unfair_lock_unlock(&_referencesLock);
+}
+
 /* Under the queue's lock, so serials follow the order of enqueue. */
 - (void)submit
 {
 	_kernelStart = host_time();
 	[_logState commandBufferStarted];
 	[_device flushIndirect];
+	[self reportSurfaces];
 	StelaCommitRequest request = {
 		.commands = stela_span(_stream.bytes, _stream.length),
 		.queue = _queue->_identity,
