@@ -895,6 +895,80 @@ attachment_accesses(const struct stela_metal_specialization *specialization,
    return true;
 }
 
+/* Whether a helper invocation's buffer read may take another address: a
+ * device read that may fault, by a 64-bit address. A read translation
+ * proved to fall in mapped memory (ACCESS_CAN_SPECULATE) keeps its own. */
+static bool
+helper_read_moves(nir_intrinsic_instr *read, void *data)
+{
+   (void)data;
+   return (read->intrinsic == nir_intrinsic_load_global ||
+           read->intrinsic == nir_intrinsic_load_global_constant) &&
+          !(nir_intrinsic_access(read) & ACCESS_CAN_SPECULATE) && read->src[0].ssa->bit_size == 64;
+}
+
+/* A fragment function also runs in helper invocations, the lanes of a quad
+ * outside the primitive that exist for derivatives. Their inputs extrapolate
+ * past the primitive's edges, so an index a function computes from them can
+ * lie outside every covered fragment's: Core Animation's buffer image blit
+ * reads byte offset + floor(uv.x) + floor(uv.y) * bpr, clamped only above,
+ * and a helper left of or above the rectangle reads up to a row and a byte
+ * before the image, below the buffer's first byte when the image starts it.
+ * NVIDIA's helpers perform such reads, and a read of a page nothing maps
+ * faults the channel and loses the device. A helper's read counts only where
+ * a derivative, a subgroup or quad operation or control flow takes its value
+ * (nir_opt_load_skip_helpers). Every other read a helper makes of memory
+ * that may be unmapped reads the start of the stage's argument table
+ * instead: every draw binds one before its fragments run, 16-byte aligned
+ * (ArgumentTable::ALIGNMENT) and larger than any one read, and the helper's
+ * value goes nowhere. Covered fragments read as before. */
+static void
+helpers_read_mapped_memory(nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_FRAGMENT)
+      return;
+   /* The analysis follows values within the entry point alone. */
+   unsigned functions = 0;
+   nir_foreach_function_impl(impl, shader)
+      functions++;
+   if (functions != 1)
+      return;
+   nir_divergence_analysis(shader);
+   nir_opt_load_skip_helpers_options options = {
+      .no_add_divergence = true,
+      .intrinsic_cb = helper_read_moves,
+   };
+   if (!nir_opt_load_skip_helpers(shader, &options))
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_builder b = nir_builder_create(impl);
+   nir_def *helper = NULL, *table = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         /* Texture reads cannot fault; the driver's compiler marks them. */
+         if (instr->type == nir_instr_type_tex)
+            nir_instr_as_tex(instr)->skip_helpers = false;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *read = nir_instr_as_intrinsic(instr);
+         if (!nir_intrinsic_has_access(read) ||
+             !(nir_intrinsic_access(read) & ACCESS_SKIP_HELPERS))
+            continue;
+         nir_intrinsic_set_access(read, nir_intrinsic_access(read) & ~ACCESS_SKIP_HELPERS);
+         if (!helper_read_moves(read, NULL))
+            continue;
+         if (!helper) {
+            b.cursor = nir_before_impl(impl);
+            helper = nir_load_helper_invocation(&b, 1);
+            table = stela_metal_load_table(&b, STELA_METAL_TABLE_FRAGMENT);
+         }
+         b.cursor = nir_before_instr(instr);
+         nir_src_rewrite(&read->src[0], nir_bcsel(&b, helper, table, read->src[0].ssa));
+      }
+   }
+   nir_progress(true, impl, helper ? nir_metadata_control_flow : nir_metadata_all);
+}
+
 nir_shader *
 stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
                               const struct stela_metal_target *target,
@@ -1094,6 +1168,8 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    };
    shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
 done:
+   if (shader)
+      helpers_read_mapped_memory(shader);
    /* A compilation that succeeded tells what it gave in place of the
     * dispatch, in its error's detail, which stays of kind STELA_AIR_OK. */
    if (shader && notice[0])

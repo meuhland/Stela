@@ -4953,6 +4953,91 @@ harness(void)
    exit(0);
 }
 
+/* A blit of one byte a pixel from a buffer, as Core Animation's buffer image
+ * blit reads it: at floor(uv.x) + floor(uv.y) * 64, an index a helper left
+ * of or above the rectangle takes below zero. USE is what the color takes of
+ * the byte %f. */
+#define BYTE_BLIT(USE)                                                                              \
+   "declare float @air.floor.f32(float)\n"                                                         \
+   "declare float @air.dfdx.f32(float)\n"                                                          \
+   "define <4 x float> @blit(<2 x float> %uv, ptr addrspace(1) %image) {\n"                        \
+   "%x = extractelement <2 x float> %uv, i64 0\n"                                                  \
+   "%y = extractelement <2 x float> %uv, i64 1\n"                                                  \
+   "%fx = call float @air.floor.f32(float %x)\n"                                                   \
+   "%fy = call float @air.floor.f32(float %y)\n"                                                   \
+   "%row = fmul float %fy, 64.0\n"                                                                 \
+   "%at = fadd float %fx, %row\n"                                                                  \
+   "%i = fptosi float %at to i32\n"                                                                \
+   "%o = sext i32 %i to i64\n"                                                                     \
+   "%p = getelementptr inbounds i8, ptr addrspace(1) %image, i64 %o\n"                             \
+   "%v = load i8, ptr addrspace(1) %p, align 1\n"                                                  \
+   "%f = uitofp i8 %v to float\n" USE                                                              \
+   "%c = insertelement <4 x float> zeroinitializer, float %g, i64 0\n"                             \
+   "ret <4 x float> %c\n}\n"                                                                       \
+   "!air.fragment = !{!2}\n"                                                                       \
+   "!2 = !{ptr @blit, !3, !4}\n!3 = !{!30}\n"                                                      \
+   "!30 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\","           \
+   " !\"air.arg_name\", !\"color\"}\n"                                                             \
+   "!4 = !{!40, !41}\n"                                                                            \
+   "!40 = !{i32 0, !\"air.fragment_input\", !\"user(uv)\", !\"air.center\", !\"air.perspective\"," \
+   " !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"uv\"}\n"                           \
+   "!41 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 9, i32 1, !\"air.read\","        \
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\","  \
+   " i32 1, !\"air.arg_type_name\", !\"uchar\", !\"air.arg_name\", !\"image\"}\n"
+
+/* The buffer reads of shader whose address a helper invocation replaces
+ * with another, and all its buffer reads. */
+static void
+helper_buffer_reads(nir_shader *shader, unsigned *moved, unsigned *reads)
+{
+   *moved = *reads = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *read = nir_instr_as_intrinsic(instr);
+         if (read->intrinsic != nir_intrinsic_load_global)
+            continue;
+         assert(!(nir_intrinsic_access(read) & ACCESS_SKIP_HELPERS));
+         (*reads)++;
+         nir_instr *address = nir_def_instr(read->src[0].ssa);
+         if (address->type != nir_instr_type_alu || nir_instr_as_alu(address)->op != nir_op_bcsel)
+            continue;
+         nir_instr *helper = nir_def_instr(nir_instr_as_alu(address)->src[0].src.ssa);
+         *moved += helper->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(helper)->intrinsic == nir_intrinsic_load_helper_invocation;
+      }
+   }
+}
+
+/* A fragment function's buffer read at an index from its inputs is made in
+ * helper invocations too, where the index can lie before the buffer, on a
+ * page nothing maps. A helper reads the stage's argument table instead,
+ * unless a derivative takes the value it reads. */
+static void
+helper_invocations_read_only_mapped_memory(void)
+{
+   const struct stela_metal_linked_varying linked[] = {{"user(uv)", 8, 0}};
+   const struct stela_metal_specialization specialization = {.varyings = linked, .varying_count = 1};
+   struct stela_air_error error;
+   unsigned moved, reads;
+   nir_shader *shader = compile(BYTE_BLIT("%g = fadd float %f, 1.0\n"), "blit", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "blit: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   helper_buffer_reads(shader, &moved, &reads);
+   assert(moved == 1 && reads >= 1);
+   assert(count_intrinsic(shader, nir_intrinsic_load_helper_invocation) == 1);
+   stela_metal_release(shader);
+
+   shader = compile(BYTE_BLIT("%g = call float @air.dfdx.f32(float %f)\n"), "blit", &specialization,
+                    &error);
+   assert(shader);
+   helper_buffer_reads(shader, &moved, &reads);
+   assert(moved == 0 && reads >= 1);
+   stela_metal_release(shader);
+}
+
 /* Each buffer a function loads from or stores to, on any path. */
 static void
 buffer_reads_name_each_accessed_slot(void)
@@ -5028,6 +5113,7 @@ main(void)
    linked_modules_specialize_their_function_constants();
    command_encoding_reflects_barriers();
    buffer_reads_name_each_accessed_slot();
+   helper_invocations_read_only_mapped_memory();
    framebuffer_reads_access_storage_attachments();
    framebuffer_reads_run_their_own_fragment_tests();
    extended_range_outputs_clamp();
