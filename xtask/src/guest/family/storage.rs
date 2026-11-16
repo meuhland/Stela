@@ -159,6 +159,34 @@ mod tests {
         );
     }
 
+    /// The kext's block driver: every slot is the manifest's, its own
+    /// methods in the fourteen pure slots.
+    #[test]
+    fn the_block_driver_overrides_the_kernels_slots() {
+        let source = crate::tools::root().join("guest/stela-virtio/kext/Block.cpp");
+        let vtables = object_vtables(&compile(&source, &directory())).unwrap();
+        let manifest = committed();
+        check_probe(&vtables, &manifest, "StelaVirtIOBlock", CLASS).unwrap();
+        let vtable = &vtables["__ZTV16StelaVirtIOBlock"];
+        for slot in manifest.class(CLASS).unwrap().expected.keys() {
+            let symbol = vtable[*slot].as_deref().unwrap_or_default();
+            assert!(
+                symbol.starts_with("__ZN16StelaVirtIOBlock")
+                    || symbol.starts_with("__ZNK16StelaVirtIOBlock"),
+                "slot {slot}: {symbol}"
+            );
+        }
+        // The flush methods it overrides beside them.
+        assert_eq!(
+            vtable[276].as_deref(),
+            Some("__ZN16StelaVirtIOBlock18doSynchronizeCacheEv")
+        );
+        assert_eq!(
+            vtable[296].as_deref(),
+            Some("__ZN16StelaVirtIOBlock13doSynchronizeEyyj")
+        );
+    }
+
     /// Two pure virtuals swapped in the header: the probe's vtable shows it.
     #[test]
     fn a_storage_header_with_two_methods_swapped_is_caught() {

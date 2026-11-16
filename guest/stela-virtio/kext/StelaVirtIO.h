@@ -7,7 +7,8 @@
  *    └─ StelaVirtIOMMIOTransport   maps the page, takes the interrupt
  *        └─ StelaVirtIODevice      the nub, VirtIODeviceID = n
  *            ├─ StelaVirtIOEntropy (n = 4)
- *            └─ StelaVirtIOConsole (n = 3, Console.h)
+ *            ├─ StelaVirtIOConsole (n = 3, Console.h)
+ *            └─ StelaVirtIOBlock   (n = 2, Block.h)
  *
  * The transport resets the device and acknowledges it, then publishes one
  * nub; a driver matches the nub by its personality's VirtIODeviceID
@@ -95,6 +96,11 @@ public:
 	bool createQueue(uint16_t index, uint16_t entries, uint64_t features, StelaVirtIOQueue *queue);
 	void freeQueue(StelaVirtIOQueue *queue);
 	void driverOK();
+	/*
+	 * 4 or 8 bytes of the device's configuration space at `offset`, read
+	 * as 32-bit words and again while CONFIG_GENERATION changes under them.
+	 */
+	uint64_t readConfig(uint32_t offset, unsigned bytes);
 	/* Marks the device FAILED: it uses no queue after this. */
 	void fail();
 	void notify(const StelaVirtIOQueue *queue);
