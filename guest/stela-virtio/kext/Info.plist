@@ -31,6 +31,17 @@
 			<key>IOProviderClass</key>
 			<string>AppleARMIODevice</string>
 		</dict>
+		<key>StelaVirtIOConsole</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.stela.StelaVirtIO</string>
+			<key>IOClass</key>
+			<string>StelaVirtIOConsole</string>
+			<key>IOProviderClass</key>
+			<string>StelaVirtIODevice</string>
+			<key>VirtIODeviceID</key>
+			<integer>3</integer>
+		</dict>
 		<key>StelaVirtIOEntropy</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
@@ -45,6 +56,8 @@
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
+		<key>com.apple.iokit.IOSerialFamily</key>
+		<string>11.0</string>
 		<key>com.apple.kpi.bsd</key>
 		<string>8.0.0</string>
 		<key>com.apple.kpi.iokit</key>

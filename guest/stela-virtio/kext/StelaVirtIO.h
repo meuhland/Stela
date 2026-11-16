@@ -6,7 +6,8 @@
  *   AppleARMIODevice (compatible "stela,virtio-mmio")
  *    └─ StelaVirtIOMMIOTransport   maps the page, takes the interrupt
  *        └─ StelaVirtIODevice      the nub, VirtIODeviceID = n
- *            └─ StelaVirtIOEntropy (n = 4)
+ *            ├─ StelaVirtIOEntropy (n = 4)
+ *            └─ StelaVirtIOConsole (n = 3, Console.h)
  *
  * The transport resets the device and acknowledges it, then publishes one
  * nub; a driver matches the nub by its personality's VirtIODeviceID

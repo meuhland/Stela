@@ -363,6 +363,33 @@ mod tests {
         }
     }
 
+    /// The kext's own serial driver: every slot, its overrides of the pure
+    /// virtuals included, is the method the manifest has there.
+    #[test]
+    fn the_console_driver_overrides_the_kernels_slots() {
+        let source = crate::tools::root().join("guest/stela-virtio/kext/Console.cpp");
+        let vtables = object_vtables(&compile(&source, &directory())).unwrap();
+        let manifest = committed(&FAMILIES[0]);
+        check_probe(
+            &vtables,
+            &manifest,
+            "StelaVirtIOConsole",
+            "IOSerialDriverSync",
+        )
+        .unwrap();
+        // Its twelve stream methods are its own, in the pure slots.
+        let vtable = &vtables["__ZTV18StelaVirtIOConsole"];
+        let own = vtable[272..284]
+            .iter()
+            .filter(|symbol| {
+                symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.starts_with("__ZN18StelaVirtIOConsole"))
+            })
+            .count();
+        assert_eq!(own, 12);
+    }
+
     /// Two of the driver's pure virtuals swapped: the probe's vtable shows
     /// it, slot by slot, where only the kernel's names could not.
     #[test]
