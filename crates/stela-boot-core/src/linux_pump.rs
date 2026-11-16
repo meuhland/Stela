@@ -11,10 +11,14 @@
 //!
 //! Linux runs on one processor at a time: the host drivers' lock covers every
 //! Linux entry, and [`Turn`] decides which processor pumps, so a second one
-//! does not spin on that lock for work the first is already doing. A clock
+//! does not spin on that lock for work the first is already doing. The turn
+//! covers only Linux's steps: a pump gives it back before it looks at the
+//! GPUs, whose waits pump again on the same processor. Work raised while a
+//! processor holds it calls no other ([`Turn::wake_due`]); the holder takes
+//! it, or calls one as it gives the turn back ([`Held::release`]). A clock
 //! that more than one processor samples uses [`advance`], which stays
 //! monotonic across their counters' small skew.
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// What the boot PE runs at a slice's end, which decides how long the
 /// environment's ready work waits for it.
@@ -106,11 +110,34 @@ impl Turn {
     pub fn holder(&self) -> Option<u32> {
         self.holder.load(Ordering::Relaxed).checked_sub(1)
     }
+
+    /// Whether work just raised needs a processor called for it: only while
+    /// no processor holds the turn. A processor called while one does finds
+    /// the turn taken and does nothing; the holder takes the work in its
+    /// pass, or finds it as it gives the turn back ([`Held::release`]) and
+    /// calls one then. Called after the work's flag is stored.
+    pub fn wake_due(&self) -> bool {
+        // Paired with the fence in `Held::release`: of a raise and a release
+        // that race, at least one sees the other's store.
+        fence(Ordering::SeqCst);
+        self.holder.load(Ordering::Relaxed) == 0
+    }
 }
 
 /// A held [`Turn`], given back when dropped.
 pub struct Held<'a> {
     turn: &'a Turn,
+}
+
+impl Held<'_> {
+    /// Gives the turn back, then answers `pending()`: whether work is still
+    /// raised, which a raiser that found the turn held called no processor
+    /// for ([`Turn::wake_due`]), so the caller calls one.
+    pub fn release(self, pending: impl FnOnce() -> bool) -> bool {
+        drop(self);
+        fence(Ordering::SeqCst);
+        pending()
+    }
 }
 
 impl Drop for Held<'_> {

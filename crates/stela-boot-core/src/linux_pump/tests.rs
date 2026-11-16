@@ -158,6 +158,94 @@ fn the_turn_excludes_concurrent_pumpers() {
     assert_eq!(turn.holder(), None);
 }
 
+/// The boot PE's look waited on a lock of Mesa's that a job held while it
+/// waited for its posted Linux call, which only a pump serves; the look's
+/// wait pumps on its own processor (`gate::relax`). With the turn kept
+/// through the look, that pump and every waiting PE's found it taken until
+/// the call was withdrawn 10 s later. Given back first, the wait's pump runs.
+#[test]
+fn a_wait_in_the_look_pumps_once_the_turn_is_given_back() {
+    let turn = Turn::new();
+    let (boot, waiting) = (0, 4);
+    let posted = AtomicBool::new(true);
+    let held = turn.try_take(boot).expect("free turn");
+    // Kept, the turn is no one's to take: not the look's own pump's, not a
+    // woken PE's.
+    assert!(turn.try_take(boot).is_none());
+    assert!(turn.try_take(waiting).is_none());
+    assert!(!held.release(|| false), "nothing raised");
+    let mut relaxes = 0;
+    while posted.load(Ordering::SeqCst) {
+        relaxes += 1;
+        assert!(relaxes <= 1, "the look's wait ran no pump");
+        if let Some(_pump) = turn.try_take(boot) {
+            posted.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A raise while a processor holds the turn calls no other, which would
+/// find the turn taken; the holder calls one as it gives the turn back,
+/// unless its pass took the work.
+#[test]
+fn work_raised_while_the_turn_is_held_is_woken_for_as_it_is_given_back() {
+    let turn = Turn::new();
+    let pending = AtomicBool::new(true);
+    assert!(turn.wake_due(), "the turn free: the raiser calls one");
+    pending.store(false, Ordering::SeqCst);
+
+    let held = turn.try_take(3).expect("free turn");
+    pending.store(true, Ordering::SeqCst);
+    assert!(!turn.wake_due(), "a wake that would find the turn taken");
+    assert!(held.release(|| pending.load(Ordering::SeqCst)));
+    assert!(turn.wake_due());
+
+    let held = turn.try_take(3).expect("free turn");
+    pending.store(true, Ordering::SeqCst);
+    assert!(!turn.wake_due());
+    // The holder's next pass takes it.
+    pending.store(false, Ordering::SeqCst);
+    assert!(!held.release(|| pending.load(Ordering::SeqCst)));
+}
+
+/// A raise and a release that race: the raiser sees the turn free or the
+/// holder sees the work raised, never neither, which would leave the work
+/// for the boot PE's deferral.
+#[test]
+fn a_raise_racing_a_release_is_never_lost() {
+    use std::sync::Barrier;
+    const ROUNDS: usize = 20_000;
+    let turn = Arc::new(Turn::new());
+    let pending = Arc::new(AtomicBool::new(false));
+    let raiser_woke = Arc::new(AtomicBool::new(false));
+    let (start, end) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    let raiser = {
+        let (turn, pending, woke) = (turn.clone(), pending.clone(), raiser_woke.clone());
+        let (start, end) = (start.clone(), end.clone());
+        std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                start.wait();
+                pending.store(true, Ordering::Relaxed);
+                woke.store(turn.wake_due(), Ordering::Relaxed);
+                end.wait();
+            }
+        })
+    };
+    let mut lost = 0;
+    for _ in 0..ROUNDS {
+        pending.store(false, Ordering::Relaxed);
+        let held = turn.try_take(1).expect("free turn");
+        start.wait();
+        let holder_woke = held.release(|| pending.load(Ordering::Relaxed));
+        end.wait();
+        if !holder_woke && !raiser_woke.load(Ordering::Relaxed) {
+            lost += 1;
+        }
+    }
+    raiser.join().unwrap();
+    assert_eq!(lost, 0);
+}
+
 #[test]
 fn one_wake_for_each_ready_episode() {
     let wakes = Wakes::new();

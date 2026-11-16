@@ -191,6 +191,34 @@ fn call_idle_core() -> bool {
     called
 }
 
+/// Calls a core for raised work: a PE whose guest waits for an interrupt
+/// takes it; with none asleep, the boot PE's slice ends, and it pumps by
+/// [`pump_due`]. A woken PE that found guest work first leaves it to the
+/// boot PE's same limits. None while a processor holds the [`TURN`]: a
+/// core called then would find it taken, and the holder takes the work in
+/// its pass or calls a core as it gives the turn back ([`pump_as`]).
+fn call_for_work() {
+    if !TURN.wake_due() {
+        PUMPS.wakes_held.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if may_move() && call_idle_core() {
+        PUMPS.woken.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // SAFETY: a published hub is leaked, so it lives for the boot.
+    if let Some(hub) = unsafe { HUB.load(Ordering::Acquire).as_ref() } {
+        // A kick writes this processor's ICR, which needs interrupts off:
+        // Linux, which raises events too, runs with them on.
+        let flags: u64;
+        // SAFETY: CPL0 IF save, restored below on this processor.
+        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+        hub.call_host(BOOT_PE.load(Ordering::Relaxed));
+        // SAFETY: the save above, on this processor.
+        unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
+    }
+}
+
 /// What wakes the service: a raised line or a call.
 struct Events {
     clock: crate::native_clock::ClockServices,
@@ -212,27 +240,9 @@ unsafe impl Idle for Events {
         }
         self.clock.notify_dispatch();
         // Only the first event since the last pump wakes a core: later ones
-        // find one already called, and the pump takes them all. A PE whose
-        // guest waits for an interrupt takes it; with none asleep, the boot
-        // PE's slice ends, and it pumps by `pump_due`. A woken PE that found
-        // guest work first leaves it to the boot PE's same limits.
-        if !raised {
-            return Ok(());
-        }
-        if may_move() && call_idle_core() {
-            PUMPS.woken.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        // SAFETY: a published hub is leaked, so it lives for the boot.
-        if let Some(hub) = unsafe { HUB.load(Ordering::Acquire).as_ref() } {
-            // A kick writes this processor's ICR, which needs interrupts
-            // off: Linux, which raises events too, runs with them on.
-            let flags: u64;
-            // SAFETY: CPL0 IF save, restored below on this processor.
-            unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
-            hub.call_host(BOOT_PE.load(Ordering::Relaxed));
-            // SAFETY: the save above, on this processor.
-            unsafe { core::arch::asm!("push {}", "popfq", in(reg) flags) };
+        // find one already called, and the pump takes them all.
+        if raised {
+            call_for_work();
         }
         Ok(())
     }
@@ -2243,6 +2253,8 @@ struct PumpCounts {
     /// because another held the turn or the host drivers' lock.
     woken: AtomicU64,
     turn_busy: AtomicU64,
+    /// Calls for raised work not made, as a processor held the turn.
+    wakes_held: AtomicU64,
     /// Pumps for raised events, and for Linux's deadline alone.
     by_event: AtomicU64,
     by_deadline: AtomicU64,
@@ -2330,6 +2342,7 @@ static PUMPS: PumpCounts = PumpCounts {
     taker_delay_longest: [const { AtomicU64::new(0) }; 2],
     woken: AtomicU64::new(0),
     turn_busy: AtomicU64::new(0),
+    wakes_held: AtomicU64::new(0),
     by_event: AtomicU64::new(0),
     by_deadline: AtomicU64::new(0),
     idle: AtomicU64::new(0),
@@ -2429,8 +2442,8 @@ pub(super) fn pump_due(calm: Calm) -> bool {
     let Some(why) = boot_decision(calm, waited, limits) else {
         PUMPS.deferred.fetch_add(1, Ordering::Relaxed);
         // A Linux timer that came due raised no event, so nothing woke a
-        // sleeper for it yet.
-        if may_move() && WAKES.first_for(since) && call_idle_core() {
+        // sleeper for it yet. Not while a processor pumps: it runs the timer.
+        if may_move() && TURN.wake_due() && WAKES.first_for(since) && call_idle_core() {
             PUMPS.woken.fetch_add(1, Ordering::Relaxed);
         }
         return false;
@@ -2647,10 +2660,15 @@ fn pump_as(taker: Taker, guest_work: &dyn Fn() -> bool) {
         PUMPS.idle.fetch_add(1, Ordering::Relaxed);
     }
     PUMPS.steps.fetch_add(u64::from(steps), Ordering::Relaxed);
-    // Off the boot CPU the turn goes first: the look may post calls, which
-    // this processor then runs Linux for itself (`serve_posted`).
-    if !boot {
-        drop(turn);
+    // The turn goes before the look, which may wait for Linux: for a call
+    // it posts, which off the boot CPU this processor runs Linux for
+    // itself (`serve_posted`), or for a lock of Mesa's a job holds while
+    // its own posted call waits for a pump, which the wait runs on this
+    // processor (`gate::relax`). Kept, every pump found the turn taken
+    // until the call was withdrawn. Work raised while it was held called
+    // no core ([`call_for_work`]), so one is called for it now.
+    if turn.release(|| gpu.events.pending.load(Ordering::Acquire)) {
+        call_for_work();
     }
     #[cfg(feature = "nvk")]
     match look_due(gpu) {
@@ -2777,12 +2795,13 @@ fn pump_waiting() {
 /// Linux step, the shootdowns during it and the posted calls being performed
 /// as it began (`-` for none), and `unmaps=device/pages/files/stacks`
 /// ([`UNMAPS`]). Then `by_boot=… by_waiting=… by_poster=… woken=…
-/// turn_busy=… boot_delay_mean_us=… boot_delay_longest_us=…
+/// turn_busy=… wakes_held=… boot_delay_mean_us=… boot_delay_longest_us=…
 /// waiting_delay_mean_us=… waiting_delay_longest_us=…`: who ran Linux
 /// ([`Taker`]: the boot PE's pumps, pumps on PEs whose guest waits, and runs
 /// of PEs for their own posted calls), the sleeping PEs woken for work, the
 /// pumps not run as another processor held the turn or the host drivers'
-/// lock, and how long ready work waited for the boot PE's pumps and the
+/// lock, the calls for work not made as a processor held the turn, and how
+/// long ready work waited for the boot PE's pumps and the
 /// waiting PEs'. And `total_us=enter/children/steps/leave/look:…` the
 /// pumps' time by [`PumpPart`], then `part_longest_us=…` the longest each
 /// part took in one pump. Then `\nGPU LINUX timers=… works=… sleepers=… timeouts=…
@@ -2825,7 +2844,7 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
          delay_mean_us={} delay_longest_us={} next_us={next_us} next_timer={} \
          step_longest_us={} step_shootdowns={} step_serving={serving} \
          unmaps={device}/{pages}/{files}/{stacks} by_boot={boot} by_waiting={waiting} \
-         by_poster={} woken={} turn_busy={} boot_delay_mean_us={} boot_delay_longest_us={} \
+         by_poster={} woken={} turn_busy={} wakes_held={} boot_delay_mean_us={} boot_delay_longest_us={} \
          waiting_delay_mean_us={} waiting_delay_longest_us={}",
         take(&PUMPS.quiet),
         take(&PUMPS.unmasked),
@@ -2844,6 +2863,7 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         take(&PUMPS.by_taker[Taker::Poster as usize]),
         take(&PUMPS.woken),
         take(&PUMPS.turn_busy),
+        take(&PUMPS.wakes_held),
         micros(take(&PUMPS.taker_delay[0]).checked_div(boot).unwrap_or(0)),
         micros(take(&PUMPS.taker_delay_longest[0])),
         micros(
