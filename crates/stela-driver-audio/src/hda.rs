@@ -200,6 +200,9 @@ pub struct Controller<R, T> {
     cirrus_codecs: Vec<cirrus::State>,
     hdmi_ports: Vec<Option<hdmi::Port>>,
     routing_failed: bool,
+    /// The answer behind the last `Error::RouteRejected`, for the owner's
+    /// log (`take_rejection`); nothing acts on it.
+    rejection: Option<hdmi::VerbRejection>,
     token: ControllerToken,
     lifecycle_failed: bool,
     discovery_ready: bool,
@@ -444,6 +447,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 cirrus_codecs: Vec::new(),
                 hdmi_ports: Vec::new(),
                 routing_failed: false,
+                rejection: None,
             };
             custody.controller = Some(alloc::boxed::Box::new(controller));
             let controller = custody.controller.as_mut().unwrap();

@@ -462,7 +462,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.verb(Verb::short(codec, node, set, value)?)?;
         let readback = self.verb(Verb::short(codec, node, get, 0)?)?;
         if readback != u32::from(value) {
-            return Err(Error::RouteRejected);
+            let expected = super::hdmi::Expected::Value(u32::from(value));
+            return Err(self.rejected(codec, node, get, 0, expected, readback));
         }
         Ok(())
     }
@@ -474,7 +475,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         loop {
             let state = self.verb(Verb::short(codec, node, GET_POWER, 0)?)?;
             if state == u32::MAX || state & (POWER_REQUESTED | POWER_ERROR) != 0 {
-                return Err(Error::RouteRejected);
+                let expected = super::hdmi::Expected::Masked {
+                    mask: POWER_REQUESTED | POWER_ERROR,
+                    value: 0,
+                };
+                return Err(self.rejected(codec, node, GET_POWER, 0, expected, state));
             }
             if state & POWER_ACTUAL == 0 {
                 return Ok(());

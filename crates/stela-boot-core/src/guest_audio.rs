@@ -321,6 +321,52 @@ pub fn s16_period(frames: impl IntoIterator<Item = [i32; 2]>, out: &mut [u8]) ->
     written
 }
 
+/// An HD Audio stream descriptor's status byte (SDnSTS, HDA 1.0a 3.3.36),
+/// in hex with its bits named, for the log: BCIS (bit 2), FIFOE (bit 3, a
+/// FIFO error: an output stream's DMA did not keep its FIFO fed), DESE
+/// (bit 4, a descriptor error: a BDL or buffer fetch failed) and FIFORDY
+/// (bit 5); bits 0, 1, 6 and 7 are reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamStatus(pub u8);
+
+impl fmt::Display for StreamStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const BITS: [(u8, &str); 4] = [
+            (1 << 2, "BCIS (buffer completion)"),
+            (
+                1 << 3,
+                "FIFOE (FIFO error: the DMA did not keep the output FIFO fed)",
+            ),
+            (
+                1 << 4,
+                "DESE (descriptor error: a BDL or buffer fetch failed)",
+            ),
+            (1 << 5, "FIFORDY (FIFO ready)"),
+        ];
+        write!(f, "{:#04x} =", self.0)?;
+        let mut first = true;
+        for (bit, name) in BITS {
+            if self.0 & bit != 0 {
+                write!(f, "{} {name}", if first { "" } else { " |" })?;
+                first = false;
+            }
+        }
+        let reserved = self.0 & !0x3c;
+        if reserved != 0 {
+            write!(
+                f,
+                "{} reserved {reserved:#04x}",
+                if first { "" } else { " |" }
+            )?;
+            first = false;
+        }
+        if first {
+            f.write_str(" none")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +387,23 @@ mod tests {
         pacer.due(0);
         let owed: u64 = (1..=3_000).map(|n| pacer.due(n * 1_000)).sum();
         assert_eq!(owed, RATE);
+    }
+
+    #[test]
+    fn a_stream_status_is_printed_in_hex_with_its_bits_named() {
+        // audio7's StreamDma { status: 40 } is decimal: 0x28.
+        assert_eq!(
+            StreamStatus(40).to_string(),
+            "0x28 = FIFOE (FIFO error: the DMA did not keep the output FIFO fed) | FIFORDY \
+             (FIFO ready)"
+        );
+        assert_eq!(
+            StreamStatus(0x14).to_string(),
+            "0x14 = BCIS (buffer completion) | DESE (descriptor error: a BDL or buffer fetch \
+             failed)"
+        );
+        assert_eq!(StreamStatus(0x40).to_string(), "0x40 = reserved 0x40");
+        assert_eq!(StreamStatus(0).to_string(), "0x00 = none");
     }
 
     #[test]

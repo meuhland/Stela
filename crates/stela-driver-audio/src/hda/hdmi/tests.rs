@@ -263,6 +263,7 @@ impl Hardware {
                 self.selected = byte;
                 0
             }
+            0xf35 => u32::from(self.selected),
             0x709 => 0,
             0xf00 => self.parameter(node, byte),
             0xf1c => self.pin_default,
