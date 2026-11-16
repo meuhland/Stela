@@ -561,4 +561,17 @@ fn guest_audio_is_off_by_default_and_round_trips() {
         assert_eq!(System::parse(text).unwrap().to_string(), line, "{text}");
     }
     assert!(!round_trip("--system --guest-audio").guest_audio_hdmi);
+    // Trusting the observed quiesced state implies both, and is written
+    // alone; the bus-reset proof stays the default.
+    assert!(!options.guest_audio_trust_quiesced);
+    let trusted = "--system --guest-audio-hdmi-trust-quiesced";
+    let options = round_trip(trusted);
+    assert!(options.guest_audio && options.guest_audio_hdmi && options.guest_audio_trust_quiesced);
+    assert_eq!(options.to_string(), trusted);
+    assert_eq!(
+        System::parse("--system --guest-audio-hdmi --guest-audio-hdmi-trust-quiesced")
+            .unwrap()
+            .to_string(),
+        trusted
+    );
 }

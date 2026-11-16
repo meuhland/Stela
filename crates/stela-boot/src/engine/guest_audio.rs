@@ -399,13 +399,44 @@ pub(super) fn claim_display_audio(
     handoff: &crate::handoff::Handoff,
     clock: stela_drivers::Clock,
     hdmi: bool,
+    trust_quiesced: bool,
 ) -> Option<DisplayAudio> {
-    use stela_drivers::probe::NativeServices;
-    let gpus = super::gpu::reset_their_bus();
+    use super::gpu::GpuReset;
+    use stela_drivers::probe::{NativeServices, native::hda::Vouch};
+    // What vouches for each GPU's audio function: its GPU's bus reset, or,
+    // by the owner's explicit choice, its observed quiesced state.
+    let gpus: Vec<(Address, Vouch)> = super::gpu::claimed_resets()
+        .into_iter()
+        .filter_map(|(gpu, reset)| {
+            let address = Address { function: 1, ..gpu };
+            match reset {
+                GpuReset::SecondaryBus => Some((gpu, Vouch::BusReset)),
+                _ if trust_quiesced => {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI {address}: GPU {gpu} started with {}, so nothing \
+                         reset this function; --guest-audio-hdmi-trust-quiesced claims it on \
+                         its observed quiesced state\n",
+                        reset.describe()
+                    ));
+                    Some((gpu, Vouch::Quiesced))
+                }
+                _ => {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI {address} not claimed: no proof its original users \
+                         stopped: GPU {gpu} started with {}, not a Secondary Bus Reset of its \
+                         bus; --guest-audio-hdmi-trust-quiesced would claim it on its observed \
+                         quiesced state\n",
+                        reset.describe()
+                    ));
+                    None
+                }
+            }
+        })
+        .collect();
     if gpus.is_empty() {
         output::arguments(format_args!(
-            "GUEST AUDIO HDMI not claimed: no GPU started with a Secondary Bus Reset of its bus, \
-             which alone vouches for its audio function\n"
+            "GUEST AUDIO HDMI not claimed: no GPU audio function has a proof that its original \
+             users stopped\n"
         ));
         return None;
     }
@@ -416,7 +447,7 @@ pub(super) fn claim_display_audio(
             super::services::Services::new(mmio, remappers, None, heap, tsc_hz, Vec::new());
         let mut hosts = Vec::new();
         let mut playback = None;
-        for gpu in gpus {
+        for (gpu, vouch) in gpus {
             let address = Address { function: 1, ..gpu };
             let minimum = match services.minimum_delay() {
                 Ok(minimum) => minimum,
@@ -427,13 +458,39 @@ pub(super) fn claim_display_audio(
                     continue;
                 }
             };
+            let mut observed = |state: &stela_drivers::probe::native::hda::Quiescence| {
+                output::arguments(format_args!(
+                    "GUEST AUDIO HDMI {address} observed: command={:#06x} gcap={:#06x} \
+                     gctl={:#010x} intctl={:#010x} intsts={:#010x} corbctl={:#04x} \
+                     rirbctl={:#04x} running_streams={:#x} unanswered={} after_reset={:?} \
+                     quiet={}\n",
+                    state.command,
+                    state.gcap,
+                    state.gctl,
+                    state.intctl,
+                    state.intsts,
+                    state.corbctl,
+                    state.rirbctl,
+                    state.running_streams,
+                    state.unanswered,
+                    state.reset,
+                    state.quiet(),
+                ));
+            };
             // SAFETY: function 1 of a display controller whose cold start
-            // completed a Secondary Bus Reset of its own bus in this boot;
-            // probe left it parked through that reset and nothing claimed
-            // it since. No later reset of that bus exists in the boot.
+            // completed in this boot; probe left it parked and nothing
+            // claimed it since. `vouch` is its GPU's Secondary Bus Reset, or
+            // the owner's explicit trust in its observed quiesced state
+            // (`--guest-audio-hdmi-trust-quiesced`). No later reset of that
+            // bus exists in the boot.
             match unsafe {
                 stela_drivers::probe::native::hda::attach_display_audio(
-                    &services, address, clock, minimum,
+                    &services,
+                    address,
+                    clock,
+                    minimum,
+                    vouch,
+                    &mut observed,
                 )
             } {
                 Ok(mut host) => {
@@ -449,7 +506,11 @@ pub(super) fn claim_display_audio(
                 }
                 Err((error, kept)) => {
                     output::arguments(format_args!(
-                        "GUEST AUDIO HDMI {address} refused: {error}\n"
+                        "GUEST AUDIO HDMI {address} refused ({}): {error}\n",
+                        match vouch {
+                            Vouch::BusReset => "vouched by its GPU's bus reset",
+                            _ => "vouched by its observed quiesced state",
+                        }
                     ));
                     // The original owners a failure keeps stay for the boot.
                     core::mem::forget(kept);
@@ -479,9 +540,17 @@ const CLAIM_US: u64 = 10_000_000;
 fn report_display_audio(host: &mut Host, gpu: Address) -> Option<(u8, u8, u8)> {
     use stela_boot_core::guest_audio::{audio_descriptor, speakers};
     let location = host.location.clone();
+    let proof = match host.vouch {
+        stela_drivers::probe::native::hda::Vouch::BusReset => {
+            alloc::format!("vouched by GPU {gpu}'s Secondary Bus Reset")
+        }
+        _ => String::from(
+            "vouched by its observed quiesced state (--guest-audio-hdmi-trust-quiesced)",
+        ),
+    };
     match host.capabilities() {
         Ok((capabilities, codecs)) => output::arguments(format_args!(
-            "GUEST AUDIO HDMI {location}: claimed after GPU {gpu}'s bus reset; codecs={codecs:#06x} \
+            "GUEST AUDIO HDMI {location}: claimed, {proof}; codecs={codecs:#06x} \
              {capabilities:?}\n"
         )),
         Err(error) => output::arguments(format_args!(

@@ -410,6 +410,11 @@ pub struct System {
     /// through its claimed HD Audio function, instead of the sink
     /// (`--guest-audio-hdmi`, which also gives the guest the speaker).
     pub guest_audio_hdmi: bool,
+    /// Claim the GPU's audio function for the monitor on its observed
+    /// quiesced state when no Secondary Bus Reset of its bus vouches for it
+    /// (`--guest-audio-hdmi-trust-quiesced`, which also gives the speaker
+    /// and the HDMI output).
+    pub guest_audio_trust_quiesced: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -510,6 +515,7 @@ impl Default for System {
             guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
             guest_audio: false,
             guest_audio_hdmi: false,
+            guest_audio_trust_quiesced: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -945,10 +951,12 @@ impl fmt::Display for System {
             )?;
         }
         line.flag("--guest-audio", self.guest_audio && !self.guest_audio_hdmi)?;
+        let trust = self.guest_audio && self.guest_audio_hdmi && self.guest_audio_trust_quiesced;
         line.flag(
             "--guest-audio-hdmi",
-            self.guest_audio && self.guest_audio_hdmi,
+            self.guest_audio && self.guest_audio_hdmi && !trust,
         )?;
+        line.flag("--guest-audio-hdmi-trust-quiesced", trust)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,
