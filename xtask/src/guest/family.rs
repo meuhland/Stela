@@ -24,6 +24,9 @@ use std::{
 };
 use stela_loader::aux_kc::manifest::{self, Manifest, ManifestClass};
 
+/// IOStorageFamily (K4's block device), in `family/storage/`.
+pub mod storage;
+
 /// A family's classes, their header and manifest.
 pub struct Family {
     /// The header in `guest/stela-virtio/family`, and its manifest there.
@@ -83,7 +86,7 @@ pub fn generate(kc: &Path) -> Result<()> {
         fs::write(&path, manifest.to_text())?;
         println!("{}: {} classes", path.display(), manifest.classes.len());
     }
-    Ok(())
+    storage::generate(&boot)
 }
 
 /// `family`'s manifest from the boot collection `boot`.
@@ -326,7 +329,7 @@ mod tests {
 
     /// Compiles `source` as the kext's sources are compiled, against the
     /// family headers in `headers`.
-    fn compile(source: &Path, headers: &Path) -> Vec<u8> {
+    pub(super) fn compile(source: &Path, headers: &Path) -> Vec<u8> {
         let built = tempfile::tempdir().unwrap();
         let root = crate::tools::root();
         let xnu = root.join("third_party/xnu");
