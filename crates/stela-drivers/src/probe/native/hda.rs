@@ -368,6 +368,24 @@ impl Host {
         }
     }
 
+    /// The playback's route as the codec answers now, with its stream
+    /// descriptor's registers (`hda::Controller::hdmi_route_state`): for
+    /// the log only; nothing is checked or programmed.
+    pub fn hdmi_route_state(
+        &mut self,
+        playback: &HdmiPlayback,
+    ) -> Result<hda::hdmi::HdmiRouteState, RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        Ok(controller.hdmi_route_state(playback.port)?)
+    }
+
+    /// The codec answer behind the last `RouteRejected`, once
+    /// (`hda::Controller::take_rejection`): for the log only.
+    pub fn take_hdmi_rejection(&mut self) -> Option<hda::hdmi::VerbRejection> {
+        let (controller, _) = self.owner.controller().ok()?;
+        controller.take_rejection()
+    }
+
     /// Stop the stream and close its route, if it runs.
     pub fn stop_hdmi(&mut self, playback: &mut HdmiPlayback) -> Result<(), RetirementError> {
         let (controller, _) = self.owner.controller()?;

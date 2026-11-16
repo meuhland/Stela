@@ -261,6 +261,216 @@ impl RuntimeFault {
         }
     }
 }
+/// What a codec answer that rejected a route was checked against
+/// ([`VerbRejection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expected {
+    /// The answer, exactly.
+    Value(u32),
+    /// The answer's bits under `mask`.
+    Masked { mask: u32, value: u32 },
+    /// An answer within `low..=high`.
+    Within { low: u32, high: u32 },
+    /// Any answer but all ones.
+    Answered,
+}
+impl core::fmt::Display for Expected {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Value(value) => write!(f, "{value:#010x}"),
+            Self::Masked { mask, value } => write!(f, "{value:#x} under mask {mask:#x}"),
+            Self::Within { low, high } => write!(f, "{low}..={high}"),
+            Self::Answered => f.write_str("an answer (not all ones)"),
+        }
+    }
+}
+/// The codec answer behind the last `Error::RouteRejected`, for the
+/// owner's log ([`Controller::take_rejection`]): which readback, what the
+/// route set or expected, and what the codec answered. Diagnostics only:
+/// recording it changes nothing the controller does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerbRejection {
+    pub codec: u8,
+    pub node: u8,
+    /// The verb that answered: a 12-bit get verb (0xfxx), or a long verb
+    /// (0xa the converter format, 0xb an amplifier).
+    pub verb: u16,
+    /// Its payload; for a DIP data read (0xf31), the byte's index in the
+    /// packet.
+    pub payload: u16,
+    pub expected: Expected,
+    pub read: u32,
+    /// Whether a verb timeout had already moved the command transport to
+    /// the immediate command interface.
+    pub single_command: bool,
+}
+impl core::fmt::Display for VerbRejection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "codec {} node {:#04x} verb {:#05x} payload {:#06x}: answered {:#010x}, expected {} \
+             (commands over {})",
+            self.codec,
+            self.node,
+            self.verb,
+            self.payload,
+            self.read,
+            self.expected,
+            if self.single_command {
+                "the immediate command interface"
+            } else {
+                "CORB/RIRB"
+            }
+        )
+    }
+}
+/// A route's converter and pin as the codec answered them, with the
+/// stream descriptor's registers ([`Controller::hdmi_route_state`]), for
+/// the owner's log. `set_*` are what the route programmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HdmiRouteState {
+    pub codec: u8,
+    pub group: u8,
+    pub converter: u8,
+    pub pin: u8,
+    pub device: u8,
+    /// GET_POWER (0xf05) of the function group, converter and pin.
+    pub group_power: u32,
+    pub converter_power: u32,
+    pub pin_power: u32,
+    /// GET_DIGI_CONVERT (0xf0d): DIG1 in bits 7:0, the category code (DIG2)
+    /// in 14:8, DIG3 in 23:16.
+    pub digital: u32,
+    pub set_digital: u8,
+    /// GET_CVT_CHAN_COUNT (0xf2d): channels - 1.
+    pub channels: u32,
+    pub set_channels: u8,
+    /// GET_STREAM_FORMAT (long 0xa).
+    pub format: u32,
+    pub set_format: u16,
+    /// GET_CONV (0xf06): stream tag in 7:4, channel in 3:0.
+    pub stream: u32,
+    pub set_stream: u8,
+    /// Output amplifier left and right (long 0xb, 0x8000 and 0xa000), for
+    /// a widget that has one.
+    pub converter_amp: Option<[u32; 2]>,
+    pub pin_amp: Option<[u32; 2]>,
+    /// GET_CONNECT_SEL (0xf01) and the mux the route set.
+    pub connection: u32,
+    pub set_connection: u8,
+    /// GET_PIN_WIDGET_CONTROL (0xf07): 0x40 is out enable.
+    pub pin_control: u32,
+    /// The device entry's pin sense (0xf09): PD bit 31, ELDV bit 30.
+    pub sense: u32,
+    /// GET_DEVICE_SELECT (0xf35), for a pin with several device entries.
+    pub device_select: Option<u32>,
+    /// GET_HDMI_CHAN_SLOT (0xf34) of ASP slots 0..8: channel in 7:4.
+    pub slots: [u32; 8],
+    /// GET_HDMI_DIP_SIZE (0xf2e) of packet 0, GET_HDMI_DIP_XMIT (0xf32),
+    /// and packet 0's bytes (0xf31), up to 32.
+    pub dip_size: u32,
+    pub dip_transmit: u32,
+    pub dip: Vec<u8>,
+    /// The stream descriptor: SDnCTL (24 bits), SDnSTS, SDnLPIB, SDnFIFOS,
+    /// SDnFMT.
+    pub sd_control: u32,
+    pub sd_status: u8,
+    pub sd_position: u32,
+    pub sd_fifo: u16,
+    pub sd_format: u16,
+    /// Whether a verb timeout had moved the command transport to the
+    /// immediate command interface.
+    pub single_command: bool,
+}
+impl HdmiRouteState {
+    /// The DIP packet's byte sum: 0 for an infoframe whose checksum holds.
+    pub fn dip_sum(&self) -> u8 {
+        self.dip.iter().fold(0u8, |s, b| s.wrapping_add(*b))
+    }
+}
+impl core::fmt::Display for HdmiRouteState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let amp = |f: &mut core::fmt::Formatter<'_>, amp: Option<[u32; 2]>| match amp {
+            Some([left, right]) => write!(f, "amp L {left:#04x} R {right:#04x}"),
+            None => f.write_str("no amp"),
+        };
+        let d = self.digital;
+        write!(
+            f,
+            "group {:#04x} power {:#x}; converter {:#04x} power {:#x} digital {d:#08x} \
+             (DigEn={} V={} VCFG={} PRE={} Copy={} NonAudio={} Pro={} L={} CC={:#04x} DIG3={:#04x}; \
+             set {:#04x}) channels-1 {:#x} (set {:#x}) format {:#06x} (set {:#06x}) stream \
+             {:#04x} (set {:#04x}) ",
+            self.group,
+            self.group_power,
+            self.converter,
+            self.converter_power,
+            d & 1,
+            (d >> 1) & 1,
+            (d >> 2) & 1,
+            (d >> 3) & 1,
+            (d >> 4) & 1,
+            (d >> 5) & 1,
+            (d >> 6) & 1,
+            (d >> 7) & 1,
+            (d >> 8) & 0x7f,
+            (d >> 16) & 0xff,
+            self.set_digital,
+            self.channels,
+            self.set_channels,
+            self.format,
+            self.set_format,
+            self.stream,
+            self.set_stream,
+        )?;
+        amp(f, self.converter_amp)?;
+        write!(
+            f,
+            "; pin {:#04x} device {} power {:#x} connection {:#x} (set {:#x}) control {:#04x} \
+             sense {:#010x} select ",
+            self.pin,
+            self.device,
+            self.pin_power,
+            self.connection,
+            self.set_connection,
+            self.pin_control,
+            self.sense,
+        )?;
+        match self.device_select {
+            Some(select) => write!(f, "{select:#x} ")?,
+            None => f.write_str("- ")?,
+        }
+        amp(f, self.pin_amp)?;
+        f.write_str(" slots")?;
+        for slot in self.slots {
+            write!(f, " {slot:02x}")?;
+        }
+        write!(
+            f,
+            "; dip size {} transmit {:#04x} bytes",
+            self.dip_size, self.dip_transmit
+        )?;
+        for byte in &self.dip {
+            write!(f, " {byte:02x}")?;
+        }
+        write!(
+            f,
+            " (sum {:#04x}); sd ctl {:#08x} sts {:#04x} lpib {} fifos {} fmt {:#06x}; commands \
+             over {}",
+            self.dip_sum(),
+            self.sd_control,
+            self.sd_status,
+            self.sd_position,
+            self.sd_fifo,
+            self.sd_format,
+            if self.single_command {
+                "the immediate command interface"
+            } else {
+                "CORB/RIRB"
+            }
+        )
+    }
+}
 /// Transient codec faults in a row (see `RuntimeFault::Transient`), each
 /// stopping only the stream for a restart, before the route is given up
 /// and the controller needs a reset. A refilled period clears the count.
@@ -835,8 +1045,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     ) -> Result<(), Error> {
         self.minimum_guard()?;
         self.verb(Verb::long(codec, node, set, value)?)?;
-        if self.verb(Verb::long(codec, node, get, 0)?)? != u32::from(value) {
-            return Err(Error::RouteRejected);
+        let read = self.verb(Verb::long(codec, node, get, 0)?)?;
+        if read != u32::from(value) {
+            let expected = Expected::Value(u32::from(value));
+            return Err(self.rejected(codec, node, u16::from(get), 0, expected, read));
         }
         Ok(())
     }
@@ -845,9 +1057,168 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.verb(Verb::short(codec, node, 0x70d, value)?)?;
         let observed = self.verb(Verb::short(codec, node, 0xf0d, 0)?)?;
         if observed == u32::MAX || observed & 255 != u32::from(value) {
-            return Err(Error::RouteRejected);
+            let expected = Expected::Masked {
+                mask: 0xff,
+                value: u32::from(value),
+            };
+            return Err(self.rejected(codec, node, 0xf0d, 0, expected, observed));
         }
         Ok(())
+    }
+    /// Records the answer behind an `Error::RouteRejected` for
+    /// [`Self::take_rejection`], and returns that error. Diagnostics only.
+    pub(super) fn rejected(
+        &mut self,
+        codec: u8,
+        node: u8,
+        verb: u16,
+        payload: u16,
+        expected: Expected,
+        read: u32,
+    ) -> Error {
+        self.rejection = Some(VerbRejection {
+            codec,
+            node,
+            verb,
+            payload,
+            expected,
+            read,
+            single_command: self.single_command,
+        });
+        Error::RouteRejected
+    }
+    /// The answer behind the last `Error::RouteRejected` of a route
+    /// control or HDMI route check, once: diagnostics for the owner's log.
+    pub fn take_rejection(&mut self) -> Option<VerbRejection> {
+        self.rejection.take()
+    }
+    fn hdmi_get(&mut self, codec: u8, node: u8, verb: u16, payload: u8) -> Result<u32, Error> {
+        self.verb(Verb::short(codec, node, verb, payload)?)
+    }
+    fn hdmi_amp(&mut self, codec: u8, node: u8) -> Result<[u32; 2], Error> {
+        Ok([
+            self.verb(Verb::long(codec, node, 0xb, 0x8000)?)?,
+            self.verb(Verb::long(codec, node, 0xb, 0xa000)?)?,
+        ])
+    }
+    /// The prepared route's converter and pin as the codec answers now, and
+    /// its stream descriptor's registers, for the owner's log. Get verbs
+    /// only, except the DIP index: set to packet 0's start before its bytes
+    /// are read, and back to it after, as `prepare_hdmi` leaves it (Linux
+    /// hdmi_infoframe_uptodate reads the DIP the same way). Nothing is
+    /// checked or programmed; `SinkUnavailable` without a route.
+    pub fn hdmi_route_state(&mut self, id: HdmiPortId) -> Result<HdmiRouteState, Error> {
+        self.minimum_guard()?;
+        let index = self.hdmi_index(id)?;
+        let port = self.hdmi_ports[index].as_ref().unwrap();
+        let route = port.route.as_ref().ok_or(Error::SinkUnavailable)?;
+        let (codec, pin, device, devices) =
+            (port.graph.address, port.pin, port.device, port.devices);
+        let (stream, converter, mux, digital, format) = (
+            route.stream,
+            route.converter,
+            route.mux,
+            route.digital,
+            route.format,
+        );
+        let group = port
+            .graph
+            .groups
+            .iter()
+            .find(|g| g.widgets.iter().any(|w| w.node == pin))
+            .ok_or(Error::InvalidCodecGraph)?
+            .node;
+        let amplified = |node| {
+            port.graph
+                .widget(node)
+                .is_some_and(|w| w.output_amplifier.is_some())
+        };
+        let (converter_amplified, pin_amplified) = (amplified(converter), amplified(pin));
+        let set_format = format.encode()?;
+        self.hdmi_select_port(index)?;
+        let group_power = self.hdmi_get(codec, group, 0xf05, 0)?;
+        let converter_power = self.hdmi_get(codec, converter, 0xf05, 0)?;
+        let digital_read = self.hdmi_get(codec, converter, 0xf0d, 0)?;
+        let channels = self.hdmi_get(codec, converter, 0xf2d, 0)?;
+        let format_read = self.verb(Verb::long(codec, converter, 0xa, 0)?)?;
+        let stream_read = self.hdmi_get(codec, converter, 0xf06, 0)?;
+        let converter_amp = if converter_amplified {
+            Some(self.hdmi_amp(codec, converter)?)
+        } else {
+            None
+        };
+        let pin_power = self.hdmi_get(codec, pin, 0xf05, 0)?;
+        let connection = self.hdmi_get(codec, pin, 0xf01, 0)?;
+        let pin_control = self.hdmi_get(codec, pin, 0xf07, 0)?;
+        let sense = self.hdmi_pin_sense(index)?;
+        let device_select = if devices > 1 {
+            Some(self.hdmi_get(codec, pin, 0xf35, 0)?)
+        } else {
+            None
+        };
+        let pin_amp = if pin_amplified {
+            Some(self.hdmi_amp(codec, pin)?)
+        } else {
+            None
+        };
+        let mut slots = [0; 8];
+        for (slot, value) in slots.iter_mut().enumerate() {
+            *value = self.hdmi_get(codec, pin, 0xf34, slot as u8)?;
+        }
+        let dip_size = self.hdmi_get(codec, pin, 0xf2e, 0)?;
+        let dip_transmit = self.hdmi_get(codec, pin, 0xf32, 0)?;
+        let mut dip = Vec::new();
+        let bytes = if dip_size == u32::MAX {
+            0
+        } else {
+            dip_size.min(32)
+        };
+        if bytes > 0 {
+            self.verb(Verb::short(codec, pin, 0x730, 0)?)?;
+            for _ in 0..bytes {
+                dip.push(self.hdmi_get(codec, pin, 0xf31, 0)? as u8);
+            }
+            self.verb(Verb::short(codec, pin, 0x730, 0)?)?;
+        }
+        let base = super::registers::stream_base(stream.descriptor_index());
+        let sd_control = u32::from(self.registers.read8(base))
+            | u32::from(self.registers.read8(base + 1)) << 8
+            | u32::from(self.registers.read8(base + 2)) << 16;
+        Ok(HdmiRouteState {
+            codec,
+            group,
+            converter,
+            pin,
+            device,
+            group_power,
+            converter_power,
+            pin_power,
+            digital: digital_read,
+            set_digital: digital,
+            channels,
+            set_channels: format.channels - 1,
+            format: format_read,
+            set_format,
+            stream: stream_read,
+            set_stream: stream.tag() << 4,
+            converter_amp,
+            pin_amp,
+            connection,
+            set_connection: mux,
+            pin_control,
+            sense,
+            device_select,
+            slots,
+            dip_size,
+            dip_transmit,
+            dip,
+            sd_control,
+            sd_status: self.registers.read8(base + 3),
+            sd_position: self.registers.read32(base + 4),
+            sd_fifo: self.registers.read16(base + 0x10),
+            sd_format: self.registers.read16(base + 0x12),
+            single_command: self.single_command,
+        })
     }
     fn hdmi_packet(
         &mut self,
@@ -879,9 +1250,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.verb(Verb::short(codec, pin, 0x731, byte)?)?;
         }
         self.route_control(codec, pin, 0x730, 0xf30, 0)?;
-        for byte in packet {
-            if self.verb(Verb::short(codec, pin, 0xf31, 0)?)? != u32::from(byte) {
-                return Err(Error::RouteRejected);
+        for (index, byte) in packet.into_iter().enumerate() {
+            let read = self.verb(Verb::short(codec, pin, 0xf31, 0)?)?;
+            if read != u32::from(byte) {
+                let expected = Expected::Value(u32::from(byte));
+                return Err(self.rejected(codec, pin, 0xf31, index as u16, expected, read));
             }
         }
         self.route_control(codec, pin, 0x730, 0xf30, 0)?;
@@ -997,11 +1370,13 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.hdmi_select_port(index)?;
         let packet_size = self.verb(Verb::short(graph.address, pin, 0xf2e, 0)?)?;
         if !(9..=32).contains(&packet_size) {
-            return Err(Error::RouteRejected);
+            let expected = Expected::Within { low: 9, high: 32 };
+            return Err(self.rejected(graph.address, pin, 0xf2e, 0, expected, packet_size));
         }
         let digital = self.verb(Verb::short(graph.address, converter, 0xf0d, 0)?)?;
         if digital == u32::MAX {
-            return Err(Error::RouteRejected);
+            let expected = Expected::Answered;
+            return Err(self.rejected(graph.address, converter, 0xf0d, 0, expected, digital));
         }
         let digital = (digital as u8 & !0x21) | 1; // LPCM + enabled; keep unrelated channel-status controls.
         // Reserve all owners BEFORE GPU or codec effects, including failed ACK.
@@ -1048,15 +1423,39 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 for slot in map.slots {
                     let value = self.verb(Verb::short(graph.address, pin, 0xf34, slot & 15)?)?;
                     if value & 0xf0 != u32::from(slot & 0xf0) || value == u32::MAX {
-                        return Err(Error::RouteRejected);
+                        let expected = Expected::Masked {
+                            mask: 0xf0,
+                            value: u32::from(slot & 0xf0),
+                        };
+                        let payload = u16::from(slot & 15);
+                        return Err(self.rejected(
+                            graph.address,
+                            pin,
+                            0xf34,
+                            payload,
+                            expected,
+                            value,
+                        ));
                     }
                 }
             }
             if graph.widget(pin).unwrap().output_amplifier.is_some() {
                 self.verb(Verb::long(graph.address, pin, 3, 0xb000)?)?;
                 for channel in [0x8000, 0xa000] {
-                    if self.verb(Verb::long(graph.address, pin, 0xb, channel)?)? & 0xff != 0 {
-                        return Err(Error::RouteRejected);
+                    let read = self.verb(Verb::long(graph.address, pin, 0xb, channel)?)?;
+                    if read & 0xff != 0 {
+                        let expected = Expected::Masked {
+                            mask: 0xff,
+                            value: 0,
+                        };
+                        return Err(self.rejected(
+                            graph.address,
+                            pin,
+                            0xb,
+                            channel,
+                            expected,
+                            read,
+                        ));
                     }
                 }
             }
@@ -1491,13 +1890,19 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 (cvt, 0xf2d, u32::from(format.channels - 1)),
                 (pin, 0xf32, 0xc0),
             ] {
-                if self.verb(Verb::short(codec, node, get, 0)?)? != expected {
-                    return Err(Error::RouteRejected);
+                let read = self.verb(Verb::short(codec, node, get, 0)?)?;
+                if read != expected {
+                    let expected = Expected::Value(expected);
+                    return Err(self.rejected(codec, node, get, 0, expected, read));
                 }
             }
             let observed_digital = self.verb(Verb::short(codec, cvt, 0xf0d, 0)?)?;
             if observed_digital == u32::MAX || observed_digital & 255 != u32::from(digital) {
-                return Err(Error::RouteRejected);
+                let expected = Expected::Masked {
+                    mask: 0xff,
+                    value: u32::from(digital),
+                };
+                return Err(self.rejected(codec, cvt, 0xf0d, 0, expected, observed_digital));
             }
             let map = self.hdmi_ports[index]
                 .as_ref()
@@ -1511,12 +1916,20 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 for slot in map.slots {
                     let observed = self.verb(Verb::short(codec, pin, 0xf34, slot & 15)?)?;
                     if observed == u32::MAX || observed & 0xf0 != u32::from(slot & 0xf0) {
-                        return Err(Error::RouteRejected);
+                        let expected = Expected::Masked {
+                            mask: 0xf0,
+                            value: u32::from(slot & 0xf0),
+                        };
+                        let payload = u16::from(slot & 15);
+                        return Err(self.rejected(codec, pin, 0xf34, payload, expected, observed));
                     }
                 }
             }
-            if self.verb(Verb::long(codec, cvt, 0xa, 0)?)? != u32::from(format.encode()?) {
-                return Err(Error::RouteRejected);
+            let encoded = u32::from(format.encode()?);
+            let read = self.verb(Verb::long(codec, cvt, 0xa, 0)?)?;
+            if read != encoded {
+                let expected = Expected::Value(encoded);
+                return Err(self.rejected(codec, cvt, 0xa, 0, expected, read));
             }
             Ok(())
         })();

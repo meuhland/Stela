@@ -450,6 +450,66 @@ fn a_transient_bad_answer_does_not_end_playback() {
 }
 
 #[test]
+fn the_route_state_reads_back_and_a_rejection_names_its_answer() {
+    for dp in [false, true] {
+        let mut f = Fixture::new(dp);
+        let (mut c, port, s, p) = playing(&mut f);
+        let fmt = c.stream_format(s).unwrap();
+        assert_eq!(c.take_rejection(), None);
+        let state = c.hdmi_route_state(port).unwrap();
+        assert_eq!((state.converter, state.pin), (2, 4));
+        assert_eq!(state.pin_control, 0x40);
+        assert_eq!(state.dip_transmit, 0xc0);
+        assert_eq!(state.connection, u32::from(state.set_connection));
+        assert_eq!(state.digital & 0xff, u32::from(state.set_digital));
+        assert_eq!(state.set_digital & 0x21, 1);
+        assert_eq!((state.channels, state.set_channels), (1, 1));
+        assert_eq!(state.format, u32::from(state.set_format));
+        assert_eq!(state.stream, u32::from(state.set_stream));
+        let header: [u8; 3] = if dp {
+            [0x84, 0x1b, 0x44]
+        } else {
+            [0x84, 1, 10]
+        };
+        assert_eq!(state.dip[..3], header);
+        assert_eq!(state.dip_sum(), 0);
+        assert!(!state.single_command);
+        assert!(alloc::format!("{state}").contains("transmit 0xc0 bytes 84 "));
+        // Reading it set nothing the route checks: playback goes on.
+        f.advance(p, fmt);
+        assert!(c.refill_hdmi_period(s, &vec![2; p]).unwrap().is_some());
+        // One wrong pin-control readback is named, once.
+        f.hardware.lock().unwrap().glitch = Some((0xf07, 1));
+        f.advance(p, fmt);
+        assert_eq!(
+            c.refill_hdmi_period(s, &vec![3; p]),
+            Err(Error::RouteRejected)
+        );
+        let rejection = c.take_rejection().unwrap();
+        assert_eq!(
+            (
+                rejection.node,
+                rejection.verb,
+                rejection.payload,
+                rejection.read
+            ),
+            (4, 0xf07, 0, 0)
+        );
+        assert_eq!(rejection.expected, Expected::Value(0x40));
+        assert!(!rejection.single_command);
+        assert!(alloc::format!("{rejection}").contains(
+            "node 0x04 verb 0xf07 payload 0x0000: answered 0x00000000, expected 0x00000040"
+        ));
+        assert_eq!(c.take_rejection(), None);
+        assert_eq!(c.restart_hdmi(port), Ok(HdmiRestart::Stream));
+        c.close_hdmi(port).unwrap();
+        assert_eq!(c.hdmi_route_state(port), Err(Error::SinkUnavailable));
+        c.detach_hdmi_port(port).unwrap();
+        c.shutdown().unwrap();
+    }
+}
+
+#[test]
 fn a_codec_that_keeps_answering_wrong_needs_a_reset_after_the_bound() {
     let mut f = Fixture::new(false);
     let (mut c, port, s, p) = playing(&mut f);

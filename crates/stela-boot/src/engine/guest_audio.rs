@@ -122,6 +122,8 @@ impl GuestAudio {
                         retry_at: 0,
                         error: None,
                         reported: None,
+                        dumps: 0,
+                        resume_dumped: false,
                     }),
                     Some(DisplayAudio {
                         hosts,
@@ -257,7 +259,15 @@ struct Hdmi {
     /// The last error, reported once.
     error: Option<RetirementError>,
     reported: Option<(bool, bool, u64, Restarts)>,
+    /// Route state dumps printed (`HDMI_STATE_DUMPS` at most), and whether
+    /// one followed a resume yet.
+    dumps: u8,
+    resume_dumped: bool,
 }
+
+/// Route state dumps per boot: each preparation of the route, and the
+/// first resume after the monitor slept, up to this many.
+const HDMI_STATE_DUMPS: u8 = 4;
 
 /// Whether restart `count` (of one reason) gets lines of its own: the
 /// first four, then each power of two; the report's counts cover the rest.
@@ -354,9 +364,53 @@ impl Hdmi {
                 reason.action(),
             ));
         }
+        self.detail(&error, self.announce);
         // The stop line already said the monitor is away.
         self.paused = reason == RestartReason::SinkAway;
         self.error = Some(error);
+    }
+
+    /// Diagnostics after `error`, printed when `print`: the codec answer
+    /// behind a rejected route readback (taken in any case, so that a later
+    /// line never shows a stale one), and a stream DMA status in hex with
+    /// its bits named.
+    fn detail(&mut self, error: &RetirementError, print: bool) {
+        if let Some(rejection) = self.host.take_hdmi_rejection()
+            && print
+        {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI rejected on {}: {rejection}\n",
+                self.place
+            ));
+        }
+        if let RetirementError::Controller(hd_audio::Error::StreamDma { status }) = error
+            && print
+        {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI stream DMA fault on {}: SDnSTS {}\n",
+                self.place,
+                guest_audio::StreamStatus(*status)
+            ));
+        }
+    }
+
+    /// Prints the route as the codec answers now, `when`: after it was
+    /// prepared, or after the first resume; [`HDMI_STATE_DUMPS`] at most.
+    fn dump(&mut self, when: &str) {
+        if self.dumps >= HDMI_STATE_DUMPS {
+            return;
+        }
+        self.dumps += 1;
+        match self.host.hdmi_route_state(&self.playback) {
+            Ok(state) => output::arguments(format_args!(
+                "GUEST AUDIO HDMI state on {} ({when}): {state}\n",
+                self.place
+            )),
+            Err(error) => output::arguments(format_args!(
+                "GUEST AUDIO HDMI state on {} ({when}): unreadable: {error:?}\n",
+                self.place
+            )),
+        }
     }
 
     fn play(&mut self, now: u64, streaming: bool, counters: &mut Counters) {
@@ -390,8 +444,24 @@ impl Hdmi {
         // that was lost is prepared again (`Host::start_hdmi`).
         match self.host.start_hdmi(&mut self.playback) {
             Ok(start) => {
+                // A readback that closed the route before it was prepared
+                // again.
+                if let Some(rejection) = self.host.take_hdmi_rejection() {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI rejected on {}: {rejection}\n",
+                        self.place
+                    ));
+                }
                 self.started(start);
                 self.error = None;
+                match start {
+                    HdmiStart::Prepared => self.dump("prepared"),
+                    HdmiStart::Resumed if !self.resume_dumped => {
+                        self.resume_dumped = true;
+                        self.dump("resumed");
+                    }
+                    _ => {}
+                }
                 true
             }
             Err(RetirementError::Controller(hd_audio::Error::SinkUnavailable)) => {
@@ -424,6 +494,9 @@ impl Hdmi {
                     ));
                     self.error = Some(error);
                 }
+                // A start a readback refused (at most HDMI_TRANSIENT_FAULTS
+                // in a row, a second apart) names the answer each time.
+                self.detail(&error, true);
                 false
             }
         }
