@@ -320,6 +320,15 @@ impl Registers for MappedModel {
     }
 }
 
+/// A refusal as the tests written before [`Rejection`] name it.
+fn plain(error: AttachError) -> AttachError {
+    match error {
+        AttachError::Rejected(_) => AttachError::ConfigurationRejected,
+        error => error,
+    }
+}
+
+mod gpu_audio;
 mod legacy;
 mod minimum;
 

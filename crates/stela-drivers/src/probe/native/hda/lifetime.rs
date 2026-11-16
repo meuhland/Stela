@@ -116,6 +116,10 @@ pub(super) struct Inputs<R, T> {
     pub pages: &'static dyn PageSource,
     pub bar: Bar,
     pub original_users: Option<OriginalUsers>,
+    /// A GPU's audio function vouched for by its quiesced state: NVIDIA's
+    /// coherence bytes are written as Linux writes them, a dropped write
+    /// kept (`hda::pci::prepare_cold_gpu_audio_with_registers`).
+    pub gpu_audio: bool,
 }
 pub(super) struct Shared<R>(Rc<RefCell<R>>);
 impl<R> Clone for Shared<R> {
@@ -186,6 +190,7 @@ struct Resources<R, T> {
     pages: &'static dyn PageSource,
     bar: Bar,
     original_users: Option<OriginalUsers>,
+    gpu_audio: bool,
     attachment: Option<Attachment>,
     pci: Option<Rc<RefCell<Pci<R>>>>,
     controller: Option<Core<R, T>>,
@@ -252,6 +257,7 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             pages,
             bar,
             original_users,
+            gpu_audio,
         } = inputs;
         let mut owner = Owner(Some(Box::new(Resources {
             requester: Some(requester),
@@ -260,6 +266,7 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
             pages,
             bar,
             original_users,
+            gpu_audio,
             attachment: None,
             pci: None,
             controller: None,
@@ -301,15 +308,29 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
         // SAFETY: actual original requester/root, exact kept BAR provider and
         // exclusive conventional/D0/decode/firmware exclusion are constructor
         // prerequisites. No private bind/new DMA occurs in this cold stage.
-        let mut registers = unsafe {
-            hda::pci::prepare_cold_with_registers(
-                requester.function_mut(),
-                r.bar,
-                &r.clock,
-                hda::pci::Ownership::ExclusiveLegacy,
-                Shared(r.registers.clone()),
-            )
-        }?;
+        let mut registers = if r.gpu_audio {
+            // SAFETY: as below; the owner vouched for this GPU audio function.
+            unsafe {
+                hda::pci::prepare_cold_gpu_audio_with_registers(
+                    requester.function_mut(),
+                    r.bar,
+                    &r.clock,
+                    hda::pci::Ownership::ExclusiveLegacy,
+                    Shared(r.registers.clone()),
+                )
+            }?
+        } else {
+            // SAFETY: as above.
+            unsafe {
+                hda::pci::prepare_cold_with_registers(
+                    requester.function_mut(),
+                    r.bar,
+                    &r.clock,
+                    hda::pci::Ownership::ExclusiveLegacy,
+                    Shared(r.registers.clone()),
+                )
+            }?
+        };
         let config = registers.config();
         let stopped = hda::cold::stop_inherited(&mut registers, &r.clock, &config)?;
         let (prepared, _, _) = registers.into_parts();

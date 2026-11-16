@@ -500,6 +500,7 @@ pub fn fixture(completed: bool) -> Fixture {
                 wide: false,
             },
             original_users: users,
+            gpu_audio: false,
         }),
         state,
         config: counters,

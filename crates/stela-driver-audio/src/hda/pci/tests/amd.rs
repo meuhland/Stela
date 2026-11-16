@@ -174,7 +174,7 @@ fn rejected_snoop_keeps_mastering_disabled() {
             );
             assert!(function.config().writes.is_empty());
         } else {
-            assert_eq!(result, AttachError::ConfigurationRejected);
+            assert_eq!(plain(result), AttachError::ConfigurationRejected);
             assert_eq!(
                 function.config().get16(regs::COMMAND)
                     & (regs::COMMAND_MEMORY | regs::COMMAND_MASTER),
@@ -201,7 +201,7 @@ fn failed_controls_rejected_before_updates() {
             function.config().set16(regs::COMMAND, u16::MAX);
         }
         assert_eq!(
-            prepare_model(&mut function, &timer, bar).unwrap_err(),
+            plain(prepare_model(&mut function, &timer, bar).unwrap_err()),
             AttachError::ConfigurationRejected
         );
         if vendor_fault {
