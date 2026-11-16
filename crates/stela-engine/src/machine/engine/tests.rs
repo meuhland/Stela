@@ -6865,8 +6865,7 @@ fn pac_exits_complete_natively_from_the_memo_under_open_tags() {
         .unwrap()
         .unwrap();
     let ib = x86_64_pointer::key_index(PointerAuthenticationKey::Ib);
-    let generation = machine.pointer.key_generations[usize::from(ib)];
-    let open = x86_64_pointer::tag(generation, ib, 0);
+    let open = x86_64_pointer::tag(machine.pointer.generation, ib, 0);
     assert_eq!(machine.pointer.tags[usize::from(ib)], open);
     // A derived change that keeps the inputs, enable and trap reopens
     // the tag; clearing the key's enable makes it DISABLED.
@@ -7853,7 +7852,6 @@ fn keys_native_code_wrote_reopen_together_at_the_next_pac_exit() {
     };
     let before = sign(&mut machine);
     let generation = machine.pointer.generation;
-    let generations = machine.pointer.key_generations;
     // What the thunk leaves: the new half, and every key closed.
     if !machine.cpu.write_el2_pointer_key(key, 0x1234) {
         machine.cpu.registers.set(key, 0, 0x1234);
@@ -7864,11 +7862,7 @@ fn keys_native_code_wrote_reopen_together_at_the_next_pac_exit() {
     assert_ne!(machine.pointer.generation, generation);
     let ia = x86_64_pointer::key_index(PointerAuthenticationKey::Ia);
     let ib = x86_64_pointer::key_index(PointerAuthenticationKey::Ib);
-    // Only the written key's results change; IA keeps its generation.
-    let keys = machine.pointer.key_generations;
-    assert_eq!(keys[usize::from(ia)], generations[usize::from(ia)]);
-    assert_ne!(keys[usize::from(ib)], generations[usize::from(ib)]);
-    let open = |key: u8| x86_64_pointer::tag(keys[usize::from(key)], key, 0);
+    let open = |key| x86_64_pointer::tag(machine.pointer.generation, key, 0);
     assert_eq!(machine.pointer.tags[usize::from(ia)], open(ia));
     assert_eq!(machine.pointer.tags[usize::from(ib)], open(ib));
 }

@@ -44,10 +44,8 @@ use alloc::vec::Vec;
 pub mod inline;
 pub mod strip;
 
-/// Entries in the memo: [`MEMO_WAYS`] to a set, each set one 64-byte line.
-pub const MEMO_ENTRIES: usize = 1 << 16;
-/// Entries a set holds, the most recently filled first.
-pub const MEMO_WAYS: usize = 2;
+/// Entries in the memo.
+pub const MEMO_ENTRIES: usize = 1 << 14;
 /// The tag word of the generic key, after those of [`key_index`].
 pub const GENERIC_KEY: u8 = 4;
 /// The tag words, one for each key.
@@ -122,43 +120,16 @@ const _: () = assert!(core::mem::size_of::<MemoEntry>() == 32);
 const MODIFIER: i32 = core::mem::offset_of!(MemoEntry, modifier) as i32;
 const TAG: i32 = core::mem::offset_of!(MemoEntry, tag) as i32;
 const VALUE: i32 = core::mem::offset_of!(MemoEntry, value) as i32;
-/// The multiplier and shift of [`slot`]: the top 15 bits index the sets.
+/// The multiplier and shift of [`slot`]: the top 14 bits index the memo.
 const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
-const SLOT_SHIFT: u8 = 49;
-const _: () = assert!((1 << (64 - SLOT_SHIFT)) * MEMO_WAYS == MEMO_ENTRIES);
-/// Bytes of a set: log2 for the native index.
-const SET_BITS: u8 = 6;
-const _: () = assert!(MEMO_WAYS * core::mem::size_of::<MemoEntry>() == 1 << SET_BITS);
+const SLOT_SHIFT: u8 = 50;
+const _: () = assert!(1 << (64 - SLOT_SHIFT) == MEMO_ENTRIES);
 
 /// The memo slot of a PAC operation's operands, which never depends on a
-/// key: the multiplicative hash of the pointer XOR the modifier with its
-/// halves swapped. A sum would put return addresses a few instructions
-/// apart, signed with stack pointers a few frames apart, in one slot
-/// (LR + SP equal), which a call tree does all the time; the swap pairs
-/// the pointer's varying low bits with the modifier's steady high bits.
-/// Returns the set's first entry.
+/// key: their sum's multiplicative hash, one LEA of both registers before
+/// the multiply.
 pub fn slot(pointer: u64, modifier: u64) -> usize {
-    ((pointer ^ modifier.rotate_left(32)).wrapping_mul(MIX) >> SLOT_SHIFT) as usize * MEMO_WAYS
-}
-
-/// Remember `entry` in its set: in place of an entry for the same operands
-/// under the same tag (whatever its kind), else first, the set's first
-/// entry moving to its second.
-pub fn insert(memo: &mut [MemoEntry], entry: MemoEntry) {
-    let first = slot(entry.pointer, entry.modifier);
-    let same = |held: &MemoEntry| {
-        held.pointer == entry.pointer
-            && held.modifier == entry.modifier
-            && held.tag & !0xf == entry.tag & !0xf
-    };
-    if same(&memo[first + 1]) && !same(&memo[first]) {
-        memo[first + 1] = entry;
-    } else {
-        if !same(&memo[first]) {
-            memo[first + 1] = memo[first];
-        }
-        memo[first] = entry;
-    }
+    (pointer.wrapping_add(modifier).wrapping_mul(MIX) >> SLOT_SHIFT) as usize
 }
 
 /// The index of `key`'s word in the engine's tags.
@@ -352,39 +323,23 @@ fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
     asm.place(R8, Place::new(tags.anchor, 0));
     let word = i32::try_from(tags.offset + usize::from(form.key) * 8).expect("a tag word offset");
     asm.mov_load(Qword, R8, Mem::base(R8, word));
-    asm.mov(Qword, Rcx, modifier);
-    asm.shift_imm(ShiftOp::Rol, Qword, Rcx, 32);
-    asm.alu(Alu::Xor, Qword, Rcx, Rax);
+    asm.lea(Qword, Rcx, Mem::indexed(Rax, modifier, 1, 0));
     asm.mov_imm64(R9, MIX);
     asm.imul(Qword, Rcx, R9);
     asm.shift_imm(ShiftOp::Shr, Qword, Rcx, SLOT_SHIFT);
-    // 64-byte sets of two 32-byte entries.
-    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, SET_BITS);
+    // 32-byte entries.
+    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, 5);
     // The memo's anchor added from the frame.
     let memo = core::mem::offset_of!(crate::GuestState, anchors) + Anchor::Memo as usize * 8;
     asm.alu_load(Alu::Add, Qword, Rcx, Mem::base(Gpr::Rdi, memo as i32));
-    // The set's first entry, then its second.
-    asm.alu_imm8(Alu::Or, Qword, R8, form.kind as i8);
-    let mut second = Vec::new();
-    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rcx, 0));
-    second.push(asm.jcc(Cond::Ne));
-    asm.alu_load(Alu::Cmp, Qword, modifier, Mem::base(Rcx, MODIFIER));
-    second.push(asm.jcc(Cond::Ne));
-    asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(Rcx, TAG));
-    let first_hit = asm.jcc(Cond::E);
-    for patch in second {
-        asm.bind(patch);
-    }
-    let entry = core::mem::size_of::<MemoEntry>() as i32;
     let mut misses = Vec::new();
-    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rcx, entry));
+    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rcx, 0));
     misses.push(asm.jcc(Cond::Ne));
-    asm.alu_load(Alu::Cmp, Qword, modifier, Mem::base(Rcx, entry + MODIFIER));
+    asm.alu_load(Alu::Cmp, Qword, modifier, Mem::base(Rcx, MODIFIER));
     misses.push(asm.jcc(Cond::Ne));
-    asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(Rcx, entry + TAG));
+    asm.alu_imm8(Alu::Or, Qword, R8, form.kind as i8);
+    asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(Rcx, TAG));
     misses.push(asm.jcc(Cond::Ne));
-    asm.alu_imm8(Alu::Add, Qword, Rcx, entry as i8);
-    asm.bind(first_hit);
     asm.mov_load(Qword, Rax, Mem::base(Rcx, VALUE));
     Lookup { misses, modifier }
 }
