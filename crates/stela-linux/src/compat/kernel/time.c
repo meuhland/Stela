@@ -5,11 +5,13 @@
 #include <linux/limits.h>
 #include <linux/hrtimer.h>
 #include <linux/sched/signal.h>
+#include <stela/atomic_callback.h>
 #include <stela/task.h>
 #include <stela/time.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/preempt.h>
+#include <linux/printk.h>
 #include <linux/timekeeping.h>
 #include <stela/linux.h>
 
@@ -31,6 +33,8 @@ static void atomic_minimum_us(u64 minimum)
     owner->services->minimum_delay_us(owner->context, minimum);
 }
 
+/* The request's own shape is Stela's contract with its callers; a bad one
+ * is fatal. Whether the caller may sleep is the driver's, checked below. */
 static const struct stela_linux_owner *sleep_context(unsigned int state,
     enum stela_linux_minimum_wake wake, u64 quantum_us)
 {
@@ -38,16 +42,48 @@ static const struct stela_linux_owner *sleep_context(unsigned int state,
     stela_linux_minimum_task(owner);
     bool admitted = state == TASK_RUNNING || state == TASK_INTERRUPTIBLE ||
         state == TASK_UNINTERRUPTIBLE || state == TASK_KILLABLE || state == TASK_IDLE;
-    if (!stela_linux_quiescent() || !admitted || !quantum_us ||
+    if (!admitted || !quantum_us ||
         (unsigned int)wake > (unsigned int)STELA_MINIMUM_SIGNAL)
         stela_linux_fatal("invalid sleepable physical minimum context");
     return owner;
+}
+
+/* A driver that sleeps for a time where it may not, under a spinlock, with
+ * interrupts off or in a callback, is reported once and goes on, as Linux's
+ * might_sleep() warns and goes on. Linux then still schedules; this
+ * scheduler cannot switch tasks from atomic scope (schedule() traps there),
+ * so the sleep spins for its minimum, as udelay() does, nothing else runs
+ * meanwhile and a signal does not end it early.
+ *
+ * A wait that a wake may end early (schedule_timeout) stays fatal there on
+ * purpose: its waker cannot run while it spins, and its timeout may be
+ * MAX_SCHEDULE_TIMEOUT, so spinning would hang the CPU instead of naming
+ * the bug. */
+static bool atomic_sleep(u64 minimum_us, enum stela_linux_minimum_wake wake)
+{
+    static bool reported;
+    if (stela_linux_quiescent())
+        return false;
+    if (wake == STELA_MINIMUM_EARLY)
+        stela_linux_fatal("a wait for a wake in atomic context, which nothing can wake");
+    if (!reported) {
+        reported = true;
+        pr_err("BUG: sleeping function called from invalid context: preempt_count %x, "
+               "irqs disabled %d, callback %d; the sleep spins for its minimum instead\n",
+               preempt_count(), irqs_disabled(),
+               stela_linux_atomic_callback_active() || stela_linux_rcu_callback_active());
+    }
+    atomic_minimum_us(minimum_us);
+    __set_current_state(TASK_RUNNING);
+    return true;
 }
 
 u64 stela_linux_minimum_sleep(u64 minimum_us, unsigned int state,
                             enum stela_linux_minimum_wake wake, u64 quantum_us)
 {
     const struct stela_linux_owner *owner = sleep_context(state, wake, quantum_us);
+    if (atomic_sleep(minimum_us, wake))
+        return 0;
     if (!owner->services->minimum_deadline_us)
         stela_linux_fatal("missing actual relative minimum provider");
     struct stela_linux_minimum_deadline *deadline =

@@ -164,8 +164,18 @@ impl Platform for Host {
     fn realtime_at(&self, now: i64, read: RealtimeRead) -> Option<(i64, u32)> {
         self.realtime.read(now, read)
     }
-    fn minimum_delay_us(&self, _: u64) -> Result<(), WorkError> {
-        Err(WorkError::Unavailable)
+    /// Spins on the host clock, as the boot spins on its counter.
+    fn minimum_delay_us(&self, minimum: u64) -> Result<(), WorkError> {
+        let minimum_ns = minimum.checked_mul(1_000).ok_or(WorkError::Exhausted)?;
+        let target_ns = self
+            .clock
+            .now_ns()?
+            .checked_add(minimum_ns)
+            .ok_or(WorkError::Exhausted)?;
+        while self.clock.now_ns()? < target_ns {
+            std::hint::spin_loop();
+        }
+        Ok(())
     }
     fn minimum_deadline_us(&self, minimum: u64) -> Result<Box<dyn MinimumDeadline>, WorkError> {
         let minimum_ns = minimum.checked_mul(1_000).ok_or(WorkError::Exhausted)?;
