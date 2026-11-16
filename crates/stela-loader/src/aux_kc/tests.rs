@@ -970,6 +970,105 @@ fn fileset_entries(file: &[u8]) -> Vec<(String, u64, u64)> {
 }
 
 #[test]
+fn two_kexts_link_into_one_collection() -> Result<()> {
+    let boot = boot_collection();
+    let first = kext_object();
+    let second = other_object();
+    let kexts = [kext(vec![&first]), other(vec![&second])];
+    let linked = link(&boot, &kexts)?;
+    assert_eq!(linked.source(&kexts).member, "Test.kext, Other.kext");
+    let file = &linked.collection;
+
+    let entries = fileset_entries(file);
+    let names: Vec<&str> = entries.iter().map(|entry| entry.0.as_str()).collect();
+    assert_eq!(names, ["com.stela.Test", "com.stela.Other"]);
+    let (test, other) = (&entries[0], &entries[1]);
+    assert!(test.1 < other.1, "each kext has its own pages");
+    assert_eq!((test.1 % PAGE_BYTES, other.1 % PAGE_BYTES), (0, 0));
+    let first_bundle = sections(file, test.2);
+    let second_bundle = sections(file, other.2);
+    for bundle in [&first_bundle, &second_bundle] {
+        assert_eq!(
+            macho::MachHeader64::<LE>::parse(&file[..], bundle["__TEXT"].offset)?.filetype(LE),
+            macho::MH_KEXT_BUNDLE
+        );
+    }
+    // No section of one lies in the other's.
+    let span = |bundle: &BTreeMap<String, Section>, segment: &str| {
+        let section = &bundle[segment];
+        section.address..section.address + section.size
+    };
+    for segment in ["__TEXT", "__TEXT_EXEC", "__DATA", "__DATA_CONST"] {
+        let (a, b) = (span(&first_bundle, segment), span(&second_bundle, segment));
+        assert!(a.end <= b.start || b.end <= a.start, "{segment}");
+    }
+    // Each kmod_info is its own kext's data.
+    let data = &second_bundle["__DATA,__data"];
+    assert_eq!(read(file, data, 0, 8), [0x77; 8]);
+
+    // The second kext's call reaches _IOLog through its own stub, and its
+    // vtable inherits Parent's `a` as the first kext's classes would.
+    let text = &second_bundle["__TEXT_EXEC,__text"];
+    let stubs = &second_bundle["__TEXT_EXEC,__auth_stubs"];
+    assert_eq!(
+        branch_target(instruction(file, text, 0), text.address),
+        stubs.address
+    );
+    let fixups = chains(file);
+    let vtable = second_bundle["__DATA_CONST,__const"].address;
+    let slot = |index: u64| {
+        let raw = fixups[&(vtable + 8 * index)];
+        (raw & 0x3fff_ffff, raw >> 30 & 3, raw >> 32 & 0xffff)
+    };
+    assert_eq!(slot(2), (text.address + 4, 3, 0x51));
+    assert_eq!(slot(4), (PARENT_A - BASE, 0, 0x53));
+    assert_eq!(slot(5), (RESERVED - BASE, 0, 0x54));
+
+    // The prelink info and the receipt list both, in order.
+    let collection = sections(file, 0);
+    let info = &collection["__PRELINK_INFO,__info"];
+    let xml = read(file, info, 0, info.size as usize);
+    let root = ::plist::Value::from_reader_xml(&xml[..xml.len() - 1])?;
+    let prelinked = root.as_dictionary().unwrap()["_PrelinkInfoDictionary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let entry = entry.as_dictionary().unwrap();
+            (
+                entry["_PrelinkBundlePath"].as_string().unwrap().to_owned(),
+                entry["_PrelinkExecutableLoadAddr"]
+                    .as_unsigned_integer()
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prelinked,
+        [
+            ("/Library/Extensions/Test.kext".to_owned(), test.1),
+            ("/Library/Extensions/Other.kext".to_owned(), other.1),
+        ]
+    );
+    let section = &collection["__RECEIPT_INFO,__aux_kc_receipt"];
+    let receipt = read(file, section, 0, section.size as usize);
+    let mut receipt = der::sequence(&receipt)?;
+    receipt.take(2)?;
+    let mut listed = der::Cursor(receipt.take(16)?.value);
+    for identifier in ["com.stela.Test", "com.stela.Other"] {
+        let mut entry = der::Cursor(listed.take(16)?.value);
+        entry.take(4)?;
+        entry.take(4)?;
+        assert_eq!(entry.take(4)?.value, &Sha256::digest(identifier)[..]);
+    }
+    listed.end()?;
+
+    // The pair links alike in either order of the same kexts' objects.
+    assert_eq!(link(&boot, &kexts)?.collection, linked.collection);
+    Ok(())
+}
+
+#[test]
 fn a_kext_that_cannot_link_is_left_out_and_the_others_kept() -> Result<()> {
     let boot = boot_collection();
     let good = kext_object();
@@ -1050,43 +1149,57 @@ fn a_kext_that_cannot_link_is_left_out_and_the_others_kept() -> Result<()> {
     Ok(())
 }
 
-/// Links a built kext against a real boot kernel collection, as every boot
+/// Links built kexts against a real boot kernel collection, as every boot
 /// does, so a kext that names a symbol the kernel does not export is found
-/// before it stops a boot. Run with
-/// `STELA_BOOT_KC=<kernelcache> STELA_KEXT=<target/guest/StelaGPU.kext>
+/// before it stops a boot. `STELA_KEXT` names one or more `xtask guest`
+/// directories, `:`-separated, which link into one collection as a boot
+/// links them; each bundle's path is its directory's name. Run with
+/// `STELA_BOOT_KC=<kernelcache>
+/// STELA_KEXT=target/guest/StelaGPU.kext:target/guest/StelaVirtIO.kext
 /// cargo test -p stela-loader --lib -- --ignored a_built_kext`.
 #[test]
 #[ignore = "oracle: STELA_BOOT_KC, STELA_KEXT"]
 fn a_built_kext_links_against_a_real_boot_collection() {
     extern crate std;
-    let (Ok(collection), Ok(kext)) = (std::env::var("STELA_BOOT_KC"), std::env::var("STELA_KEXT"))
+    let (Ok(collection), Ok(kexts)) = (std::env::var("STELA_BOOT_KC"), std::env::var("STELA_KEXT"))
     else {
         std::eprintln!("STELA_BOOT_KC or STELA_KEXT unset: nothing linked");
         return;
     };
     let boot = std::fs::read(&collection).unwrap();
-    let directory = std::path::Path::new(&kext);
-    let info = std::fs::read(directory.join("Info.plist")).unwrap();
-    let mut objects: Vec<Vec<u8>> = Vec::new();
-    let mut names: Vec<_> = std::fs::read_dir(directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "o"))
-        .collect();
-    names.sort();
-    for name in &names {
-        objects.push(std::fs::read(name).unwrap());
+    let mut built = Vec::new();
+    for kext in kexts.split(':') {
+        let directory = std::path::Path::new(kext);
+        let info = std::fs::read(directory.join("Info.plist")).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "o"))
+            .collect();
+        names.sort();
+        let objects: Vec<Vec<u8>> = names
+            .iter()
+            .map(|name| std::fs::read(name).unwrap())
+            .collect();
+        let bundle = directory.file_name().unwrap().to_str().unwrap();
+        built.push((info, objects, format!("/Library/Extensions/{bundle}")));
     }
-    let kext = Kext {
-        info: &info,
-        objects: objects.iter().map(Vec::as_slice).collect(),
-        bundle_path: "/Library/Extensions/StelaGPU.kext".into(),
-        trusted_code: Vec::new(),
-    };
-    let linked = link(&boot, &[kext]).unwrap_or_else(|error| panic!("{error:#}"));
+    let kexts: Vec<Kext<'_>> = built
+        .iter()
+        .map(|(info, objects, bundle_path)| Kext {
+            info,
+            objects: objects.iter().map(Vec::as_slice).collect(),
+            bundle_path: bundle_path.clone(),
+            trusted_code: Vec::new(),
+        })
+        .collect();
+    let linked = link(&boot, &kexts).unwrap_or_else(|error| panic!("{error:#}"));
+    for kext in &kexts {
+        std::eprintln!("{}: {} objects", kext.bundle_name(), kext.objects.len());
+    }
     std::eprintln!(
-        "linked {} objects into {} bytes",
-        names.len(),
+        "linked {} into {} bytes",
+        linked.source(&kexts).member,
         linked.collection.len()
     );
 }
