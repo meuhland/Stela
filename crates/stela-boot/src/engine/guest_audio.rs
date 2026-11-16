@@ -14,17 +14,20 @@
 //!
 //! With `--guest-audio-hdmi` the output is the monitor instead: one HDMI
 //! playback on the pin and device entry whose ELD the GPU wrote, 48 kHz
-//! 16-bit stereo in six 10 ms periods (`Hdmi`). Each turn moves the guest's
-//! frames to a host queue under the devices' lock, then, in the loader's
-//! root without waiting for the host drivers' lock, writes each period the
-//! DMA completed: the queue's oldest frames, silence for any it lacks. More
-//! than 20 ms left queued after that is dropped, oldest first. A route an
-//! underrun or a sink change stopped starts again at a later turn, at most
-//! once a second.
+//! 16-bit stereo in 22 periods of 10 ms (`Hdmi`, `HDMI_PERIODS`). Each turn
+//! moves the guest's frames to a host queue under the devices' lock, then,
+//! in the loader's root without waiting for the host drivers' lock, writes
+//! each period the DMA completed: the queue's oldest frames, silence for
+//! any it lacks. More than 20 ms left queued after that is dropped, oldest
+//! first. A stream an underrun or a transient codec fault stopped restarts
+//! alone at the next turn, on its route as prepared; a monitor that went
+//! away pauses the route until it returns; a route that was lost is
+//! prepared again, at most once a second.
 use super::{host, output, storage::RestoreRoot};
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use stela_boot_core::guest_audio::{
-    self, BACKLOG_FRAMES, Counters, MAX_STEP_FRAMES, Pacer, Report, Step, s16_period,
+    self, BACKLOG_FRAMES, Counters, MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts, Step,
+    s16_period,
 };
 use stela_drivers::{
     audio::{
@@ -35,7 +38,7 @@ use stela_drivers::{
         },
     },
     bus::pci::Address,
-    probe::native::hda::{HdmiPlayback, Host, RetirementError},
+    probe::native::hda::{HdmiPlayback, HdmiStart, Host, RetirementError},
 };
 use stela_soc::machine::{AppleDevices, USB_AUDIO_CHANNELS, UsbAudioStatus};
 
@@ -48,11 +51,19 @@ const HDMI_FORMAT: PcmFormat = hdmi_codec::BASIC_AUDIO;
 /// One period: 10 ms, 1920 bytes, a multiple of the HDA's 128 bytes.
 const HDMI_PERIOD_FRAMES: usize = 480;
 const HDMI_PERIOD_BYTES: usize = HDMI_PERIOD_FRAMES * 4;
-/// Six periods, 60 ms: a service gap of up to about 55 ms keeps the DMA
-/// fed; a period plays about 50 ms after it is written.
-const HDMI_PERIODS: usize = 6;
+/// 22 periods, 220 ms (`guest_audio::hdmi_periods`): a service gap of up
+/// to about 210 ms keeps the DMA fed, as long as the guest's own 200 ms
+/// ring rides out. The service has no timer of its own to refill from (a
+/// turn runs when a PE waits or starves), so the ring is what covers a
+/// turn's lateness. Audio X ms ahead of the DMA plays X ms later: a period
+/// plays about 210 ms after it is written, plus at most the 20 ms backlog.
+/// Six periods (60 ms) underran 112 times in 5 minutes on VM 117.
+const HDMI_PERIODS: usize = guest_audio::hdmi_periods(HDMI_PERIOD_FRAMES);
+const HDMI_PERIOD_MS: usize = HDMI_PERIOD_FRAMES * 1000 / guest_audio::RATE as usize;
 /// The wait before a route that could not start is tried again.
 const HDMI_RETRY_TICKS: u64 = host::COUNTER_HZ;
+/// How often a paused route looks for its monitor again: one pin sense.
+const HDMI_PAUSED_TICKS: u64 = host::COUNTER_HZ / 4;
 
 pub(super) struct GuestAudio {
     pacer: Pacer,
@@ -83,6 +94,17 @@ impl GuestAudio {
                     "GUEST AUDIO speaker on the native hub: 48 kHz stereo, played on the \
                      monitor: {place}\n"
                 ));
+                let ring_ms = HDMI_PERIODS * HDMI_PERIOD_MS;
+                output::arguments(format_args!(
+                    "GUEST AUDIO HDMI ring: {HDMI_PERIODS} periods of {HDMI_PERIOD_MS} ms \
+                     ({ring_ms} ms, {} bytes), refilled each service turn: a turn up to about {} \
+                     ms late keeps the DMA fed (the guest's own ring holds {} ms); about {} ms \
+                     from the guest to the monitor at most\n",
+                    HDMI_PERIODS * HDMI_PERIOD_BYTES,
+                    ring_ms - HDMI_PERIOD_MS,
+                    MAX_STEP_FRAMES * 1000 / guest_audio::RATE,
+                    ring_ms + BACKLOG_FRAMES * 1000 / guest_audio::RATE as usize,
+                ));
                 (
                     Some(Hdmi {
                         host,
@@ -92,7 +114,11 @@ impl GuestAudio {
                         pending: VecDeque::with_capacity(MAX_STEP_FRAMES as usize),
                         period: vec![0; HDMI_PERIOD_BYTES],
                         refills: 0,
-                        restarts: 0,
+                        started: false,
+                        restarts: Restarts::default(),
+                        last_reason: None,
+                        announce: true,
+                        paused: false,
                         retry_at: 0,
                         error: None,
                         reported: None,
@@ -217,86 +243,195 @@ struct Hdmi {
     /// One period of 16-bit stereo, as written.
     period: Vec<u8>,
     refills: u64,
-    restarts: u64,
+    /// Whether the route ever started.
+    started: bool,
+    restarts: Restarts,
+    /// The last stop's reason.
+    last_reason: Option<RestartReason>,
+    /// Whether the next start gets a line: its stop had one.
+    announce: bool,
+    /// The monitor is away; the route waits for it, prepared when it was.
+    paused: bool,
     /// When a route that could not start is tried again.
     retry_at: u64,
     /// The last error, reported once.
     error: Option<RetirementError>,
-    reported: Option<(bool, u64, u64)>,
+    reported: Option<(bool, bool, u64, Restarts)>,
 }
 
-/// Whether restart `count` gets lines of its own: the first four, then
-/// each power of two; the report's count covers the rest.
+/// Whether restart `count` (of one reason) gets lines of its own: the
+/// first four, then each power of two; the report's counts cover the rest.
 fn logged(count: u64) -> bool {
     count <= 4 || count.is_power_of_two()
 }
 
+/// Why the playback stopped, from the error the refill returned; the
+/// driver stops the same way (`hda::hdmi`): an underrun or a codec fault
+/// stops the stream only, a sink away pauses the route, anything else
+/// closes it.
+fn restart_reason(error: &RetirementError) -> RestartReason {
+    use hd_audio::Error;
+    match error {
+        RetirementError::Controller(Error::PlaybackUnderrun | Error::InvalidPosition(_)) => {
+            RestartReason::Underrun
+        }
+        RetirementError::Controller(Error::SinkUnavailable) => RestartReason::SinkAway,
+        RetirementError::Controller(
+            Error::RouteRejected | Error::InvalidEld | Error::Timeout(hd_audio::Phase::Verb),
+        ) => RestartReason::CodecFault,
+        _ => RestartReason::RouteLost,
+    }
+}
+
 impl Hdmi {
+    /// The route started: the first time, how it plays; after a stop
+    /// whose line was printed, or after a pause, how it started again.
+    fn started(&mut self, start: HdmiStart) {
+        let resumed = core::mem::take(&mut self.paused);
+        let without_eld = self.playback.without_eld();
+        if !self.started {
+            self.started = true;
+            match without_eld {
+                Some(error) => output::arguments(format_args!(
+                    "GUEST AUDIO HDMI playing on {} without an ELD ({}): converter {:#04x}, \
+                     stream tag {}, basic audio 48 kHz 16-bit stereo on FL/FR, {HDMI_PERIODS} \
+                     periods of {HDMI_PERIOD_MS} ms\n",
+                    self.place,
+                    eld_reason(&error),
+                    self.playback.converter(),
+                    self.playback.stream_tag(),
+                )),
+                None => output::arguments(format_args!(
+                    "GUEST AUDIO HDMI playing on {}: converter {:#04x}, stream tag {}, 48 kHz \
+                     16-bit stereo, {HDMI_PERIODS} periods of {HDMI_PERIOD_MS} ms\n",
+                    self.place,
+                    self.playback.converter(),
+                    self.playback.stream_tag(),
+                )),
+            }
+            return;
+        }
+        if !self.announce && !resumed {
+            return;
+        }
+        let how = match start {
+            HdmiStart::Stream => "stream only: its descriptor reset and re-armed",
+            HdmiStart::Resumed => {
+                "resumed: the monitor is back with the same ELD; stream only, its descriptor \
+                 reset and re-armed"
+            }
+            HdmiStart::Prepared => "route prepared again: codec walked, ELD read",
+        };
+        output::arguments(format_args!(
+            "GUEST AUDIO HDMI playing again on {} (restart {}): {how}; converter {:#04x}, \
+             stream tag {}{}\n",
+            self.place,
+            self.restarts.total(),
+            self.playback.converter(),
+            self.playback.stream_tag(),
+            if without_eld.is_some() {
+                ", without an ELD"
+            } else {
+                ""
+            }
+        ));
+    }
+
+    /// The refill failed with `error`, which stopped the stream: count
+    /// its reason, and print it unless it repeats the last one's past
+    /// [`logged`].
+    fn stopped(&mut self, error: RetirementError) {
+        let reason = restart_reason(&error);
+        let count = self.restarts.add(reason);
+        self.announce = self.last_reason != Some(reason) || logged(count);
+        self.last_reason = Some(reason);
+        if self.announce {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI stopped on {} (restart {}, {} {count}): {error:?}: {}\n",
+                self.place,
+                self.restarts.total(),
+                reason.name(),
+                reason.action(),
+            ));
+        }
+        // The stop line already said the monitor is away.
+        self.paused = reason == RestartReason::SinkAway;
+        self.error = Some(error);
+    }
+
     fn play(&mut self, now: u64, streaming: bool, counters: &mut Counters) {
         // SAFETY: the loader root `storage::open` captured, which maps the
         // claimed function's registers and DMA pages for the whole run; a
         // service turn runs with its processor's pinned record active.
-        let Some(_root) = (unsafe { RestoreRoot::try_enter(self.root) }) else {
-            return;
-        };
-        if !self.playback.running() {
-            if now < self.retry_at {
-                return;
+        if let Some(_root) = unsafe { RestoreRoot::try_enter(self.root) }
+            && (self.playback.running() || self.start(now))
+        {
+            self.refill(streaming, counters);
+        }
+        // Running or not (paused while the monitor sleeps, waiting to
+        // start again), at most the backlog waits, oldest dropped first.
+        let excess = self.pending.len().saturating_sub(BACKLOG_FRAMES);
+        if excess > 0 {
+            self.pending.drain(..excess);
+            counters.add(Step {
+                dropped: excess,
+                take: 0,
+                silent: 0,
+            });
+        }
+    }
+
+    /// Starts the route when it is due, at counter `now`: whether it runs.
+    fn start(&mut self, now: u64) -> bool {
+        if now < self.retry_at {
+            return false;
+        }
+        // A route the stop left prepared restarts its stream alone; one
+        // that was lost is prepared again (`Host::start_hdmi`).
+        match self.host.start_hdmi(&mut self.playback) {
+            Ok(start) => {
+                self.started(start);
+                self.error = None;
+                true
             }
-            // A route an error left prepared closes first; closing none
-            // changes nothing.
-            let _ = self.host.stop_hdmi(&mut self.playback);
-            match self.host.start_hdmi(&mut self.playback) {
-                Ok(()) => {
-                    if self.refills == 0
-                        && self.restarts == 0
-                        && let Some(error) = self.playback.without_eld()
-                    {
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI playing on {} without an ELD ({}): converter \
-                             {:#04x}, stream tag {}, basic audio 48 kHz 16-bit stereo on FL/FR, \
-                             {HDMI_PERIODS} periods of 10 ms\n",
-                            self.place,
-                            eld_reason(&error),
-                            self.playback.converter(),
-                            self.playback.stream_tag(),
-                        ));
-                    } else if self.refills == 0 && self.restarts == 0 {
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI playing on {}: converter {:#04x}, stream tag {}, \
-                             48 kHz 16-bit stereo, {HDMI_PERIODS} periods of 10 ms\n",
-                            self.place,
-                            self.playback.converter(),
-                            self.playback.stream_tag(),
-                        ));
-                    } else if logged(self.restarts) {
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI playing again on {} (restart {}){}\n",
-                            self.place,
-                            self.restarts,
-                            if self.playback.without_eld().is_some() {
-                                " without an ELD"
-                            } else {
-                                ""
-                            }
-                        ));
-                    }
-                    self.error = None;
+            Err(RetirementError::Controller(hd_audio::Error::SinkUnavailable)) => {
+                // The monitor sleeps or was unplugged: look again soon, one
+                // pin sense each time.
+                self.retry_at = now.wrapping_add(HDMI_PAUSED_TICKS);
+                if !self.paused {
+                    self.paused = true;
+                    let prepared = self.host.hdmi_paused(&self.playback).unwrap_or(false);
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI paused on {}: the pin senses no monitor with a valid \
+                         ELD (asleep or unplugged){}; playing again when it returns\n",
+                        self.place,
+                        if prepared {
+                            "; the route stays prepared"
+                        } else {
+                            ""
+                        }
+                    ));
                 }
-                Err(error) => {
-                    self.retry_at = now.wrapping_add(HDMI_RETRY_TICKS);
-                    if self.error != Some(error) {
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI cannot start on {}: {error:?}; trying again \
-                             each second\n",
-                            self.place
-                        ));
-                        self.error = Some(error);
-                    }
-                    return;
+                false
+            }
+            Err(error) => {
+                self.retry_at = now.wrapping_add(HDMI_RETRY_TICKS);
+                if self.error != Some(error) {
+                    output::arguments(format_args!(
+                        "GUEST AUDIO HDMI cannot start on {}: {error:?}; trying again each \
+                         second\n",
+                        self.place
+                    ));
+                    self.error = Some(error);
                 }
+                false
             }
         }
+    }
+
+    /// Writes every period the DMA completed: the queue's oldest frames,
+    /// silence for any it lacks.
+    fn refill(&mut self, streaming: bool, counters: &mut Counters) {
         loop {
             let take = self.pending.len().min(HDMI_PERIOD_FRAMES);
             s16_period(self.pending.iter().take(take).copied(), &mut self.period);
@@ -318,39 +453,28 @@ impl Hdmi {
                 }
                 Ok(false) => break,
                 Err(error) => {
-                    self.restarts += 1;
-                    if logged(self.restarts) {
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI stopped on {} (restart {}): {error:?}; starting \
-                             again\n",
-                            self.place, self.restarts
-                        ));
-                    }
-                    self.error = Some(error);
+                    self.stopped(error);
                     break;
                 }
             }
         }
-        let excess = self.pending.len().saturating_sub(BACKLOG_FRAMES);
-        if excess > 0 {
-            self.pending.drain(..excess);
-            counters.add(Step {
-                dropped: excess,
-                take: 0,
-                silent: 0,
-            });
-        }
     }
 
     fn report(&mut self) {
-        let state = (self.playback.running(), self.refills, self.restarts);
+        let state = (
+            self.playback.running(),
+            self.paused,
+            self.refills,
+            self.restarts,
+        );
         if self.reported != Some(state) {
             self.reported = Some(state);
             output::arguments(format_args!(
-                "GUEST AUDIO HDMI running={} periods={} restarts={} pending={}\n",
+                "GUEST AUDIO HDMI running={} paused={} periods={} {} pending={}\n",
                 state.0,
                 state.1,
                 state.2,
+                state.3,
                 self.pending.len()
             ));
         }
@@ -779,6 +903,16 @@ fn report_eld(entry: &HdmiEntry, read: &EldRead) {
             hdmi_codec::ELD_READS
         ));
     }
+    // The length used: the header's BLL, not the codec's buffer size.
+    output::arguments(format_args!(
+        "GUEST AUDIO HDMI ELD pin {:#04x} device {}: length {} bytes (4-byte header, baseline of \
+         {} dwords) of the codec's {}-byte ELD buffer\n",
+        entry.pin,
+        entry.device,
+        read.raw.len(),
+        read.raw.get(2).copied().unwrap_or(0),
+        read.buffer.unwrap_or(0),
+    ));
     let sads: Vec<_> = eld
         .descriptors
         .iter()

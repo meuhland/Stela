@@ -87,12 +87,13 @@ impl Progress {
     }
 }
 impl<R: Registers, T: Timer> Controller<R, T> {
+    /// The stream descriptor's reset and re-arm before a start, once the
+    /// route's runtime check passed (`Controller::start` runs it first).
     pub(in crate::hda) fn hdmi_before_start(&mut self, id: StreamId) -> Result<(), Error> {
         self.minimum_guard()?;
         let Some(index) = self.hdmi_stream_port(id) else {
             return Ok(());
         };
-        self.hdmi_runtime(id)?;
         let stream = self.stream(id)?;
         let (period, ring, format, bdl) = (
             stream.period_bytes,
@@ -163,12 +164,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .as_mut()
             .map_or(Ok(()), |p| p.observe(position, ioc, now));
         if let Err(error) = result {
-            self.hdmi_record(index, error);
-            if let Err(cleanup) = self.hdmi_close_index(index) {
-                self.routing_failed = true;
-                self.hdmi_record(index, cleanup);
-            }
-            return Err(error);
+            // The DMA's timing, not the route: stop the stream only.
+            return Err(self.hdmi_stream_fault(index, error));
         }
         Ok(())
     }
@@ -231,12 +228,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .as_mut()
             .unwrap();
         if let Err(error) = progress.reusable() {
-            self.hdmi_record(index, error);
-            if let Err(cleanup) = self.hdmi_close_index(index) {
-                self.routing_failed = true;
-                self.hdmi_record(index, cleanup);
-            }
-            return Err(error);
+            return Err(self.hdmi_stream_fault(index, error));
         }
         progress.refilled = progress
             .refilled
@@ -246,6 +238,14 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .submitted
             .checked_add(period as u64)
             .ok_or(Error::PlaybackUnderrun)?;
+        // A period played and refilled: the codec answers as prepared.
+        self.hdmi_ports[index]
+            .as_mut()
+            .unwrap()
+            .route
+            .as_mut()
+            .unwrap()
+            .faults = 0;
         Ok(Some(RefilledPeriod {
             sequence,
             ring_offset: start,

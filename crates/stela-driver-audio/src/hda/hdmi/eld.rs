@@ -68,6 +68,10 @@ pub enum EldParseFault {
     },
     /// Conn_Type (byte 5 bits 3:2) is neither 0 (HDMI) nor 1 (DP).
     Connection { conn_type: u8 },
+    /// The ELD's own length, the 4-byte header and BLL (byte 2) dwords of
+    /// baseline, passes the ELD buffer size the codec answered (get HDMI
+    /// ELD data, parameter 8).
+    BaselineBeyondBuffer { baseline_dwords: u8, buffer: u16 },
 }
 
 impl fmt::Display for EldParseFault {
@@ -100,8 +104,24 @@ impl fmt::Display for EldParseFault {
                     "connection type {conn_type} is neither 0 (HDMI) nor 1 (DP)"
                 )
             }
+            Self::BaselineBeyondBuffer {
+                baseline_dwords,
+                buffer,
+            } => write!(
+                f,
+                "baseline of {baseline_dwords} dwords ends at byte {}, past the codec's ELD \
+                 buffer of {buffer} bytes",
+                eld_length(baseline_dwords)
+            ),
         }
     }
+}
+
+/// The ELD's length from its header's BLL (byte 2): the 4-byte header and
+/// that many dwords of baseline (Linux drm_eld_size). Vendor-specific
+/// blocks after the baseline are not read.
+pub const fn eld_length(baseline_dwords: u8) -> u16 {
+    4 + 4 * baseline_dwords as u16
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,5 +373,14 @@ mod tests {
             EldReadFault::Size { response: 300 }.to_string(),
             "ELD size 300 (0x12c) is outside 20..=256 bytes"
         );
+        assert_eq!(
+            EldParseFault::BaselineBeyondBuffer {
+                baseline_dwords: 8,
+                buffer: 32
+            }
+            .to_string(),
+            "baseline of 8 dwords ends at byte 36, past the codec's ELD buffer of 32 bytes"
+        );
+        assert_eq!(eld_length(8), 36);
     }
 }

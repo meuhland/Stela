@@ -33,7 +33,9 @@ struct Hardware {
     bar: [u8; 0x440],
     clock: Clock,
     commands: Vec<u32>,
-    eld: [u8; 32],
+    /// The ELD bytes the codec answers valid; a byte past them answers
+    /// without ELD-valid bit 31, as the GA106's codec did past its ELD.
+    eld: Vec<u8>,
     vendor: u32,
     pin_caps: u32,
     pin_default: u32,
@@ -53,6 +55,8 @@ struct Hardware {
     starts: usize,
     stops: usize,
     reject: Option<u16>,
+    /// A verb answered zero the next `count` times: a transient fault.
+    glitch: Option<(u16, usize)>,
     drop_reply: Option<u16>,
     bad_eld: Option<u8>,
     /// Reads of `bad_eld` that fail before it reads as written.
@@ -72,7 +76,7 @@ struct Hardware {
 }
 impl Hardware {
     fn new(clock: Clock, dp: bool) -> Self {
-        let mut eld = [0; 32];
+        let mut eld = vec![0; 32];
         eld[0] = 0x10;
         eld[2] = 7;
         eld[5] = 0x10 | if dp { 4 } else { 0 };
@@ -106,6 +110,7 @@ impl Hardware {
             starts: 0,
             stops: 0,
             reject: None,
+            glitch: None,
             drop_reply: None,
             bad_eld: None,
             bad_eld_reads: usize::MAX,
@@ -235,6 +240,13 @@ impl Hardware {
         if self.reject == Some(verb) {
             return 0;
         }
+        if let Some((glitched, count)) = self.glitch.as_mut()
+            && *glitched == verb
+            && *count > 0
+        {
+            *count -= 1;
+            return 0;
+        }
         // Pin-scoped state belongs to the selected DP-MST device entry.
         if node == 4
             && self.device_list > 0
@@ -294,7 +306,9 @@ impl Hardware {
                     self.bad_eld_reads -= 1;
                     0
                 } else {
-                    0x80000000 | u32::from(self.eld[usize::from(byte)])
+                    self.eld
+                        .get(usize::from(byte))
+                        .map_or(0, |b| 0x80000000 | u32::from(*b))
                 }
             }
             0x730 => {

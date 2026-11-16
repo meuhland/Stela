@@ -456,6 +456,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if self.stream(id)?.hdmi_required && self.hdmi_stream_port(id).is_none() {
             return Err(Error::SinkUnavailable);
         }
+        // An HDMI route's runtime check handles its own failure: a sink
+        // away pauses the route, a transient codec fault stops the stream
+        // and counts, anything else closes the route. Nothing started.
+        self.hdmi_runtime(id)?;
         if let Err(error) = self.hdmi_before_start(id) {
             if let Some(index) = self.hdmi_stream_port(id) {
                 self.hdmi_start_failed(index, id, error);
