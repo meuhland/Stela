@@ -133,18 +133,6 @@ static SHARED_DRAINING: AtomicBool = AtomicBool::new(false);
 /// Bursts a draining processor sends at once ([`drain_some`]): a few
 /// hundred bytes, a few hundred microseconds under a hypervisor.
 const DRAIN_BURSTS: usize = 32;
-/// When a processor whose guest waits last sent from the queue, or the
-/// queue last had nothing to send: the counter then. Processors whose guest
-/// waits send the queue in their waits; one whose guest runs sends only
-/// once they left it this long ([`drain_due`]).
-static SERVED_AT: AtomicU64 = AtomicU64::new(0);
-/// How long the queue may wait for a processor whose guest waits before
-/// one whose guest runs sends it between slices. Each burst is a port
-/// access, and under a hypervisor two exits, each of which can wait there
-/// for its device model's lock as long as the host refreshes its display:
-/// 8 to 15 ms on every processor that sent a beat's reports. A waiting
-/// processor's guest loses nothing by it.
-const STARVED_MILLIS: u64 = 100;
 
 /// A ring of bytes not yet sent.
 struct Queue {
@@ -208,9 +196,6 @@ impl Queue {
 
     /// Append `data`, which fits.
     fn copy(&mut self, data: &[u8]) {
-        if self.len == 0 {
-            SERVED_AT.store(rdtsc(), Ordering::Relaxed);
-        }
         let size = self.bytes.len();
         let tail = (self.head + self.len) % size;
         let first = data.len().min(size - tail);
@@ -389,15 +374,8 @@ pub fn pump_serial() {
 
 /// Send a burst of queued bytes if the port takes it now without waiting;
 /// whether this processor should send more. Never waits for another
-/// processor: while one sends, the others leave the port to it. For a
-/// processor whose guest waits, which serves the queue first
-/// ([`drain_due`]).
+/// processor: while one sends, the others leave the port to it.
 pub fn send_queued() -> bool {
-    send_burst(true)
-}
-
-/// [`send_queued`], from a processor whose guest `waits` or not.
-fn send_burst(waits: bool) -> bool {
     if !SERIAL_QUEUED.load(Ordering::Acquire)
         || SENDING
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -417,9 +395,6 @@ fn send_burst(waits: bool) -> bool {
         })
         .unwrap_or(0);
         crate::serial::burst(&burst[..taken]);
-        if waits {
-            SERVED_AT.store(rdtsc(), Ordering::Relaxed);
-        }
     }
     SENDING.store(false, Ordering::Release);
     SERIAL_QUEUED.load(Ordering::Acquire)
@@ -431,25 +406,11 @@ pub fn share_draining() {
     SHARED_DRAINING.store(true, Ordering::Relaxed);
 }
 
-/// Whether a processor whose guest runs sends queued output between two
-/// slices ([`drain_some`]): only once no processor whose guest waits served
-/// the queue for [`STARVED_MILLIS`], as when every guest CPU is busy.
-pub fn drain_due() -> bool {
-    let hz = TSC_HZ.load(Ordering::Relaxed);
-    SERIAL_QUEUED.load(Ordering::Relaxed)
-        && stela_boot_core::service_watch::starved(
-            rdtsc(),
-            SERVED_AT.load(Ordering::Relaxed),
-            hz / 1000 * STARVED_MILLIS,
-        )
-}
-
 /// Send up to [`DRAIN_BURSTS`] bursts of queued output, as far as the port
-/// takes them now, from a processor whose guest runs; never waits for the
-/// port or another processor.
+/// takes them now; never waits for the port or another processor.
 pub fn drain_some() {
     for _ in 0..DRAIN_BURSTS {
-        if !send_burst(false) {
+        if !send_queued() {
             break;
         }
     }
