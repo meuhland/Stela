@@ -7,12 +7,15 @@
 //! feature negotiation, the queues' places, notifications and the level
 //! interrupt. Behind it a [`VirtioDevice`] moves buffers on its queues in the
 //! board's DMA step, as StelaNet's frames move: the guest's notifications
-//! and the device's own [`VirtioDevice::due`] work bring the step about. The
+//! and the device's own [`VirtioDevice::due`] work, or its timed work at
+//! [`VirtioDevice::deadline`] (the sound device's pacing), bring the step
+//! about. The
 //! queues are split virtqueues ([`queue`]), shared with StelaNet.
 pub mod console;
 pub mod mmio;
 pub mod queue;
 pub mod rng;
+pub mod snd;
 #[cfg(test)]
 mod tests;
 
@@ -60,6 +63,20 @@ pub trait VirtioDevice {
     fn reset(&mut self) {}
     /// Whether it has work without a notification.
     fn due(&self) -> bool {
+        false
+    }
+    /// The guest counter tick its next timed work is due at, such as the
+    /// sound device's next completion, `None` for none.
+    fn deadline(&self) -> Option<u64> {
+        None
+    }
+    /// Notes of its own for the boot log since the last call, logged as
+    /// they are, such as the sound stream's state changes and level.
+    fn take_notes(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Whether it has notes for [`Self::take_notes`].
+    fn has_notes(&self) -> bool {
         false
     }
     /// Lines of its own for the boot log since the last call, such as the

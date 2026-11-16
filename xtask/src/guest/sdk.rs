@@ -15,6 +15,8 @@
 //! - `stela/gate.h`: the gate window's layout from [`window`].
 //! - `stela/net.h` and `stela/virtio.h`: StelaNet's and the virtio-mmio
 //!   transport's layouts, from `stela_contracts::net` and `::virtio`.
+//! - `stela/virtio_snd.h`: the virtio sound device's messages, from
+//!   `stela_contracts::virtio_snd`.
 use anyhow::{Context, Result, bail};
 use std::{fmt::Write as _, fs, path::Path};
 use stela_contracts::gate::window;
@@ -99,6 +101,7 @@ pub fn generate(xnu: &Path, include: &Path) -> Result<()> {
     fs::write(stela.join("gate.h"), gate_header())?;
     fs::write(stela.join("net.h"), net_header())?;
     fs::write(stela.join("virtio.h"), virtio_header())?;
+    fs::write(stela.join("virtio_snd.h"), virtio_snd_header())?;
     Ok(())
 }
 
@@ -326,9 +329,41 @@ pub fn virtio_header() -> String {
     header
 }
 
+/// `stela/virtio_snd.h`: the sound device's queues, codes and message
+/// layouts, from `stela_contracts::virtio_snd`.
+pub fn virtio_snd_header() -> String {
+    use stela_contracts::virtio_snd::{codes, messages};
+    let mut header = String::from(
+        "/* The virtio sound device's messages, from stela_contracts::virtio_snd. */\n\
+         #pragma once\n",
+    );
+    for layout in [codes::LAYOUT, messages::LAYOUT] {
+        for (name, value) in layout {
+            writeln!(header, "#define STELA_VIRTIO_SND_{name} {value:#x}ULL").unwrap();
+        }
+    }
+    header
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_virtio_snd_header_names_codes_and_message_sizes() {
+        let header = virtio_snd_header();
+        for line in [
+            "#define STELA_VIRTIO_SND_VQ_TX 0x2ULL\n",
+            "#define STELA_VIRTIO_SND_R_PCM_SET_PARAMS 0x101ULL\n",
+            "#define STELA_VIRTIO_SND_S_OK 0x8000ULL\n",
+            "#define STELA_VIRTIO_SND_FMT_S16 0x5ULL\n",
+            "#define STELA_VIRTIO_SND_RATE_48000 0x7ULL\n",
+            "#define STELA_VIRTIO_SND_SET_PARAMS_BYTES 0x18ULL\n",
+            "#define STELA_VIRTIO_SND_PCM_STATUS_BYTES 0x8ULL\n",
+        ] {
+            assert!(header.contains(line), "{line}");
+        }
+    }
 
     #[test]
     fn the_virtio_header_names_registers_bits_and_ring_sizes() {

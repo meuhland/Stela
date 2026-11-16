@@ -27,6 +27,9 @@ pub struct VirtioReport {
     /// The device's own lines since the last report, such as what the
     /// guest wrote to its console.
     pub lines: Vec<String>,
+    /// The device's own notes since the last report, such as the sound
+    /// stream's state changes, logged as they are.
+    pub notes: Vec<String>,
     /// The device's own counters, by name.
     pub counters: Vec<(&'static str, u64)>,
 }
@@ -79,6 +82,7 @@ impl AppleDevices {
                     events,
                     dropped_events,
                     lines: model.take_lines(),
+                    notes: model.take_notes(),
                     counters: model.device_counters(),
                 }
             })
@@ -90,10 +94,13 @@ impl AppleDevices {
         !self.virtio.is_empty()
     }
 
-    pub(super) fn virtio_due(&self) -> bool {
+    /// The guest counter tick a virtio device's DMA step is next due at:
+    /// now for buffers to move, or a device's own timed work.
+    pub(super) fn virtio_deadline(&self) -> Option<u64> {
         self.virtio
             .iter()
-            .any(|&device| self.virtio_model(device).due())
+            .filter_map(|&device| self.virtio_model(device).deadline())
+            .min()
     }
 
     /// Each device's DMA step, in a transfer of the home machine's own,
@@ -110,7 +117,7 @@ impl AppleDevices {
                 .bus
                 .device_mut::<Mmio>(device)
                 .expect("a virtio device is mapped");
-            if !takes_step(written, &[device], || model.due()) {
+            if !takes_step(written, &[device], || model.due_at(now)) {
                 continue;
             }
             let mut access = Access::new(cpu, now, &mut self.latch);

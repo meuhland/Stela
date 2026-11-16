@@ -22,6 +22,7 @@ pub mod refusal;
 pub mod tag_storage;
 pub mod uuid;
 pub mod virtio;
+pub mod virtio_snd;
 
 pub use chip::Chip;
 pub use cpu_features::Feature;

@@ -1451,8 +1451,9 @@ impl Devices for AppleDevices {
             .chain(self.native_pmp_services_deadline())
             // StelaNet frames to move, now.
             .chain(self.stela_net_due().then_some(0))
-            // Virtio devices' buffers to fill, now.
-            .chain(self.virtio_due().then_some(0))
+            // Virtio devices' buffers to fill, now, or the sound device's
+            // next completion.
+            .chain(self.virtio_deadline())
             // A SEP passcode derivation runs one bounded slice per step,
             // so it finishes while every PE waits.
             .chain(

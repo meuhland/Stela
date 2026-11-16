@@ -224,6 +224,20 @@ impl Mmio {
         self.running() && (!self.checked || self.notified != 0 || self.device.due())
     }
 
+    /// The guest counter tick the DMA step is next due at: now when
+    /// [`Self::due`], else the device's own timed work.
+    pub fn deadline(&self) -> Option<u64> {
+        if self.due() {
+            return Some(0);
+        }
+        self.running().then(|| self.device.deadline()).flatten()
+    }
+
+    /// Whether the DMA step has work at guest counter tick `now`.
+    pub fn due_at(&self, now: u64) -> bool {
+        self.deadline().is_some_and(|deadline| deadline <= now)
+    }
+
     fn event_idx(&self) -> bool {
         self.accepted & features::EVENT_IDX != 0
     }
@@ -260,7 +274,7 @@ impl Mmio {
             }
             Err(why) => self.fail(why, access),
         }
-        if self.device.has_lines()
+        if (self.device.has_lines() || self.device.has_notes())
             && let Some(notice) = self.notice
         {
             notice.store(true, Ordering::Release);
@@ -270,6 +284,11 @@ impl Mmio {
     /// The device's own lines for the log since the last call.
     pub fn take_lines(&mut self) -> Vec<alloc::string::String> {
         self.device.take_lines()
+    }
+
+    /// The device's own notes for the log since the last call.
+    pub fn take_notes(&mut self) -> Vec<alloc::string::String> {
+        self.device.take_notes()
     }
 
     /// The device's own counters, by name.
