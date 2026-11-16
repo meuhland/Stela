@@ -18,9 +18,23 @@
 //! output terminal (ID 4). There is no input terminal, so the host sees no
 //! capture device. Interface 1 streams: alternate setting 1 carries 16-bit
 //! and setting 2 24-bit samples (3-byte subslots), each on isochronous OUT
-//! endpoint 1, adaptive: the host sends at its own clock's rate and the
-//! owner absorbs the difference. Each 1 ms service interval carries up to
-//! one frame more than the nominal 48.
+//! endpoint 1. Its synchronization is the owner's choice ([`Mode`]):
+//! - **adaptive** ([`Audio::new`]): the host sends at its own clock's rate
+//!   and the owner absorbs the difference. Each 1 ms service interval
+//!   carries up to one frame more than the nominal 48.
+//! - **asynchronous** ([`Audio::asynchronous`]): each streaming setting also
+//!   has an isochronous IN explicit feedback endpoint (0x81, usage
+//!   feedback, USB 2.0 5.12.4.2 and 9.6.6), polled every 1 ms like the data
+//!   endpoint. Its packet is the rate the owner says its output consumes
+//!   ([`Audio::set_feedback`]), as frames per (micro)frame: 16.16 in 4 bytes
+//!   at high speed, 10.14 in 3 bytes at full speed (the endpoint's
+//!   wMaxPacketSize says which). The host sizes its packets from it, so its
+//!   own sample clock follows the owner's. Each 1 ms interval then carries
+//!   up to an eighth more than the nominal 48 (54 frames), the most a
+//!   feedback value ([`FEEDBACK_MAX`]) can ask. UAC2 endpoints are the
+//!   standard 7-byte ones: the data and feedback endpoints pair by sharing
+//!   the alternate setting (there is no bSynchAddress, which only UAC1's
+//!   9-byte audio endpoints carry).
 //!
 //! Received frames go to a ring of [`RING_FRAMES`] stereo frames, kept as
 //! 32-bit samples MSB-aligned. A packet arriving at a full ring drops the
@@ -54,6 +68,8 @@ pub const RING_FRAMES: usize = RATE as usize / 5;
 const DUE_FRAMES: usize = RATE as usize / 200;
 
 const STREAM: u8 = 0x01;
+/// The asynchronous mode's explicit feedback endpoint: IN 1.
+const FEEDBACK: u8 = 0x81;
 const CONTROL_INTERFACE: u16 = 0;
 const STREAM_INTERFACE: u16 = 1;
 const CLOCK: u8 = 1;
@@ -91,8 +107,35 @@ const UNITY: i64 = 1 << 30;
 
 /// The streaming settings: (alternate, subslot bytes, bit resolution).
 const SETTINGS: [(u8, u8, u8); 2] = [(1, 2, 16), (2, 3, 24)];
-/// Frames one service interval carries at most: the nominal 48 and one.
+/// Frames one adaptive service interval carries at most: the nominal 48
+/// and one.
 const PACKET_FRAMES: usize = RATE as usize / 1000 + 1;
+/// Frames one asynchronous service interval carries at most: the nominal
+/// 48 and an eighth, so that [`FEEDBACK_MAX`] fits the data endpoint's
+/// wMaxPacketSize (a host ignores feedback its packets cannot carry).
+const ASYNC_PACKET_FRAMES: usize = RATE as usize / 1000 + RATE as usize / 8000;
+/// Microframes a second at high speed.
+const MICROFRAMES: u32 = 8000;
+/// The nominal feedback: [`RATE`] as frames per microframe in 16.16
+/// (USB 2.0 5.12.4.2, high speed), 6.0.
+pub const FEEDBACK_NOMINAL: u32 = (RATE << 16) / MICROFRAMES;
+/// The least and most feedback the function sends: an eighth either side
+/// of nominal. Hosts take -12.5% up to what the data endpoint's packets
+/// hold (Linux `snd_usb_handle_sync_urb`); the owner's own bound is
+/// tighter.
+pub const FEEDBACK_MIN: u32 = FEEDBACK_NOMINAL - FEEDBACK_NOMINAL / 8;
+pub const FEEDBACK_MAX: u32 = (ASYNC_PACKET_FRAMES as u32) << 16 >> 3;
+
+/// How the streaming endpoint synchronizes with the host (USB 2.0
+/// 5.12.4.1, endpoint bmAttributes bits 3:2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The host's clock paces the samples; no feedback.
+    Adaptive,
+    /// The function's clock paces them, through the explicit feedback
+    /// endpoint the owner sets ([`Audio::set_feedback`]).
+    Asynchronous,
+}
 
 /// Counters for the owner's diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,6 +146,11 @@ pub struct Counters {
     pub overflowed: u64,
     /// Bytes of packets that split a frame, dropped.
     pub split: u64,
+    /// Isochronous OUT packets that carried frames: `received` over it is
+    /// the frames a guest service interval carries.
+    pub packets: u64,
+    /// Feedback packets the host read (asynchronous mode).
+    pub feedback_reads: u64,
 }
 
 /// What the owner reports about the stream.
@@ -114,6 +162,12 @@ pub struct Status {
     /// 1/256 dB.
     pub volume: i16,
     pub counters: Counters,
+    pub mode: Mode,
+    /// The feedback the function sends, 16.16 frames per microframe.
+    pub feedback: u32,
+    /// The system count at the function's last bus service
+    /// ([`Function::set_time`]): the guest's time, which paces its packets.
+    pub time: u64,
 }
 
 pub struct Audio {
@@ -122,6 +176,11 @@ pub struct Audio {
 }
 
 struct State {
+    mode: Mode,
+    /// 16.16 frames per microframe, [`FEEDBACK_MIN`]..=[`FEEDBACK_MAX`].
+    feedback: u32,
+    /// The system count at the last bus service.
+    time: u64,
     alternate: u8,
     muted: bool,
     volume: i16,
@@ -134,7 +193,7 @@ struct State {
     counters: Counters,
 }
 
-fn descriptors() -> Descriptors {
+fn descriptors(mode: Mode) -> Descriptors {
     let device = [
         18,
         DEVICE,
@@ -225,12 +284,18 @@ fn descriptors() -> Descriptors {
         total_high,
         0,
     ];
-    let configuration = |interval: u8| {
+    // Isochronous data: adaptive (bits 3:2 = 2) or asynchronous (1).
+    let (attributes, packet_frames, endpoints) = match mode {
+        Mode::Adaptive => (0x09, PACKET_FRAMES, 1),
+        Mode::Asynchronous => (0x05, ASYNC_PACKET_FRAMES, 2),
+    };
+    // `interval` is bInterval; `high` the high-speed configuration.
+    let configuration = |interval: u8, high: bool| {
         let mut streams: Vec<Vec<u8>> = vec![vec![9, INTERFACE, 1, 0, 0, 1, 2, 0x20, 0]];
         for (alternate, subslot, bits) in SETTINGS {
-            let [low, high] =
-                ((PACKET_FRAMES * CHANNELS * usize::from(subslot)) as u16).to_le_bytes();
-            streams.push(vec![9, INTERFACE, 1, alternate, 1, 1, 2, 0x20, 0]);
+            let [low, high_byte] =
+                ((packet_frames * CHANNELS * usize::from(subslot)) as u16).to_le_bytes();
+            streams.push(vec![9, INTERFACE, 1, alternate, endpoints, 1, 2, 0x20, 0]);
             streams.push(vec![
                 16,
                 CS_INTERFACE,
@@ -250,9 +315,17 @@ fn descriptors() -> Descriptors {
                 0,
             ]);
             streams.push(vec![6, CS_INTERFACE, FORMAT_TYPE, 1, subslot, bits]);
-            // Isochronous, adaptive, data.
-            streams.push(vec![7, ENDPOINT, STREAM, 0x09, low, high, interval]);
+            streams.push(vec![
+                7, ENDPOINT, STREAM, attributes, low, high_byte, interval,
+            ]);
             streams.push(vec![8, CS_ENDPOINT, EP_GENERAL, 0, 0, 0, 0, 0]);
+            if mode == Mode::Asynchronous {
+                // Isochronous, no synchronization, feedback usage (bits
+                // 5:4 = 1): 16.16 in 4 bytes at high speed, 10.14 in 3 at
+                // full speed, every 1 ms like the data endpoint.
+                let size = if high { 4 } else { 3 };
+                streams.push(vec![7, ENDPOINT, FEEDBACK, 0x11, size, 0, interval]);
+            }
         }
         let mut parts: Vec<&[u8]> = vec![
             // One association of the control and streaming interfaces.
@@ -282,8 +355,8 @@ fn descriptors() -> Descriptors {
     Descriptors {
         device,
         // High speed: 2^(4-1) microframes, 1 ms; full speed: one frame.
-        configuration: configuration(4),
-        other_speed: Some((qualifier, configuration(1))),
+        configuration: configuration(4, true),
+        other_speed: Some((qualifier, configuration(1, false))),
         strings: vec![
             String::from("Stela"),
             String::from("Stela USB Audio"),
@@ -315,10 +388,24 @@ impl Default for Audio {
 }
 
 impl Audio {
+    /// The adaptive speaker.
     pub fn new() -> Self {
+        Self::with_mode(Mode::Adaptive)
+    }
+
+    /// The asynchronous speaker, with its explicit feedback endpoint,
+    /// sending [`FEEDBACK_NOMINAL`] until the owner sets another.
+    pub fn asynchronous() -> Self {
+        Self::with_mode(Mode::Asynchronous)
+    }
+
+    pub fn with_mode(mode: Mode) -> Self {
         Self {
-            control: Control::new(descriptors()),
+            control: Control::new(descriptors(mode)),
             state: State {
+                mode,
+                feedback: FEEDBACK_NOMINAL,
+                time: 0,
                 alternate: 0,
                 muted: false,
                 volume: VOLUME_MAX,
@@ -352,7 +439,19 @@ impl Audio {
             muted: self.state.muted,
             volume: self.state.volume,
             counters: self.state.counters,
+            mode: self.state.mode,
+            feedback: self.state.feedback,
+            time: self.state.time,
         }
+    }
+
+    /// The rate the owner's output consumes, as 16.16 frames per
+    /// microframe ([`FEEDBACK_NOMINAL`] is 48 kHz), which the asynchronous
+    /// mode's feedback endpoint sends from now on; held to
+    /// [`FEEDBACK_MIN`]..=[`FEEDBACK_MAX`]. The adaptive mode keeps it
+    /// unsent.
+    pub fn set_feedback(&mut self, feedback: u32) {
+        self.state.feedback = feedback.clamp(FEEDBACK_MIN, FEEDBACK_MAX);
     }
 
     /// Frames waiting for the owner.
@@ -405,11 +504,34 @@ impl State {
             self.ring.push_back(samples);
         }
         let count = frames.len() / frame;
+        self.counters.packets += u64::from(count > 0);
         self.counters.received += count as u64;
         self.fresh += count;
         if self.fresh >= DUE_FRAMES {
             self.due = true;
         }
+    }
+
+    /// One explicit feedback packet into `data`, sized by the endpoint's
+    /// wMaxPacketSize: 16.16 frames per microframe in 4 bytes (high
+    /// speed), else 10.14 frames per 1 ms frame in 3 (full speed, eight
+    /// microframes and two fraction bits fewer: the value doubled). The
+    /// bytes written.
+    fn feedback_packet(&mut self, data: &mut [u8]) -> usize {
+        let (value, n) = match data.len() {
+            4.. => (self.feedback, 4),
+            3 => (self.feedback << 1, 3),
+            _ => return 0,
+        };
+        data[..n].copy_from_slice(&value.to_le_bytes()[..n]);
+        self.counters.feedback_reads += 1;
+        n
+    }
+
+    /// Whether `index` names one of the streaming endpoints.
+    fn stream_endpoint(&self, index: u16) -> bool {
+        index == u16::from(STREAM)
+            || (self.mode == Mode::Asynchronous && index == u16::from(FEEDBACK))
     }
 
     /// A class request to an entity of the control interface.
@@ -489,12 +611,12 @@ impl Requests for State {
             }
             // An isochronous endpoint has no halt; the requests succeed.
             (STANDARD, RECIPIENT_ENDPOINT, GET_STATUS, true)
-                if setup.index == u16::from(STREAM) =>
+                if self.stream_endpoint(setup.index) =>
             {
                 Ok(Outcome::Data(vec![0, 0]))
             }
             (STANDARD, RECIPIENT_ENDPOINT, CLEAR_FEATURE | SET_FEATURE, false)
-                if setup.index == u16::from(STREAM) && setup.value == ENDPOINT_HALT =>
+                if self.stream_endpoint(setup.index) && setup.value == ENDPOINT_HALT =>
             {
                 Ok(Outcome::Done)
             }
@@ -519,13 +641,18 @@ impl BusPeer for Audio {
                 self.state.receive(data, usize::from(subslot));
                 Reply::Ack(data.len())
             }
+            (FEEDBACK, Token::In, Some(_)) if self.state.mode == Mode::Asynchronous => {
+                Reply::Ack(self.state.feedback_packet(data))
+            }
             _ => Reply::Stall,
         })
     }
 }
 
 impl Function for Audio {
-    fn set_time(&mut self, _now: u64) {}
+    fn set_time(&mut self, now: u64) {
+        self.state.time = now;
+    }
 
     fn ready_at(&self, _endpoint: u8) -> Option<u64> {
         None

@@ -1223,6 +1223,8 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                         display_audio,
                         handoff.root,
                         options.guest_audio_hdmi_tone,
+                        options.guest_audio_async,
+                        handoff.tsc_hz,
                     )
                 }),
                 guest_network,
@@ -1773,6 +1775,7 @@ fn place_devices(
                 network: placement.guest_mac,
                 bluetooth: placement.guest_bluetooth,
                 audio: options.guest_audio,
+                audio_async: options.guest_audio && options.guest_audio_async,
             },
             scanout,
             firmware: &firmware,

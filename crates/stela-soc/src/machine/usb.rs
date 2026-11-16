@@ -159,6 +159,7 @@ impl AppleDevices {
             network,
             bluetooth,
             audio,
+            audio_async,
         } = cables;
         let extras = usize::from(network.is_some()) + usize::from(bluetooth) + usize::from(audio);
         if 1 + extras + disks.len() > hub::MAX_PORTS {
@@ -180,7 +181,13 @@ impl AppleDevices {
             input: Peripheral::new(),
             network,
             bluetooth: bluetooth.then(Hci::new),
-            audio: audio.then(Audio::new),
+            audio: audio.then(|| {
+                if audio_async {
+                    Audio::asynchronous()
+                } else {
+                    Audio::new()
+                }
+            }),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
@@ -212,6 +219,15 @@ impl AppleDevices {
     /// a speaker.
     pub fn guest_audio_take(&mut self, out: &mut [[i32; USB_AUDIO_CHANNELS]]) -> usize {
         self.usb_audio().map_or(0, |audio| audio.take(out))
+    }
+
+    /// The rate the owner's output consumes, as 16.16 frames per
+    /// microframe, for the speaker's explicit feedback (`Audio::set_feedback`;
+    /// kept unsent by an adaptive speaker).
+    pub fn guest_audio_feedback(&mut self, feedback: u32) {
+        if let Some(audio) = self.usb_audio() {
+            audio.set_feedback(feedback);
+        }
     }
 
     pub(super) fn usb_network(&mut self) -> Result<&mut Ecm> {
