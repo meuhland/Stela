@@ -13,6 +13,21 @@ struct Calls {
     result: vk::Result,
     waits: AtomicUsize,
     frees: AtomicUsize,
+    /// Submitted work never finishes, and waits for it time out.
+    hung: bool,
+    timeline: AtomicUsize,
+}
+
+impl Calls {
+    fn new(result: vk::Result) -> Self {
+        Self {
+            result,
+            waits: AtomicUsize::new(0),
+            frees: AtomicUsize::new(0),
+            hung: false,
+            timeline: AtomicUsize::new(0),
+        }
+    }
 }
 
 unsafe extern "system" fn wait_queue(queue: vk::Queue) -> vk::Result {
@@ -49,6 +64,7 @@ fn device(calls: &Calls) -> ash::Device {
                 b"vkQueueWaitIdle" => wait_queue as *const c_void,
                 b"vkDeviceWaitIdle" => wait_device as *const c_void,
                 b"vkFreeCommandBuffers" => free_buffers as *const c_void,
+                b"vkWaitSemaphores" => wait_timeline as *const c_void,
                 _ => core::ptr::null(),
             },
             vk::Device::from_raw(calls as *const Calls as u64),
@@ -56,28 +72,29 @@ fn device(calls: &Calls) -> ash::Device {
     }
 }
 
-#[test]
-fn failed_idle_keeps_possibly_submitted_command_buffers() {
-    for (result, freed) in [
-        (vk::Result::SUCCESS, 2),
-        (vk::Result::ERROR_DEVICE_LOST, 0),
-        (vk::Result::ERROR_OUT_OF_HOST_MEMORY, 0),
-    ] {
-        let calls = Calls {
-            result,
-            waits: AtomicUsize::new(0),
-            frees: AtomicUsize::new(0),
-        };
-        let device = device(&calls);
-        let queue = vk::Queue::from_raw(&calls as *const Calls as u64);
-        let buffers = [
-            vk::CommandBuffer::from_raw(1),
-            vk::CommandBuffer::from_raw(2),
-        ];
-        let outcome = free_after_idle(&device, queue, vk::CommandPool::null(), &buffers);
-        assert_eq!(outcome.is_ok(), result == vk::Result::SUCCESS);
-        assert_eq!(calls.waits.load(Ordering::Relaxed), 1);
-        assert_eq!(calls.frees.load(Ordering::Relaxed), freed);
+/// A wait for submitted work answers this: the work finished, or not in
+/// time, as on a hung channel.
+unsafe extern "system" fn wait_timeline(
+    device: vk::Device,
+    info: *const vk::SemaphoreWaitInfo<'_>,
+    timeout: u64,
+) -> vk::Result {
+    // SAFETY: as in wait_device; the caller passes a valid wait.
+    let (calls, info) = unsafe { (&*(device.as_raw() as *const Calls), &*info) };
+    assert_eq!(info.semaphore_count, 1);
+    // SAFETY: one semaphore and one value, as counted.
+    let (semaphore, value) = unsafe { (*info.p_semaphores, *info.p_values) };
+    assert_eq!(
+        (semaphore.as_raw(), value),
+        (7, 3),
+        "each timeline's last value"
+    );
+    assert_eq!(timeout, IDLE_WAIT_NS);
+    calls.timeline.fetch_add(1, Ordering::Relaxed);
+    if calls.hung {
+        vk::Result::TIMEOUT
+    } else {
+        vk::Result::SUCCESS
     }
 }
 
@@ -207,11 +224,7 @@ fn backend(device: ash::Device, drops: &Arc<AtomicUsize>) -> NativeBackend {
 
 #[test]
 fn failed_device_idle_keeps_the_export_owner() {
-    let calls = Calls {
-        result: vk::Result::ERROR_DEVICE_LOST,
-        waits: AtomicUsize::new(0),
-        frees: AtomicUsize::new(0),
-    };
+    let calls = Calls::new(vk::Result::ERROR_DEVICE_LOST);
     let drops = Arc::new(AtomicUsize::new(0));
     let backend = backend(device(&calls), &drops);
     drop(backend);
@@ -230,11 +243,7 @@ fn idle_acknowledgement_requires_native_success_and_keeps_roots_owned() {
             Err(Error::OutOfMemory),
         ),
     ] {
-        let calls = Calls {
-            result,
-            waits: AtomicUsize::new(0),
-            frees: AtomicUsize::new(0),
-        };
+        let calls = Calls::new(result);
         let drops = Arc::new(AtomicUsize::new(0));
         let mut backend = ManuallyDrop::new(backend(device(&calls), &drops));
         assert_eq!(backend.acknowledge_idle(), expected);
@@ -248,6 +257,55 @@ fn idle_acknowledgement_requires_native_success_and_keeps_roots_owned() {
             ManuallyDrop::drop(&mut backend._entry);
         }
     }
+}
+
+/// Work in flight on two submissions of one timeline.
+fn in_flight(backend: &mut NativeBackend) {
+    for (value, buffer) in [(2, 1), (3, 2)] {
+        backend.in_flight.push_back(InFlight {
+            buffers: CommandBuffers::One(vk::CommandBuffer::from_raw(buffer)),
+            timeline: vk::Semaphore::from_raw(7),
+            value,
+        });
+    }
+}
+
+/// A hung channel's fences signal only when the kernel driver's job timeout
+/// kills it, 10 s on: the idle proof waits a bounded time for the queue's
+/// own work, and work unfinished by then keeps everything, never waiting
+/// in `vkDeviceWaitIdle` for the channel.
+#[test]
+fn idle_proofs_wait_a_bounded_time_for_submitted_work() {
+    for hung in [false, true] {
+        let calls = Calls {
+            hung,
+            ..Calls::new(vk::Result::SUCCESS)
+        };
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut backend = ManuallyDrop::new(backend(device(&calls), &drops));
+        in_flight(&mut backend);
+        let expected = if hung { Err(Error::DeviceLost) } else { Ok(()) };
+        assert_eq!(backend.acknowledge_idle(), expected);
+        assert_eq!(calls.timeline.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.waits.load(Ordering::Relaxed), usize::from(!hung));
+        // SAFETY: as in the test above; the fake buffers own nothing.
+        unsafe {
+            ManuallyDrop::drop(&mut backend.exporter);
+            ManuallyDrop::drop(&mut backend._entry);
+        }
+    }
+    // Dropped with hung work, the backend keeps its export owner.
+    let calls = Calls {
+        hung: true,
+        ..Calls::new(vk::Result::SUCCESS)
+    };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut backend = backend(device(&calls), &drops);
+    in_flight(&mut backend);
+    drop(backend);
+    assert_eq!(calls.timeline.load(Ordering::Relaxed), 1);
+    assert_eq!(calls.waits.load(Ordering::Relaxed), 0);
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
 }
 
 struct BufferCalls {

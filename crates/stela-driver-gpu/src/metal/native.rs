@@ -370,6 +370,12 @@ impl CommandBuffers {
 /// completed rather than waiting for a completion poll to.
 const RECLAIM_AFTER: usize = 64;
 
+/// The longest the backend waits for the queue's submitted work before it
+/// proves the device idle: a processor waits for the call, and a hung
+/// channel's fences signal only once the kernel driver's job timeout kills
+/// it, 10 s later. Work unfinished by then is not proven stopped.
+const IDLE_WAIT_NS: u64 = 1_000_000_000;
+
 /// Command buffers of one submission, freed once the queue's timeline
 /// passes `value`.
 #[derive(Debug)]
@@ -1754,6 +1760,38 @@ impl NativeBackend {
         result
     }
 
+    /// Waits at most `timeout` ns for every submission in flight to finish:
+    /// the last value each of their timelines reaches. `DeviceLost` when
+    /// they do not finish in time.
+    fn wait_submitted(&self, timeout: u64) -> Result<()> {
+        let mut last: Vec<(vk::Semaphore, u64)> = Vec::new();
+        for entry in &self.in_flight {
+            if entry.timeline == vk::Semaphore::null() {
+                continue;
+            }
+            match last
+                .iter_mut()
+                .find(|(timeline, _)| *timeline == entry.timeline)
+            {
+                Some((_, value)) => *value = (*value).max(entry.value),
+                None => last.push((entry.timeline, entry.value)),
+            }
+        }
+        if last.is_empty() {
+            return Ok(());
+        }
+        let (semaphores, values): (Vec<_>, Vec<_>) = last.into_iter().unzip();
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the timelines are alive while submissions use them.
+        match unsafe { self.device.wait_semaphores(&info, timeout) } {
+            Ok(()) => Ok(()),
+            Err(vk::Result::TIMEOUT) => Err(Error::DeviceLost),
+            Err(error) => Err(failure(error)),
+        }
+    }
+
     /// Frees the command buffers of submissions the queue has finished.
     fn reclaim(&mut self) -> Result<()> {
         // Leave the queue intact if observing a completion fails.
@@ -1804,8 +1842,12 @@ impl Drop for NativeBackend {
         // does a call's import after its turn.
         self.deferral.retire();
         let deferred = self.outside.close();
-        // An error is not evidence that queued DMA stopped. Keep every native
-        // handle, the driver's code and the exporter on that uncertain path.
+        // An error is not evidence that queued DMA stopped, nor is work that
+        // does not finish in time. Keep every native handle, the driver's
+        // code and the exporter on that uncertain path.
+        if self.wait_submitted(IDLE_WAIT_NS).is_err() {
+            return;
+        }
         // SAFETY: the device belongs to this backend and no caller uses it now.
         if unsafe { self.device.device_wait_idle() }.is_err() {
             return;
@@ -2329,6 +2371,7 @@ fn raw<T: vk::Handle>(handle: T) -> u64 {
 
 impl Backend for NativeBackend {
     fn acknowledge_idle(&mut self) -> Result<()> {
+        self.wait_submitted(IDLE_WAIT_NS)?;
         // SAFETY: this backend exclusively owns the device. The Metal owner
         // closes admission and drains its submission timeline before asking;
         // only a successful Vulkan acknowledgement establishes idleness.
@@ -3195,10 +3238,11 @@ impl Backend for NativeBackend {
         let submitted = recorded.and_then(|()| self.queue_segments(segments, handles));
         self.time_split([started, reclaimed, recorded_at, (self.ticks)()]);
         if let Err(error) = submitted {
-            // Some segments may have reached the queue. A failed idle query
-            // leaves their buffers owned by the command pool until device
-            // teardown can prove idleness.
-            let _ = free_after_idle(&self.device, self.queue, self.command_pool, handles);
+            // Some segments may have reached the queue: their buffers go with
+            // the next submission that signals, whose signal follows them, or
+            // with the pool. Waiting here for the queue to idle would wait
+            // without a bound on a hung channel.
+            self.unsignaled.extend_from_slice(handles);
             self.new_images = new_images;
             self.zeroing.pending = pending;
             return Err(error);
@@ -3263,21 +3307,6 @@ impl Backend for NativeBackend {
             .resolve(memory)
             .is_some_and(|resolved| resolved.size.is_none())
     }
-}
-
-/// Free possibly submitted buffers only after the driver acknowledges idle.
-fn free_after_idle(
-    device: &ash::Device,
-    queue: vk::Queue,
-    pool: vk::CommandPool,
-    buffers: &[vk::CommandBuffer],
-) -> Result<()> {
-    // SAFETY: the backend exclusively owns this queue, pool and buffers.
-    unsafe {
-        device.queue_wait_idle(queue).map_err(failure)?;
-        device.free_command_buffers(pool, buffers);
-    }
-    Ok(())
 }
 
 /// Submits `pending` in one `vkQueueSubmit2` and empties it.
