@@ -893,6 +893,163 @@ fn a_method_in_a_slot_the_kernel_reserves_is_refused() {
     );
 }
 
+/// A second kext, `com.stela.Other`, whose class `Other : Parent` inherits
+/// `Base::a` and the reserved slot, and which calls `_IOLog`.
+fn other_object() -> Vec<u8> {
+    let vtable = [
+        vec![0; 16],
+        [auth(0, 0x51), auth(0, 0x52), auth(0, 0x53), auth(0, 0x54)].concat(),
+        vec![0; 8],
+    ]
+    .concat();
+    let auth_pointer = macho::ARM64_RELOC_AUTHENTICATED_POINTER;
+    let sections = [
+        InputSection::new(
+            "__TEXT",
+            "__text",
+            CODE,
+            words(&[0x9400_0000, 0xd65f_03c0, 0xd65f_03c0]),
+        )
+        .relocate(0x0, 8, macho::ARM64_RELOC_BRANCH26, 2),
+        InputSection::new("__DATA", "__data", 0, vec![0x77; 8]),
+        InputSection::new("__DATA", "__const", 0, vtable)
+            .relocate(0x10, 3, auth_pointer, 3)
+            .relocate(0x18, 4, auth_pointer, 3)
+            .relocate(0x20, 5, auth_pointer, 3)
+            .relocate(0x28, 6, auth_pointer, 3)
+            .relocate(0x30, 7, macho::ARM64_RELOC_UNSIGNED, 3),
+    ];
+    let symbols = [
+        defined("_kmod_info", true, 1, 0),
+        defined("__ZTV5Other", true, 2, 0),
+        defined("__ZN5Other10superClassE", true, 2, 0x30),
+        defined("__ZN5OtherD1Ev", true, 0, 4),
+        defined("__ZN5OtherD0Ev", true, 0, 8),
+        undefined("__ZN4Base1aEv", false),
+        undefined("__ZN4Base10_RESERVED0Ev", false),
+        undefined("__ZN6Parent10gMetaClassE", false),
+        undefined("_IOLog", false),
+    ];
+    object_file(&sections, &symbols)
+}
+
+const OTHER_INFO: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.stela.Other</string>
+<key>CFBundleExecutable</key><string>Other</string>
+<key>CFBundleVersion</key><string>2.0.0</string>
+<key>OSBundleLibraries</key><dict><key>com.apple.kpi.iokit</key><string>8.0.0</string></dict>
+</dict></plist>"#;
+
+fn other(objects: Vec<&[u8]>) -> Kext<'_> {
+    Kext {
+        info: OTHER_INFO,
+        objects,
+        bundle_path: "/Library/Extensions/Other.kext".into(),
+        trusted_code: Vec::new(),
+    }
+}
+
+/// Each fileset entry's identifier, address and file offset, in order.
+fn fileset_entries(file: &[u8]) -> Vec<(String, u64, u64)> {
+    let header = macho::MachHeader64::<LE>::parse(file, 0).unwrap();
+    let mut commands = header.load_commands(LE, file, 0).unwrap();
+    let mut entries = Vec::new();
+    while let Some(command) = commands.next().unwrap() {
+        if command.cmd() == macho::LC_FILESET_ENTRY {
+            let entry = command.data::<macho::FilesetEntryCommand<LE>>().unwrap();
+            let name = command.string(LE, entry.entry_id).unwrap();
+            entries.push((
+                String::from_utf8_lossy(name).into_owned(),
+                entry.vmaddr.get(LE),
+                entry.fileoff.get(LE),
+            ));
+        }
+    }
+    entries
+}
+
+#[test]
+fn a_kext_that_cannot_link_is_left_out_and_the_others_kept() -> Result<()> {
+    let boot = boot_collection();
+    let good = kext_object();
+    let second = other_object();
+    // A kext naming a symbol the kernel does not export.
+    let bad = object_file(
+        &[
+            InputSection::new("__DATA", "__data", 0, vec![0; 16]).relocate(
+                0x8,
+                1,
+                macho::ARM64_RELOC_UNSIGNED,
+                3,
+            ),
+        ],
+        &[
+            defined("_kmod_info", true, 0, 0),
+            undefined("_hidden", false),
+        ],
+    );
+    let bad_kext = Kext {
+        info: br#"<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.stela.Bad</string>
+<key>CFBundleExecutable</key><string>Bad</string>
+<key>CFBundleVersion</key><string>1.0.0</string>
+<key>OSBundleLibraries</key><dict><key>com.apple.kpi.iokit</key><string>8.0.0</string></dict>
+</dict></plist>"#,
+        objects: vec![&bad],
+        bundle_path: "/Library/Extensions/Bad.kext".into(),
+        trusted_code: Vec::new(),
+    };
+    let kexts = [kext(vec![&good]), bad_kext.clone(), other(vec![&second])];
+    assert!(link(&boot, &kexts).is_err(), "together they do not link");
+    let mut left_out = Vec::new();
+    let (linked, kept) = link_dropping(&boot, &kexts, &mut |index, why| {
+        left_out.push((index, format!("{why:#}")));
+    })?;
+    assert_eq!(kept, [0, 2]);
+    let [(1, why)] = &left_out[..] else {
+        panic!("only the bad kext is left out: {left_out:?}");
+    };
+    assert!(why.contains("_hidden is undefined"), "{why}");
+    assert!(
+        why.contains("com.stela.Bad"),
+        "the refusal names the kext: {why}"
+    );
+    let survivors = [kext(vec![&good]), other(vec![&second])];
+    assert_eq!(
+        linked.collection,
+        link(&boot, &survivors)?.collection,
+        "the survivors link as they would alone"
+    );
+    let names: Vec<String> = fileset_entries(&linked.collection)
+        .into_iter()
+        .map(|entry| entry.0)
+        .collect();
+    assert_eq!(names, ["com.stela.Test", "com.stela.Other"]);
+
+    // Everything links: nothing is left out.
+    let (_, kept) = link_dropping(&boot, &survivors, &mut |index, _| {
+        panic!("kext {index} left out")
+    })?;
+    assert_eq!(kept, [0, 1]);
+    // Kexts that link alone but not together: the later one goes.
+    let twice = [kext(vec![&good]), kext(vec![&good])];
+    let mut left_out = Vec::new();
+    let (_, kept) = link_dropping(&boot, &twice, &mut |index, why| {
+        left_out.push((index, format!("{why:#}")));
+    })?;
+    assert_eq!(kept, [0]);
+    assert!(
+        matches!(&left_out[..], [(1, why)] if why.contains("listed twice")),
+        "{left_out:?}"
+    );
+    // Nothing links: the first refusal, and one kext alone is refused as
+    // `link` refuses it.
+    assert!(link_dropping(&boot, core::slice::from_ref(&bad_kext), &mut |_, _| ()).is_err());
+    assert!(link_dropping(&boot, &[bad_kext.clone(), bad_kext], &mut |_, _| ()).is_err());
+    Ok(())
+}
+
 /// Links a built kext against a real boot kernel collection, as every boot
 /// does, so a kext that names a symbol the kernel does not export is found
 /// before it stops a boot. Run with

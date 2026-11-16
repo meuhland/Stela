@@ -107,19 +107,61 @@ pub struct Request<'a> {
     /// names when it holds none for the options' ECID: the ECID is an
     /// option of the USB that installed, and a USB made again has another.
     pub adopt_ecid: bool,
+    /// Hears how the kexts' collection was linked, for the boot's log.
+    pub report: Option<&'a dyn LinkReport>,
+}
+
+/// What the boot hears of the auxiliary collection's link.
+pub trait LinkReport {
+    /// The link starts.
+    fn linking(&self) {}
+    /// The kext `bundle` is left out of the collection: it cannot be linked.
+    fn dropped(&self, bundle: &str, why: &Error);
+    /// The collection, `bytes` long, holds the kexts `bundles`.
+    fn linked(&self, bundles: &[&str], bytes: usize);
+}
+
+/// The auxiliary collection of a request's kexts.
+struct Auxiliary {
+    collection: Decoded,
+    /// What admits it.
+    grant: KextGrant,
+    /// The trust cache of the code its kexts install, if any.
+    code: Option<Decoded>,
 }
 
 /// The collection of `request`'s kexts, linked against `kernel`, and what
-/// admits it.
-fn auxiliary_collection(kernel: &[u8], request: &Request) -> Result<Option<(Decoded, KextGrant)>> {
+/// admits it. A kext that cannot be linked is left out, and reported, while
+/// another links ([`aux_kc::link_dropping`]).
+fn auxiliary_collection(kernel: &[u8], request: &Request) -> Result<Option<Auxiliary>> {
     if request.kexts.is_empty() {
         return Ok(None);
     }
-    let linked = aux_kc::link(kernel, request.kexts)?;
-    let source = linked.source(request.kexts);
+    if let Some(report) = request.report {
+        report.linking();
+    }
+    let (linked, kept) = aux_kc::link_dropping(kernel, request.kexts, &mut |index, why| {
+        if let Some(report) = request.report {
+            report.dropped(request.kexts[index].bundle_name(), why);
+        }
+    })?;
+    let kexts: Vec<Kext<'_>> = kept
+        .iter()
+        .map(|&index| request.kexts[index].clone())
+        .collect();
+    if let Some(report) = request.report {
+        let names: Vec<&str> = kexts.iter().map(Kext::bundle_name).collect();
+        report.linked(&names, linked.collection.len());
+    }
+    let source = linked.source(&kexts);
     let grant = linked.grant();
     let bytes = linked.collection;
-    Ok(Some((Decoded { source, bytes }, grant)))
+    let code = Linked::trust_cache(&kexts)?.map(|(source, bytes)| Decoded { source, bytes });
+    Ok(Some(Auxiliary {
+        collection: Decoded { source, bytes },
+        grant,
+        code,
+    }))
 }
 
 /// The hash type and hash of a root-hash record: an `isys` object's payload,
@@ -747,9 +789,14 @@ pub fn prepare<R: ReadAt>(
         },
         bytes,
     });
-    let (auxiliary, kexts) = auxiliary_collection(&kernel.bytes, request)?.unzip();
-    let kext_code =
-        Linked::trust_cache(request.kexts)?.map(|(source, bytes)| Decoded { source, bytes });
+    let (auxiliary, kexts, kext_code) = match auxiliary_collection(&kernel.bytes, request)? {
+        Some(Auxiliary {
+            collection,
+            grant,
+            code,
+        }) => (Some(collection), Some(grant), code),
+        None => (None, None, None),
+    };
     let inputs = Inputs {
         target: Target {
             product_type,

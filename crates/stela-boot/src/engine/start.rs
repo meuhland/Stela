@@ -26,6 +26,33 @@ pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
     lock_scale_arguments(scale)
 }
 
+/// The auxiliary collection's link in the boot's log: the kexts it holds and
+/// how long the link took, and each kext left out and why.
+#[derive(Default)]
+struct KextLog {
+    started: core::cell::Cell<u64>,
+}
+
+impl installed::LinkReport for KextLog {
+    fn linking(&self) {
+        self.started.set(output::now());
+    }
+
+    fn dropped(&self, bundle: &str, why: &stela_loader::Error) {
+        output::arguments(format_args!(
+            "KEXTS {bundle} left out of the auxiliary collection, which the others keep: {why}\n"
+        ));
+    }
+
+    fn linked(&self, bundles: &[&str], bytes: usize) {
+        output::arguments(format_args!(
+            "KEXTS auxiliary collection {} ({bytes} bytes) linked in {} ms\n",
+            bundles.join(", "),
+            output::millis_since(self.started.get())
+        ));
+    }
+}
+
 /// The boot bundle `--preboot` names, built from the installed system on
 /// `partition`: its macOS, its staged update or its recoveryOS.
 fn from_disk(
@@ -123,10 +150,12 @@ fn from_disk(
                  its devices have no driver\n"
             ));
         }
+        let log = KextLog::default();
         let request = installed::Request {
             volume: options.boot_volume,
             kexts: &kexts,
             adopt_ecid,
+            report: Some(&log),
             ..installed::Request::default()
         };
         let mut defaults = defaults;
