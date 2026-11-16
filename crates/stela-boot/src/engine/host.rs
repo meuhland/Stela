@@ -450,6 +450,13 @@ pub(crate) fn device_counter_behind() -> u64 {
     DEVICE_COUNTER.longest_behind()
 }
 
+/// The device clock ([`device_counter`]) in [`fresh_counter`]'s 24 MHz
+/// ticks: a count one core takes and another subtracts from, never earlier
+/// than one any core was given.
+pub(crate) fn device_ticks() -> u64 {
+    counter_at_tsc(state(), device_counter())
+}
+
 impl State {
     /// The base native count reads, which take this core's raw counter,
     /// subtract: `tsc_base`, the BSP's, moved by this core's software

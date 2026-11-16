@@ -432,10 +432,11 @@ impl Service {
             lap.part(Part::Bluetooth);
         }
         if let Some(audio) = audio.as_mut().filter(|_| due(AUDIO, false, &mut turn)) {
-            // The sink's clock is the corrected count, as the turn may run
-            // on any core.
-            devices.with(|devices| audio.serve(devices, host::fresh_counter()));
-            audio.play(host::fresh_counter());
+            // The sink's clock is the device clock in counter ticks: the
+            // turn may run on any core, and a core whose counter trails the
+            // last turn's would owe nothing now and the gap again next turn.
+            devices.with(|devices| audio.serve(devices, host::device_ticks()));
+            audio.play(host::device_ticks());
             audio.transitions();
             lap.part(Part::Audio);
         }
