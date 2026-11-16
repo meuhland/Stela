@@ -264,6 +264,13 @@ pub(super) struct Resources {
     recycle_hits: u64,
     recycle_misses: u64,
     heap_refusals: HeapRefusals,
+    /// Who may still read a live buffer's or texture's memory through the
+    /// destroyed textures over it or views of it, by buffer and by texture:
+    /// a view or buffer texture shared with other connections, or with an
+    /// aligned copy every commit refreshes from the rows, is read beyond
+    /// its owner's connection, and its memory is the buffer's or parent's.
+    buffer_readers: BTreeMap<u32, super::pins::Scope>,
+    texture_readers: BTreeMap<u32, super::pins::Scope>,
 }
 
 /// What the device keeps of destroyed private textures, and how often
@@ -530,8 +537,35 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "textures still alias the buffer",
         )?;
         let buffer = self.resources.buffers.remove(id.0)?;
-        self.defer(Object::Buffer(buffer.buffer));
-        self.release_backing(buffer.backing, Some(buffer.memory))
+        let readers = self.resources.buffer_readers.remove(&id.0);
+        let scope = self.with_readers(readers);
+        self.release_for(scope, |device| {
+            device.defer(Object::Buffer(buffer.buffer));
+            device.release_backing(buffer.backing, Some(buffer.memory))
+        })
+    }
+
+    /// The current release scope and `readers`: who read the object through
+    /// what was destroyed over it.
+    fn with_readers(&self, readers: Option<super::pins::Scope>) -> super::pins::Scope {
+        match readers {
+            Some(readers) => self.scope.union(&readers),
+            None => self.scope.clone(),
+        }
+    }
+
+    /// Notes that the readers of what is released now read `slot`'s memory.
+    fn add_readers(&mut self, texture: bool, slot: u32) {
+        let readers = if texture {
+            &mut self.resources.texture_readers
+        } else {
+            &mut self.resources.buffer_readers
+        };
+        let scope = match readers.remove(&slot) {
+            Some(known) => known.union(&self.scope),
+            None => self.scope.clone(),
+        };
+        readers.insert(slot, scope);
     }
 
     /// `newTextureWithDescriptor:`.
@@ -1996,6 +2030,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "views of the texture are still alive",
         )?;
         let texture = self.resources.textures.remove(id.0)?;
+        let readers = self.resources.texture_readers.remove(&id.0);
         self.forget_extended_planes(id);
         // Every commit refreshes an aligned copy, whatever its connection.
         let copies = self.take_aligned_copies(id);
@@ -2011,9 +2046,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let mut scope = self
             .queue
             .carriers(id)
-            .fold(self.scope.clone(), |scope, key| super::pins::Scope {
-                reach: scope.reach.with(key),
-                ..scope
+            .fold(self.with_readers(readers), |scope, key| {
+                super::pins::Scope {
+                    reach: scope.reach.with(key),
+                    ..scope
+                }
             });
         if copies.is_some() {
             scope.reach = super::pins::Reach::All;
@@ -2138,7 +2175,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             self.defer(Object::BufferView(view));
         }
         match texture.parent {
-            Some(parent) => self.resources.textures.get_mut(parent.0)?.dependents -= 1,
+            Some(parent) => {
+                self.resources.textures.get_mut(parent.0)?.dependents -= 1;
+                self.add_readers(true, parent.0);
+            }
             None => {
                 if let Some(image) = texture.image {
                     self.release_sparse(image)?;
@@ -2184,7 +2224,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
             }
             (Backing::Buffer(buffer), _) => {
-                self.resources.buffers.get_mut(buffer.0)?.dependents -= 1
+                self.resources.buffers.get_mut(buffer.0)?.dependents -= 1;
+                self.add_readers(false, buffer.0);
             }
             (Backing::Sparse(heap), _) => self.resources.heaps.get_mut(heap.0)?.resources -= 1,
         }

@@ -5263,3 +5263,52 @@ fn the_completion_timeline_is_offered_again_until_the_device_is_lost() {
     assert!(!device.rearm_completion());
     assert_eq!(device.take_completion(), None);
 }
+
+/// A view others read, as a shared one is read by every connection that
+/// held it, keeps its parent for their command buffers too: before, the
+/// parent's release by its own connection freed its image while another
+/// connection's command buffer still sampled the view.
+#[test]
+fn a_parent_outlives_the_readers_of_its_views() {
+    let mut device = device_on(MockBackend::new());
+    let made = device.submitted_serial();
+    let descriptor = TextureDescriptor {
+        options: options(StorageMode::Managed),
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let parent = device.new_texture(&descriptor).unwrap();
+    let image = device.texture_image(parent).unwrap();
+    let view = device
+        .new_texture_view(
+            parent,
+            &crate::metal::resource::TextureViewDescriptor {
+                pixel_format: PixelFormat::Rgba8UnormSrgb,
+                texture_type: TextureType::D2,
+                levels: 0..1,
+                slices: 0..1,
+                swizzle: SwizzleChannels::IDENTITY,
+                min_lod: 0.0,
+            },
+        )
+        .unwrap();
+    let commands = device.new_command_buffer();
+    let other = device.commit_for(2, commands).unwrap();
+    let holders = pins::Scope {
+        created: 0,
+        reach: pins::Reach::Many([1, 2].into()),
+    };
+    device
+        .release_for(holders, |device| device.destroy_texture(view))
+        .unwrap();
+    release_as(&mut device, 1, made, |device| {
+        device.destroy_texture(parent)
+    })
+    .unwrap();
+    assert!(
+        !device.backend().destroyed.contains(&Object::Image(image)),
+        "the parent stays while connection 2's command buffer runs"
+    );
+    device.backend().finish();
+    assert_eq!(device.poll(), Ok(other));
+    assert!(device.backend().destroyed.contains(&Object::Image(image)));
+}

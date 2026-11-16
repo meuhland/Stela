@@ -302,3 +302,40 @@ fn two_plane_surfaces_copy_each_unaligned_plane() {
     );
     device.destroy_texture(texture).unwrap();
 }
+
+/// Every connection's command buffer refreshes an aligned copy from its
+/// rows, so the rows' buffer outlives the command buffers of other
+/// connections that read it, though the buffer is its own connection's:
+/// before, connection 1's release of the texture and then the buffer freed
+/// the rows while connection 2's command buffer still copied from them.
+#[test]
+fn rows_another_connections_work_refreshes_from_outlive_it() {
+    use crate::metal::{device::pins::Scope, vulkan::backend::Object};
+    let mut device = device();
+    let made = device.submitted_serial();
+    let buffer = buffer(&mut device, 1 << 20);
+    let (memory, ..) = device.buffer_memory(buffer).unwrap();
+    let usage = TextureUsage::SHADER_READ;
+    let odd = descriptor(PixelFormat::Bgra8Unorm, 1004, 10, usage);
+    let texture = device
+        .new_texture_from_buffer(buffer, &odd, 65_536, 4016)
+        .unwrap();
+    assert!(device.has_aligned_copy(texture));
+    let commands = device.new_command_buffer();
+    let other = device.commit_for(2, commands).unwrap();
+    assert_eq!(row_copies(&mut device).len(), 1, "it reads the rows");
+    let own = Scope::connection(1, made);
+    device
+        .release_for(own.clone(), |device| device.destroy_texture(texture))
+        .unwrap();
+    device
+        .release_for(own, |device| device.destroy_buffer(buffer))
+        .unwrap();
+    assert!(
+        !device.backend().destroyed.contains(&Object::Memory(memory)),
+        "the rows stay while connection 2's command buffer runs"
+    );
+    device.backend().finish();
+    assert_eq!(device.poll(), Ok(other));
+    assert!(device.backend().destroyed.contains(&Object::Memory(memory)));
+}
