@@ -271,6 +271,13 @@ pub(super) struct Resources {
     /// its owner's connection, and its memory is the buffer's or parent's.
     buffer_readers: BTreeMap<u32, super::pins::Scope>,
     texture_readers: BTreeMap<u32, super::pins::Scope>,
+    /// Who may still read a live heap's memory through the destroyed
+    /// resources placed in it, by heap: a resource read beyond the heap's
+    /// connection (CPU-copy uploads another connection's commit carried,
+    /// an aligned copy every commit refreshes, a view or buffer texture
+    /// over it others read) lies in the heap's memory, which goes with the
+    /// heap.
+    heap_readers: BTreeMap<u32, super::pins::Scope>,
 }
 
 /// What the device keeps of destroyed private textures, and how often
@@ -281,6 +288,15 @@ pub struct RecycleReport {
     pub bytes: u64,
     pub hits: u64,
     pub misses: u64,
+}
+
+/// Whose memory the readers of a destroyed resource read
+/// ([`Device::add_readers`]).
+#[derive(Clone, Copy, Debug)]
+enum Readers {
+    Buffer,
+    Texture,
+    Heap,
 }
 
 /// Resources automatic heaps answered nil for, as Metal does when a heap
@@ -554,12 +570,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         }
     }
 
-    /// Notes that the readers of what is released now read `slot`'s memory.
-    fn add_readers(&mut self, texture: bool, slot: u32) {
-        let readers = if texture {
-            &mut self.resources.texture_readers
-        } else {
-            &mut self.resources.buffer_readers
+    /// Notes that the readers of what is released now read the memory of
+    /// `owner`'s `slot`.
+    fn add_readers(&mut self, owner: Readers, slot: u32) {
+        let readers = match owner {
+            Readers::Buffer => &mut self.resources.buffer_readers,
+            Readers::Texture => &mut self.resources.texture_readers,
+            Readers::Heap => &mut self.resources.heap_readers,
         };
         let scope = match readers.remove(&slot) {
             Some(known) => known.union(&self.scope),
@@ -647,7 +664,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             Ok(created) => created,
             Err(error) => {
                 self.backend.destroy(Object::Image(image));
-                self.release_backing(backing, memory)?;
+                self.unwind_backing(backing, memory)?;
                 return Err(error);
             }
         };
@@ -2177,7 +2194,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         match texture.parent {
             Some(parent) => {
                 self.resources.textures.get_mut(parent.0)?.dependents -= 1;
-                self.add_readers(true, parent.0);
+                self.add_readers(Readers::Texture, parent.0);
             }
             None => {
                 if let Some(image) = texture.image {
@@ -2197,6 +2214,18 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     fn release_backing(&mut self, backing: Backing, memory: Option<Memory>) -> Result<()> {
+        self.give_back(backing, memory, true)
+    }
+
+    /// Gives back what a resource that failed to be made reserved: nothing
+    /// read it.
+    fn unwind_backing(&mut self, backing: Backing, memory: Option<Memory>) -> Result<()> {
+        self.give_back(backing, memory, false)
+    }
+
+    /// Gives back a resource's backing; one that was `read` leaves its
+    /// readers to the heap it lay in.
+    fn give_back(&mut self, backing: Backing, memory: Option<Memory>, read: bool) -> Result<()> {
         match (backing, memory) {
             (Backing::Owned(bytes), Some(memory)) => self.release_memory(memory, bytes),
             (Backing::Owned(_), None) => {}
@@ -2211,7 +2240,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 },
                 memory,
             ) => {
-                let heap = self.resources.heaps.get_mut(heap.0)?;
+                let slot = heap.0;
+                let heap = self.resources.heaps.get_mut(slot)?;
                 heap.resources -= 1;
                 if let (Some(allocator), false) = (&mut heap.allocator, aliasable) {
                     allocator.free(offset, size)?;
@@ -2222,12 +2252,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 if let (Some(memory), true) = (memory, own != 0) {
                     self.release_memory(memory, own);
                 }
+                if read {
+                    self.add_readers(Readers::Heap, slot);
+                }
             }
             (Backing::Buffer(buffer), _) => {
                 self.resources.buffers.get_mut(buffer.0)?.dependents -= 1;
-                self.add_readers(false, buffer.0);
+                if read {
+                    self.add_readers(Readers::Buffer, buffer.0);
+                }
             }
-            (Backing::Sparse(heap), _) => self.resources.heaps.get_mut(heap.0)?.resources -= 1,
+            (Backing::Sparse(heap), _) => {
+                self.resources.heaps.get_mut(heap.0)?.resources -= 1;
+                if read {
+                    self.add_readers(Readers::Heap, heap.0);
+                }
+            }
         }
         Ok(())
     }
@@ -2588,7 +2628,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let (buffer, memory, memory_offset, address) = match created {
             Ok(created) => created,
             Err(error) => {
-                self.release_backing(backing, None)?;
+                self.unwind_backing(backing, None)?;
                 return Err(error);
             }
         };
@@ -2666,7 +2706,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let (image, own) = match created {
             Ok(created) => created,
             Err(error) => {
-                self.release_backing(backing, None)?;
+                self.unwind_backing(backing, None)?;
                 return Err(error);
             }
         };
@@ -2871,7 +2911,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "resources still live in the heap",
         )?;
         let heap = self.resources.heaps.remove(id.0)?;
-        self.release_memory(heap.memory, heap.bytes);
+        let readers = self.resources.heap_readers.remove(&id.0);
+        let scope = self.with_readers(readers);
+        self.release_for(scope, |device| {
+            device.release_memory(heap.memory, heap.bytes);
+        });
         Ok(())
     }
 }

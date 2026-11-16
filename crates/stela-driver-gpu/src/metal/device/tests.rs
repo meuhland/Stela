@@ -5312,3 +5312,61 @@ fn a_parent_outlives_the_readers_of_its_views() {
     assert_eq!(device.poll(), Ok(other));
     assert!(device.backend().destroyed.contains(&Object::Image(image)));
 }
+
+/// The whole allocations the backend freed so far.
+fn memory_frees(device: &mut TestDevice) -> usize {
+    device
+        .backend()
+        .destroyed
+        .iter()
+        .filter(|object| matches!(object, Object::Memory(_)))
+        .count()
+}
+
+/// A resource placed in a heap that others read, as another connection's
+/// commit carries a CPU-copy upload into it or every commit refreshes an
+/// aligned copy from its rows, keeps the heap's memory for their command
+/// buffers too: before, the heap's release by its own connection freed the
+/// memory while another connection's held command buffer still had to read
+/// the resource.
+#[test]
+fn a_heap_outlives_the_readers_of_its_resources() {
+    let mut device = device_on(MockBackend::new());
+    let made = device.submitted_serial();
+    let private = options(StorageMode::Private);
+    let heap = device
+        .new_heap(&HeapDescriptor {
+            size: 1 << 20,
+            options: private,
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size64,
+        })
+        .unwrap();
+    let descriptor = TextureDescriptor {
+        options: private,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let placed = device.new_heap_texture(heap, &descriptor, None).unwrap();
+    let (event, _) = hold_for_event(&mut device, 2);
+    let readers = pins::Scope {
+        created: 0,
+        reach: pins::Reach::Many([1, 2].into()),
+    };
+    device
+        .release_for(readers, |device| device.destroy_texture(placed))
+        .unwrap();
+    let before = memory_frees(&mut device);
+    release_as(&mut device, 1, made, |device| device.destroy_heap(heap)).unwrap();
+    device.poll().unwrap();
+    assert_eq!(
+        memory_frees(&mut device),
+        before,
+        "the heap's memory stays while connection 2's held work may read its texture"
+    );
+    device.set_signaled_value(event, 1).unwrap();
+    device.backend().finish();
+    device.poll().unwrap();
+    assert_eq!(memory_frees(&mut device), before + 1);
+    let memory = device.memory();
+    assert_eq!((memory.deferred, memory.pinned), (0, 0));
+}
