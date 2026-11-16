@@ -105,9 +105,16 @@ mod tests {
         let gate = place_gpu_gate(&mut tree, 0, GATE).unwrap();
         let net = place_net(&mut tree).unwrap();
         let virtio = place_virtio(&mut tree, 0).unwrap();
-        let windows = [(gate, GATE), (net, 0x4000), (virtio, 0x4000)];
+        // The console, a second device, after the entropy device.
+        let console = place_virtio(&mut tree, 1).unwrap();
+        let windows = [
+            (gate, GATE),
+            (net, 0x4000),
+            (virtio, 0x4000),
+            (console, 0x4000),
+        ];
         let inputs: Vec<u32> = windows.iter().map(|(placement, _)| placement.irq).collect();
-        assert_eq!(inputs, [0x41, 0x42, 0x43]);
+        assert_eq!(inputs, [0x41, 0x42, 0x43, 0x44]);
         for (index, (a, a_bytes)) in windows.iter().enumerate() {
             for (b, b_bytes) in &windows[index + 1..] {
                 assert!(
@@ -117,6 +124,10 @@ mod tests {
             }
         }
         assert_eq!(virtio.physical, 0x2_0ffe_8000);
+        assert_eq!(console.physical, 0x2_0ffe_4000);
         assert!(tree.node("/arm-io/stela-virtio0").is_some());
+        let node = tree.node("/arm-io/stela-virtio1").unwrap();
+        assert_eq!(node.property("compatible").unwrap().value, COMPATIBLE);
+        assert_eq!(node.property("interrupts").unwrap().as_u32(), Some(0x44));
     }
 }

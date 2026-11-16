@@ -223,6 +223,12 @@ fn virtio_is_off_unless_asked_and_round_trips() {
     let line = format!("{preboot} --external-disks --virtio --page-relative --shared-aliases");
     let options = round_trip(&line);
     assert!(options.virtio && options.page_relative && options.shared_aliases);
+    assert!(!options.virtio_console_echo);
+    assert_eq!(options.to_string(), line);
+    // The console's echo source, the K2 boot's line.
+    let line = format!("{preboot} --virtio --virtio-console-echo --page-relative --shared-aliases");
+    let options = round_trip(&line);
+    assert!(options.virtio && options.virtio_console_echo);
     assert_eq!(options.to_string(), line);
 }
 

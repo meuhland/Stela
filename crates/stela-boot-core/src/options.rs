@@ -33,6 +33,7 @@ pub const VERIFY_ON_READ: &str = "--verify-on-read";
 pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const VIRTIO: &str = "--virtio";
+pub const VIRTIO_CONSOLE_ECHO: &str = "--virtio-console-echo";
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -406,9 +407,15 @@ pub struct System {
     pub guest_network_stelanet_offloads: StelaNetOffloads,
     /// Give the guest Stela's virtio-mmio devices and link Stela's own
     /// virtio kext, StelaVirtIO, beside StelaGPU (`--virtio`): the entropy
-    /// device at `/arm-io/stela-virtio0`. Without it neither the nodes nor
-    /// the kext are in the boot.
+    /// device at `/arm-io/stela-virtio0` and the console at
+    /// `/arm-io/stela-virtio1`. Without it neither the nodes nor the kext
+    /// are in the boot.
     pub virtio: bool,
+    /// Feed the virtio console's input from the host's test source
+    /// (`--virtio-console-echo`, with `--virtio`): a greeting when the
+    /// guest's driver starts, then each line the guest writes sent back
+    /// prefixed with `echo: `. Without it the console has no input.
+    pub virtio_console_echo: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -508,6 +515,7 @@ impl Default for System {
             guest_network_stelanet: false,
             guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
             virtio: false,
+            virtio_console_echo: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -943,6 +951,7 @@ impl fmt::Display for System {
             )?;
         }
         line.flag(VIRTIO, self.virtio)?;
+        line.flag(VIRTIO_CONSOLE_ECHO, self.virtio_console_echo)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

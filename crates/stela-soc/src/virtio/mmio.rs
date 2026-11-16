@@ -249,7 +249,7 @@ impl Mmio {
         let event_idx = self.event_idx();
         match self
             .device
-            .step(&mut self.queues, notified, memory, event_idx)
+            .step(&mut self.queues, notified, memory, event_idx, access.now)
         {
             Ok(served) => {
                 self.stats.chains += served.chains;
@@ -260,6 +260,21 @@ impl Mmio {
             }
             Err(why) => self.fail(why, access),
         }
+        if self.device.has_lines()
+            && let Some(notice) = self.notice
+        {
+            notice.store(true, Ordering::Release);
+        }
+    }
+
+    /// The device's own lines for the log since the last call.
+    pub fn take_lines(&mut self) -> Vec<alloc::string::String> {
+        self.device.take_lines()
+    }
+
+    /// The device's own counters, by name.
+    pub fn device_counters(&self) -> Vec<(&'static str, u64)> {
+        self.device.counters()
     }
 
     fn raise(&mut self, bits: u32, access: &mut Access<'_>) {
@@ -519,6 +534,11 @@ impl MmioDevice for Mmio {
                 .config_write(offset - CONFIG, width.bytes(), value)
             {
                 self.config_generation = self.config_generation.wrapping_add(1);
+                if self.device.has_lines()
+                    && let Some(notice) = self.notice
+                {
+                    notice.store(true, Ordering::Release);
+                }
                 Ok(())
             } else {
                 Err(refused("the configuration space takes no such write"))

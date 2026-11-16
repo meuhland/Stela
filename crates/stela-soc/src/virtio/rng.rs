@@ -107,6 +107,7 @@ impl VirtioDevice for Rng {
         notified: u64,
         memory: &mut dyn Memory,
         event_idx: bool,
+        _now: u64,
     ) -> Result<Served, &'static str> {
         let Some(queue) = queues.first_mut().and_then(Option::as_mut) else {
             return Ok(Served::default());

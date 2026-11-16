@@ -1,15 +1,23 @@
 //! Stela's virtio devices and its own virtio kext, StelaVirtIO, which a
-//! `--virtio` boot gives the guest: the entropy device at
-//! `/arm-io/stela-virtio0` on the virtio-mmio transport
-//! (`stela_soc::virtio`), fed from the boot's seeded random stream, and the
-//! kext linked into the auxiliary collection beside StelaGPU. The kext is in
-//! the image only with the `virtio-kext` feature, as `include_bytes!` needs
-//! `xtask guest`'s output; unlike StelaGPU it needs no `nvk`.
+//! `--virtio` boot gives the guest on the virtio-mmio transport
+//! (`stela_soc::virtio`), each device its own node, page and AIC input:
 //!
-//! The boot log has a `VIRTIO` line for the device's placement, each thing
+//! - `/arm-io/stela-virtio0`: the entropy device, fed from the boot's
+//!   seeded random stream;
+//! - `/arm-io/stela-virtio1`: the console. What the guest writes is logged
+//!   as `VIRTIO console tx: <line>`; its input is the host's test source
+//!   with `--virtio-console-echo` (a greeting, then each line echoed), else
+//!   nothing, as Stela has no host terminal channel yet.
+//!
+//! The kext is linked into the auxiliary collection beside StelaGPU. It is
+//! in the image only with the `virtio-kext` feature, as `include_bytes!`
+//! needs `xtask guest`'s output; unlike StelaGPU it needs no `nvk`.
+//!
+//! The boot log has a `VIRTIO` line for each device's placement, each thing
 //! its driver does (status changes, the features agreed, the queues'
-//! places, the first notification, errors) soon after it happens, and the
-//! device's counters at each service report while they move.
+//! places, the first notification, errors) soon after it happens, the
+//! console's lines, and the devices' counters at each service report while
+//! they move.
 use super::{output, parallel};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +25,12 @@ use stela_contracts::interrupt::AicInput;
 use stela_contracts::virtio::status;
 use stela_loader::{apple_device_tree::DeviceTree, aux_kc::Kext, stela_gpu::Placement};
 use stela_soc::machine::{AppleDevices, VirtioReport};
-use stela_soc::virtio::{mmio::Event, rng::Rng};
+use stela_soc::virtio::{
+    VirtioDevice,
+    console::{Console, Echo, Input, Silent},
+    mmio::Event,
+    rng::Rng,
+};
 
 /// `xtask guest`'s objects of the StelaVirtIO kext.
 #[cfg(feature = "virtio-kext")]
@@ -36,10 +49,27 @@ const BUNDLE_PATH: &str = "/Library/Extensions/StelaVirtIO.kext";
 /// Whether this image carries the kext.
 pub(super) const EMBEDDED: bool = cfg!(feature = "virtio-kext");
 
-/// The entropy device's node index.
-const RNG: usize = 0;
+/// The devices a `--virtio` boot places, by node index: the entropy device
+/// stays `stela-virtio0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Rng,
+    Console,
+}
 
-/// Set when a device has events for the log.
+const DEVICES: [Kind; 2] = [Kind::Rng, Kind::Console];
+
+impl Kind {
+    /// Its name in the log, as its device names itself without `virtio-`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rng => "rng",
+            Self::Console => "console",
+        }
+    }
+}
+
+/// Set when a device has events or lines for the log.
 static EVENTS: AtomicBool = AtomicBool::new(false);
 
 /// The kexts a boot links for its virtio devices: StelaVirtIO when the boot
@@ -59,50 +89,83 @@ pub(super) fn kexts(wanted: bool) -> Vec<Kext<'static>> {
     Vec::new()
 }
 
-/// Places the entropy device's node, after the GPU gates and StelaNet: it
-/// takes the next free window and AIC input. A tree with no room has none.
-pub(super) fn place(tree: &mut DeviceTree) -> Option<Placement> {
-    match stela_loader::virtio::place_virtio(tree, RNG) {
-        Ok(placement) => Some(placement),
-        Err(error) => {
-            output::arguments(format_args!("VIRTIO rng not placed: {error}\n"));
-            None
+/// A device's node, placed.
+pub(super) struct Placed {
+    index: usize,
+    kind: Kind,
+    placement: Placement,
+}
+
+/// Places every device's node, in index order, after the GPU gates and
+/// StelaNet: each takes the next free window and AIC input. A device the
+/// tree has no room for is left out, and those after it still placed.
+pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
+    let mut placed = Vec::new();
+    for (index, kind) in DEVICES.into_iter().enumerate() {
+        match stela_loader::virtio::place_virtio(tree, index) {
+            Ok(placement) => placed.push(Placed {
+                index,
+                kind,
+                placement,
+            }),
+            Err(error) => {
+                output::arguments(format_args!("VIRTIO {} not placed: {error}\n", kind.name()))
+            }
         }
+    }
+    placed
+}
+
+/// Puts each placed device where its node says, its AIC input split into
+/// die and input by the board's `per_die`. `echo` gives the console the
+/// host's test input.
+pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32, echo: bool) {
+    for Placed {
+        index,
+        kind,
+        placement,
+    } in placed
+    {
+        let irq = AicInput::new(
+            (placement.irq / per_die) as u8,
+            (placement.irq % per_die) as u16,
+        );
+        let (device, detail): (Box<dyn VirtioDevice>, &str) = match kind {
+            Kind::Rng => {
+                let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
+                (Box::new(Rng::new(source)), "")
+            }
+            Kind::Console => {
+                let (input, detail): (Box<dyn Input>, &str) = if echo {
+                    (Box::new(Echo::new()), ", input: the echo test source")
+                } else {
+                    (Box::new(Silent), ", no input")
+                };
+                (Box::new(Console::new(input)), detail)
+            }
+        };
+        devices
+            .add_virtio_mmio(placement.physical, irq, device, Some(&EVENTS))
+            .unwrap_or_else(|error| output::fatal(&error));
+        output::arguments(format_args!(
+            "VIRTIO {} /arm-io/{} at {:#x} aic input {:#x}{detail}{}\n",
+            kind.name(),
+            stela_loader::virtio::name(index),
+            placement.physical,
+            placement.irq,
+            if EMBEDDED {
+                ""
+            } else {
+                " (no StelaVirtIO kext in this image)"
+            }
+        ));
     }
 }
 
-/// Puts the entropy device where its node says, its AIC input split into
-/// die and input by the board's `per_die`.
-pub(super) fn add(devices: &mut AppleDevices, placement: Placement, per_die: u32) {
-    let irq = AicInput::new(
-        (placement.irq / per_die) as u8,
-        (placement.irq % per_die) as u16,
-    );
-    let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
-    devices
-        .add_virtio_mmio(
-            placement.physical,
-            irq,
-            Box::new(Rng::new(source)),
-            Some(&EVENTS),
-        )
-        .unwrap_or_else(|error| output::fatal(&error));
-    output::arguments(format_args!(
-        "VIRTIO rng /arm-io/{} at {:#x} aic input {:#x}{}\n",
-        stela_loader::virtio::name(RNG),
-        placement.physical,
-        placement.irq,
-        if EMBEDDED {
-            ""
-        } else {
-            " (no StelaVirtIO kext in this image)"
-        }
-    ));
-}
-
-/// Logs what the devices' drivers did since the last call; `counters` adds
-/// each device's counters, when they moved. Without `counters` it looks
-/// only when a device has events, and never waits for the devices' lock.
+/// Logs what the devices' drivers did since the last call, and the
+/// console's lines; `counters` adds each device's counters, when they
+/// moved. Without `counters` it looks only when a device has events or
+/// lines, and never waits for the devices' lock.
 pub(super) fn report(devices: &parallel::Board, counters: bool) {
     if !counters && !EVENTS.load(Ordering::Acquire) {
         return;
@@ -167,11 +230,20 @@ fn log(report: &VirtioReport) {
             report.dropped_events
         ));
     }
+    // The console's output, already escaped and rate-limited.
+    for line in &report.lines {
+        output::arguments(format_args!("VIRTIO {name} tx: {line}\n"));
+    }
     if report.fresh {
         let stats = report.stats;
+        let own: String = report
+            .counters
+            .iter()
+            .map(|(counter, value)| alloc::format!(" {counter}={value}"))
+            .collect();
         output::arguments(format_args!(
             "VIRTIO {name} served={} chains={} notifies={} interrupts={} status={:#x} \
-             features={:#x}{}\n",
+             features={:#x}{own}{}\n",
             stats.bytes,
             stats.chains,
             stats.notifies,

@@ -9,13 +9,14 @@
 //! board's DMA step, as StelaNet's frames move: the guest's notifications
 //! and the device's own [`VirtioDevice::due`] work bring the step about. The
 //! queues are split virtqueues ([`queue`]), shared with StelaNet.
+pub mod console;
 pub mod mmio;
 pub mod queue;
 pub mod rng;
 #[cfg(test)]
 mod tests;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use queue::{Queue, RingError};
 use stela_contracts::dma::Memory;
 
@@ -61,15 +62,30 @@ pub trait VirtioDevice {
     fn due(&self) -> bool {
         false
     }
+    /// Lines of its own for the boot log since the last call, such as the
+    /// console's output.
+    fn take_lines(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Whether it has lines for [`Self::take_lines`].
+    fn has_lines(&self) -> bool {
+        false
+    }
+    /// Counters of its own for the boot log's report, by name.
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
     /// Its DMA step on `queues` (`None` where a queue is not ready), the
     /// ones in `notified` (bit per index) told of new buffers, with
-    /// `VIRTIO_F_EVENT_IDX` as negotiated. An error stops the device.
+    /// `VIRTIO_F_EVENT_IDX` as negotiated, at counter tick `now`. An error
+    /// stops the device.
     fn step(
         &mut self,
         queues: &mut [Option<Queue>],
         notified: u64,
         memory: &mut dyn Memory,
         event_idx: bool,
+        now: u64,
     ) -> Result<Served, &'static str>;
 }
 
