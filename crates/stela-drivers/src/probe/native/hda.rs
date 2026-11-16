@@ -192,9 +192,15 @@ pub struct HdmiPlayback {
     period: usize,
     ring: usize,
     running: bool,
+    without_eld: Option<audio::Error>,
 }
 
 impl HdmiPlayback {
+    /// With the route prepared on a sink whose ELD did not read or parse
+    /// (`hda::hdmi::BASIC_AUDIO` only): why.
+    pub fn without_eld(&self) -> Option<audio::Error> {
+        self.without_eld
+    }
     pub fn converter(&self) -> u8 {
         self.converter
     }
@@ -270,16 +276,22 @@ impl Host {
             period: period_bytes,
             ring,
             running: false,
+            without_eld: None,
         })
     }
 
     /// Prepare the route (`hda::Controller::prepare_hdmi`, which reads the
     /// sink's ELD again), fill the whole ring with silence and start its
-    /// DMA. A sink without a valid ELD is `SinkUnavailable`.
+    /// DMA. A sink without ELD_VALID is `SinkUnavailable`; one whose ELD
+    /// does not read or parse takes basic audio only
+    /// ([`HdmiPlayback::without_eld`]).
     pub fn start_hdmi(&mut self, playback: &mut HdmiPlayback) -> Result<(), RetirementError> {
         let (controller, _) = self.owner.controller()?;
         playback.running = false;
         controller.prepare_hdmi(playback.port, playback.stream, playback.converter, None)?;
+        playback.without_eld = controller
+            .hdmi_sink(playback.port)?
+            .and_then(|sink| sink.eld_error);
         let silence = alloc::vec![0u8; playback.ring];
         controller.write_pcm(playback.stream, 0, &silence)?;
         controller.start(playback.stream)?;

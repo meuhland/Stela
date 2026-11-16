@@ -29,7 +29,10 @@ use stela_boot_core::guest_audio::{
 use stela_drivers::{
     audio::{
         self as hd_audio, PcmFormat,
-        hda::hdmi::{DisplayAudioIdentity, DisplayAudioPort, DisplayAudioState},
+        hda::hdmi::{
+            self as hdmi_codec, DisplayAudioIdentity, DisplayAudioPort, DisplayAudioState, EldRead,
+            HdmiEntry, SinkAudio,
+        },
     },
     bus::pci::Address,
     probe::native::hda::{HdmiPlayback, Host, RetirementError},
@@ -39,12 +42,9 @@ use stela_soc::machine::{AppleDevices, USB_AUDIO_CHANNELS, UsbAudioStatus};
 type Frame = [i32; USB_AUDIO_CHANNELS];
 
 /// The HDMI output's stream: 48 kHz 16-bit stereo, which every HDMI sink
-/// takes (`Eld::supports`'s baseline).
-const HDMI_FORMAT: PcmFormat = PcmFormat {
-    rate: 48_000,
-    bits: 16,
-    channels: 2,
-};
+/// takes (`Eld::supports`'s baseline), and all a sink whose ELD stayed
+/// unreadable or malformed is given (`hdmi::BASIC_AUDIO`).
+const HDMI_FORMAT: PcmFormat = hdmi_codec::BASIC_AUDIO;
 /// One period: 10 ms, 1920 bytes, a multiple of the HDA's 128 bytes.
 const HDMI_PERIOD_FRAMES: usize = 480;
 const HDMI_PERIOD_BYTES: usize = HDMI_PERIOD_FRAMES * 4;
@@ -248,7 +248,20 @@ impl Hdmi {
             let _ = self.host.stop_hdmi(&mut self.playback);
             match self.host.start_hdmi(&mut self.playback) {
                 Ok(()) => {
-                    if self.refills == 0 && self.restarts == 0 {
+                    if self.refills == 0
+                        && self.restarts == 0
+                        && let Some(error) = self.playback.without_eld()
+                    {
+                        output::arguments(format_args!(
+                            "GUEST AUDIO HDMI playing on {} without an ELD ({}): converter \
+                             {:#04x}, stream tag {}, basic audio 48 kHz 16-bit stereo on FL/FR, \
+                             {HDMI_PERIODS} periods of 10 ms\n",
+                            self.place,
+                            eld_reason(&error),
+                            self.playback.converter(),
+                            self.playback.stream_tag(),
+                        ));
+                    } else if self.refills == 0 && self.restarts == 0 {
                         output::arguments(format_args!(
                             "GUEST AUDIO HDMI playing on {}: converter {:#04x}, stream tag {}, \
                              48 kHz 16-bit stereo, {HDMI_PERIODS} periods of 10 ms\n",
@@ -258,8 +271,14 @@ impl Hdmi {
                         ));
                     } else if logged(self.restarts) {
                         output::arguments(format_args!(
-                            "GUEST AUDIO HDMI playing again on {} (restart {})\n",
-                            self.place, self.restarts
+                            "GUEST AUDIO HDMI playing again on {} (restart {}){}\n",
+                            self.place,
+                            self.restarts,
+                            if self.playback.without_eld().is_some() {
+                                " without an ELD"
+                            } else {
+                                ""
+                            }
                         ));
                     }
                     self.error = None;
@@ -499,8 +518,20 @@ pub(super) fn claim_display_audio(
                         && playback.is_none()
                         && let Some(target) = target
                     {
-                        playback = hdmi_playback(&mut host, address, target)
-                            .map(|(output, place)| (hosts.len(), output, place));
+                        if let Some(why) = &target.without_eld {
+                            output::arguments(format_args!(
+                                "GUEST AUDIO HDMI {address} codec {} pin {:#04x} device {} \
+                                 plays without an ELD: {why}; basic audio only: 2-channel 48 kHz \
+                                 16-bit LPCM on front left/right (FL/FR)\n",
+                                target.codec, target.pin, target.device
+                            ));
+                        }
+                        playback = hdmi_playback(
+                            &mut host,
+                            address,
+                            (target.codec, target.pin, target.device),
+                        )
+                        .map(|(output, place)| (hosts.len(), output, place));
                     }
                     hosts.push(host);
                 }
@@ -531,14 +562,86 @@ pub(super) fn claim_display_audio(
     }
 }
 
-/// The longest the claim and the codecs' discovery may take.
+/// The longest the claim and the codecs' discovery may take, the survey's
+/// ELD repolls (`hdmi::ELD_READS` reads `hdmi::ELD_REPOLL_US` apart, for a
+/// sink whose ELD does not read or parse) included.
 const CLAIM_US: u64 = 10_000_000;
 
+/// Where the monitor's sound plays: a codec, pin and device entry, and,
+/// for a sink whose ELD stayed unreadable or malformed, why it plays basic
+/// audio without one.
+struct Target {
+    codec: u8,
+    pin: u8,
+    device: u8,
+    without_eld: Option<String>,
+}
+
+/// An ELD read or parse failure as the check that failed names it.
+fn eld_reason(error: &hd_audio::Error) -> String {
+    match error {
+        hd_audio::Error::EldRead(fault) => alloc::format!("{fault}"),
+        hd_audio::Error::EldParse(fault) => alloc::format!("{fault}"),
+        error => alloc::format!("{error:?}"),
+    }
+}
+
+/// Bytes as the `ELD ... bytes:` lines print them; `-` for none.
+fn hex_bytes(raw: &[u8]) -> String {
+    if raw.is_empty() {
+        return String::from("-");
+    }
+    let bytes: Vec<_> = raw.iter().map(|b| alloc::format!("{b:02x}")).collect();
+    bytes.join(" ")
+}
+
+/// How an ELD read ended: read, malformed (all bytes read, not parsed) or
+/// unreadable (the read stopped).
+fn eld_kind(eld: &Result<hd_audio::hda::hdmi::Eld, hd_audio::Error>) -> &'static str {
+    match eld {
+        Ok(_) => "read",
+        Err(hd_audio::Error::EldParse(_)) => "malformed",
+        Err(_) => "unreadable",
+    }
+}
+
+/// One failed ELD read of `entry`: the check that stopped it, and the
+/// bytes read before it stopped (or all of them, malformed).
+fn report_eld_failure(
+    entry: &HdmiEntry,
+    read: u8,
+    error: &hd_audio::Error,
+    raw: &[u8],
+    more: &str,
+) {
+    let failed = Err(*error);
+    let kind = eld_kind(&failed);
+    output::arguments(format_args!(
+        "GUEST AUDIO HDMI ELD pin {:#04x} device {}: {kind} on read {read} of up to {}: {}{more}\n",
+        entry.pin,
+        entry.device,
+        hdmi_codec::ELD_READS,
+        eld_reason(error),
+    ));
+    output::arguments(format_args!(
+        "GUEST AUDIO HDMI ELD pin {:#04x} device {} bytes of read {read} ({} {}): {}\n",
+        entry.pin,
+        entry.device,
+        raw.len(),
+        if kind == "malformed" {
+            "read, malformed"
+        } else {
+            "read before it stopped"
+        },
+        hex_bytes(raw)
+    ));
+}
+
 /// The claimed controller's codecs, HDMI/DP pins and the ELDs on them;
-/// the first entry whose ELD takes 48 kHz 16-bit stereo, as its codec,
-/// pin and device entry.
-fn report_display_audio(host: &mut Host, gpu: Address) -> Option<(u8, u8, u8)> {
-    use stela_boot_core::guest_audio::{audio_descriptor, speakers};
+/// the first entry whose ELD takes 48 kHz 16-bit stereo, else the first
+/// present with ELD_VALID set whose ELD stayed unreadable or malformed,
+/// for basic audio (`hdmi::choose_hdmi_target`).
+fn report_display_audio(host: &mut Host, gpu: Address) -> Option<Target> {
     let location = host.location.clone();
     let proof = match host.vouch {
         stela_drivers::probe::native::hda::Vouch::BusReset => {
@@ -591,7 +694,7 @@ fn report_display_audio(host: &mut Host, gpu: Address) -> Option<(u8, u8, u8)> {
             return None;
         }
     };
-    let mut target = None;
+    let mut surveyed: Vec<(u8, HdmiEntry)> = Vec::new();
     for (codec, survey) in surveys {
         let entries = match survey {
             Ok(entries) => entries,
@@ -604,10 +707,11 @@ fn report_display_audio(host: &mut Host, gpu: Address) -> Option<(u8, u8, u8)> {
         };
         for entry in entries {
             let eld = match &entry.eld {
-                None => "none",
-                Some(Ok((_, Ok(_)))) => "read",
-                Some(Ok((_, Err(_)))) => "malformed",
-                Some(Err(_)) => "unreadable",
+                None => String::from("none"),
+                Some(read) if read.reads > 1 => {
+                    alloc::format!("{} after {} reads", eld_kind(&read.eld), read.reads)
+                }
+                Some(read) => String::from(eld_kind(&read.eld)),
             };
             output::arguments(format_args!(
                 "GUEST AUDIO HDMI {location} codec {codec} pin {:#04x} device {}/{}: \
@@ -621,64 +725,88 @@ fn report_display_audio(host: &mut Host, gpu: Address) -> Option<(u8, u8, u8)> {
                 entry.present(),
                 entry.eld_valid(),
             ));
-            match &entry.eld {
-                Some(Ok((raw, parsed))) => {
-                    if let Ok(eld) = parsed {
-                        if target.is_none() && eld.supports(HDMI_FORMAT) {
-                            target = Some((codec, entry.pin, entry.device));
-                        }
-                        let sads: Vec<_> = eld
-                            .descriptors
-                            .iter()
-                            .map(|sad| {
-                                audio_descriptor(
-                                    sad.coding_type,
-                                    sad.channels,
-                                    sad.rates,
-                                    sad.sample_bits,
-                                )
-                            })
-                            .collect();
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI ELD pin {:#04x} device {}: monitor=\"{}\" \
-                             connection={:?} version={} manufacturer={:#06x} product={:#06x} \
-                             port={:#x} speakers={:#04x}[{}] sync_delay_ms={} sads=[{}]\n",
-                            entry.pin,
-                            entry.device,
-                            alloc::string::String::from_utf8_lossy(&eld.monitor_name),
-                            eld.connection,
-                            eld.version,
-                            eld.manufacturer,
-                            eld.product,
-                            eld.port_id,
-                            eld.speakers,
-                            speakers(eld.speakers),
-                            eld.audio_sync_delay_ms,
-                            sads.join(", "),
-                        ));
-                    } else if let Err(error) = parsed {
-                        output::arguments(format_args!(
-                            "GUEST AUDIO HDMI ELD pin {:#04x} device {}: malformed: {error:?}\n",
-                            entry.pin, entry.device
-                        ));
-                    }
-                    let bytes: Vec<_> = raw.iter().map(|b| alloc::format!("{b:02x}")).collect();
-                    output::arguments(format_args!(
-                        "GUEST AUDIO HDMI ELD pin {:#04x} device {} bytes: {}\n",
-                        entry.pin,
-                        entry.device,
-                        bytes.join(" ")
-                    ));
-                }
-                Some(Err(error)) => output::arguments(format_args!(
-                    "GUEST AUDIO HDMI ELD pin {:#04x} device {}: unreadable: {error:?}\n",
-                    entry.pin, entry.device
-                )),
-                None => {}
+            if let Some(read) = &entry.eld {
+                report_eld(&entry, read);
             }
+            surveyed.push((codec, entry));
         }
     }
-    target
+    let (codec, entry, audio) =
+        hdmi_codec::choose_hdmi_target(surveyed.iter().map(|(c, e)| (*c, e)), HDMI_FORMAT)?;
+    let without_eld = match audio {
+        SinkAudio::Eld => None,
+        SinkAudio::Basic(error) => Some(alloc::format!(
+            "present with ELD_VALID set, but its ELD stayed {} after {} reads: {}",
+            eld_kind(&Err(error)),
+            entry.eld.as_ref().map_or(0, |read| read.reads),
+            eld_reason(&error)
+        )),
+    };
+    Some(Target {
+        codec,
+        pin: entry.pin,
+        device: entry.device,
+        without_eld,
+    })
+}
+
+/// An entry's ELD reads: the first failure when it was read again, then
+/// the last read's ELD and bytes, or the check that stopped it and the
+/// bytes read before.
+fn report_eld(entry: &HdmiEntry, read: &EldRead) {
+    use stela_boot_core::guest_audio::{audio_descriptor, speakers};
+    if let Some((error, raw)) = &read.first_failure {
+        let again = alloc::format!(
+            "; reading it again every {} ms, up to {} reads",
+            hdmi_codec::ELD_REPOLL_US / 1000,
+            hdmi_codec::ELD_READS
+        );
+        report_eld_failure(entry, 1, error, raw, &again);
+    }
+    let eld = match &read.eld {
+        Ok(eld) => eld,
+        Err(error) => {
+            report_eld_failure(entry, read.reads, error, &read.raw, "");
+            return;
+        }
+    };
+    if read.reads > 1 {
+        output::arguments(format_args!(
+            "GUEST AUDIO HDMI ELD pin {:#04x} device {}: valid on read {} of up to {}\n",
+            entry.pin,
+            entry.device,
+            read.reads,
+            hdmi_codec::ELD_READS
+        ));
+    }
+    let sads: Vec<_> = eld
+        .descriptors
+        .iter()
+        .map(|sad| audio_descriptor(sad.coding_type, sad.channels, sad.rates, sad.sample_bits))
+        .collect();
+    output::arguments(format_args!(
+        "GUEST AUDIO HDMI ELD pin {:#04x} device {}: monitor=\"{}\" \
+         connection={:?} version={} manufacturer={:#06x} product={:#06x} \
+         port={:#x} speakers={:#04x}[{}] sync_delay_ms={} sads=[{}]\n",
+        entry.pin,
+        entry.device,
+        alloc::string::String::from_utf8_lossy(&eld.monitor_name),
+        eld.connection,
+        eld.version,
+        eld.manufacturer,
+        eld.product,
+        eld.port_id,
+        eld.speakers,
+        speakers(eld.speakers),
+        eld.audio_sync_delay_ms,
+        sads.join(", "),
+    ));
+    output::arguments(format_args!(
+        "GUEST AUDIO HDMI ELD pin {:#04x} device {} bytes: {}\n",
+        entry.pin,
+        entry.device,
+        hex_bytes(&read.raw)
+    ));
 }
 
 /// Sets up the playback on `target` of the claimed function at `address`,
