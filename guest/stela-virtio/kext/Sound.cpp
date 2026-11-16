@@ -609,7 +609,11 @@ StelaVirtIOSoundEngine::initHardware(IOService *provider)
 	    0,
 	};
 	stream->setSampleBuffer(device->sampleBuffer(), StelaVirtIOSound::kBufferBytes);
-	stream->addAvailableFormat(&format, &rate, &rate);
+	// No IO functions, so the stream clips with clipOutputSamples below.
+	// The one-function form with a null function would leave the stream a
+	// list of one null entry, which it clips with by calling nothing [kc:
+	// IOAudioStream::clipOutputSamples(UInt32, UInt32)]: K5's silence.
+	stream->addAvailableFormat(&format, &rate, &rate, static_cast<const AudioIOFunction *>(nullptr), 0);
 	IOReturn formatSet = stream->setFormat(&format);
 	IOReturn added = addAudioStream(stream);
 	stream->release();

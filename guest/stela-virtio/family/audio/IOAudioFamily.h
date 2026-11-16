@@ -24,8 +24,9 @@
  *   offsets and widths), the four-character codes AppleUSBAudio and the
  *   family pass ('lpcm', 'sint', 'outp', 'vlme', 'mute'), that
  *   IOAudioDevice::start calls initHardware (and, managing power, joins its
- *   provider's power tree), that output is direction 0, and
- *   IOAF_Float32ToNativeInt16's saturating conversion.
+ *   provider's power tree), that output is direction 0,
+ *   IOAF_Float32ToNativeInt16's saturating conversion, and when a stream
+ *   clips with its engine's clipOutputSamples (AudioIOFunction, below).
  * - [mem]: from memory of the open-source IOAudioFamily headers alone:
  *   every return type (a slot's mangled name carries none), the enums'
  *   values, the other structures' fields and the default arguments. The
@@ -135,7 +136,19 @@ enum : UInt8 {
 #define kIOAudioControlChannelNameAll "All Channels"
 #define kIOAudioNewClockDomain 0xFFFFFFFF
 
-/* IOAudioStream.h: what a stream calls to clip or convert its samples. */
+/*
+ * IOAudioStream.h: what a stream calls to clip or convert its samples.
+ *
+ * [kc] A stream clips with its format's IO function list when it has one,
+ * and with its engine's clipOutputSamples (IOAudioEngine slot 351) only
+ * when it has none: IOAudioStream::clipOutputSamples(UInt32, UInt32) calls
+ * each non-null entry of a non-empty list and then returns, never the
+ * engine's. The overloads taking one AudioIOFunction (and setIOFunction)
+ * always pass a list of one, `&ioFunction, 1`, even for a null function, so
+ * they leave a list of one null entry and nothing is ever clipped. A driver
+ * that clips in its engine passes the list form with no list, `nullptr, 0`,
+ * as AppleUSBAudio does. Their `= NULL` default is left out here for that.
+ */
 typedef IOReturn (*AudioIOFunction)(const void *mixBuf, void *sampleBuf, UInt32 firstSampleFrame,
     UInt32 numSampleFrames, const IOAudioStreamFormat *streamFormat, IOAudioStream *audioStream);
 
@@ -409,9 +422,10 @@ public:
 	virtual void addAvailableFormat(const IOAudioStreamFormat *streamFormat,
 	    const IOAudioStreamFormatExtension *formatExtension, const IOAudioSampleRate *minRate,
 	    const IOAudioSampleRate *maxRate, const AudioIOFunction *ioFunctionList, UInt32 numFunctions);
+	/* No default: see AudioIOFunction. */
 	virtual void addAvailableFormat(const IOAudioStreamFormat *streamFormat,
 	    const IOAudioStreamFormatExtension *formatExtension, const IOAudioSampleRate *minRate,
-	    const IOAudioSampleRate *maxRate, AudioIOFunction ioFunction = NULL);
+	    const IOAudioSampleRate *maxRate, AudioIOFunction ioFunction);
 	virtual bool validateFormat(IOAudioStreamFormat *streamFormat, IOAudioStreamFormatExtension *formatExtension,
 	    IOAudioStreamFormatDesc *formatDesc);
 	virtual void setTerminalType(const UInt32 terminalType);
@@ -489,8 +503,9 @@ public:
 	virtual IOReturn hardwareFormatChanged(const IOAudioStreamFormat *streamFormat);
 	virtual void addAvailableFormat(const IOAudioStreamFormat *streamFormat, const IOAudioSampleRate *minRate,
 	    const IOAudioSampleRate *maxRate, const AudioIOFunction *ioFunctionList, UInt32 numFunctions);
+	/* No default: see AudioIOFunction. */
 	virtual void addAvailableFormat(const IOAudioStreamFormat *streamFormat, const IOAudioSampleRate *minRate,
-	    const IOAudioSampleRate *maxRate, AudioIOFunction ioFunction = NULL);
+	    const IOAudioSampleRate *maxRate, AudioIOFunction ioFunction);
 	virtual void clearAvailableFormats();
 	virtual bool validateFormat(IOAudioStreamFormat *streamFormat, IOAudioStreamFormatDesc *formatDesc);
 	virtual UInt32 getStartingChannelID();

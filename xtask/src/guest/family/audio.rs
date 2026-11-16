@@ -70,16 +70,15 @@ mod tests {
         Manifest::parse(&text).unwrap()
     }
 
-    /// Compiles `source` as the kext's sources are compiled, with the
-    /// family headers of `headers` (which has `audio/IOAudioFamily.h`).
-    fn compile(source: &Path, headers: &Path) -> Vec<u8> {
-        let built = tempfile::tempdir().unwrap();
+    /// The command that compiles `source` into `built/object.o` as the
+    /// kext's sources are compiled, with the family headers of `headers`
+    /// (which has `audio/IOAudioFamily.h`).
+    fn compile_command(source: &Path, headers: &Path, built: &Path) -> Command {
         let root = crate::tools::root();
         let xnu = root.join("third_party/xnu");
-        let include = built.path().join("include");
+        let include = built.join("include");
         crate::guest::sdk::generate(&xnu, &include).unwrap();
         let clang = &crate::clang::toolset().unwrap().clangxx;
-        let object = built.path().join("object.o");
         let mut command = Command::new(clang);
         command
             .args(crate::guest::KEXT_FLAGS)
@@ -90,8 +89,18 @@ mod tests {
             command.arg("-isystem").arg(xnu.join(headers));
         }
         command.arg("-isystem").arg(&include);
-        crate::tools::exec(command.arg("-c").arg(source).arg("-o").arg(&object)).unwrap();
-        fs::read(object).unwrap()
+        command
+            .arg("-c")
+            .arg(source)
+            .arg("-o")
+            .arg(built.join("object.o"));
+        command
+    }
+
+    fn compile(source: &Path, headers: &Path) -> Vec<u8> {
+        let built = tempfile::tempdir().unwrap();
+        crate::tools::exec(&mut compile_command(source, headers, built.path())).unwrap();
+        fs::read(built.path().join("object.o")).unwrap()
     }
 
     fn probe_object(headers: &Path) -> Vec<u8> {
@@ -157,6 +166,54 @@ mod tests {
         assert_eq!(
             device[77].as_deref(),
             Some("__ZN16StelaVirtIOSound4initEP12OSDictionary")
+        );
+    }
+
+    /// K5's silence: a stream given a format by the one-function
+    /// `addAvailableFormat` with no function keeps a list of one null IO
+    /// function, which IOAudioStream::clipOutputSamples calls instead of
+    /// the engine's clipOutputSamples, so nothing is ever clipped [kc]. The
+    /// header has no default for that function, so the three-argument call
+    /// does not compile, and the list form with no list does.
+    #[test]
+    fn a_format_without_an_io_function_list_is_the_only_form_that_compiles() {
+        let built = tempfile::tempdir().unwrap();
+        let source = |body: &str| {
+            format!(
+                "#include <audio/IOAudioFamily.h>\n\
+                 void addFormat(IOAudioStream *stream, const IOAudioStreamFormat *format,\n\
+                 \x20   const IOAudioSampleRate *rate)\n{{\n\t{body}\n}}\n"
+            )
+        };
+        let silent = built.path().join("silent.cpp");
+        fs::write(
+            &silent,
+            source("stream->addAvailableFormat(format, rate, rate);"),
+        )
+        .unwrap();
+        let output = compile_command(&silent, &directory(), built.path())
+            .output()
+            .unwrap();
+        let errors = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{errors}");
+        assert!(errors.contains("addAvailableFormat"), "{errors}");
+
+        let listless = built.path().join("listless.cpp");
+        fs::write(
+            &listless,
+            source(
+                "stream->addAvailableFormat(format, rate, rate, \
+                 static_cast<const AudioIOFunction *>(nullptr), 0);",
+            ),
+        )
+        .unwrap();
+        let output = compile_command(&listless, &directory(), built.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
