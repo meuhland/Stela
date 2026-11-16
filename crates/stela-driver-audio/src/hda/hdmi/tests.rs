@@ -55,6 +55,10 @@ struct Hardware {
     reject: Option<u16>,
     drop_reply: Option<u16>,
     bad_eld: Option<u8>,
+    /// Reads of `bad_eld` that fail before it reads as written.
+    bad_eld_reads: usize,
+    /// The ELD size the codec answers.
+    eld_size: u32,
     stop_stuck: bool,
     reset_stuck: bool,
     late_position: Option<(usize, u32, u64)>,
@@ -104,6 +108,8 @@ impl Hardware {
             reject: None,
             drop_reply: None,
             bad_eld: None,
+            bad_eld_reads: usize::MAX,
+            eld_size: 32,
             stop_stuck: false,
             reset_stuck: false,
             late_position: None,
@@ -281,9 +287,11 @@ impl Hardware {
                 0
             }
             0xf06 => u32::from(self.binding),
+            0xf2e if byte == 8 => self.eld_size,
             0xf2e => 32,
             0xf2f => {
-                if self.bad_eld == Some(byte) {
+                if self.bad_eld == Some(byte) && self.bad_eld_reads > 0 {
+                    self.bad_eld_reads -= 1;
                     0
                 } else {
                     0x80000000 | u32::from(self.eld[usize::from(byte)])

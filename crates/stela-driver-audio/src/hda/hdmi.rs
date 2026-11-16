@@ -19,7 +19,7 @@ mod chmap;
 mod eld;
 mod playback;
 pub use chmap::{ChannelMap, Speaker};
-pub use eld::{AudioDescriptor, Connection, Eld};
+pub use eld::{AudioDescriptor, Connection, Eld, EldParseFault, EldReadFault};
 pub use playback::RefilledPeriod;
 
 const LEGACY_IDS: &[u32] = &[
@@ -48,6 +48,25 @@ const ELD_VALID: u32 = 1 << 30;
 const DIGITAL: u32 = 1 << 9;
 const PIN_HDMI: u32 = 1 << 7;
 const PIN_DP: u32 = 1 << 24;
+/// Linux hdmi_repoll_eld: the reads of an ELD that does not read or parse
+/// on a pin showing a sink with a valid ELD, and their spacing.
+pub const ELD_READS: u8 = 6;
+pub const ELD_REPOLL_US: u64 = 300_000;
+/// What a sink present with ELD_VALID set but without an ELD that reads
+/// and parses takes: basic audio, 2-channel 48 kHz 16-bit LPCM on front
+/// left/right, which every HDMI audio sink must accept. Linux likewise
+/// opens a PCM on a present sink without a valid ELD, on the codec's caps.
+pub const BASIC_AUDIO: PcmFormat = PcmFormat {
+    rate: 48_000,
+    bits: 16,
+    channels: 2,
+};
+/// CEA-861 speaker allocation bit 0: FL/FR, basic audio's speakers.
+const BASIC_SPEAKERS: u8 = 1;
+/// A pin sense showing a sink present with a valid ELD.
+fn eld_ready(sense: u32) -> bool {
+    sense != u32::MAX && sense & (PRESENT | ELD_VALID) == PRESENT | ELD_VALID
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayAudioIdentity {
@@ -105,12 +124,41 @@ pub struct HdmiEntry {
     pub pin_capabilities: u32,
     /// The entry's pin sense: presence detect in bit 31, ELD valid in 30.
     pub sense: u32,
-    /// With presence and a valid ELD: the ELD's bytes and their parse, or
-    /// the error that stopped the read.
+    /// With presence and a valid ELD: the ELD's reads, their bytes and
+    /// parse, or the check that stopped them.
     pub eld: Option<EldRead>,
 }
-/// An ELD's bytes and their parse, or why they could not be read.
-pub type EldRead = Result<(Vec<u8>, Result<Eld, Error>), Error>;
+/// The survey's reads of one entry's ELD (Linux hdmi_present_sense with
+/// hdmi_repoll_eld): the last read, and the first when it failed and the
+/// ELD was read again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EldRead {
+    /// The last read's bytes: the whole ELD, or those read before the
+    /// read stopped.
+    pub raw: Vec<u8>,
+    /// Their parse, or what stopped the read (`Error::EldRead`, or a
+    /// command transport error) or the parse (`Error::EldParse`).
+    pub eld: Result<Eld, Error>,
+    /// The reads made, 1..=[`ELD_READS`].
+    pub reads: u8,
+    /// With more than one read: what stopped the first, and its bytes.
+    pub first_failure: Option<(Error, Vec<u8>)>,
+}
+impl EldRead {
+    /// Whether the bytes were all read, but did not parse.
+    pub fn malformed(&self) -> bool {
+        matches!(self.eld, Err(Error::EldParse(_)))
+    }
+}
+/// How a surveyed entry takes a format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SinkAudio {
+    /// Its parsed ELD supports the format (`Eld::supports`).
+    Eld,
+    /// Present with ELD_VALID set, but its ELD did not read or parse, for
+    /// this reason: [`BASIC_AUDIO`] only.
+    Basic(Error),
+}
 impl HdmiEntry {
     pub fn present(&self) -> bool {
         self.sense != u32::MAX && self.sense & PRESENT != 0
@@ -118,6 +166,40 @@ impl HdmiEntry {
     pub fn eld_valid(&self) -> bool {
         self.sense != u32::MAX && self.sense & ELD_VALID != 0
     }
+    /// Whether, and how, this entry takes `format`: a sink present with a
+    /// valid ELD that supports it, or, whose ELD stayed unreadable or
+    /// malformed, basic audio. `prepare_hdmi` applies the same rule.
+    pub fn takes(&self, format: PcmFormat) -> Option<SinkAudio> {
+        if !self.present() || !self.eld_valid() {
+            return None;
+        }
+        match &self.eld.as_ref()?.eld {
+            Ok(eld) => eld.supports(format).then_some(SinkAudio::Eld),
+            Err(error @ (Error::EldRead(_) | Error::EldParse(_))) => {
+                (format == BASIC_AUDIO).then_some(SinkAudio::Basic(*error))
+            }
+            Err(_) => None,
+        }
+    }
+}
+/// The playback target among surveyed `entries` (by codec address) for
+/// `format`: the first whose ELD supports it, else the first present with
+/// ELD_VALID set whose ELD stayed unreadable or malformed, as basic audio.
+pub fn choose_hdmi_target<'a>(
+    entries: impl IntoIterator<Item = (u8, &'a HdmiEntry)>,
+    format: PcmFormat,
+) -> Option<(u8, &'a HdmiEntry, SinkAudio)> {
+    let mut basic = None;
+    for (codec, entry) in entries {
+        match entry.takes(format) {
+            Some(SinkAudio::Eld) => return Some((codec, entry, SinkAudio::Eld)),
+            Some(audio) => {
+                basic.get_or_insert((codec, entry, audio));
+            }
+            None => {}
+        }
+    }
+    basic
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdmiPortId {
@@ -128,6 +210,9 @@ pub struct HdmiPortId {
 pub struct HdmiSink {
     pub state: DisplayAudioState,
     pub eld: Option<Eld>,
+    /// A sink present with ELD_VALID set whose ELD did not read or parse:
+    /// why. It takes [`BASIC_AUDIO`] only.
+    pub eld_error: Option<Error>,
 }
 struct Route {
     stream: StreamId,
@@ -330,29 +415,97 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.verb(Verb::short(codec, pin, PIN_SENSE, device)?)
     }
     /// The selected device entry's ELD bytes, as Linux snd_hdmi_get_eld
-    /// reads them through the codec's command transport.
-    fn read_eld_bytes(&mut self, codec: u8, pin: u8) -> Result<Vec<u8>, Error> {
+    /// reads them through the codec's command transport, into `raw`: on a
+    /// failed check, the bytes read before it.
+    fn read_eld_bytes(&mut self, codec: u8, pin: u8, raw: &mut Vec<u8>) -> Result<(), Error> {
         self.minimum_guard()?;
-        let size = self.verb(Verb::short(codec, pin, 0xf2e, 8)?)?;
+        raw.clear();
+        let response = self.verb(Verb::short(codec, pin, 0xf2e, 8)?)?;
         // Same donor compatibility fallback: a zero length means 128,
         // never a missing service or invented monitor/ELD-valid bit.
-        let size = if size == 0 {
+        let size = if response == 0 {
             128
         } else {
-            usize::try_from(size).map_err(|_| Error::InvalidEld)?
+            usize::try_from(response).unwrap_or(usize::MAX)
         };
         if !(20..=256).contains(&size) {
-            return Err(Error::InvalidEld);
+            return Err(Error::EldRead(EldReadFault::Size { response }));
         }
-        let mut raw = Vec::with_capacity(size);
+        raw.reserve(size);
         for byte in 0..size {
-            let value = self.verb(Verb::short(codec, pin, 0xf2f, byte as u8)?)?;
-            if value == u32::MAX || value & (1 << 31) == 0 || (byte == 0 && value & 255 == 0) {
-                return Err(Error::InvalidEld);
+            let index = byte as u8;
+            let value = self.verb(Verb::short(codec, pin, 0xf2f, index)?)?;
+            let fault = if value == u32::MAX {
+                Some(EldReadFault::ByteUnanswered { index })
+            } else if value & (1 << 31) == 0 {
+                Some(EldReadFault::ByteNotValid {
+                    index,
+                    response: value,
+                })
+            } else if byte == 0 && value & 255 == 0 {
+                Some(EldReadFault::FirstByteZero { response: value })
+            } else {
+                None
+            };
+            if let Some(fault) = fault {
+                return Err(Error::EldRead(fault));
             }
             raw.push(value as u8);
         }
-        Ok(raw)
+        Ok(())
+    }
+    /// One ELD read and its parse: the bytes read, and the ELD or what
+    /// stopped the read or parse.
+    fn read_eld(&mut self, codec: u8, pin: u8) -> (Vec<u8>, Result<Eld, Error>) {
+        let mut raw = Vec::new();
+        let eld = self
+            .read_eld_bytes(codec, pin, &mut raw)
+            .and_then(|()| Eld::parse(&raw));
+        (raw, eld)
+    }
+    /// Linux hdmi_present_sense with hdmi_repoll_eld, for the survey: read
+    /// the selected entry's ELD and, while the read or its parse fails and
+    /// the entry still senses a sink with a valid ELD, read it again
+    /// [`ELD_REPOLL_US`] later, up to [`ELD_READS`] reads. `sense` is the
+    /// entry's sense, left at its last value.
+    fn survey_eld(
+        &mut self,
+        codec: u8,
+        pin: u8,
+        device: u8,
+        capabilities: u32,
+        sense: &mut u32,
+    ) -> Result<EldRead, Error> {
+        let mut first_failure = None;
+        let mut reads = 0;
+        loop {
+            reads += 1;
+            let (raw, eld) = self.read_eld(codec, pin);
+            let done = |raw, eld, first_failure| EldRead {
+                raw,
+                eld,
+                reads,
+                first_failure,
+            };
+            let error = match eld {
+                Err(error @ (Error::EldRead(_) | Error::EldParse(_))) if reads < ELD_READS => error,
+                eld => return Ok(done(raw, eld, first_failure)),
+            };
+            // A minimum delay that cannot be kept ends the repoll, not the survey.
+            if self
+                .timer
+                .check()
+                .and_then(|()| self.timer.wait_us(ELD_REPOLL_US))
+                .is_err()
+            {
+                return Ok(done(raw, Err(error), first_failure));
+            }
+            *sense = self.pin_sense(codec, pin, device, capabilities)?;
+            if !eld_ready(*sense) {
+                return Ok(done(raw, Err(error), first_failure));
+            }
+            first_failure.get_or_insert((error, raw));
+        }
     }
     /// Every HDMI/DP pin of NVIDIA HDMI codec `graph` and each of its device
     /// entries: its pin sense and, with a sink present and a valid ELD, the
@@ -387,16 +540,12 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             let devices = self.hdmi_devices(codec, vendor, pin)?;
             for device in 0..devices {
                 self.hdmi_select(codec, vendor, pin, device)?;
-                let sense = self.pin_sense(codec, pin, device, pin_capabilities)?;
-                let eld =
-                    if sense != u32::MAX && sense & (PRESENT | ELD_VALID) == PRESENT | ELD_VALID {
-                        Some(self.read_eld_bytes(codec, pin).map(|raw| {
-                            let parsed = Eld::parse(&raw);
-                            (raw, parsed)
-                        }))
-                    } else {
-                        None
-                    };
+                let mut sense = self.pin_sense(codec, pin, device, pin_capabilities)?;
+                let eld = if eld_ready(sense) {
+                    Some(self.survey_eld(codec, pin, device, pin_capabilities, &mut sense)?)
+                } else {
+                    None
+                };
                 entries.push(HdmiEntry {
                     pin,
                     device,
@@ -512,21 +661,44 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if sense == u32::MAX {
             return Err(Error::InvalidEld);
         }
-        if !state.connected || sense & PRESENT == 0 {
-            return Ok(HdmiSink { state, eld: None });
+        if !state.connected || sense & PRESENT == 0 || sense & ELD_VALID == 0 {
+            return Ok(HdmiSink {
+                state,
+                eld: None,
+                eld_error: None,
+            });
         }
-        if sense & ELD_VALID == 0 {
-            return Ok(HdmiSink { state, eld: None });
+        // One read: the survey repolls; a sink whose ELD does not read or
+        // parse keeps the reason and takes basic audio only. A command
+        // transport failure is no such reason.
+        let (_, eld) = self.read_eld(codec, pin);
+        if let Err(error) = eld
+            && !matches!(error, Error::EldRead(_) | Error::EldParse(_))
+        {
+            return Err(error);
         }
-        let raw = self.read_eld_bytes(codec, pin)?;
         let after = self.hdmi_pin_sense(index)?;
         if after != sense || self.hdmi_observe(index)? != state {
             return Err(Error::SinkChanged);
         }
-        Ok(HdmiSink {
-            state,
-            eld: Some(Eld::parse(&raw)?),
+        Ok(match eld {
+            Ok(eld) => HdmiSink {
+                state,
+                eld: Some(eld),
+                eld_error: None,
+            },
+            Err(error) => HdmiSink {
+                state,
+                eld: None,
+                eld_error: Some(error),
+            },
         })
+    }
+    /// The port's sink as the last [`Self::poll_hdmi_sink`] (or
+    /// [`Self::prepare_hdmi`]) read it.
+    pub fn hdmi_sink(&self, id: HdmiPortId) -> Result<Option<HdmiSink>, Error> {
+        let index = self.hdmi_index(id)?;
+        Ok(self.hdmi_ports[index].as_ref().unwrap().sink.clone())
     }
     /// Explicit polled hotplug/ELD service. A failed/changed snapshot first
     /// stops any PCM route; a new valid snapshot requires fresh prepare.
@@ -627,7 +799,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.route_control(codec, pin, 0x732, 0xf32, 0xc0)
     }
     /// Prepare digital converter, mux, count, slots, packet and pin for
-    /// 2..8ch LPCM, constrained by this sink's ELD. No HBR/non-PCM alias.
+    /// 2..8ch LPCM, constrained by this sink's ELD; a sink present with
+    /// ELD_VALID set whose ELD does not read or parse takes [`BASIC_AUDIO`]
+    /// on FL/FR only, else its ELD error. No HBR/non-PCM alias.
     pub fn prepare_hdmi(
         &mut self,
         id: HdmiPortId,
@@ -657,11 +831,34 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         let pin = self.hdmi_ports[index].as_ref().unwrap().pin;
         self.hdmi_topology(&graph, pin)?;
         let snapshot = self.poll_hdmi_sink(id)?;
-        let eld = snapshot.eld.as_ref().ok_or(Error::SinkUnavailable)?;
-        if !eld.supports(format) {
-            return Err(Error::InvalidFormat);
-        }
-        let map = ChannelMap::choose(format.channels, eld.speakers, custom_map)?;
+        let (speakers, connection) = match (&snapshot.eld, snapshot.eld_error) {
+            (Some(eld), _) => {
+                if !eld.supports(format) {
+                    return Err(Error::InvalidFormat);
+                }
+                (eld.speakers, eld.connection)
+            }
+            // Present with ELD_VALID set, but its ELD did not read or
+            // parse: basic audio on FL/FR only, over HDMI unless the pin
+            // cannot carry it (Linux's default connection type).
+            (None, Some(error)) => {
+                if format != BASIC_AUDIO {
+                    return Err(error);
+                }
+                let caps = graph
+                    .widget(pin)
+                    .and_then(|w| w.pin_capabilities)
+                    .unwrap_or(0);
+                let connection = if caps & PIN_HDMI == 0 && caps & PIN_DP != 0 {
+                    Connection::DisplayPort
+                } else {
+                    Connection::Hdmi
+                };
+                (BASIC_SPEAKERS, connection)
+            }
+            (None, None) => return Err(Error::SinkUnavailable),
+        };
+        let map = ChannelMap::choose(format.channels, speakers, custom_map)?;
         let widget = graph.widget(converter).ok_or(Error::InvalidCodecGraph)?;
         let actual = self.enumerate_codec(graph.address)?;
         let live = actual.widget(converter).ok_or(Error::InvalidCodecGraph)?;
@@ -772,7 +969,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                     }
                 }
             }
-            self.hdmi_packet(graph.address, pin, eld.connection, &map)?;
+            self.hdmi_packet(graph.address, pin, connection, &map)?;
             self.route_control(graph.address, pin, 0x707, 0xf07, 0x40)?;
             self.hdmi_long_control(graph.address, converter, 2, 0xa, format.encode()?)?;
             self.route_control(graph.address, converter, 0x706, 0xf06, stream.tag() << 4)?;

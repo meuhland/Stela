@@ -12,9 +12,10 @@ fn survey_reads_a_legacy_pins_sense_and_eld() {
     let entry = &entries[0];
     assert_eq!((entry.pin, entry.device, entry.devices), (4, 0, 1));
     assert!(entry.present() && entry.eld_valid());
-    let (raw, eld) = entry.eld.clone().unwrap().unwrap();
-    assert_eq!(raw, f.hardware.lock().unwrap().eld.to_vec());
-    let eld = eld.unwrap();
+    let read = entry.eld.clone().unwrap();
+    assert_eq!((read.reads, read.first_failure), (1, None));
+    assert_eq!(read.raw, f.hardware.lock().unwrap().eld.to_vec());
+    let eld = read.eld.unwrap();
     assert_eq!(eld.connection, Connection::Hdmi);
     assert_eq!(eld.speakers, 0x4f);
     assert_eq!(eld.port_id, 0x12345678);
@@ -87,6 +88,122 @@ fn survey_lists_every_mst_device_entry_and_reads_the_eld_where_the_gpu_wrote_it(
         .filter(|c| **c == (4 << 20) | (0x709 << 8))
         .count();
     assert_eq!(triggers, 4);
+}
+
+/// The ELD reads (get ELD size) the hardware has seen.
+fn eld_reads(f: &Fixture) -> usize {
+    f.hardware
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .filter(|c| **c == (4 << 20) | (0xf2e << 8) | 8)
+        .count()
+}
+
+#[test]
+fn survey_names_a_failed_eld_check_and_repolls_like_linux() {
+    // Byte 12 never valid: six reads 300 ms apart, the bytes before it kept.
+    let mut f = Fixture::new(false);
+    f.hardware.lock().unwrap().bad_eld = Some(12);
+    let mut c = f.controller();
+    let graph = c.enumerate_codec(0).unwrap();
+    let start = f.clock.0.load(Ordering::SeqCst);
+    let entries = c.survey_hdmi(&graph).unwrap();
+    assert!(f.clock.0.load(Ordering::SeqCst) - start >= 5 * ELD_REPOLL_US);
+    assert_eq!(eld_reads(&f), usize::from(ELD_READS));
+    let fault = Error::EldRead(EldReadFault::ByteNotValid {
+        index: 12,
+        response: 0,
+    });
+    let read = entries[0].eld.clone().unwrap();
+    let before = f.hardware.lock().unwrap().eld[..12].to_vec();
+    assert_eq!(read.raw, before);
+    assert_eq!(read.eld, Err(fault));
+    assert_eq!(read.reads, ELD_READS);
+    assert_eq!(read.first_failure, Some((fault, before)));
+    assert!(!read.malformed());
+    // Still the playback target: basic audio, never a wider format.
+    assert_eq!(
+        choose_hdmi_target(entries.iter().map(|e| (0, e)), BASIC_AUDIO)
+            .map(|(codec, e, audio)| (codec, e.pin, e.device, audio)),
+        Some((0, 4, 0, SinkAudio::Basic(fault)))
+    );
+    let wide = PcmFormat {
+        bits: 24,
+        ..BASIC_AUDIO
+    };
+    assert_eq!(entries[0].takes(wide), None);
+    c.shutdown().unwrap();
+
+    // Valid on the third read: the first failure and the ELD.
+    let mut f = Fixture::new(false);
+    {
+        let mut h = f.hardware.lock().unwrap();
+        h.bad_eld = Some(12);
+        h.bad_eld_reads = 2;
+    }
+    let mut c = f.controller();
+    let graph = c.enumerate_codec(0).unwrap();
+    let entries = c.survey_hdmi(&graph).unwrap();
+    let read = entries[0].eld.clone().unwrap();
+    assert_eq!(read.reads, 3);
+    assert_eq!(read.raw, f.hardware.lock().unwrap().eld.to_vec());
+    assert!(read.eld.is_ok());
+    assert_eq!(
+        read.first_failure.map(|(e, raw)| (e, raw.len())),
+        Some((fault, 12))
+    );
+    assert_eq!(entries[0].takes(BASIC_AUDIO), Some(SinkAudio::Eld));
+    c.shutdown().unwrap();
+
+    // A size out of range: nothing read; malformed bytes: all read.
+    for malformed in [false, true] {
+        let mut f = Fixture::new(false);
+        let expected = if malformed {
+            f.hardware.lock().unwrap().eld[4] = 31;
+            Error::EldParse(EldParseFault::MonitorNameLength { length: 31 })
+        } else {
+            f.hardware.lock().unwrap().eld_size = 19;
+            Error::EldRead(EldReadFault::Size { response: 19 })
+        };
+        let mut c = f.controller();
+        let graph = c.enumerate_codec(0).unwrap();
+        let entries = c.survey_hdmi(&graph).unwrap();
+        let read = entries[0].eld.clone().unwrap();
+        assert_eq!((read.eld.clone(), read.reads), (Err(expected), ELD_READS));
+        assert_eq!(read.malformed(), malformed);
+        assert_eq!(read.raw.len(), if malformed { 32 } else { 0 });
+        assert_eq!(
+            entries[0].takes(BASIC_AUDIO),
+            Some(SinkAudio::Basic(expected))
+        );
+        c.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn the_target_prefers_an_eld_that_takes_the_format() {
+    let mut f = Fixture::new(false);
+    let mut c = f.controller();
+    let graph = c.enumerate_codec(0).unwrap();
+    let good = c.survey_hdmi(&graph).unwrap().remove(0);
+    f.hardware.lock().unwrap().bad_eld = Some(3);
+    let bad = c.survey_hdmi(&graph).unwrap().remove(0);
+    f.hardware.lock().unwrap().sense = 0x8000_0000;
+    let no_eld = c.survey_hdmi(&graph).unwrap().remove(0);
+    c.shutdown().unwrap();
+    assert_eq!(no_eld.takes(BASIC_AUDIO), None);
+    let target = |entries: &[(u8, &HdmiEntry)]| {
+        choose_hdmi_target(entries.iter().copied(), BASIC_AUDIO)
+            .map(|(codec, _, audio)| (codec, audio == SinkAudio::Eld))
+    };
+    assert_eq!(
+        target(&[(1, &no_eld), (2, &bad), (3, &good)]),
+        Some((3, true))
+    );
+    assert_eq!(target(&[(1, &no_eld), (2, &bad)]), Some((2, false)));
+    assert_eq!(target(&[(1, &no_eld)]), None);
 }
 
 #[test]

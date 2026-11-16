@@ -159,6 +159,10 @@ pub enum Error {
     InvalidCodecGraph,
     InvalidHdmiPort,
     InvalidEld,
+    /// An ELD read stopped at a named check (`hda::hdmi::EldReadFault`).
+    EldRead(hda::hdmi::EldReadFault),
+    /// The ELD's bytes failed a named layout check (`hda::hdmi::EldParseFault`).
+    EldParse(hda::hdmi::EldParseFault),
     InvalidChannelMap,
     SinkUnavailable,
     SinkChanged,

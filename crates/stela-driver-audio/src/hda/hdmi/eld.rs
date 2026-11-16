@@ -7,6 +7,102 @@
 //! a804c5742bff224d4cb4d25dd383554d598be32b. See NOTICE.
 use crate::{Error, PcmFormat};
 use alloc::vec::Vec;
+use core::fmt;
+
+/// Which check of Linux snd_hdmi_get_eld stopped an ELD read through the
+/// codec's command transport, with the values it saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EldReadFault {
+    /// The ELD size (get HDMI ELD data, parameter 8) is outside 20..=256
+    /// bytes; a zero size is read as 128, as Linux does.
+    Size { response: u32 },
+    /// Byte `index`'s response has no ELD-valid bit 31: the graphics
+    /// driver may be writing the ELD right now (Linux repolls).
+    ByteNotValid { index: u8, response: u32 },
+    /// Byte `index` was not answered: an all-ones response.
+    ByteUnanswered { index: u8 },
+    /// Byte 0, the ELD version byte, read zero.
+    FirstByteZero { response: u32 },
+}
+
+impl fmt::Display for EldReadFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Size { response } => write!(
+                f,
+                "ELD size {response} ({response:#x}) is outside 20..=256 bytes"
+            ),
+            Self::ByteNotValid { index, response } => write!(
+                f,
+                "byte {index} response {response:#010x} has no ELD-valid bit 31 (the GPU may be \
+                 writing the ELD)"
+            ),
+            Self::ByteUnanswered { index } => {
+                write!(f, "byte {index} was not answered (response 0xffffffff)")
+            }
+            Self::FirstByteZero { response } => {
+                write!(f, "byte 0 (ELD version) is zero: response {response:#010x}")
+            }
+        }
+    }
+}
+
+/// Which check of the ELD's layout (Linux drm_eld / hda_eld) its bytes
+/// failed, with the values it saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EldParseFault {
+    /// The ELD is not 20..=256 bytes.
+    Length { bytes: u16 },
+    /// ELD_Ver (byte 0 bits 7:3) is neither 2 (CEA-861-D) nor 31.
+    Version { byte0: u8 },
+    /// MNL (byte 4 bits 4:0), the monitor name's length, exceeds 16.
+    MonitorNameLength { length: u8 },
+    /// The baseline block (BLL, byte 2, in dwords after the 4-byte header)
+    /// does not hold the 16 fixed bytes, the monitor name and the SADs, or
+    /// passes the ELD's end.
+    Baseline {
+        baseline_dwords: u8,
+        name_length: u8,
+        sads: u8,
+        bytes: u16,
+    },
+    /// Conn_Type (byte 5 bits 3:2) is neither 0 (HDMI) nor 1 (DP).
+    Connection { conn_type: u8 },
+}
+
+impl fmt::Display for EldParseFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Length { bytes } => write!(f, "{bytes} bytes, not 20..=256"),
+            Self::Version { byte0 } => write!(
+                f,
+                "version {} (byte 0 {byte0:#04x}) is neither 2 nor 31",
+                byte0 >> 3
+            ),
+            Self::MonitorNameLength { length } => {
+                write!(f, "monitor name length {length} exceeds 16")
+            }
+            Self::Baseline {
+                baseline_dwords,
+                name_length,
+                sads,
+                bytes,
+            } => write!(
+                f,
+                "baseline of {baseline_dwords} dwords ends at byte {}, but the monitor name \
+                 ({name_length} bytes) and {sads} SADs end at byte {} of {bytes}",
+                4 + u16::from(baseline_dwords) * 4,
+                20 + u16::from(name_length) + 3 * u16::from(sads)
+            ),
+            Self::Connection { conn_type } => {
+                write!(
+                    f,
+                    "connection type {conn_type} is neither 0 (HDMI) nor 1 (DP)"
+                )
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Connection {
@@ -46,20 +142,34 @@ impl Eld {
         &self.raw
     }
     pub fn parse(raw: &[u8]) -> Result<Self, Error> {
-        if !(20..=256).contains(&raw.len()) || !matches!(raw[0] >> 3, 2 | 31) {
-            return Err(Error::InvalidEld);
+        let fault = |fault| Err(Error::EldParse(fault));
+        if !(20..=256).contains(&raw.len()) {
+            return fault(EldParseFault::Length {
+                bytes: raw.len().min(usize::from(u16::MAX)) as u16,
+            });
+        }
+        if !matches!(raw[0] >> 3, 2 | 31) {
+            return fault(EldParseFault::Version { byte0: raw[0] });
         }
         let name = usize::from(raw[4] & 31);
         let count = usize::from(raw[5] >> 4);
         let baseline = 4 + usize::from(raw[2]) * 4;
         let end = 20 + name + 3 * count;
-        if name > 16 || end > raw.len() || baseline < end || baseline > raw.len() {
-            return Err(Error::InvalidEld);
+        if name > 16 {
+            return fault(EldParseFault::MonitorNameLength { length: name as u8 });
+        }
+        if end > raw.len() || baseline < end || baseline > raw.len() {
+            return fault(EldParseFault::Baseline {
+                baseline_dwords: raw[2],
+                name_length: name as u8,
+                sads: count as u8,
+                bytes: raw.len() as u16,
+            });
         }
         let connection = match (raw[5] >> 2) & 3 {
             0 => Connection::Hdmi,
             1 => Connection::DisplayPort,
-            _ => return Err(Error::InvalidEld),
+            conn_type => return fault(EldParseFault::Connection { conn_type }),
         };
         let descriptors = raw[20 + name..end]
             .as_chunks::<3>()
@@ -170,17 +280,78 @@ mod tests {
     }
     #[test]
     fn malformed_lengths_versions_and_connection_are_rejected() {
+        use EldParseFault::*;
         for index in 0..5 {
             let mut b = bytes();
-            match index {
-                0 => b[0] = 8,
-                1 => b[4] = 31,
-                2 => b[2] = 1,
-                3 => b[5] = 0xf0,
-                _ => b[5] |= 8,
+            let expected = match index {
+                0 => {
+                    b[0] = 8;
+                    Version { byte0: 8 }
+                }
+                1 => {
+                    b[4] = 31;
+                    MonitorNameLength { length: 31 }
+                }
+                2 => {
+                    b[2] = 1;
+                    Baseline {
+                        baseline_dwords: 1,
+                        name_length: 0,
+                        sads: 2,
+                        bytes: 32,
+                    }
+                }
+                3 => {
+                    b[5] = 0xf0;
+                    Baseline {
+                        baseline_dwords: 7,
+                        name_length: 0,
+                        sads: 15,
+                        bytes: 32,
+                    }
+                }
+                _ => {
+                    b[5] |= 8;
+                    Connection { conn_type: 2 }
+                }
             };
-            assert_eq!(Eld::parse(&b), Err(Error::InvalidEld));
+            assert_eq!(Eld::parse(&b), Err(Error::EldParse(expected)));
         }
-        assert_eq!(Eld::parse(&[0; 19]), Err(Error::InvalidEld));
+        assert_eq!(
+            Eld::parse(&[0; 19]),
+            Err(Error::EldParse(Length { bytes: 19 }))
+        );
+    }
+
+    #[test]
+    fn faults_name_their_check_and_values() {
+        use alloc::string::ToString;
+        assert_eq!(
+            EldParseFault::Version { byte0: 0x08 }.to_string(),
+            "version 1 (byte 0 0x08) is neither 2 nor 31"
+        );
+        assert_eq!(
+            EldParseFault::Baseline {
+                baseline_dwords: 1,
+                name_length: 0,
+                sads: 2,
+                bytes: 32
+            }
+            .to_string(),
+            "baseline of 1 dwords ends at byte 8, but the monitor name (0 bytes) and 2 SADs end \
+             at byte 26 of 32"
+        );
+        assert_eq!(
+            EldReadFault::ByteNotValid {
+                index: 12,
+                response: 0x41
+            }
+            .to_string(),
+            "byte 12 response 0x00000041 has no ELD-valid bit 31 (the GPU may be writing the ELD)"
+        );
+        assert_eq!(
+            EldReadFault::Size { response: 300 }.to_string(),
+            "ELD size 300 (0x12c) is outside 20..=256 bytes"
+        );
     }
 }

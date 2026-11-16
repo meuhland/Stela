@@ -67,8 +67,18 @@ fn invalid_port_rejected() {
         let attached = unsafe { c.attach_hdmi_port(&graph, 4, 0, f.owner.clone()) };
         if fault == 3 || fault == 4 {
             let port = attached.unwrap();
-            let (s, _) = f.stream(&mut c, 2, 16);
-            assert_eq!(c.prepare_hdmi(port, s, 2, None), Err(Error::InvalidEld));
+            // Beyond basic audio, an ELD that does not read or parse
+            // refuses the route, naming the check.
+            let (s, _) = f.stream(&mut c, 6, 24);
+            let expected = if fault == 3 {
+                Error::EldRead(EldReadFault::ByteNotValid {
+                    index: 12,
+                    response: 0,
+                })
+            } else {
+                Error::EldParse(EldParseFault::MonitorNameLength { length: 31 })
+            };
+            assert_eq!(c.prepare_hdmi(port, s, 2, None), Err(expected));
             c.detach_hdmi_port(port).unwrap();
         } else {
             assert!(attached.is_err());
@@ -76,6 +86,92 @@ fn invalid_port_rejected() {
         assert_eq!(f.owner.state.lock().unwrap().enable, 0);
         assert_eq!(f.hardware.lock().unwrap().pin, 0);
     }
+}
+
+#[test]
+fn a_sink_whose_eld_does_not_read_or_parse_plays_basic_audio() {
+    for (fault, wide) in (0..5).flat_map(|fault| [(fault, true), (fault, false)]) {
+        let mut f = Fixture::new(false);
+        let expected = {
+            let mut h = f.hardware.lock().unwrap();
+            match fault {
+                0 => {
+                    h.bad_eld = Some(12);
+                    Error::EldRead(EldReadFault::ByteNotValid {
+                        index: 12,
+                        response: 0,
+                    })
+                }
+                1 => {
+                    h.eld_size = 300;
+                    Error::EldRead(EldReadFault::Size { response: 300 })
+                }
+                2 => {
+                    h.eld[0] = 0;
+                    Error::EldRead(EldReadFault::FirstByteZero {
+                        response: 0x8000_0000,
+                    })
+                }
+                3 => {
+                    h.eld[4] = 31;
+                    Error::EldParse(EldParseFault::MonitorNameLength { length: 31 })
+                }
+                _ => {
+                    // A DP-only pin: the packet is DisplayPort's.
+                    h.pin_caps = 0x01000014;
+                    h.eld[0] = 0x08;
+                    Error::EldParse(EldParseFault::Version { byte0: 0x08 })
+                }
+            }
+        };
+        let mut c = f.controller();
+        let port = f.attach(&mut c);
+        if wide {
+            // 24-bit stereo is not basic audio: refused, naming the check.
+            let (s, _) = f.stream(&mut c, 2, 24);
+            assert_eq!(c.prepare_hdmi(port, s, 2, None), Err(expected));
+            assert_eq!(f.owner.state.lock().unwrap().enable, 0);
+            assert_eq!(f.hardware.lock().unwrap().pin, 0);
+            c.detach_hdmi_port(port).unwrap();
+            continue;
+        }
+        let (s, period) = f.stream(&mut c, 2, 16);
+        let map = c.prepare_hdmi(port, s, 2, None).unwrap();
+        assert_eq!(map.allocation(), 0);
+        assert_eq!(map.speakers(), [Speaker::Fl, Speaker::Fr]);
+        let sink = c.hdmi_sink(port).unwrap().unwrap();
+        assert_eq!((sink.eld, sink.eld_error), (None, Some(expected)));
+        for n in 0..4 {
+            c.write_pcm(s, n * period, &vec![n as u8; period]).unwrap();
+        }
+        c.start(s).unwrap();
+        let format = c.stream_format(s).unwrap();
+        f.advance(period, format);
+        assert!(c.refill_hdmi_period(s, &vec![4; period]).unwrap().is_some());
+        {
+            let h = f.hardware.lock().unwrap();
+            assert_eq!(h.starts, 1);
+            assert_eq!(h.count, 1);
+            assert_eq!(h.packet[0], 0x84);
+            let dp = fault == 4;
+            assert_eq!(&h.packet[1..3], if dp { &[0x1b, 0x44] } else { &[1, 10] });
+            assert_eq!(h.packet[7], 0);
+        }
+        c.close_hdmi(port).unwrap();
+        c.detach_hdmi_port(port).unwrap();
+        c.shutdown().unwrap();
+    }
+    // Present without ELD_VALID: still no sink to play to.
+    let mut f = Fixture::new(false);
+    f.hardware.lock().unwrap().sense = 0x8000_0000;
+    let mut c = f.controller();
+    let port = f.attach(&mut c);
+    let (s, _) = f.stream(&mut c, 2, 16);
+    assert_eq!(
+        c.prepare_hdmi(port, s, 2, None),
+        Err(Error::SinkUnavailable)
+    );
+    c.detach_hdmi_port(port).unwrap();
 }
 
 #[test]
