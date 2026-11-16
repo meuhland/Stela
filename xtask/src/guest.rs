@@ -21,6 +21,8 @@ pub mod app;
 pub mod compression;
 pub mod sdk;
 pub mod stelanet;
+#[cfg(test)]
+mod virtio_tests;
 pub mod wire;
 
 /// The macOS the guest components target, as clang's `-target` names it.
@@ -39,7 +41,11 @@ const BUNDLE_TARGETS: [(&str, &str); 2] = [("arm64", "arm64-apple-macos27.0"), (
 /// The kexts [`run`] builds, each from `guest/<component>/kext` with the
 /// sources every kext shares ([`COMMON`]) into `target/guest/<name>.kext`,
 /// and embedded for `stela.efi` as `target/guest/<name>.kext.rs`.
-pub const KEXTS: [(&str, &str); 1] = [("stela-gpu", GPU_KEXT)];
+pub const KEXTS: [(&str, &str); 2] = [
+    ("stela-gpu", GPU_KEXT),
+    // Stela's virtio drivers: the transport and its device drivers.
+    ("stela-virtio", "StelaVirtIO"),
+];
 /// The kext that carries the Metal plugin, StelaVT and Stela.app, whose code
 /// the boot's trust cache lists.
 const GPU_KEXT: &str = "StelaGPU";

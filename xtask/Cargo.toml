@@ -33,6 +33,12 @@ sha2.workspace = true
 shlex = "2"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+# The device side of the virtqueues the StelaVirtIO kext's ring core is
+# checked against (`guest::virtio_tests`), and the RAM it runs on.
+stela-soc = { path = "../crates/stela-soc" }
+stela-contracts = { path = "../crates/stela-contracts", features = ["test-support"] }
+
 [build-dependencies]
 object = { version = "0.37", features = ["read"] }
 
