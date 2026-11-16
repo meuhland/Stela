@@ -18,6 +18,9 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     {
         return Err(Error::Constraint(Constraint::NativePciIoapicExclusive));
     }
+    if options.virtio_blk_ram.is_some() && !options.virtio {
+        return Err(Error::Constraint(Constraint::VirtioBlkDependency));
+    }
     Ok(())
 }
 

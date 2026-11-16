@@ -230,6 +230,39 @@ fn virtio_is_off_unless_asked_and_round_trips() {
     let options = round_trip(&line);
     assert!(options.virtio && options.virtio_console_echo);
     assert_eq!(options.to_string(), line);
+    assert_eq!(options.virtio_blk_ram, None);
+}
+
+#[test]
+fn the_virtio_ram_disk_takes_its_size_and_needs_virtio() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    // The K4 boot's line.
+    let line = format!("{preboot} --virtio --virtio-blk-ram 64 --page-relative --shared-aliases");
+    let options = round_trip(&line);
+    assert_eq!(options.virtio_blk_ram, Some(64));
+    assert_eq!(options.to_string(), line);
+    assert_eq!(
+        round_trip(&format!("{preboot} --virtio --virtio-blk-ram 256")).virtio_blk_ram,
+        Some(256)
+    );
+    assert_eq!(
+        System::parse(&format!("{preboot} --virtio-blk-ram 64")).unwrap_err(),
+        Error::Constraint(Constraint::VirtioBlkDependency)
+    );
+    for size in ["0", "257", "64M", "-1", ""] {
+        assert_eq!(
+            System::parse(&format!("{preboot} --virtio --virtio-blk-ram {size}")).unwrap_err(),
+            Error::VirtioBlkRam,
+            "{size:?}"
+        );
+    }
+    assert_eq!(
+        System::parse(&format!(
+            "{preboot} --virtio --virtio-blk-ram 64 --virtio-blk-ram 32"
+        ))
+        .unwrap_err(),
+        Error::DuplicateVirtioBlkRam
+    );
 }
 
 #[test]

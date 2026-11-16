@@ -8,6 +8,9 @@
 //!   as `VIRTIO console tx: <line>`; its input is the host's test source
 //!   with `--virtio-console-echo` (a greeting, then each line echoed), else
 //!   nothing, as Stela has no host terminal channel yet.
+//! - `/arm-io/stela-virtio2`, only with `--virtio-blk-ram MIB`: the block
+//!   device, in front of a zero-filled RAM disk of the host's memory. No
+//!   host disk is ever opened for it.
 //!
 //! The kext is linked into the auxiliary collection beside StelaGPU. It is
 //! in the image only with the `virtio-kext` feature, as `include_bytes!`
@@ -26,7 +29,7 @@ use stela_contracts::virtio::status;
 use stela_loader::{apple_device_tree::DeviceTree, aux_kc::Kext, stela_gpu::Placement};
 use stela_soc::machine::{AppleDevices, VirtioReport};
 use stela_soc::virtio::{
-    VirtioDevice,
+    VirtioDevice, blk,
     console::{Console, Echo, Input, Silent},
     mmio::Event,
     rng::Rng,
@@ -49,15 +52,19 @@ const BUNDLE_PATH: &str = "/Library/Extensions/StelaVirtIO.kext";
 /// Whether this image carries the kext.
 pub(super) const EMBEDDED: bool = cfg!(feature = "virtio-kext");
 
-/// The devices a `--virtio` boot places, by node index: the entropy device
-/// stays `stela-virtio0`.
+/// The devices a `--virtio` boot may place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Rng,
     Console,
+    Block,
 }
 
-const DEVICES: [Kind; 2] = [Kind::Rng, Kind::Console];
+/// Every device by its node index, `stela-virtio<index>`: the one place
+/// the nodes are numbered. A device the boot does not ask for leaves its
+/// index unused; each placed one takes the next free window and AIC input
+/// in this order.
+const DEVICES: [Kind; 3] = [Kind::Rng, Kind::Console, Kind::Block];
 
 impl Kind {
     /// Its name in the log, as its device names itself without `virtio-`.
@@ -65,8 +72,61 @@ impl Kind {
         match self {
             Self::Rng => "rng",
             Self::Console => "console",
+            Self::Block => "blk",
         }
     }
+}
+
+/// What a `--virtio` boot asked of its devices.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Wanted {
+    /// The console's input is the echo test source (`--virtio-console-echo`).
+    pub echo: bool,
+    /// The block device's RAM disk, in MiB (`--virtio-blk-ram`); no block
+    /// device without it.
+    pub blk_ram: Option<u64>,
+}
+
+/// A device made for its node, with the words its placement line adds, or
+/// why it could not be made.
+type Made = Result<(Box<dyn VirtioDevice>, String), String>;
+
+/// The device of `kind` a boot that asked `wanted` gets; `None` for one it
+/// did not ask for.
+fn device(kind: Kind, wanted: Wanted) -> Option<Made> {
+    Some(Ok(match kind {
+        Kind::Rng => {
+            let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
+            (Box::new(Rng::new(source)), String::new())
+        }
+        Kind::Console => {
+            let (input, detail): (Box<dyn Input>, &str) = if wanted.echo {
+                (Box::new(Echo::new()), ", input: the echo test source")
+            } else {
+                (Box::new(Silent), ", no input")
+            };
+            (Box::new(Console::new(input)), String::from(detail))
+        }
+        Kind::Block => {
+            let mib = wanted.blk_ram?;
+            let disk = match blk::ram(mib) {
+                Ok(disk) => disk,
+                Err(error) => return Some(Err(error)),
+            };
+            let detail = alloc::format!(
+                ", RAM disk {mib} MiB ({} bytes, {}-byte blocks), {}, serial {}, no host disk",
+                disk.bytes(),
+                disk.block_size(),
+                if disk.read_only() {
+                    "read-only"
+                } else {
+                    "writable"
+                },
+                blk::RAM_SERIAL
+            );
+            (Box::new(disk), detail)
+        }
+    }))
 }
 
 /// Set when a device has events or lines for the log.
@@ -89,24 +149,37 @@ pub(super) fn kexts(wanted: bool) -> Vec<Kext<'static>> {
     Vec::new()
 }
 
-/// A device's node, placed.
+/// A device's node, placed, and the device behind it.
 pub(super) struct Placed {
     index: usize,
     kind: Kind,
     placement: Placement,
+    device: Box<dyn VirtioDevice>,
+    detail: String,
 }
 
-/// Places every device's node, in index order, after the GPU gates and
-/// StelaNet: each takes the next free window and AIC input. A device the
-/// tree has no room for is left out, and those after it still placed.
-pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
+/// Makes the devices `wanted` asks for and places each one's node, in index
+/// order, after the GPU gates and StelaNet: each takes the next free window
+/// and AIC input. A device that cannot be made has no node; one the tree
+/// has no room for is left out; those after either are still placed.
+pub(super) fn place(tree: &mut DeviceTree, wanted: Wanted) -> Vec<Placed> {
     let mut placed = Vec::new();
     for (index, kind) in DEVICES.into_iter().enumerate() {
+        let (device, detail) = match device(kind, wanted) {
+            None => continue,
+            Some(Ok(device)) => device,
+            Some(Err(error)) => {
+                output::arguments(format_args!("VIRTIO {} not placed: {error}\n", kind.name()));
+                continue;
+            }
+        };
         match stela_loader::virtio::place_virtio(tree, index) {
             Ok(placement) => placed.push(Placed {
                 index,
                 kind,
                 placement,
+                device,
+                detail,
             }),
             Err(error) => {
                 output::arguments(format_args!("VIRTIO {} not placed: {error}\n", kind.name()))
@@ -117,33 +190,20 @@ pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
 }
 
 /// Puts each placed device where its node says, its AIC input split into
-/// die and input by the board's `per_die`. `echo` gives the console the
-/// host's test input.
-pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32, echo: bool) {
+/// die and input by the board's `per_die`.
+pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32) {
     for Placed {
         index,
         kind,
         placement,
+        device,
+        detail,
     } in placed
     {
         let irq = AicInput::new(
             (placement.irq / per_die) as u8,
             (placement.irq % per_die) as u16,
         );
-        let (device, detail): (Box<dyn VirtioDevice>, &str) = match kind {
-            Kind::Rng => {
-                let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
-                (Box::new(Rng::new(source)), "")
-            }
-            Kind::Console => {
-                let (input, detail): (Box<dyn Input>, &str) = if echo {
-                    (Box::new(Echo::new()), ", input: the echo test source")
-                } else {
-                    (Box::new(Silent), ", no input")
-                };
-                (Box::new(Console::new(input)), detail)
-            }
-        };
         devices
             .add_virtio_mmio(placement.physical, irq, device, Some(&EVENTS))
             .unwrap_or_else(|error| output::fatal(&error));

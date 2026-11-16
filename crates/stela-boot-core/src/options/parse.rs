@@ -223,6 +223,15 @@ impl ParseState<'_> {
             EXTERNAL_DISKS => options.external_disks = true,
             VIRTIO => options.virtio = true,
             VIRTIO_CONSOLE_ECHO => options.virtio_console_echo = true,
+            VIRTIO_BLK_RAM => {
+                let mib = value()
+                    .and_then(|mib| mib.parse::<u64>().ok())
+                    .filter(|mib| (1..=stela_soc::virtio::blk::RAM_MOST_MIB).contains(mib))
+                    .ok_or(Error::VirtioBlkRam)?;
+                if options.virtio_blk_ram.replace(mib).is_some() {
+                    return Err(Error::DuplicateVirtioBlkRam);
+                }
+            }
             "--audio-check" => {
                 if options.audio_check.is_some() {
                     return Err(Error::DuplicateAudioCheck);
