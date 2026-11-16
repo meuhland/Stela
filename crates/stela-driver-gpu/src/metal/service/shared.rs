@@ -449,6 +449,12 @@ pub struct ServiceHost {
     /// Told what the kext found of the Metal plugin, which the platform's
     /// boot decides on: the plugin is the boot's.
     pub bundle: fn(BundleReport),
+    /// Told that a call answered `Pending` waits for a job no processor has
+    /// started: when it parks on the job, and each time it is made again
+    /// while the job stays queued. The platform may call an idle processor
+    /// to start it ([`SharedService::run_job`]) rather than leave it to the
+    /// next one that looks.
+    pub job_waiting: fn(),
 }
 
 /// A guest call the gate served, in the platform's ticks: the PE that rang
@@ -1173,6 +1179,11 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             .with(|jobs| !jobs.queued.is_empty() || jobs.active.is_some())
     }
 
+    /// Whether a job waits in the queue for a processor to start it.
+    pub fn job_queued(&self) -> bool {
+        self.jobs.with(|jobs| !jobs.queued.is_empty())
+    }
+
     /// Whether a job ran a slice and waits to be resumed.
     pub fn job_between_slices(&self) -> bool {
         self.jobs.with(|jobs| jobs.active.is_some())
@@ -1207,6 +1218,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let Some(call) = read_call(record, caller) else {
             return false;
         };
+        let mut unstarted = false;
         let pending = self.jobs.with(|jobs| {
             let at = jobs.parked.iter().position(|parked| {
                 (
@@ -1226,11 +1238,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                 jobs.running == Some(key) || jobs.queued.iter().any(|(job, _)| job.key == key);
             if waits {
                 jobs.report.repeated += 1;
+                unstarted = !jobs.queued.is_empty();
             } else {
                 jobs.parked.remove(at);
             }
             Some(waits)
         });
+        if unstarted {
+            (self.host.job_waiting)();
+        }
         if pending != Some(true) {
             return false;
         }
@@ -1402,7 +1418,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         };
         let now = (self.host.ticks)();
         let new = jobs;
-        let unwanted = self.jobs.with(|jobs| {
+        let (unwanted, unstarted) = self.jobs.with(|jobs| {
             jobs.report.deferred += 1;
             jobs.parked.retain(|other| {
                 (other.connection, other.record) != (parked.connection, parked.record)
@@ -1432,10 +1448,13 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                 parked.key = running;
             }
             jobs.parked.push_back(parked);
-            unwanted
+            (unwanted, !jobs.queued.is_empty())
         });
         // Dropped outside the lock: a job frees what it holds.
         drop(unwanted);
+        if unstarted {
+            (self.host.job_waiting)();
+        }
     }
 
     /// The compiler's counts, unless a call holds the service now.
@@ -2279,6 +2298,7 @@ mod tests {
         served: |_| {},
         wake: || {},
         bundle: |_| {},
+        job_waiting: || {},
     };
 
     fn shared() -> SharedService<MockBackend, crate::metal::device::fixture::MockCompiler> {

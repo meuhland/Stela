@@ -500,6 +500,15 @@ fn report_peaks() {
     }
 }
 
+/// A guest call waits for a job no processor started: a PE whose guest
+/// sleeps waiting for an interrupt is called to start it now. A sleeping PE
+/// wakes only for its guest or the host's service, so a queued job waited
+/// for the next PE that stopped to wait, or 20 ms for a busy one
+/// (`Taker::Busy`), while the guest's call slept and asked again.
+fn job_waiting() {
+    super::call_job_taker();
+}
+
 /// What the kext found of the Metal plugin, the bundle whose code this boot's
 /// trust cache lists. A multi-user boot's Metal clients cannot start without
 /// it. A missing plugin, whose directories a kext cannot create, is repaired
@@ -1189,6 +1198,7 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
             served,
             wake: look_again,
             bundle,
+            job_waiting,
         },
     )))
 }

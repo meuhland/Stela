@@ -210,6 +210,7 @@ const HOST: ServiceHost = ServiceHost {
     served: |_| {},
     wake: || panic!("no turn kept an interrupt from looking"),
     bundle: |_| panic!("no kext reports"),
+    job_waiting: || {},
 };
 
 /// The GPU finishes what was committed.

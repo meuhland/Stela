@@ -1122,6 +1122,33 @@ fn a_host_call_ends_a_run_and_wakes_a_sleeping_pe() {
     hub.inboxes[1].sleeping.store(false, Ordering::SeqCst);
 }
 
+/// Host work for an idle core calls a PE that sleeps waiting for an
+/// interrupt, never the one skipped and never one asleep in WFE; with none,
+/// nobody is called.
+#[test]
+fn host_work_for_an_idle_core_calls_a_pe_that_sleeps_waiting_for_an_interrupt() {
+    let (hub, kicks) = hub(3);
+    // Nobody sleeps.
+    assert!(!hub.call_sleeping_server(0));
+    // PE 0 sleeps serving, but is skipped; PE 2 sleeps in WFE.
+    hub.inboxes[0].sleeping.store(true, Ordering::SeqCst);
+    hub.inboxes[0].serves.store(true, Ordering::SeqCst);
+    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    assert!(!hub.call_sleeping_server(0));
+    assert_eq!(kicks.load(Ordering::Relaxed), 0);
+    assert!(!hub.take_host_call(0) && !hub.take_host_call(2));
+    // PE 2 now waits for an interrupt: it is called and woken.
+    hub.inboxes[2].serves.store(true, Ordering::SeqCst);
+    assert!(hub.call_sleeping_server(0));
+    assert_eq!(kicks.load(Ordering::Relaxed), 1);
+    assert!(!hub.take_host_call(0));
+    assert!(hub.take_host_call(2), "its wait ends as for a host call");
+    for pe in [0, 2] {
+        hub.inboxes[pe].sleeping.store(false, Ordering::SeqCst);
+        hub.inboxes[pe].serves.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A line change publishes the receiver's pins before it moves the
 /// receiver's epoch, so a running receiver reads them at once; a sleeping
 /// one is kicked only after the producer releases the board lock, which no
