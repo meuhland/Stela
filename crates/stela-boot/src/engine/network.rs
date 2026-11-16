@@ -203,10 +203,7 @@ impl Link for RootLink {
     }
 }
 
-/// The PC's clock, moving the screen's running step as the stack waits. It
-/// reads the device clock (`host::device_counter`) on whichever processor
-/// serves the host, so the stack's time never goes back when its calls move
-/// between processors.
+/// The PC's clock, moving the screen's running step as the stack waits.
 struct Ticking(Clock);
 
 impl stela_runtime::net::Clock for Ticking {
