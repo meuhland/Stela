@@ -229,7 +229,26 @@ fn virtio_is_off_unless_asked_and_round_trips() {
     let line = format!("{preboot} --virtio --virtio-console-echo --page-relative --shared-aliases");
     let options = round_trip(&line);
     assert!(options.virtio && options.virtio_console_echo);
+    assert!(!options.virtio_net);
     assert_eq!(options.to_string(), line);
+}
+
+#[test]
+fn virtio_net_needs_virtio_and_round_trips() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    let line = format!(
+        "{preboot} --guest-network --guest-network-stelanet --virtio --virtio-net \
+         --page-relative --shared-aliases"
+    );
+    let options = round_trip(&line);
+    assert!(options.virtio && options.virtio_net && options.guest_network_stelanet);
+    assert_eq!(options.to_string(), line);
+    // Without a host adapter it is still a device, its link down.
+    assert!(round_trip(&format!("{preboot} --virtio --virtio-net")).virtio_net);
+    assert_eq!(
+        System::parse(&format!("{preboot} --virtio-net")).unwrap_err(),
+        Error::Constraint(Constraint::VirtioNetDependency)
+    );
 }
 
 #[test]

@@ -7,7 +7,14 @@
 //! - `/arm-io/stela-virtio1`: the console. What the guest writes is logged
 //!   as `VIRTIO console tx: <line>`; its input is the host's test source
 //!   with `--virtio-console-echo` (a greeting, then each line echoed), else
-//!   nothing, as Stela has no host terminal channel yet.
+//!   nothing, as Stela has no host terminal channel yet;
+//! - `/arm-io/stela-virtio2`, with `--virtio-net`: the network device, the
+//!   guest's second interface on the guest network's host adapter
+//!   (`--guest-network`), beside StelaNet or the USB Ethernet adapter, with
+//!   a station address of its own that derives from the board's ECID. The
+//!   board switches frames from the host between the two by destination
+//!   (`stela_soc::machine::route`); its link follows the host adapter's
+//!   carrier, and without a guest network it is down.
 //!
 //! The kext is linked into the auxiliary collection beside StelaGPU. It is
 //! in the image only with the `virtio-kext` feature, as `include_bytes!`
@@ -29,6 +36,7 @@ use stela_soc::virtio::{
     VirtioDevice,
     console::{Console, Echo, Input, Silent},
     mmio::Event,
+    net::OFFLOADS,
     rng::Rng,
 };
 
@@ -50,11 +58,12 @@ const BUNDLE_PATH: &str = "/Library/Extensions/StelaVirtIO.kext";
 pub(super) const EMBEDDED: bool = cfg!(feature = "virtio-kext");
 
 /// The devices a `--virtio` boot places, by node index: the entropy device
-/// stays `stela-virtio0`.
+/// stays `stela-virtio0`; the network device (`--virtio-net`) comes last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Rng,
     Console,
+    Net,
 }
 
 const DEVICES: [Kind; 2] = [Kind::Rng, Kind::Console];
@@ -65,8 +74,19 @@ impl Kind {
         match self {
             Self::Rng => "rng",
             Self::Console => "console",
+            Self::Net => "net",
         }
     }
+}
+
+/// What the network device takes from the boot's guest network.
+pub(super) struct NetSetup {
+    /// The StelaNet offloads the boot offers (`--guest-network-stelanet-*`),
+    /// in virtio-net numbering; the device offers those it can.
+    pub offloads: u64,
+    /// The host adapter's station address, the guest's first interface's,
+    /// if the boot has a guest network.
+    pub host: Option<[u8; 6]>,
 }
 
 /// Set when a device has events or lines for the log.
@@ -97,11 +117,13 @@ pub(super) struct Placed {
 }
 
 /// Places every device's node, in index order, after the GPU gates and
-/// StelaNet: each takes the next free window and AIC input. A device the
-/// tree has no room for is left out, and those after it still placed.
-pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
+/// StelaNet, with the network device last when `net` asks for it: each
+/// takes the next free window and AIC input. A device the tree has no room
+/// for is left out, and those after it still placed.
+pub(super) fn place(tree: &mut DeviceTree, net: bool) -> Vec<Placed> {
     let mut placed = Vec::new();
-    for (index, kind) in DEVICES.into_iter().enumerate() {
+    let kinds = DEVICES.into_iter().chain(net.then_some(Kind::Net));
+    for (index, kind) in kinds.enumerate() {
         match stela_loader::virtio::place_virtio(tree, index) {
             Ok(placement) => placed.push(Placed {
                 index,
@@ -118,8 +140,14 @@ pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
 
 /// Puts each placed device where its node says, its AIC input split into
 /// die and input by the board's `per_die`. `echo` gives the console the
-/// host's test input.
-pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32, echo: bool) {
+/// host's test input; `net` is the network device's guest network.
+pub(super) fn add(
+    devices: &mut AppleDevices,
+    placed: Vec<Placed>,
+    per_die: u32,
+    echo: bool,
+    net: &NetSetup,
+) {
     for Placed {
         index,
         kind,
@@ -130,36 +158,78 @@ pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32,
             (placement.irq / per_die) as u8,
             (placement.irq % per_die) as u16,
         );
-        let (device, detail): (Box<dyn VirtioDevice>, &str) = match kind {
+        let device: Box<dyn VirtioDevice> = match kind {
             Kind::Rng => {
                 let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
-                (Box::new(Rng::new(source)), "")
+                Box::new(Rng::new(source))
             }
             Kind::Console => {
-                let (input, detail): (Box<dyn Input>, &str) = if echo {
-                    (Box::new(Echo::new()), ", input: the echo test source")
+                let input: Box<dyn Input> = if echo {
+                    Box::new(Echo::new())
                 } else {
-                    (Box::new(Silent), ", no input")
+                    Box::new(Silent)
                 };
-                (Box::new(Console::new(input)), detail)
+                Box::new(Console::new(input))
+            }
+            Kind::Net => {
+                let mac = devices
+                    .add_virtio_net(
+                        placement.physical,
+                        irq,
+                        net.offloads,
+                        net.host,
+                        Some(&EVENTS),
+                    )
+                    .unwrap_or_else(|error| output::fatal(&error));
+                if net.host.is_none() {
+                    devices.virtio_net_set_link(false);
+                }
+                log_placed(
+                    kind,
+                    index,
+                    &placement,
+                    &alloc::format!(
+                        " mac={} offloads={:#x} host adapter {}",
+                        colons(mac),
+                        net.offloads & OFFLOADS,
+                        net.host.map_or_else(
+                            || String::from("none: link down"),
+                            |host| alloc::format!(
+                                "{} shared with the first interface",
+                                colons(host)
+                            )
+                        )
+                    ),
+                );
+                continue;
             }
         };
         devices
             .add_virtio_mmio(placement.physical, irq, device, Some(&EVENTS))
             .unwrap_or_else(|error| output::fatal(&error));
-        output::arguments(format_args!(
-            "VIRTIO {} /arm-io/{} at {:#x} aic input {:#x}{detail}{}\n",
-            kind.name(),
-            stela_loader::virtio::name(index),
-            placement.physical,
-            placement.irq,
-            if EMBEDDED {
-                ""
-            } else {
-                " (no StelaVirtIO kext in this image)"
-            }
-        ));
+        let detail = match kind {
+            Kind::Console if echo => ", input: the echo test source",
+            Kind::Console => ", no input",
+            _ => "",
+        };
+        log_placed(kind, index, &placement, detail);
     }
+}
+
+/// The placement line of device `kind` at node `index`, with `detail`.
+fn log_placed(kind: Kind, index: usize, placement: &Placement, detail: &str) {
+    output::arguments(format_args!(
+        "VIRTIO {} /arm-io/{} at {:#x} aic input {:#x}{detail}{}\n",
+        kind.name(),
+        stela_loader::virtio::name(index),
+        placement.physical,
+        placement.irq,
+        if EMBEDDED {
+            ""
+        } else {
+            " (no StelaVirtIO kext in this image)"
+        }
+    ));
 }
 
 /// Logs what the devices' drivers did since the last call, and the
@@ -256,6 +326,12 @@ fn log(report: &VirtioReport) {
                 .unwrap_or_default()
         ));
     }
+}
+
+/// A station address as `aa:bb:cc:dd:ee:ff`.
+fn colons(mac: [u8; 6]) -> String {
+    let [a, b, c, d, e, f] = mac;
+    alloc::format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
 
 /// The status bits' names, `|`-joined.

@@ -34,6 +34,8 @@ pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const VIRTIO: &str = "--virtio";
 pub const VIRTIO_CONSOLE_ECHO: &str = "--virtio-console-echo";
+/// Adds the virtio network device to `--virtio`'s devices.
+pub const VIRTIO_NET: &str = "--virtio-net";
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -416,6 +418,12 @@ pub struct System {
     /// guest's driver starts, then each line the guest writes sent back
     /// prefixed with `echo: `. Without it the console has no input.
     pub virtio_console_echo: bool,
+    /// Add the virtio network device to `--virtio`'s: the guest's second
+    /// network interface, beside StelaNet or the USB Ethernet adapter, with
+    /// a station address of its own on the same host adapter
+    /// (`--virtio-net`, which needs `--virtio`). Without `--guest-network`
+    /// it has no host adapter, and its link is down.
+    pub virtio_net: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -516,6 +524,7 @@ impl Default for System {
             guest_network_stelanet_offloads: StelaNetOffloads::Coalescing,
             virtio: false,
             virtio_console_echo: false,
+            virtio_net: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -952,6 +961,7 @@ impl fmt::Display for System {
         }
         line.flag(VIRTIO, self.virtio)?;
         line.flag(VIRTIO_CONSOLE_ECHO, self.virtio_console_echo)?;
+        line.flag(VIRTIO_NET, self.virtio_net)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,
