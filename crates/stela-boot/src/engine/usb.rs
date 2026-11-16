@@ -276,16 +276,19 @@ impl HostUsb {
             let changes = due.then(|| {
                 let changes = host.poll_after_boot(&mut self.dma, firmware);
                 // A new device's driver may have found its firmware missing;
-                // the record is reached under the same lock.
-                firmware.report();
-                changes
+                // the record is reached under the same lock, and printed
+                // after it.
+                (changes, firmware.take_report())
             });
             lap(&mut self.split, DRIVER);
             drop(root);
             lap(&mut self.split, LEAVE);
-            let Some(mut changes) = changes else {
+            let Some((mut changes, missing)) = changes else {
                 continue;
             };
+            if let Some(missing) = missing {
+                output::arguments(format_args!("{missing}"));
+            }
             for device in &changes.removed {
                 output::arguments(format_args!("USB removed {}\n", device.location));
                 for kept in &mut self.kept {
