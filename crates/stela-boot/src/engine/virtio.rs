@@ -8,6 +8,15 @@
 //!   as `VIRTIO console tx: <line>`; its input is the host's test source
 //!   with `--virtio-console-echo` (a greeting, then each line echoed), else
 //!   nothing, as Stela has no host terminal channel yet.
+//! - `/arm-io/stela-virtio2`, with `--virtio-snd`: the sound device, one
+//!   48 kHz stereo output stream played to a counting sink at the host's
+//!   counter (`stela_soc::virtio::snd`), which paces the guest's engine;
+//!   with `--virtio-snd-capture SECONDS` the sink also keeps the first
+//!   seconds of sound and logs their fingerprint. Its stream's requests,
+//!   state changes and level are logged as `VIRTIO snd <note>`.
+//!
+//! The devices' node indices are [`DEVICES`]' order, kept in this one
+//! place: a device a boot leaves out keeps its index free.
 //!
 //! The kext is linked into the auxiliary collection beside StelaGPU. It is
 //! in the image only with the `virtio-kext` feature, as `include_bytes!`
@@ -18,9 +27,10 @@
 //! places, the first notification, errors) soon after it happens, the
 //! console's lines, and the devices' counters at each service report while
 //! they move.
-use super::{output, parallel};
-use alloc::{boxed::Box, string::String, vec::Vec};
+use super::{host, output, parallel};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
+use stela_boot_core::options::System;
 use stela_contracts::interrupt::AicInput;
 use stela_contracts::virtio::status;
 use stela_loader::{apple_device_tree::DeviceTree, aux_kc::Kext, stela_gpu::Placement};
@@ -30,7 +40,12 @@ use stela_soc::virtio::{
     console::{Console, Echo, Input, Silent},
     mmio::Event,
     rng::Rng,
+    snd::{Snd, sink},
 };
+
+// The sound device's clock is the host's counter, which ticks as the
+// guest's does.
+const _: () = assert!(host::COUNTER_HZ == stela_soc::counter::FREQUENCY_HZ);
 
 /// `xtask guest`'s objects of the StelaVirtIO kext.
 #[cfg(feature = "virtio-kext")]
@@ -49,15 +64,18 @@ const BUNDLE_PATH: &str = "/Library/Extensions/StelaVirtIO.kext";
 /// Whether this image carries the kext.
 pub(super) const EMBEDDED: bool = cfg!(feature = "virtio-kext");
 
-/// The devices a `--virtio` boot places, by node index: the entropy device
-/// stays `stela-virtio0`.
+/// The devices a `--virtio` boot can place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Rng,
     Console,
+    Sound,
 }
 
-const DEVICES: [Kind; 2] = [Kind::Rng, Kind::Console];
+/// The devices by node index, in this one place: the entropy device stays
+/// `stela-virtio0`, and a device a boot leaves out keeps its index. A new
+/// device is the next entry.
+const DEVICES: [Kind; 3] = [Kind::Rng, Kind::Console, Kind::Sound];
 
 impl Kind {
     /// Its name in the log, as its device names itself without `virtio-`.
@@ -65,6 +83,33 @@ impl Kind {
         match self {
             Self::Rng => "rng",
             Self::Console => "console",
+            Self::Sound => "snd",
+        }
+    }
+}
+
+/// What a `--virtio` boot asked of its devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Config {
+    /// The console's input is the echo test source.
+    console_echo: bool,
+    /// The sound device, and the seconds its capture keeps, if any.
+    sound: Option<Option<u32>>,
+}
+
+impl Config {
+    pub(super) fn of(options: &System) -> Self {
+        Self {
+            console_echo: options.virtio_console_echo,
+            sound: options.virtio_snd.then_some(options.virtio_snd_capture),
+        }
+    }
+
+    /// Whether the boot places `kind`.
+    fn places(&self, kind: Kind) -> bool {
+        match kind {
+            Kind::Rng | Kind::Console => true,
+            Kind::Sound => self.sound.is_some(),
         }
     }
 }
@@ -96,12 +141,16 @@ pub(super) struct Placed {
     placement: Placement,
 }
 
-/// Places every device's node, in index order, after the GPU gates and
-/// StelaNet: each takes the next free window and AIC input. A device the
-/// tree has no room for is left out, and those after it still placed.
-pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
+/// Places every device `config` asks for, in index order, after the GPU
+/// gates and StelaNet: each takes the next free window and AIC input. A
+/// device the tree has no room for is left out, and those after it still
+/// placed.
+pub(super) fn place(tree: &mut DeviceTree, config: &Config) -> Vec<Placed> {
     let mut placed = Vec::new();
     for (index, kind) in DEVICES.into_iter().enumerate() {
+        if !config.places(kind) {
+            continue;
+        }
         match stela_loader::virtio::place_virtio(tree, index) {
             Ok(placement) => placed.push(Placed {
                 index,
@@ -117,9 +166,8 @@ pub(super) fn place(tree: &mut DeviceTree) -> Vec<Placed> {
 }
 
 /// Puts each placed device where its node says, its AIC input split into
-/// die and input by the board's `per_die`. `echo` gives the console the
-/// host's test input.
-pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32, echo: bool) {
+/// die and input by the board's `per_die`, as `config` asks.
+pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32, config: &Config) {
     for Placed {
         index,
         kind,
@@ -130,18 +178,30 @@ pub(super) fn add(devices: &mut AppleDevices, placed: Vec<Placed>, per_die: u32,
             (placement.irq / per_die) as u8,
             (placement.irq % per_die) as u16,
         );
-        let (device, detail): (Box<dyn VirtioDevice>, &str) = match kind {
+        let (device, detail): (Box<dyn VirtioDevice>, String) = match kind {
             Kind::Rng => {
                 let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
-                (Box::new(Rng::new(source)), "")
+                (Box::new(Rng::new(source)), String::new())
             }
             Kind::Console => {
-                let (input, detail): (Box<dyn Input>, &str) = if echo {
+                let (input, detail): (Box<dyn Input>, &str) = if config.console_echo {
                     (Box::new(Echo::new()), ", input: the echo test source")
                 } else {
                     (Box::new(Silent), ", no input")
                 };
-                (Box::new(Console::new(input)), detail)
+                (Box::new(Console::new(input)), detail.into())
+            }
+            Kind::Sound => {
+                let sink = sink::boxed(host::COUNTER_HZ, config.sound.flatten());
+                let detail = format!(
+                    ", one output stream (2ch S16/S32, 48/44.1 kHz) played to {}",
+                    sink.describe()
+                );
+                let clock = Box::new(host::fresh_counter);
+                (
+                    Box::new(Snd::new(sink, Some(clock), host::COUNTER_HZ)),
+                    detail,
+                )
             }
         };
         devices
@@ -233,6 +293,10 @@ fn log(report: &VirtioReport) {
     // The console's output, already escaped and rate-limited.
     for line in &report.lines {
         output::arguments(format_args!("VIRTIO {name} tx: {line}\n"));
+    }
+    // The device's own notes: the sound stream's requests and level.
+    for note in &report.notes {
+        output::arguments(format_args!("VIRTIO {name} {note}\n"));
     }
     if report.fresh {
         let stats = report.stats;
