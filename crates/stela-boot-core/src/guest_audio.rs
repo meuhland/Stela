@@ -18,6 +18,106 @@ pub const BACKLOG_FRAMES: usize = RATE as usize / 50;
 /// gap in the service is not paid back with that much silence.
 pub const MAX_STEP_FRAMES: u64 = RATE / 5;
 
+/// The periods of `period_frames` an HDMI playback's ring holds: a service
+/// gap the guest's own ring rides out ([`MAX_STEP_FRAMES`], 200 ms) also
+/// leaves the HDA ring's DMA fed. The service refills a period only once
+/// the DMA completed it, so the refilled frontier lags the DMA by up to a
+/// period, and the controller keeps its guard (the FIFO and one link
+/// packet, a few ms) out of the ring: one period more for each. A longer
+/// ring would only add latency, as a longer gap already loses the guest's
+/// frames at its own ring.
+pub const fn hdmi_periods(period_frames: usize) -> usize {
+    (MAX_STEP_FRAMES as usize).div_ceil(period_frames) + 2
+}
+
+/// Why the HDMI playback's stream stopped, and so how it starts again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartReason {
+    /// The DMA ran past the refilled periods: a service gap longer than
+    /// the ring. The stream alone restarts.
+    Underrun,
+    /// The pin sensed no sink with a valid ELD: the monitor sleeps or was
+    /// unplugged. The route pauses, prepared, until it returns.
+    SinkAway,
+    /// A codec answer the route did not set (a readback, an unanswered
+    /// sense, a verb timeout). The stream alone restarts, a bounded number
+    /// of times in a row.
+    CodecFault,
+    /// The route itself was lost (another ELD, a failed access, the bound
+    /// of codec faults). It is prepared again, the codec walked.
+    RouteLost,
+}
+
+impl RestartReason {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Underrun => "underrun",
+            Self::SinkAway => "sink_away",
+            Self::CodecFault => "codec_fault",
+            Self::RouteLost => "route_lost",
+        }
+    }
+
+    /// What the playback does about it, for the stop line.
+    pub const fn action(self) -> &'static str {
+        match self {
+            Self::Underrun => {
+                "the DMA ran past the refilled periods (a service gap longer than the ring); \
+                 restarting the stream only"
+            }
+            Self::SinkAway => {
+                "the pin senses no monitor with a valid ELD (asleep or unplugged); paused, \
+                 the route stays prepared until it returns"
+            }
+            Self::CodecFault => {
+                "the codec answered what the route did not set; restarting the stream only"
+            }
+            Self::RouteLost => "the route was lost; preparing it again",
+        }
+    }
+}
+
+/// The HDMI playback's restarts, by reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Restarts {
+    pub underrun: u64,
+    pub sink_away: u64,
+    pub codec_fault: u64,
+    pub route_lost: u64,
+}
+
+impl Restarts {
+    /// Counts one restart for `reason`: its reason's count after it.
+    pub fn add(&mut self, reason: RestartReason) -> u64 {
+        let count = match reason {
+            RestartReason::Underrun => &mut self.underrun,
+            RestartReason::SinkAway => &mut self.sink_away,
+            RestartReason::CodecFault => &mut self.codec_fault,
+            RestartReason::RouteLost => &mut self.route_lost,
+        };
+        *count += 1;
+        *count
+    }
+
+    pub const fn total(&self) -> u64 {
+        self.underrun + self.sink_away + self.codec_fault + self.route_lost
+    }
+}
+
+impl fmt::Display for Restarts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "restarts={} underrun={} sink_away={} codec_fault={} route_lost={}",
+            self.total(),
+            self.underrun,
+            self.sink_away,
+            self.codec_fault,
+            self.route_lost
+        )
+    }
+}
+
 /// Paces a consumer at [`RATE`] frames a second of a counter that ticks
 /// `hz` times a second.
 #[derive(Clone, Copy, Debug)]
@@ -348,6 +448,41 @@ mod tests {
             "LPCM 8ch 32/44.1/48/88.2/96/176.4/192kHz 16-bit"
         );
         assert_eq!(audio_descriptor(2, 6, 0x04, 0), "coding2 6ch 48kHz");
+    }
+
+    #[test]
+    fn the_hdmi_ring_rides_out_what_the_guests_ring_does() {
+        // 10 ms periods: 200 ms of the guest's ring, a period of refill lag
+        // and one of guard.
+        assert_eq!(hdmi_periods(480), 22);
+        for period in [128, 256, 480, 960, 1920] {
+            let periods = hdmi_periods(period);
+            // Less the refill lag and the guard, the ring still covers
+            // the guest's ring...
+            assert!((periods - 2) * period >= MAX_STEP_FRAMES as usize);
+            // ...and not a period more.
+            assert!((periods - 3) * period < MAX_STEP_FRAMES as usize);
+        }
+    }
+
+    #[test]
+    fn restarts_count_by_reason() {
+        let mut restarts = Restarts::default();
+        assert_eq!(restarts.add(RestartReason::Underrun), 1);
+        assert_eq!(restarts.add(RestartReason::Underrun), 2);
+        assert_eq!(restarts.add(RestartReason::SinkAway), 1);
+        assert_eq!(restarts.add(RestartReason::CodecFault), 1);
+        assert_eq!(restarts.total(), 4);
+        assert_eq!(
+            restarts.to_string(),
+            "restarts=4 underrun=2 sink_away=1 codec_fault=1 route_lost=0"
+        );
+        assert_eq!(RestartReason::RouteLost.name(), "route_lost");
+        assert!(
+            RestartReason::Underrun
+                .action()
+                .ends_with("restarting the stream only")
+        );
     }
 
     #[test]

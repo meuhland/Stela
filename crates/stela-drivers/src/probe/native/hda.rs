@@ -182,9 +182,24 @@ impl Host {
 /// One codec's HDMI/DP entries by its address, or why it has none.
 pub type HdmiSurvey = (u8, Result<Vec<hda::hdmi::HdmiEntry>, audio::Error>);
 
+/// How [`Host::start_hdmi`] started a playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdmiStart {
+    /// The route was prepared: the codec walked, the ELD read, the
+    /// converter, pin and infoframe set, the stream started.
+    Prepared,
+    /// The stream alone, on the route as prepared (after an underrun or a
+    /// transient codec fault).
+    Stream,
+    /// The stream alone, after a pause: the sink came back with the same
+    /// ELD.
+    Resumed,
+}
+
 /// One HDMI/DP output the owner plays PCM to: a playback stream of the
 /// controller routed to one pin's device entry (`hda::hdmi`). The stream is
-/// allocated once; its route is prepared again after each loss.
+/// allocated once; its route is prepared once and kept through stream
+/// restarts, and prepared again only after it was lost.
 pub struct HdmiPlayback {
     port: hda::hdmi::HdmiPortId,
     stream: hda::StreamId,
@@ -280,14 +295,41 @@ impl Host {
         })
     }
 
-    /// Prepare the route (`hda::Controller::prepare_hdmi`, which reads the
-    /// sink's ELD again), fill the whole ring with silence and start its
-    /// DMA. A sink without ELD_VALID is `SinkUnavailable`; one whose ELD
+    /// Start the playback. A route still prepared from an earlier start
+    /// (its stream stopped by an underrun, a transient codec fault or the
+    /// sink going away) restarts its stream only
+    /// (`hda::Controller::restart_hdmi`): the same converter, stream tag
+    /// and format, with no codec walk. Otherwise, or when the sink came
+    /// back with another ELD, the route is prepared
+    /// (`hda::Controller::prepare_hdmi`, which walks the codec and reads
+    /// the sink's ELD again), the whole ring filled with silence and its
+    /// DMA started.
+    ///
+    /// A sink away (no presence or no ELD_VALID) is `SinkUnavailable`: a
+    /// prepared route stays paused for the next start. A sink whose ELD
     /// does not read or parse takes basic audio only
     /// ([`HdmiPlayback::without_eld`]).
-    pub fn start_hdmi(&mut self, playback: &mut HdmiPlayback) -> Result<(), RetirementError> {
+    pub fn start_hdmi(
+        &mut self,
+        playback: &mut HdmiPlayback,
+    ) -> Result<HdmiStart, RetirementError> {
         let (controller, _) = self.owner.controller()?;
         playback.running = false;
+        if controller.hdmi_prepared(playback.port)? {
+            match controller.restart_hdmi(playback.port) {
+                Ok(restart) => {
+                    playback.running = true;
+                    return Ok(match restart {
+                        hda::hdmi::HdmiRestart::Stream => HdmiStart::Stream,
+                        hda::hdmi::HdmiRestart::Resumed => HdmiStart::Resumed,
+                    });
+                }
+                // Another ELD, or a route the codec no longer holds after
+                // the sink came back: closed, so prepared again below.
+                Err(audio::Error::SinkChanged) if !controller.hdmi_prepared(playback.port)? => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         controller.prepare_hdmi(playback.port, playback.stream, playback.converter, None)?;
         playback.without_eld = controller
             .hdmi_sink(playback.port)?
@@ -296,12 +338,20 @@ impl Host {
         controller.write_pcm(playback.stream, 0, &silence)?;
         controller.start(playback.stream)?;
         playback.running = true;
-        Ok(())
+        Ok(HdmiStart::Prepared)
+    }
+
+    /// Whether the playback's route is paused: prepared, its stream
+    /// stopped because the pin sensed no sink with a valid ELD.
+    pub fn hdmi_paused(&mut self, playback: &HdmiPlayback) -> Result<bool, RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        Ok(controller.hdmi_paused(playback.port)?)
     }
 
     /// Refill the next completed period with `pcm`, exactly one period:
-    /// whether one was due. An error stopped the stream and closed the
-    /// route (an underrun, a sink change); [`Self::start_hdmi`] starts it
+    /// whether one was due. An error stopped the stream: an underrun or a
+    /// transient codec fault stops only the stream, a sink away pauses the
+    /// route, anything else closes it; [`Self::start_hdmi`] starts it
     /// again.
     pub fn refill_hdmi(
         &mut self,

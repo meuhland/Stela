@@ -133,9 +133,12 @@ pub struct HdmiEntry {
 /// ELD was read again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EldRead {
-    /// The last read's bytes: the whole ELD, or those read before the
-    /// read stopped.
+    /// The last read's bytes: the whole ELD (header and baseline, as
+    /// long as its byte 2 says), or those read before the read stopped.
     pub raw: Vec<u8>,
+    /// The ELD buffer size the codec answered on the last read, when it
+    /// was in range; the ELD itself may be shorter.
+    pub buffer: Option<u16>,
     /// Their parse, or what stopped the read (`Error::EldRead`, or a
     /// command transport error) or the parse (`Error::EldParse`).
     pub eld: Result<Eld, Error>,
@@ -224,6 +227,56 @@ struct Route {
     generation: u64,
     prepared: bool,
     progress: Option<playback::Progress>,
+    /// The stream stopped because the pin sensed no sink with a valid ELD
+    /// (a monitor asleep or unplugged); the route stays prepared, and
+    /// [`Controller::restart_hdmi`] resumes it once the sink is back with
+    /// the ELD it was prepared for.
+    paused: bool,
+    /// Transient codec faults in a row, each of which stopped only the
+    /// stream; a refilled period clears them. Past
+    /// [`HDMI_TRANSIENT_FAULTS`] the route is given up (`NeedsReset`).
+    faults: u8,
+}
+/// How a route's runtime check failed, and so what it stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeFault {
+    /// The pin answered its sense without presence and ELD valid: the
+    /// stream stops and the route pauses, prepared.
+    Absent,
+    /// A codec answer the route did not expect (a readback that does not
+    /// match, an unanswered pin sense, a verb timeout): the stream stops,
+    /// the route stays prepared, and the fault counts.
+    Transient,
+    /// The display owner reports another sink, or anything else: the
+    /// route closes, as before.
+    Lost,
+}
+impl RuntimeFault {
+    fn of(error: Error) -> Self {
+        match error {
+            Error::RouteRejected | Error::InvalidEld | Error::Timeout(Phase::Verb) => {
+                Self::Transient
+            }
+            _ => Self::Lost,
+        }
+    }
+}
+/// Transient codec faults in a row (see `RuntimeFault::Transient`), each
+/// stopping only the stream for a restart, before the route is given up
+/// and the controller needs a reset. A refilled period clears the count.
+pub const HDMI_TRANSIENT_FAULTS: u8 = 8;
+/// How [`Controller::restart_hdmi`] started a prepared route's stream
+/// again: on the same converter, stream tag and format, after the stream
+/// descriptor's reset; neither the codec graph nor a connection list is
+/// read again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdmiRestart {
+    /// The stream alone, after a stream-level stop (an underrun, a
+    /// transient codec fault).
+    Stream,
+    /// The stream, after a pause: the sink came back with the ELD the
+    /// route was prepared for.
+    Resumed,
 }
 pub(super) struct Port {
     attachment: HdmiPortId,
@@ -232,6 +285,9 @@ pub(super) struct Port {
     graph: CodecGraph,
     pin: u8,
     device: u8,
+    /// The pin's device entries, read once at attach: a status read selects
+    /// the entry without reading the parameter again.
+    devices: u8,
     /// The device entry's connection list, as Linux hdmi_read_pin_conn reads it.
     connections: Vec<u8>,
     sink: Option<HdmiSink>,
@@ -377,16 +433,17 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.verb(Verb::short(codec, pin, SET_DEVICE_SELECT, device)?)?;
         Ok(())
     }
+    /// Select the port's device entry, on the device count read at attach.
     fn hdmi_select_port(&mut self, index: usize) -> Result<(), Error> {
         self.minimum_guard()?;
         let port = self.hdmi_ports[index].as_ref().unwrap();
-        let (codec, vendor, pin, device) = (
-            port.graph.address,
-            port.graph.vendor_id,
-            port.pin,
-            port.device,
-        );
-        self.hdmi_select(codec, vendor, pin, device)
+        let (codec, pin, device, devices) =
+            (port.graph.address, port.pin, port.device, port.devices);
+        if devices == 1 {
+            return Ok(());
+        }
+        self.verb(Verb::short(codec, pin, SET_DEVICE_SELECT, device)?)?;
+        Ok(())
     }
     /// Linux read_pin_sense: trigger when the pin requires it, then read the
     /// port's device entry.
@@ -414,12 +471,25 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         self.verb(Verb::short(codec, pin, PIN_SENSE, device)?)
     }
-    /// The selected device entry's ELD bytes, as Linux snd_hdmi_get_eld
-    /// reads them through the codec's command transport, into `raw`: on a
-    /// failed check, the bytes read before it.
-    fn read_eld_bytes(&mut self, codec: u8, pin: u8, raw: &mut Vec<u8>) -> Result<(), Error> {
+    /// The selected device entry's ELD bytes through the codec's command
+    /// transport, into `raw`, with the checks of Linux snd_hdmi_get_eld:
+    /// on a failed check, the bytes read before it. `buffer` is set to the
+    /// ELD buffer size the codec answered, once it is in range.
+    ///
+    /// The 4-byte header is read first, then only the ELD its BLL (byte 2)
+    /// sizes, [`eld::eld_length`]: the codec's buffer may be larger, and a
+    /// GPU codec need not mark the bytes past the ELD valid (NVIDIA's did
+    /// not: byte 37 of a 36-byte ELD in a larger buffer).
+    fn read_eld_bytes(
+        &mut self,
+        codec: u8,
+        pin: u8,
+        raw: &mut Vec<u8>,
+        buffer: &mut Option<u16>,
+    ) -> Result<(), Error> {
         self.minimum_guard()?;
         raw.clear();
+        *buffer = None;
         let response = self.verb(Verb::short(codec, pin, 0xf2e, 8)?)?;
         // Same donor compatibility fallback: a zero length means 128,
         // never a missing service or invented monitor/ELD-valid bit.
@@ -431,8 +501,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if !(20..=256).contains(&size) {
             return Err(Error::EldRead(EldReadFault::Size { response }));
         }
+        *buffer = Some(size as u16);
         raw.reserve(size);
-        for byte in 0..size {
+        let mut length = 4;
+        let mut byte = 0;
+        while byte < length {
             let index = byte as u8;
             let value = self.verb(Verb::short(codec, pin, 0xf2f, index)?)?;
             let fault = if value == u32::MAX {
@@ -451,17 +524,30 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Err(Error::EldRead(fault));
             }
             raw.push(value as u8);
+            byte += 1;
+            if byte == 4 {
+                let baseline_dwords = raw[2];
+                length = usize::from(eld::eld_length(baseline_dwords));
+                if length > size {
+                    return Err(Error::EldParse(EldParseFault::BaselineBeyondBuffer {
+                        baseline_dwords,
+                        buffer: size as u16,
+                    }));
+                }
+            }
         }
         Ok(())
     }
-    /// One ELD read and its parse: the bytes read, and the ELD or what
-    /// stopped the read or parse.
-    fn read_eld(&mut self, codec: u8, pin: u8) -> (Vec<u8>, Result<Eld, Error>) {
+    /// One ELD read and its parse: the bytes read, the codec's ELD buffer
+    /// size when it answered one in range, and the ELD or what stopped the
+    /// read or parse.
+    fn read_eld(&mut self, codec: u8, pin: u8) -> (Vec<u8>, Option<u16>, Result<Eld, Error>) {
         let mut raw = Vec::new();
+        let mut buffer = None;
         let eld = self
-            .read_eld_bytes(codec, pin, &mut raw)
+            .read_eld_bytes(codec, pin, &mut raw, &mut buffer)
             .and_then(|()| Eld::parse(&raw));
-        (raw, eld)
+        (raw, buffer, eld)
     }
     /// Linux hdmi_present_sense with hdmi_repoll_eld, for the survey: read
     /// the selected entry's ELD and, while the read or its parse fails and
@@ -480,9 +566,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         let mut reads = 0;
         loop {
             reads += 1;
-            let (raw, eld) = self.read_eld(codec, pin);
+            let (raw, buffer, eld) = self.read_eld(codec, pin);
             let done = |raw, eld, first_failure| EldRead {
                 raw,
+                buffer,
                 eld,
                 reads,
                 first_failure,
@@ -594,7 +681,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             return Err(Error::InvalidHdmiPort);
         }
         self.hdmi_topology(graph, pin)?;
-        if device >= self.hdmi_devices(graph.address, graph.vendor_id, pin)? {
+        let devices = self.hdmi_devices(graph.address, graph.vendor_id, pin)?;
+        if device >= devices {
             return Err(Error::InvalidHdmiPort);
         }
         self.hdmi_select(graph.address, graph.vendor_id, pin, device)?;
@@ -615,6 +703,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             graph: graph.clone(),
             pin,
             device,
+            devices,
             connections,
             sink: None,
             route: None,
@@ -671,7 +760,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         // One read: the survey repolls; a sink whose ELD does not read or
         // parse keeps the reason and takes basic audio only. A command
         // transport failure is no such reason.
-        let (_, eld) = self.read_eld(codec, pin);
+        let (_, _, eld) = self.read_eld(codec, pin);
         if let Err(error) = eld
             && !matches!(error, Error::EldRead(_) | Error::EldParse(_))
         {
@@ -930,6 +1019,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             generation: snapshot.state.generation,
             prepared: false,
             progress: None,
+            paused: false,
+            faults: 0,
         });
         let result = (|| {
             self.hdmi_effect(index, Some(format))?;
@@ -1164,11 +1255,204 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 .is_some_and(|p| p.route.as_ref().is_some_and(|r| r.stream == id))
         })
     }
+    /// Stop only the route's stream: its DMA stops (acknowledged) and its
+    /// progress ends, while the converter, stream tag, format, pin and the
+    /// display owner's audio stay as prepared. A stop that is not
+    /// acknowledged poisons the stream and fails routing, as a failed
+    /// close does.
+    fn hdmi_stop_stream(&mut self, index: usize) -> Result<(), Error> {
+        self.minimum_guard()?;
+        let route = self.hdmi_ports[index]
+            .as_mut()
+            .unwrap()
+            .route
+            .as_mut()
+            .ok_or(Error::SinkUnavailable)?;
+        route.progress = None;
+        let stream = route.stream;
+        let result = self.stop_descriptor(stream.descriptor_index());
+        if let Some(s) = self.streams[usize::from(stream.descriptor_index())].as_mut() {
+            s.running = false;
+            if result.is_err() {
+                s.poisoned = true;
+            }
+        }
+        if let Err(cleanup) = result {
+            self.routing_failed = true;
+            self.hdmi_record(index, cleanup);
+        }
+        result
+    }
+    /// A stream-level fault of the route's DMA (an underrun, a position
+    /// past the ring): `error` is recorded and only the stream stops; the
+    /// route stays prepared for [`Self::restart_hdmi`].
+    pub(super) fn hdmi_stream_fault(&mut self, index: usize, error: Error) -> Error {
+        self.hdmi_record(index, error);
+        let _ = self.hdmi_stop_stream(index);
+        error
+    }
+    /// A failed runtime check of the route at `index`, by `kind`.
+    fn hdmi_runtime_fault(&mut self, index: usize, error: Error, kind: RuntimeFault) -> Error {
+        self.hdmi_record(index, error);
+        match kind {
+            RuntimeFault::Absent => {
+                if self.hdmi_stop_stream(index).is_ok() {
+                    let route = self.hdmi_ports[index].as_mut().unwrap().route.as_mut();
+                    if let Some(route) = route {
+                        route.paused = true;
+                    }
+                }
+                error
+            }
+            RuntimeFault::Transient => {
+                if self.hdmi_stop_stream(index).is_err() {
+                    return error;
+                }
+                let route = self.hdmi_ports[index].as_mut().unwrap().route.as_mut();
+                let faults = route.map_or(0, |route| {
+                    route.faults = route.faults.saturating_add(1);
+                    route.faults
+                });
+                if faults <= HDMI_TRANSIENT_FAULTS {
+                    return error;
+                }
+                // Bounded: the codec keeps answering what the route did not
+                // set. Give the route up as a reset condition.
+                if let Err(cleanup) = self.hdmi_close_index(index) {
+                    self.hdmi_record(index, cleanup);
+                }
+                self.routing_failed = true;
+                Error::NeedsReset
+            }
+            RuntimeFault::Lost => {
+                // A normal hotplug is recoverable after cleanup. A failed
+                // stop/command/access keeps the route, first error and owners.
+                if let Err(cleanup) = self.hdmi_close_index(index) {
+                    self.routing_failed = true;
+                    self.hdmi_record(index, cleanup);
+                }
+                error
+            }
+        }
+    }
+    /// Whether the port has a prepared route, running or stopped.
+    pub fn hdmi_prepared(&self, id: HdmiPortId) -> Result<bool, Error> {
+        let index = self.hdmi_index(id)?;
+        Ok(self.hdmi_ports[index]
+            .as_ref()
+            .unwrap()
+            .route
+            .as_ref()
+            .is_some_and(|route| route.prepared))
+    }
+    /// Whether the port's prepared route is paused: its stream stopped
+    /// because the pin sensed no sink with a valid ELD.
+    pub fn hdmi_paused(&self, id: HdmiPortId) -> Result<bool, Error> {
+        let index = self.hdmi_index(id)?;
+        Ok(self.hdmi_ports[index]
+            .as_ref()
+            .unwrap()
+            .route
+            .as_ref()
+            .is_some_and(|route| route.paused))
+    }
+    /// Start the stream of a route that is still prepared after a
+    /// stream-level stop: an underrun, a transient codec fault, or a pause
+    /// while the sink was away. The ring is silenced and the stream starts
+    /// as [`Self::start`] does: the route's readback (pin sense, mux, pin
+    /// control, stream tag, channel count, packet transmit, digital
+    /// control, format), then the stream descriptor's reset and re-arm on
+    /// the same converter, stream tag and format. Neither the codec graph
+    /// nor a connection list is read; the ELD is read only when resuming
+    /// from a pause.
+    ///
+    /// `SinkUnavailable`: no prepared route, or the sink is still away (the
+    /// route stays paused). `SinkChanged`: the sink came back with another
+    /// ELD, or its route no longer read back as prepared; the route was
+    /// closed and needs [`Self::prepare_hdmi`]. A transient codec fault
+    /// counts toward [`HDMI_TRANSIENT_FAULTS`].
+    pub fn restart_hdmi(&mut self, id: HdmiPortId) -> Result<HdmiRestart, Error> {
+        self.minimum_guard()?;
+        let index = self.hdmi_index(id)?;
+        if self.routing_failed {
+            return Err(Error::NeedsReset);
+        }
+        let port = self.hdmi_ports[index].as_ref().unwrap();
+        let (codec, pin) = (port.graph.address, port.pin);
+        let (stream, paused) = match port.route.as_ref() {
+            Some(route) if route.prepared => (route.stream, route.paused),
+            _ => return Err(Error::SinkUnavailable),
+        };
+        if self.stream(stream)?.running {
+            return Err(Error::StreamRunning);
+        }
+        if paused {
+            let sense = self
+                .hdmi_select_port(index)
+                .and_then(|()| self.hdmi_pin_sense(index));
+            let sense = match sense {
+                Ok(u32::MAX) => Err(Error::InvalidEld),
+                sense => sense,
+            };
+            let sense = match sense {
+                Ok(sense) => sense,
+                Err(error) => {
+                    let kind = RuntimeFault::of(error);
+                    return Err(self.hdmi_runtime_fault(index, error, kind));
+                }
+            };
+            if !eld_ready(sense) {
+                return Err(Error::SinkUnavailable);
+            }
+            // The sink is back: the route plays to it again only with the
+            // ELD it was prepared for (or, for basic audio, still none that
+            // reads or parses).
+            let (_, _, eld) = self.read_eld(codec, pin);
+            if let Err(error) = eld
+                && !matches!(error, Error::EldRead(_) | Error::EldParse(_))
+            {
+                let kind = RuntimeFault::of(error);
+                return Err(self.hdmi_runtime_fault(index, error, kind));
+            }
+            let sink = self.hdmi_ports[index].as_ref().unwrap().sink.as_ref();
+            let same = match (&eld, sink) {
+                (Ok(eld), Some(sink)) => sink.eld.as_ref() == Some(eld),
+                (Err(_), Some(sink)) => sink.eld.is_none() && sink.eld_error.is_some(),
+                (_, None) => false,
+            };
+            if !same {
+                return Err(self.hdmi_runtime_fault(index, Error::SinkChanged, RuntimeFault::Lost));
+            }
+            let route = self.hdmi_ports[index].as_mut().unwrap().route.as_mut();
+            if let Some(route) = route {
+                route.paused = false;
+            }
+        }
+        // The ring restarts from its start: silence until refilled.
+        self.streams[usize::from(stream.descriptor_index())]
+            .as_mut()
+            .ok_or(Error::InvalidStream)?
+            .buffer
+            .bytes_mut()
+            .fill(0);
+        match self.start(stream) {
+            Ok(()) if paused => Ok(HdmiRestart::Resumed),
+            Ok(()) => Ok(HdmiRestart::Stream),
+            // Back from a pause, the codec no longer holds the route as
+            // prepared (the display side may have reset it): prepare it
+            // again rather than counting toward a reset.
+            Err(Error::RouteRejected) if paused && self.hdmi_stream_port(stream) == Some(index) => {
+                Err(self.hdmi_runtime_fault(index, Error::SinkChanged, RuntimeFault::Lost))
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub(super) fn hdmi_runtime(&mut self, id: StreamId) -> Result<(), Error> {
         self.minimum_guard()?;
         let Some(index) = self.hdmi_stream_port(id) else {
             return Ok(());
         };
+        let mut absent = false;
         let result = (|| {
             let port = self.hdmi_ports[index].as_ref().unwrap();
             let route = port.route.as_ref().unwrap();
@@ -1191,8 +1475,14 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             self.hdmi_select_port(index)?;
             let sense = self.hdmi_pin_sense(index)?;
-            if sense == u32::MAX || sense & (PRESENT | ELD_VALID) != (PRESENT | ELD_VALID) {
-                return Err(Error::SinkChanged);
+            if sense == u32::MAX {
+                // Unanswered: a transient codec fault, not a sink change.
+                return Err(Error::InvalidEld);
+            }
+            if sense & (PRESENT | ELD_VALID) != (PRESENT | ELD_VALID) {
+                // The monitor sleeps or was unplugged: pause.
+                absent = true;
+                return Err(Error::SinkUnavailable);
             }
             for (node, get, expected) in [
                 (pin, 0xf01, u32::from(mux)),
@@ -1231,14 +1521,12 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Ok(())
         })();
         if let Err(error) = result {
-            // A normal hotplug is recoverable after cleanup. A failed
-            // stop/command/access keeps the route, first error and owners.
-            self.hdmi_record(index, error);
-            if let Err(cleanup) = self.hdmi_close_index(index) {
-                self.routing_failed = true;
-                self.hdmi_record(index, cleanup);
-            }
-            return Err(error);
+            let kind = if absent {
+                RuntimeFault::Absent
+            } else {
+                RuntimeFault::of(error)
+            };
+            return Err(self.hdmi_runtime_fault(index, error, kind));
         }
         Ok(())
     }
