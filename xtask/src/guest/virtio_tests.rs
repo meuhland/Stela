@@ -1,7 +1,9 @@
 //! The StelaVirtIO kext's ring core (`guest/stela-virtio/kext/stela_vq.h`)
 //! in host programs: its own tests, and a loopback against the device's
 //! queue (`stela_soc::virtio::queue`), so the kext's rings and the device's
-//! agree byte for byte.
+//! agree byte for byte. And the sound driver's sample path
+//! (`guest/stela-virtio/kext/stela_pcm.h`): its clip, volume, mute and
+//! meters, and the sample buffer's layout as the TX transfers read it.
 use super::sdk;
 use std::{
     fs,
@@ -37,6 +39,31 @@ fn run(program: &Path, arguments: &[&std::ffi::OsStr]) -> String {
     let printed = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "{printed}");
     printed
+}
+
+/// Builds `guest/stela-virtio/kext/tests/pcm.c` with the `clang` on PATH.
+fn pcm(built: &Path) -> PathBuf {
+    let clang = crate::tools::which("clang").expect("a clang on PATH for the kext's host tests");
+    let source = crate::tools::root().join("guest/stela-virtio/kext/tests/pcm.c");
+    let program = built.join("pcm");
+    crate::tools::exec(
+        Command::new(clang)
+            .args(["-std=c17", "-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(&program)
+            .arg(source)
+            .arg("-lm"),
+    )
+    .unwrap();
+    program
+}
+
+/// The engine's clip (float to S16, the volume, mute), its meters, and
+/// the bytes the device reads for each frame clipped.
+#[test]
+fn the_kext_sample_path_passes_its_host_tests() {
+    let built = tempfile::tempdir().unwrap();
+    let program = pcm(built.path());
+    assert_eq!(run(&program, &[]), "ok\n");
 }
 
 #[test]

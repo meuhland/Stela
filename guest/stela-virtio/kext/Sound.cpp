@@ -40,22 +40,11 @@ static const unsigned kReleasePolls = 200;
 static const uint32_t kSampleOffsetFrames = 3 * StelaVirtIOSound::kPeriodFrames;
 /* Counters are published every this many wraps (about a second). */
 static const uint64_t kPublishWraps = 16;
-/* The volume control: 0 to kVolumeSteps, a dB each, the top 0 dB. */
-static const SInt32 kVolumeSteps = 64;
-/* Each step's gain, 16.16: 65536 x 10^((step - 64) / 20). */
-static const uint32_t kGain[kVolumeSteps + 1] = {
-    41, 46, 52, 58, 66, 74, 83, 93,
-    104, 117, 131, 147, 165, 185, 207, 233,
-    261, 293, 328, 369, 414, 464, 521, 584,
-    655, 735, 825, 926, 1039, 1165, 1308, 1467,
-    1646, 1847, 2072, 2325, 2609, 2927, 3285, 3685,
-    4135, 4640, 5206, 5841, 6554, 7353, 8250, 9257,
-    10387, 11654, 13076, 14672, 16462, 18471, 20724, 23253,
-    26090, 29274, 32846, 36854, 41350, 46396, 52057, 58409,
-    65536,
-};
+/* The volume control: 0 to kVolumeSteps, a dB each, the top 0 dB (stela_pcm_gain). */
+static const SInt32 kVolumeSteps = STELA_PCM_VOLUME_STEPS;
 
 static_assert(StelaVirtIOSound::kBufferBytes <= kPage, "the sample buffer is one page");
+static_assert(StelaVirtIOSound::kFrameBytes == StelaVirtIOSound::kChannels * sizeof(SInt16), "S16 frames");
 static_assert(StelaVirtIOSound::kPeriods * 3 <= kTxEntries, "every period's transfer fits the TX queue");
 static_assert(kHeaderOffset + StelaVirtIOSound::kPeriods * STELA_VIRTIO_SND_PCM_XFER_BYTES <= kStatusOffset,
     "the headers fit before the statuses");
@@ -126,6 +115,16 @@ requestName(uint32_t code)
 	case STELA_VIRTIO_SND_R_PCM_START: return "PCM_START";
 	case STELA_VIRTIO_SND_R_PCM_STOP: return "PCM_STOP";
 	default: return "a request";
+	}
+}
+
+/* `*at` = max(`*at`, `value`), from any thread. */
+static void
+atomicMax(uint32_t *at, uint32_t value)
+{
+	uint32_t seen = __atomic_load_n(at, __ATOMIC_RELAXED);
+	while (value > seen &&
+	    !__atomic_compare_exchange_n(at, &seen, value, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
 	}
 }
 
@@ -351,14 +350,19 @@ StelaVirtIOSound::sampleBuffer() const
 	return samples ? samples->getBytesNoCopy() : nullptr;
 }
 
-/* With queueLock held: period `period` to the device, unpublished. */
+/*
+ * With queueLock held: period `period` to the device, unpublished. Its
+ * frames are the sample buffer's own: `samples` is both the buffer the
+ * stream was given (setSampleBuffer, its getBytesNoCopy) and, by its one
+ * physical segment, what the device reads.
+ */
 bool
 StelaVirtIOSound::post(unsigned period)
 {
 	struct stela_vq_buf buffers[3] = {
 	    {messagesPhysical + kHeaderOffset + period * STELA_VIRTIO_SND_PCM_XFER_BYTES,
 	        uint32_t(STELA_VIRTIO_SND_PCM_XFER_BYTES)},
-	    {samplesPhysical + period * kPeriodBytes, kPeriodBytes},
+	    {samplesPhysical + stela_pcm_period_offset(period), kPeriodBytes},
 	    {messagesPhysical + kStatusOffset + period * STELA_VIRTIO_SND_PCM_STATUS_BYTES,
 	        uint32_t(STELA_VIRTIO_SND_PCM_STATUS_BYTES)},
 	};
@@ -378,6 +382,9 @@ StelaVirtIOSound::startStream(StelaVirtIOSoundEngine *owner)
 	IOLockLock(queueLock);
 	engine = owner;
 	__atomic_store_n(&currentFrame, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&streamClipCalls, __atomic_load_n(&clipCalls, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+	__atomic_store_n(&streamMixPeak, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&streamSamplePeak, 0, __ATOMIC_RELAXED);
 	bool posted = true;
 	for (unsigned period = 0; period < kPeriods; period++) {
 		if (!held[period]) {
@@ -423,6 +430,13 @@ StelaVirtIOSound::stopStream()
 		IOSleep(1);
 	}
 	pcm(STELA_VIRTIO_SND_R_PCM_PREPARE);
+	// One line a stream: did any sound reach the buffer the device read?
+	IOLog("StelaVirtIOSound: stream stopped: %llu clip calls, mix peak %u, sample peak %u (full scale 32768), "
+	      "volume step %d, %s\n",
+	    __atomic_load_n(&clipCalls, __ATOMIC_RELAXED) - __atomic_load_n(&streamClipCalls, __ATOMIC_RELAXED),
+	    __atomic_load_n(&streamMixPeak, __ATOMIC_RELAXED), __atomic_load_n(&streamSamplePeak, __ATOMIC_RELAXED),
+	    __atomic_load_n(&volumeStep, __ATOMIC_RELAXED),
+	    __atomic_load_n(&outputMuted, __ATOMIC_RELAXED) ? "muted" : "not muted");
 	publishCounters();
 }
 
@@ -465,9 +479,14 @@ StelaVirtIOSound::harvest()
 		if (!running) {
 			continue;
 		}
-		// The device read this period and played it out: it is silence
-		// until the HAL writes the buffer's next loop there.
-		bzero(static_cast<uint8_t *>(samples->getBytesNoCopy()) + period * kPeriodBytes, kPeriodBytes);
+		// The device read this period and played it out: its peak is what
+		// was sent, and it is silence until the HAL writes the buffer's
+		// next loop there.
+		auto frames = static_cast<uint8_t *>(samples->getBytesNoCopy()) + stela_pcm_period_offset(period);
+		uint32_t peak = stela_pcm_s16_peak(reinterpret_cast<const int16_t *>(frames), kPeriodFrames * kChannels);
+		atomicMax(&samplePeak, peak);
+		atomicMax(&streamSamplePeak, peak);
+		bzero(frames, kPeriodBytes);
 		__atomic_store_n(&currentFrame, ((period + 1) % kPeriods) * kPeriodFrames, __ATOMIC_RELEASE);
 		if (period == kPeriods - 1) {
 			wraps++;
@@ -506,6 +525,51 @@ StelaVirtIOSound::publishCounters()
 	setProperty("ControlFailures", controlFailures, 64);
 	setProperty("LatencyBytes", lastLatencyBytes, 32);
 	setProperty("DeviceLive", live);
+	// The sample path, where a silent stream loses its signal: no
+	// ClipCalls (the family never clips into the buffer), a MixPeak of 0
+	// (the HAL mixed silence), Muted or a low Level, or a SamplePeak of 0
+	// with a MixPeak above it (the buffer the device read is not the one
+	// clipped into). The peaks are since the last update; full scale 32768.
+	setProperty("ClipCalls", __atomic_load_n(&clipCalls, __ATOMIC_RELAXED), 64);
+	setProperty("ClipErrors", __atomic_load_n(&clipErrors, __ATOMIC_RELAXED), 64);
+	setProperty("MixPeak", __atomic_exchange_n(&mixPeak, 0, __ATOMIC_RELAXED), 32);
+	setProperty("SamplePeak", __atomic_exchange_n(&samplePeak, 0, __ATOMIC_RELAXED), 32);
+	setProperty("Muted", __atomic_load_n(&outputMuted, __ATOMIC_RELAXED));
+	setProperty("Level", uint32_t(__atomic_load_n(&volumeStep, __ATOMIC_RELAXED)), 32);
+}
+
+IOReturn
+StelaVirtIOSound::clip(const void *mixBuf, void *sampleBuf, UInt32 firstSampleFrame, UInt32 numSampleFrames)
+{
+	__atomic_fetch_add(&clipCalls, 1, __ATOMIC_RELAXED);
+	if (!mixBuf || !sampleBuf) {
+		__atomic_fetch_add(&clipErrors, 1, __ATOMIC_RELAXED);
+		return kIOReturnBadArgument;
+	}
+	int64_t peak = stela_pcm_clip(static_cast<const float *>(mixBuf), static_cast<int16_t *>(sampleBuf),
+	    firstSampleFrame, numSampleFrames, __atomic_load_n(&outputGain, __ATOMIC_RELAXED),
+	    __atomic_load_n(&outputMuted, __ATOMIC_RELAXED), IOAF_Float32ToNativeInt16);
+	if (peak < 0) {
+		__atomic_fetch_add(&clipErrors, 1, __ATOMIC_RELAXED);
+		return kIOReturnBadArgument;
+	}
+	atomicMax(&mixPeak, uint32_t(peak));
+	atomicMax(&streamMixPeak, uint32_t(peak));
+	return kIOReturnSuccess;
+}
+
+void
+StelaVirtIOSound::setVolumeStep(SInt32 step)
+{
+	SInt32 clamped = step < 0 ? 0 : step > kVolumeSteps ? kVolumeSteps : step;
+	__atomic_store_n(&volumeStep, clamped, __ATOMIC_RELAXED);
+	__atomic_store_n(&outputGain, stela_pcm_gain(clamped), __ATOMIC_RELAXED);
+}
+
+void
+StelaVirtIOSound::setMuted(bool muted)
+{
+	__atomic_store_n(&outputMuted, muted, __ATOMIC_RELAXED);
 }
 
 void
@@ -622,6 +686,9 @@ StelaVirtIOSoundEngine::initHardware(IOService *provider)
 		return false;
 	}
 
+	// The controls start at 0 dB and not muted, as the output does.
+	device->setVolumeStep(kVolumeSteps);
+	device->setMuted(false);
 	auto volume = IOAudioLevelControl::createVolumeControl(kVolumeSteps, 0, kVolumeSteps, -(kVolumeSteps << 16), 0,
 	    kIOAudioControlChannelIDAll, kIOAudioControlChannelNameAll, 0, kIOAudioControlUsageOutput);
 	if (volume) {
@@ -684,44 +751,27 @@ StelaVirtIOSoundEngine::wrapped()
 /*
  * The family's mix buffer, float, to the sample buffer, 16-bit: the
  * family's own saturating conversion, then the volume as an integer gain,
- * or silence while muted.
+ * or silence while muted (stela_pcm_clip). The stream calls it after each
+ * mix, for the frames mixed since [kc: IOAudioStream::clipIfNecessary].
  */
 IOReturn
 StelaVirtIOSoundEngine::clipOutputSamples(const void *mixBuf, void *sampleBuf, UInt32 firstSampleFrame,
     UInt32 numSampleFrames, const IOAudioStreamFormat *streamFormat, IOAudioStream *)
 {
-	if (!mixBuf || !sampleBuf || firstSampleFrame > StelaVirtIOSound::kBufferFrames ||
-	    numSampleFrames > StelaVirtIOSound::kBufferFrames - firstSampleFrame ||
-	    (streamFormat && streamFormat->fNumChannels != StelaVirtIOSound::kChannels)) {
+	if (!device || (streamFormat && streamFormat->fNumChannels != StelaVirtIOSound::kChannels)) {
 		return kIOReturnBadArgument;
 	}
-	const UInt32 channels = StelaVirtIOSound::kChannels;
-	const UInt32 count = numSampleFrames * channels;
-	auto in = static_cast<const float *>(mixBuf) + firstSampleFrame * channels;
-	auto out = static_cast<SInt16 *>(sampleBuf) + firstSampleFrame * channels;
-	if (__atomic_load_n(&muted, __ATOMIC_RELAXED)) {
-		bzero(out, count * sizeof(SInt16));
-		return kIOReturnSuccess;
-	}
-	IOAF_Float32ToNativeInt16(in, out, count);
-	uint32_t level = __atomic_load_n(&gain, __ATOMIC_RELAXED);
-	if (level < 0x10000) {
-		for (UInt32 index = 0; index < count; index++) {
-			out[index] = SInt16((int32_t(out[index]) * int32_t(level)) >> 16);
-		}
-	}
-	return kIOReturnSuccess;
+	return device->clip(mixBuf, sampleBuf, firstSampleFrame, numSampleFrames);
 }
 
 IOReturn
 StelaVirtIOSoundEngine::volumeChanged(OSObject *target, IOAudioControl *, SInt32, SInt32 newValue)
 {
 	auto engine = OSDynamicCast(StelaVirtIOSoundEngine, target);
-	if (!engine) {
+	if (!engine || !engine->device) {
 		return kIOReturnBadArgument;
 	}
-	SInt32 step = newValue < 0 ? 0 : newValue > kVolumeSteps ? kVolumeSteps : newValue;
-	__atomic_store_n(&engine->gain, kGain[step], __ATOMIC_RELAXED);
+	engine->device->setVolumeStep(newValue);
 	return kIOReturnSuccess;
 }
 
@@ -729,9 +779,9 @@ IOReturn
 StelaVirtIOSoundEngine::muteChanged(OSObject *target, IOAudioControl *, SInt32, SInt32 newValue)
 {
 	auto engine = OSDynamicCast(StelaVirtIOSoundEngine, target);
-	if (!engine) {
+	if (!engine || !engine->device) {
 		return kIOReturnBadArgument;
 	}
-	__atomic_store_n(&engine->muted, newValue != 0, __ATOMIC_RELAXED);
+	engine->device->setMuted(newValue != 0);
 	return kIOReturnSuccess;
 }

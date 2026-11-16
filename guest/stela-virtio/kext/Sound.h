@@ -23,21 +23,23 @@
 #include <IOKit/IOLocks.h>
 #include <audio/IOAudioFamily.h>
 
+#include "stela_pcm.h"
+
 class StelaVirtIOSoundEngine;
 
 class StelaVirtIOSound : public IOAudioDevice {
 	OSDeclareDefaultStructors(StelaVirtIOSound);
 
 public:
-	/* The stream, as SET_PARAMS sets it. */
-	static const uint32_t kRate = 48000;
-	static const uint32_t kChannels = 2;
-	static const uint32_t kFrameBytes = 4;
-	static const uint32_t kPeriodFrames = 480;
-	static const uint32_t kPeriods = 8;
-	static const uint32_t kBufferFrames = kPeriodFrames * kPeriods;
-	static const uint32_t kPeriodBytes = kPeriodFrames * kFrameBytes;
-	static const uint32_t kBufferBytes = kBufferFrames * kFrameBytes;
+	/* The stream, as SET_PARAMS sets it (stela_pcm.h). */
+	static const uint32_t kRate = STELA_PCM_RATE;
+	static const uint32_t kChannels = STELA_PCM_CHANNELS;
+	static const uint32_t kFrameBytes = STELA_PCM_FRAME_BYTES;
+	static const uint32_t kPeriodFrames = STELA_PCM_PERIOD_FRAMES;
+	static const uint32_t kPeriods = STELA_PCM_PERIODS;
+	static const uint32_t kBufferFrames = STELA_PCM_BUFFER_FRAMES;
+	static const uint32_t kPeriodBytes = STELA_PCM_PERIOD_BYTES;
+	static const uint32_t kBufferBytes = STELA_PCM_BUFFER_BYTES;
 
 	bool init(OSDictionary *properties) override;
 	bool initHardware(IOService *provider) override;
@@ -53,6 +55,11 @@ public:
 	bool startStream(StelaVirtIOSoundEngine *engine);
 	/* STOP, then RELEASE and every period back, then PREPARE for the next start. */
 	void stopStream();
+	/* The engine's clipOutputSamples: stela_pcm_clip at the output's volume and mute, metered. */
+	IOReturn clip(const void *mixBuf, void *sampleBuf, UInt32 firstSampleFrame, UInt32 numSampleFrames);
+	/* The volume control's step (0 to STELA_PCM_VOLUME_STEPS) and the mute control's value. */
+	void setVolumeStep(SInt32 step);
+	void setMuted(bool muted);
 
 private:
 	/* One control request and its answer's status; false when none came. */
@@ -99,6 +106,25 @@ private:
 	uint64_t starts = 0;
 	uint64_t controlFailures = 0;
 	uint32_t lastLatencyBytes = 0;
+	/*
+	 * The output: its gain (16.16), volume step and mute, set by the
+	 * controls and read by clip. The sample path's meters, for the boot's
+	 * checks: clip's calls, the mix's peak (|x| x 32768) clip saw and the
+	 * sample buffer's peak in the periods the device read, both since the
+	 * last publishCounters. Atomics: clip runs on the family's IO threads,
+	 * the completions on the transport's work loop.
+	 */
+	uint32_t outputGain = STELA_PCM_UNITY;
+	int32_t volumeStep = STELA_PCM_VOLUME_STEPS;
+	bool outputMuted = false;
+	uint64_t clipCalls = 0;
+	uint64_t clipErrors = 0;
+	uint32_t mixPeak = 0;
+	uint32_t samplePeak = 0;
+	/* The same over the stream, for its line at stop. */
+	uint64_t streamClipCalls = 0;
+	uint32_t streamMixPeak = 0;
+	uint32_t streamSamplePeak = 0;
 };
 
 class StelaVirtIOSoundEngine : public IOAudioEngine {
@@ -124,7 +150,4 @@ private:
 	static IOReturn muteChanged(OSObject *target, IOAudioControl *control, SInt32 oldValue, SInt32 newValue);
 
 	StelaVirtIOSound *device = nullptr;
-	/* The output's gain, 16.16, and mute. */
-	uint32_t gain = 0x10000;
-	bool muted = false;
 };
