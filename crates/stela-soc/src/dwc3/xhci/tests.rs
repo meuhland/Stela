@@ -958,6 +958,150 @@ fn isochronous_tds_run_in_their_service_interval() {
     assert_eq!(b.event()[0], (RING + 32) as u32);
 }
 
+/// The keyboard, with its IN endpoint 1 answered by the test: a 4-byte
+/// isochronous packet such as a UAC2 explicit feedback endpoint sends, or
+/// nothing.
+struct IsochIn<'a> {
+    keyboard: &'a mut crate::usb::hid::Peripheral,
+    reply: Option<&'a [u8]>,
+}
+
+impl crate::usb::BusPeer for IsochIn<'_> {
+    fn reset(&mut self) -> Result<()> {
+        self.keyboard.reset()
+    }
+    fn packet(
+        &mut self,
+        endpoint: u8,
+        token: crate::usb::Token,
+        data: &mut [u8],
+    ) -> Result<crate::usb::Reply> {
+        if (endpoint, token) != (0x81, crate::usb::Token::In) {
+            return self.keyboard.packet(endpoint, token, data);
+        }
+        Ok(match self.reply {
+            Some(bytes) => {
+                data[..bytes.len()].copy_from_slice(bytes);
+                crate::usb::Reply::Ack(bytes.len())
+            }
+            None => crate::usb::Reply::Nak,
+        })
+    }
+}
+
+impl Function for IsochIn<'_> {
+    fn set_time(&mut self, now: u64) {
+        self.keyboard.set_time(now);
+    }
+    fn ready_at(&self, endpoint: u8) -> Option<u64> {
+        self.keyboard.ready_at(endpoint)
+    }
+}
+
+/// An isochronous IN endpoint, as a UAC2 speaker's explicit feedback
+/// endpoint is: each TD runs at its service interval and carries the
+/// function's packet; a function with nothing to send gives a zero-length
+/// packet (Short Packet, the TD's length residual); a packet longer than
+/// the TD babbles. None of them halts the endpoint, and the TD's data
+/// lands where its Isoch TRB points.
+#[test]
+fn isochronous_in_tds_carry_the_functions_packet_in_their_interval() {
+    const ISOCH_TRB: u32 = 5 << 10;
+    const SIA: u32 = 1 << 31;
+    const SHORT_PACKET: u32 = 13;
+    const BABBLE: u32 = 3;
+    const RING: u64 = RAM + 0xa000;
+    let mut b = enumerated();
+    // Endpoint 0x81 (DCI 3) again, as isochronous IN (type 5), one frame
+    // (2^3 microframes), 4-byte packets.
+    b.put_context(INPUT, [0, 1 | 1 << 3, 0, 0, 0, 0, 0, 0]);
+    b.put_context(INPUT + 0x20, [3 << 27, 1 << 16, 0, 0, 0, 0, 0, 0]);
+    b.put_context(
+        INPUT + 0x20 * 4,
+        [
+            3 << 16,
+            5 << 3 | 4 << 16,
+            RING as u32 | 1,
+            (RING >> 32) as u32,
+            4,
+            0,
+            0,
+            0,
+        ],
+    );
+    let e = b.command([
+        INPUT as u32,
+        (INPUT >> 32) as u32,
+        0,
+        CONFIGURE_ENDPOINT << 10 | 1 << 24 | CYCLE,
+    ]);
+    assert_eq!(e[2] >> 24, SUCCESS);
+    let frame = 8 * MICROFRAME;
+    let isoch = |length: u32| {
+        [
+            BUFFER as u32,
+            (BUFFER >> 32) as u32,
+            length,
+            ISOCH_TRB | SIA | TRB_ISP | TRB_IOC | CYCLE,
+        ]
+    };
+    let run = |b: &mut Bench, reply: Option<&[u8]>| {
+        let mut function = IsochIn {
+            keyboard: &mut b.hid,
+            reply,
+        };
+        service_with(&mut b.x, &mut b.ram, b.now, Some(&mut function));
+    };
+    let feedback = (6u32 << 16).to_le_bytes();
+    // SIA at frame 10: the TD waits for the next interval, frame 11.
+    b.now = 10 * frame;
+    trb(&mut b.ram, RING, isoch(4));
+    wr(&mut b.x, DOORBELLS + 4, 3);
+    run(&mut b, Some(&feedback));
+    assert_eq!(event(&mut b.ram, b.events)[3] & CYCLE, 0);
+    assert_eq!(b.x.deadline(None), Some(11 * frame));
+    b.now = 11 * frame;
+    run(&mut b, Some(&feedback));
+    let e = b.event();
+    assert_eq!(
+        (e[0], e[2] >> 24, e[2] & 0xff_ffff, e[3] >> 16 & 0x1f),
+        (RING as u32, SUCCESS, 0, 3)
+    );
+    let mut landed = [0u8; 4];
+    assert!(b.ram.read(BUFFER, &mut landed));
+    assert_eq!(landed, feedback);
+    // Nothing to send: a zero-length packet in the next interval.
+    trb(&mut b.ram, RING + 16, isoch(4));
+    wr(&mut b.x, DOORBELLS + 4, 3);
+    run(&mut b, None);
+    assert_eq!(event(&mut b.ram, b.events)[3] & CYCLE, 0);
+    assert_eq!(b.x.deadline(None), Some(12 * frame));
+    b.now = 12 * frame;
+    run(&mut b, None);
+    let e = b.event();
+    assert_eq!(
+        (e[0], e[2] >> 24, e[2] & 0xff_ffff),
+        ((RING + 16) as u32, SHORT_PACKET, 4)
+    );
+    // A 2-byte TD the function answers with 4: babble, the endpoint runs on.
+    trb(&mut b.ram, RING + 32, isoch(2));
+    wr(&mut b.x, DOORBELLS + 4, 3);
+    b.now = 13 * frame;
+    run(&mut b, Some(&feedback));
+    let e = b.event();
+    assert_eq!((e[0], e[2] >> 24), ((RING + 32) as u32, BABBLE));
+    assert_eq!(b.context(OUTPUT + 0x20 * 3)[0] & 7, 1);
+    // And it still carries the next interval's packet.
+    trb(&mut b.ram, RING + 48, isoch(4));
+    wr(&mut b.x, DOORBELLS + 4, 3);
+    b.now = 14 * frame;
+    run(&mut b, Some(&[1, 2, 3, 4]));
+    let e = b.event();
+    assert_eq!((e[0], e[2] >> 24), ((RING + 48) as u32, SUCCESS));
+    assert!(b.ram.read(BUFFER, &mut landed));
+    assert_eq!(landed, [1, 2, 3, 4]);
+}
+
 pub(crate) mod host {
     use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
     use core::cell::RefCell;

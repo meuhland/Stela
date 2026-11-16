@@ -578,6 +578,36 @@ fn guest_audio_is_off_by_default_and_round_trips() {
 }
 
 #[test]
+fn the_asynchronous_speaker_implies_the_speaker_and_round_trips() {
+    // Off by default; it implies the speaker and is written alone.
+    assert!(!System::default().guest_audio_async);
+    assert!(!round_trip("--system --guest-audio").guest_audio_async);
+    let line = "--system --guest-audio-async";
+    let options = round_trip(line);
+    assert!(options.guest_audio && options.guest_audio_async && !options.guest_audio_hdmi);
+    assert_eq!(options.to_string(), line);
+    for text in [
+        "--system --guest-audio --guest-audio-async",
+        "--system --guest-audio-async --guest-audio",
+        "--system --guest-audio-async --guest-audio-async",
+    ] {
+        assert_eq!(System::parse(text).unwrap().to_string(), line, "{text}");
+    }
+    // With the HDMI output and its options, after them.
+    let both = "--system --guest-audio-hdmi-trust-quiesced --guest-audio-async";
+    let options = round_trip(both);
+    assert!(options.guest_audio_hdmi && options.guest_audio_trust_quiesced);
+    assert!(options.guest_audio_async);
+    assert_eq!(options.to_string(), both);
+    assert_eq!(
+        System::parse("--system --guest-audio-async --guest-audio-hdmi")
+            .unwrap()
+            .to_string(),
+        "--system --guest-audio-hdmi --guest-audio-async"
+    );
+}
+
+#[test]
 fn the_hdmi_test_tone_implies_the_hdmi_output_and_round_trips() {
     // The tone implies the speaker and the HDMI output, and is written
     // alone; it is off by default.

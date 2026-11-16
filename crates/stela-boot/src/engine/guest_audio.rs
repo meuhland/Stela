@@ -5,8 +5,17 @@
 //! The host's output is a sink that consumes 48 kHz of the host's counter
 //! (`stela_boot_core::guest_audio::Pacer`): what the guest sent is counted
 //! and discarded, a turn that owes more than waits counts silence, and more
-//! than 20 ms left waiting is dropped, oldest first. The `GUEST AUDIO` line
-//! reports the counts every report period when they changed.
+//! than 80 ms left waiting is dropped, oldest first (`Backlog`: a stream
+//! fills to 40 ms before it plays, and again after it ran dry). The
+//! `GUEST AUDIO` line reports the counts every report period when they
+//! changed, with the period's silence and drops, the backlog's level and
+//! the feedback.
+//!
+//! Each turn also measures the output's rate against the guest's time and
+//! regulates the backlog (`guest_audio::Feedback`). With
+//! `--guest-audio-async` the speaker's endpoint is asynchronous and that
+//! value is its explicit feedback, so macOS sends what the output consumes;
+//! otherwise it is only reported.
 //!
 //! With the option, the HD Audio function of the GPU whose start reset its
 //! bus is claimed once that start finished, and its HDMI codec's pins and
@@ -18,8 +27,11 @@
 //! moves the guest's frames to a host queue under the devices' lock, then,
 //! in the loader's root without waiting for the host drivers' lock, writes
 //! each period the DMA completed: the queue's oldest frames, silence for
-//! any it lacks. More than 20 ms left queued after that is dropped, oldest
-//! first. A DMA FIFO error is acknowledged and the stream plays on. A stream
+//! any it lacks (or while the backlog fills). More than 80 ms left queued
+//! after that is dropped, oldest first. A DMA FIFO error is acknowledged and
+//! the stream plays on; whether FIFO errors come near the GPU's frame
+//! uploads is counted (`FifoCorrelation`, from `upload_started` and
+//! `upload_finished`, which the display marks). A stream
 //! an underrun, a stalled position or a transient codec fault (a readback
 //! still wrong when read again at once) stopped restarts alone at the next
 //! turn, on its route as prepared (after
@@ -32,9 +44,11 @@
 //! instead of the guest's frames.
 use super::{host, output, storage::RestoreRoot};
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_boot_core::guest_audio::{
-    self, BACKLOG_FRAMES, Counters, Dbfs, MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts,
-    Step, Tone, crossed, logged, s16_period,
+    self, Backlog, CAP_FRAMES, Counters, Dbfs, Feedback, FifoCorrelation, Level, MAX_STEP_FRAMES,
+    Pacer, Report, RestartReason, Restarts, Sample, Step, Tone, Uploads, crossed, logged,
+    s16_period,
 };
 use stela_drivers::{
     audio::{
@@ -50,9 +64,40 @@ use stela_drivers::{
         HdmiStart, Host, RetirementError,
     },
 };
-use stela_soc::machine::{AppleDevices, USB_AUDIO_CHANNELS, UsbAudioStatus};
+use stela_soc::machine::{AppleDevices, USB_AUDIO_CHANNELS, UsbAudioMode, UsbAudioStatus};
 
 type Frame = [i32; USB_AUDIO_CHANNELS];
+
+/// The GPU's frame uploads into its scanout buffers (`gpu::display`'s
+/// presents, which copy the guest's rows through the BAR into video memory
+/// and then queue the flip): how many finished, the TSC when the last did,
+/// and whether one runs. For the FIFO correlation only.
+static UPLOADS: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_END: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// A frame upload starts (the display's present, on any PE). Only a build
+/// with the GPU display (`nvk`) uploads frames.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(super) fn upload_started() {
+    UPLOAD_BUSY.store(true, Ordering::Relaxed);
+}
+
+/// The frame upload [`upload_started`] marked ended.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(super) fn upload_finished() {
+    UPLOAD_END.store(host::rdtsc(), Ordering::Relaxed);
+    UPLOADS.fetch_add(1, Ordering::Release);
+    UPLOAD_BUSY.store(false, Ordering::Relaxed);
+}
+
+fn uploads() -> Uploads {
+    Uploads {
+        count: UPLOADS.load(Ordering::Acquire),
+        last_end: UPLOAD_END.load(Ordering::Relaxed),
+        busy: UPLOAD_BUSY.load(Ordering::Relaxed),
+    }
+}
 
 /// The HDMI output's stream: 48 kHz 16-bit stereo, which every HDMI sink
 /// takes (`Eld::supports`'s baseline), and all a sink whose ELD stayed
@@ -78,6 +123,20 @@ const HDMI_PAUSED_TICKS: u64 = host::COUNTER_HZ / 4;
 pub(super) struct GuestAudio {
     pacer: Pacer,
     counters: Counters,
+    /// Whether the backlog fills or plays.
+    backlog: Backlog,
+    /// The output's rate against the guest's time, and the backlog's PI
+    /// loop: the speaker's feedback.
+    feedback: Feedback,
+    /// The backlog after each streaming turn, since the last report.
+    level: Level,
+    /// Frames the output consumed, silence included: what the sink's
+    /// clock owed, or HDMI periods written.
+    output_frames: u64,
+    /// The silence and drops at the last report, for the period's.
+    last_totals: (u64, u64),
+    /// To the sink: the guest's frames left waiting after the last turn.
+    left: usize,
     /// The frames a turn takes, before they leave the devices' lock.
     frames: Vec<Frame>,
     /// The function's last status and queue, from the last turn.
@@ -93,8 +152,20 @@ pub(super) struct GuestAudio {
 
 impl GuestAudio {
     /// `tone`: the HDMI route plays the built-in test tone instead of the
-    /// guest's sound (`--guest-audio-hdmi-tone`).
-    pub(super) fn new(display: Option<DisplayAudio>, root: u64, tone: bool) -> Self {
+    /// guest's sound (`--guest-audio-hdmi-tone`). `asynchronous`: the
+    /// speaker sends the feedback (`--guest-audio-async`). `tsc_hz` times
+    /// the FIFO correlation's window.
+    pub(super) fn new(
+        display: Option<DisplayAudio>,
+        root: u64,
+        tone: bool,
+        asynchronous: bool,
+        tsc_hz: u64,
+    ) -> Self {
+        output::arguments(format_args!(
+            "{}\n",
+            guest_audio::endpoint_mode(asynchronous)
+        ));
         let (hdmi, display) = match display {
             Some(DisplayAudio {
                 hosts,
@@ -110,12 +181,17 @@ impl GuestAudio {
                 output::arguments(format_args!(
                     "GUEST AUDIO HDMI ring: {HDMI_PERIODS} periods of {HDMI_PERIOD_MS} ms \
                      ({ring_ms} ms, {} bytes), refilled each service turn: a turn up to about {} \
-                     ms late keeps the DMA fed (the guest's own ring holds {} ms); about {} ms \
-                     from the guest to the monitor at most\n",
+                     ms late keeps the DMA fed (the guest's own ring holds {} ms); a backlog of \
+                     {} ms kept ahead of the ring, {} ms at most, so about {} to {} ms from the \
+                     guest to the monitor\n",
                     HDMI_PERIODS * HDMI_PERIOD_BYTES,
                     ring_ms - HDMI_PERIOD_MS,
                     MAX_STEP_FRAMES * 1000 / guest_audio::RATE,
-                    ring_ms + BACKLOG_FRAMES * 1000 / guest_audio::RATE as usize,
+                    guest_audio::TARGET_FRAMES * 1000 / guest_audio::RATE as usize,
+                    CAP_FRAMES * 1000 / guest_audio::RATE as usize,
+                    ring_ms - HDMI_PERIOD_MS
+                        + guest_audio::TARGET_FRAMES * 1000 / guest_audio::RATE as usize,
+                    ring_ms + CAP_FRAMES * 1000 / guest_audio::RATE as usize,
                 ));
                 if tone {
                     output::arguments(format_args!(
@@ -156,6 +232,9 @@ impl GuestAudio {
                         reset_waiting: false,
                         gave_up: false,
                         stats: hd_audio::hda::Stats::default(),
+                        correlation: FifoCorrelation::default(),
+                        near_ticks: tsc_hz / 1000 * guest_audio::UPLOAD_NEAR_MS,
+                        was_running: false,
                     }),
                     Some(DisplayAudio {
                         hosts,
@@ -180,6 +259,12 @@ impl GuestAudio {
         Self {
             pacer: Pacer::new(host::COUNTER_HZ),
             counters: Counters::default(),
+            backlog: Backlog::default(),
+            feedback: Feedback::default(),
+            level: Level::default(),
+            output_frames: 0,
+            last_totals: (0, 0),
+            left: 0,
             // A turn takes at most the guest ring's 200 ms.
             frames: vec![[0; USB_AUDIO_CHANNELS]; MAX_STEP_FRAMES as usize],
             status: None,
@@ -199,6 +284,9 @@ impl GuestAudio {
         let Some((status, queued)) = devices.guest_audio_status() else {
             return;
         };
+        // The feedback the last turn computed (unsent by an adaptive
+        // speaker).
+        devices.guest_audio_feedback(self.feedback.value());
         self.status = Some((status, queued));
         let taken = queued.min(self.frames.len());
         if status.bits == 0 {
@@ -211,21 +299,56 @@ impl GuestAudio {
             hdmi.pending.extend(&self.frames[..moved]);
             return;
         }
-        let step = guest_audio::step(self.pacer.due(now), queued);
+        let due = self.pacer.due(now);
+        let step = self.backlog.step(due, queued, true);
         devices.guest_audio_take(&mut self.frames[..step.dropped.min(MAX_STEP_FRAMES as usize)]);
         devices.guest_audio_take(&mut self.frames[..step.take]);
         self.counters.add(step);
+        self.output_frames += due;
+        self.left = queued - step.take - step.dropped;
+        self.level.observe(self.left);
     }
 
     /// The monitor's turn, outside the devices' lock, at counter `now`:
     /// starts its route when it is not running and is due, writes every
-    /// period the DMA completed, and trims the queue to the backlog.
+    /// period the DMA completed, and trims the queue to the cap. Then, on
+    /// the monitor or the sink, the feedback looks at the turn.
     pub(super) fn play(&mut self, now: u64) {
-        let streaming = self.status.is_some_and(|(status, _)| status.bits != 0);
-        let Some(hdmi) = self.hdmi.as_mut() else {
+        let Some((status, _)) = self.status else {
             return;
         };
-        hdmi.play(now, streaming, &mut self.counters);
+        let streaming = status.bits != 0;
+        let running = match self.hdmi.as_mut() {
+            Some(hdmi) => {
+                let turn = hdmi.play(
+                    now,
+                    streaming,
+                    &mut self.counters,
+                    &mut self.backlog,
+                    &mut self.output_frames,
+                );
+                if streaming {
+                    self.level.observe(hdmi.pending.len());
+                }
+                // A turn that wrote nothing (the loader root was busy)
+                // measures nothing: the DMA ran on unseen.
+                let Some(continuous) = turn else {
+                    return;
+                };
+                streaming && continuous
+            }
+            None => streaming,
+        };
+        let backlog = match &self.hdmi {
+            Some(hdmi) => hdmi.pending.len(),
+            None => self.left,
+        };
+        self.feedback.update(Sample {
+            guest_ticks: status.time,
+            output_frames: self.output_frames,
+            backlog,
+            running,
+        });
     }
 
     /// Reports the guest starting or stopping its stream, outside the lock.
@@ -251,6 +374,11 @@ impl GuestAudio {
         let Some((status, queued)) = self.status else {
             return;
         };
+        let totals = (
+            self.counters.silent,
+            status.counters.overflowed + self.counters.trimmed,
+        );
+        let last = core::mem::replace(&mut self.last_totals, totals);
         let report = Report {
             bits: status.bits,
             received: status.counters.received,
@@ -260,6 +388,14 @@ impl GuestAudio {
             muted: status.muted,
             volume: status.volume,
             host: self.counters,
+            interval_silent: totals.0.saturating_sub(last.0),
+            interval_dropped: totals.1.saturating_sub(last.1),
+            backlog: self.level.take(),
+            asynchronous: status.mode == UsbAudioMode::Asynchronous,
+            feedback: self.feedback.value(),
+            measured: self.feedback.estimate(),
+            packets: status.counters.packets,
+            feedback_reads: status.counters.feedback_reads,
         };
         if self.reported != Some(report) {
             self.reported = Some(report);
@@ -295,7 +431,15 @@ struct Hdmi {
     retry_at: u64,
     /// The last error, reported once.
     error: Option<RetirementError>,
-    reported: Option<(bool, bool, u64, Restarts, u8, hd_audio::hda::Stats)>,
+    reported: Option<(
+        bool,
+        bool,
+        u64,
+        Restarts,
+        u8,
+        hd_audio::hda::Stats,
+        FifoCorrelation,
+    )>,
     /// Route state dumps printed (`HDMI_STATE_DUMPS` at most), and whether
     /// one followed a resume yet.
     dumps: u8,
@@ -318,6 +462,12 @@ struct Hdmi {
     gave_up: bool,
     /// The controller's counts as last logged (`Hdmi::absorbed`).
     stats: hd_audio::hda::Stats,
+    /// FIFO errors near the GPU's frame uploads or apart from them.
+    correlation: FifoCorrelation,
+    /// [`guest_audio::UPLOAD_NEAR_MS`] in TSC ticks.
+    near_ticks: u64,
+    /// The stream ran at the end of the last turn that wrote.
+    was_running: bool,
 }
 
 /// Route state dumps per boot: each preparation of the route, and the
@@ -476,18 +626,36 @@ impl Hdmi {
         }
     }
 
-    fn play(&mut self, now: u64, streaming: bool, counters: &mut Counters) {
+    /// The turn: start the route when due, write every period the DMA
+    /// completed, trim the queue to the cap. `None` when it could not look
+    /// at the stream (the loader root was busy); else whether the stream
+    /// ran through the turn and the last one, consuming without a break.
+    fn play(
+        &mut self,
+        now: u64,
+        streaming: bool,
+        counters: &mut Counters,
+        backlog: &mut Backlog,
+        output_frames: &mut u64,
+    ) -> Option<bool> {
+        let mut turn = None;
         // SAFETY: the loader root `storage::open` captured, which maps the
         // claimed function's registers and DMA pages for the whole run; a
         // service turn runs with its processor's pinned record active.
-        if let Some(_root) = unsafe { RestoreRoot::try_enter(self.root) }
-            && (self.playback.running() || self.start(now))
-        {
-            self.refill(streaming, counters);
+        if let Some(_root) = unsafe { RestoreRoot::try_enter(self.root) } {
+            let was_running = self.was_running && self.playback.running();
+            if self.playback.running() || self.start(now) {
+                *output_frames +=
+                    self.refill(streaming, counters, backlog) * HDMI_PERIOD_FRAMES as u64;
+            } else {
+                self.correlation.interrupt();
+            }
+            self.was_running = self.playback.running();
+            turn = Some(was_running && self.was_running);
         }
         // Running or not (paused while the monitor sleeps, waiting to
-        // start again), at most the backlog waits, oldest dropped first.
-        let excess = self.pending.len().saturating_sub(BACKLOG_FRAMES);
+        // start again), at most the cap waits, oldest dropped first.
+        let excess = self.pending.len().saturating_sub(CAP_FRAMES);
         if excess > 0 {
             self.pending.drain(..excess);
             counters.add(Step {
@@ -496,6 +664,7 @@ impl Hdmi {
                 silent: 0,
             });
         }
+        turn
     }
 
     /// Starts the route when it is due, at counter `now`: whether it runs.
@@ -676,14 +845,18 @@ impl Hdmi {
         }
     }
 
-    /// Writes every period the DMA completed: the queue's oldest frames,
-    /// silence for any it lacks.
-    fn refill(&mut self, streaming: bool, counters: &mut Counters) {
+    /// Writes every period the DMA completed: the queue's oldest frames
+    /// once the backlog plays, silence for any it lacks; the periods
+    /// written.
+    fn refill(&mut self, streaming: bool, counters: &mut Counters, backlog: &mut Backlog) -> u64 {
         // One whole route readback a turn, at its first status read; the
         // others sense the pin only. A failure shows at the refill.
         let _ = self.host.schedule_hdmi_readback(&self.playback);
+        let mut written = 0;
         loop {
-            let take = self.pending.len().min(HDMI_PERIOD_FRAMES);
+            // What the backlog would play; taken only once written.
+            let mut next = *backlog;
+            let take = next.take(HDMI_PERIOD_FRAMES, self.pending.len(), streaming);
             // The test tone instead of the guest's frames, which are still
             // taken (and discarded) as they would be played.
             let tone = self.tone;
@@ -695,6 +868,8 @@ impl Hdmi {
             }
             match self.host.refill_hdmi(&mut self.playback, &self.period) {
                 Ok(true) => {
+                    *backlog = next;
+                    written += 1;
                     self.pending.drain(..take);
                     self.refills += 1;
                     let peak = guest_audio::peak(&self.period);
@@ -743,6 +918,7 @@ impl Hdmi {
             }
         }
         self.absorbed();
+        written
     }
 
     /// What the controller absorbed since the last turn without stopping
@@ -750,6 +926,8 @@ impl Hdmi {
     /// pin senses a second read contradicted, RIRB entries waited for or
     /// lost, and responses that were never taken as an answer. Each kind's
     /// first four, then at each power of two; the report counts them all.
+    /// FIFO errors are also counted near the GPU's frame uploads or apart
+    /// from them (`FifoCorrelation`), as is the turn.
     fn absorbed(&mut self) {
         let Some(now) = self.host.hdmi_stats() else {
             return;
@@ -758,13 +936,43 @@ impl Hdmi {
         // The misread is taken in any case, so that a later line never
         // shows a stale one.
         let misread = self.host.take_hdmi_misread();
+        let fresh = now.fifo_errors.saturating_sub(last.fifo_errors);
+        let uploads = uploads();
+        let read = host::rdtsc();
+        let near = if self.playback.running() {
+            self.correlation.turn(read, uploads, fresh, self.near_ticks)
+        } else {
+            self.correlation.interrupt();
+            None
+        };
         if crossed(last.fifo_errors, now.fifo_errors) {
+            let since = if uploads.count == 0 {
+                String::from("no GPU frame upload yet")
+            } else if uploads.busy {
+                String::from("a GPU frame upload under way")
+            } else {
+                let per_ms = (self.near_ticks / guest_audio::UPLOAD_NEAR_MS).max(1);
+                let tenths = read.saturating_sub(uploads.last_end).saturating_mul(10) / per_ms;
+                alloc::format!(
+                    "the last GPU frame upload ended {}.{} ms before this read",
+                    tenths / 10,
+                    tenths % 10
+                )
+            };
             output::arguments(format_args!(
                 "GUEST AUDIO HDMI FIFO error on {} (fifo_errors {}): SDnSTS {}; acknowledged \
-                 (FIFOE written 1 to clear), the stream plays on: no stop, no restart\n",
+                 (FIFOE written 1 to clear), the stream plays on: no stop, no restart; {}: {since} \
+                 ({} uploads so far; {})\n",
                 self.place,
                 now.fifo_errors,
-                guest_audio::StreamStatus(now.fifo_status)
+                guest_audio::StreamStatus(now.fifo_status),
+                match near {
+                    Some(true) => "near an upload",
+                    Some(false) => "apart from uploads",
+                    None => "no window yet",
+                },
+                uploads.count,
+                self.correlation,
             ));
         }
         if let Some(misread) = misread
@@ -800,6 +1008,7 @@ impl Hdmi {
             self.restarts,
             self.playback.resets(),
             self.stats,
+            self.correlation,
         );
         if self.reported != Some(state) {
             self.reported = Some(state);
@@ -808,7 +1017,7 @@ impl Hdmi {
             output::arguments(format_args!(
                 "GUEST AUDIO HDMI running={} paused={} periods={} {} resets={}/{HDMI_RESETS} \
                  fifo_errors={} misreads={} sense_misreads={} rirb_late={} rirb_lost={} \
-                 spurious={} pending={} peak={}{}\n",
+                 spurious={} {} pending={} peak={}{}\n",
                 state.0,
                 state.1,
                 state.2,
@@ -820,6 +1029,7 @@ impl Hdmi {
                 stats.rirb_late,
                 stats.rirb_lost,
                 stats.spurious,
+                state.6,
                 self.pending.len(),
                 Dbfs(core::mem::take(&mut self.peak)),
                 if self.tone.is_some() {

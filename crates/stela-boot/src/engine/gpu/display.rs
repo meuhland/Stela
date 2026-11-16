@@ -113,7 +113,11 @@ impl Scanout for KmsScanout {
             return Ok(());
         };
         console::release();
+        // The rows' copy into video memory, for the guest audio's FIFO
+        // correlation (diagnostics; the present is unchanged).
+        crate::engine::guest_audio::upload_started();
         let presented = display.present(rows);
+        crate::engine::guest_audio::upload_finished();
         finish_present(display, presented)
     }
 
@@ -129,9 +133,15 @@ impl Scanout for KmsScanout {
             self.look();
             return Ok(true);
         };
-        let prepared = display.prepare_rows(damage, fill)?;
+        crate::engine::guest_audio::upload_started();
+        let prepared = display.prepare_rows(damage, fill);
+        if prepared.is_err() {
+            crate::engine::guest_audio::upload_finished();
+        }
+        let prepared = prepared?;
         console::release();
         let presented = prepared.present();
+        crate::engine::guest_audio::upload_finished();
         finish_present(display, presented)?;
         Ok(true)
     }

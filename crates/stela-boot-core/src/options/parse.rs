@@ -183,6 +183,10 @@ impl ParseState<'_> {
                 options.guest_audio_hdmi = true;
                 options.guest_audio_hdmi_tone = true;
             }
+            "--guest-audio-async" => {
+                options.guest_audio = true;
+                options.guest_audio_async = true;
+            }
             WIFI => {
                 let ssid = ssid(value().ok_or(Error::MissingWifiNetwork)?)?;
                 if options.ssid.replace(ssid).is_some() {

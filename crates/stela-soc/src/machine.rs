@@ -31,7 +31,10 @@ use crate::usb::{
     storage::MassStorage,
 };
 pub use crate::usb::{
-    audio::{CHANNELS as USB_AUDIO_CHANNELS, Status as UsbAudioStatus},
+    audio::{
+        CHANNELS as USB_AUDIO_CHANNELS, FEEDBACK_NOMINAL as USB_AUDIO_FEEDBACK_NOMINAL,
+        Mode as UsbAudioMode, Status as UsbAudioStatus,
+    },
     ecm::Counters as UsbNetworkCounters,
     hci::{Counters as UsbBluetoothCounters, Outbound},
     host::{Descriptor as UsbDescriptor, MuxEndpoints},
@@ -399,6 +402,10 @@ pub struct UsbCables {
     /// A USB Audio Class 2 speaker (`crate::usb::audio`), whose frames the
     /// owner takes with [`AppleDevices::guest_audio_take`].
     pub audio: bool,
+    /// The speaker's streaming endpoint is asynchronous, with the explicit
+    /// feedback the owner sets ([`AppleDevices::guest_audio_feedback`]),
+    /// instead of adaptive.
+    pub audio_async: bool,
 }
 
 impl UsbCables {

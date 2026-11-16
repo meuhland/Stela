@@ -4,16 +4,25 @@
 //!
 //! The guest's frames come at 48 kHz of guest time; the host consumes them
 //! at 48 kHz of its own clock, the counter for a sink or the HDA link for
-//! an HDMI stream. Nothing resamples. A turn that owes more frames than wait
-//! plays silence for the rest, and frames beyond [`BACKLOG_FRAMES`] after a
-//! turn are dropped, oldest first, so the guest's sound never trails the
-//! host's clock by more than that.
+//! an HDMI stream. Nothing resamples. The host keeps a backlog
+//! ([`Backlog`]): a stream fills to [`TARGET_FRAMES`] before it plays, and
+//! again after it ran dry; a turn that owes more frames than wait plays
+//! silence for the rest, and frames beyond [`CAP_FRAMES`] after a turn are
+//! dropped, oldest first, so the guest's sound never trails the host's
+//! clock by more than that. An asynchronous speaker is told the rate the
+//! host consumes ([`Feedback`]), so the guest's own resampler matches it
+//! and the backlog stays near its target.
 use core::fmt;
 
 /// The only sample rate.
 pub const RATE: u64 = 48_000;
-/// The guest's frames a turn leaves waiting at most: 20 ms.
-pub const BACKLOG_FRAMES: usize = RATE as usize / 50;
+/// The backlog the host keeps of the guest's frames: 40 ms. A stream fills
+/// to it before it plays, and the feedback holds it there.
+pub const TARGET_FRAMES: usize = RATE as usize / 25;
+/// The guest's frames a turn leaves waiting at most: 80 ms. Delivery
+/// jitter up to the target is absorbed without padding, and a guest
+/// faster than the output loses frames only past this.
+pub const CAP_FRAMES: usize = 2 * TARGET_FRAMES;
 /// The most one turn owes a sink: 200 ms, the guest ring's size. A longer
 /// gap in the service is not paid back with that much silence.
 pub const MAX_STEP_FRAMES: u64 = RATE / 5;
@@ -315,15 +324,359 @@ pub struct Step {
     pub silent: u64,
 }
 
-/// A turn that owes `due` frames with `queued` waiting: it plays what is
-/// there up to `due`, silence for the rest, and first drops the oldest
-/// frames that would leave more than [`BACKLOG_FRAMES`] waiting after it.
-pub fn step(due: u64, queued: usize) -> Step {
-    let take = usize::try_from(due).unwrap_or(usize::MAX).min(queued);
-    Step {
-        dropped: (queued - take).saturating_sub(BACKLOG_FRAMES),
-        take,
-        silent: due - take as u64,
+/// The host's backlog of the guest's frames: whether it plays or fills.
+///
+/// A stream fills first: the output plays silence until [`TARGET_FRAMES`]
+/// wait, so delivery jitter up to that much never shows as padding. It
+/// then plays what waits; a turn that finds fewer frames than it owes ran
+/// dry, plays what there is and fills again. A guest that stopped
+/// streaming has what it left played out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Backlog {
+    playing: bool,
+}
+
+impl Backlog {
+    /// Whether it fills, playing silence until the target waits.
+    pub const fn filling(&self) -> bool {
+        !self.playing
+    }
+
+    /// Frames to play of `due` owed, with `queued` waiting; `streaming`
+    /// whether the guest streams.
+    pub fn take(&mut self, due: usize, queued: usize, streaming: bool) -> usize {
+        if !self.playing && (queued >= TARGET_FRAMES || !streaming) {
+            self.playing = true;
+        }
+        if !self.playing {
+            return 0;
+        }
+        let take = due.min(queued);
+        if take < due && streaming {
+            self.playing = false;
+        }
+        take
+    }
+
+    /// A turn that owes `due` frames with `queued` waiting: it plays what
+    /// [`Self::take`] gives, silence for the rest, and first drops the
+    /// oldest frames that would leave more than [`CAP_FRAMES`] waiting
+    /// after it.
+    pub fn step(&mut self, due: u64, queued: usize, streaming: bool) -> Step {
+        let take = self.take(
+            usize::try_from(due).unwrap_or(usize::MAX),
+            queued,
+            streaming,
+        );
+        Step {
+            dropped: (queued - take).saturating_sub(CAP_FRAMES),
+            take,
+            silent: due - take as u64,
+        }
+    }
+}
+
+/// The backlog's level over a report period: frames waiting after each
+/// turn, at least, on average and at most.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Level {
+    min: usize,
+    max: usize,
+    sum: u64,
+    samples: u64,
+}
+
+/// A [`Level`]'s summary, in frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Levels {
+    pub min: usize,
+    pub avg: usize,
+    pub max: usize,
+}
+
+impl Level {
+    pub fn observe(&mut self, frames: usize) {
+        if self.samples == 0 {
+            self.min = frames;
+            self.max = frames;
+        }
+        self.min = self.min.min(frames);
+        self.max = self.max.max(frames);
+        self.sum += frames as u64;
+        self.samples += 1;
+    }
+
+    /// The period's summary, and a new period; `None` without a turn.
+    pub fn take(&mut self) -> Option<Levels> {
+        let level = core::mem::take(self);
+        (level.samples != 0).then(|| Levels {
+            min: level.min,
+            avg: (level.sum / level.samples) as usize,
+            max: level.max,
+        })
+    }
+}
+
+/// Frames as milliseconds to a tenth: `40.0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Millis(pub usize);
+
+impl fmt::Display for Millis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tenths = self.0 as u64 * 10_000 / RATE;
+        write!(f, "{}.{}", tenths / 10, tenths % 10)
+    }
+}
+
+impl fmt::Display for Levels {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}/{}",
+            Millis(self.min),
+            Millis(self.avg),
+            Millis(self.max)
+        )
+    }
+}
+
+/// Microframes a second at high speed.
+const MICROFRAMES: u64 = 8000;
+/// The nominal feedback: [`RATE`] as 16.16 frames per microframe, 6.0
+/// (`stela_soc::usb::audio::FEEDBACK_NOMINAL`).
+pub const FEEDBACK_NOMINAL: u32 = ((RATE << 16) / MICROFRAMES) as u32;
+/// How far the feedback moves from nominal at most: 5%.
+pub const FEEDBACK_SPAN: u32 = FEEDBACK_NOMINAL / 20;
+/// The guest's system counts (24 MHz) per microframe.
+pub const GUEST_TICKS_PER_MICROFRAME: u64 = 3000;
+/// The first measurement of the output's rate against the guest's time
+/// spans a second of guest time, the later ones two.
+const FIRST_WINDOW_MICROFRAMES: u64 = MICROFRAMES;
+const WINDOW_MICROFRAMES: u64 = 2 * MICROFRAMES;
+/// Proportional gain: a backlog this many frames off its target moves the
+/// feedback by all of nominal, so the whole target (1920 frames) moves it
+/// by 2.5%.
+const PROPORTIONAL_FRAMES: i128 = 76_800;
+/// Integral gain: an error of e frames held while the output consumes c
+/// frames adds e x c / this of nominal: 10 ms off target for 10 s of
+/// output is 1%. With the proportional gain this is about critically
+/// damped, settling in some 15 s.
+const INTEGRAL_FRAMES2: i128 = 100 * 480 * 480_000;
+
+/// One look at the stream for [`Feedback::update`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// The guest's system count (24 MHz) at the speaker's last bus service.
+    pub guest_ticks: u64,
+    /// Frames the output consumed since it was made, silence included:
+    /// HDMI periods written, or what the sink's clock owed.
+    pub output_frames: u64,
+    /// Frames waiting.
+    pub backlog: usize,
+    /// The guest streams and the output consumed without a break since the
+    /// last look; otherwise the look only ends the measurement.
+    pub running: bool,
+}
+
+/// The rate the host's output consumes, told to the guest as the speaker's
+/// explicit feedback (16.16 frames per microframe of guest time).
+///
+/// Two terms: the output's rate measured against the guest's time (frames
+/// consumed over guest microframes, over windows of 1 then 2 s, smoothed by
+/// a quarter each window), which is what the guest must send; and a PI
+/// loop on the backlog's distance from [`TARGET_FRAMES`], which brings it
+/// back there and absorbs what the measurement misses. The sum is held to
+/// [`FEEDBACK_SPAN`] either side of [`FEEDBACK_NOMINAL`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Feedback {
+    value: u32,
+    estimate: Option<u32>,
+    /// The measurement's start: guest count and output frames.
+    window: Option<(u64, u64)>,
+    /// Output frames at the last running look.
+    last: Option<u64>,
+    /// The sum of backlog error times frames consumed, frames squared.
+    integral: i128,
+}
+
+impl Default for Feedback {
+    fn default() -> Self {
+        Self {
+            value: FEEDBACK_NOMINAL,
+            estimate: None,
+            window: None,
+            last: None,
+            integral: 0,
+        }
+    }
+}
+
+impl Feedback {
+    /// The feedback to send.
+    pub const fn value(&self) -> u32 {
+        self.value
+    }
+
+    /// The output's rate as last measured against the guest's time.
+    pub const fn estimate(&self) -> Option<u32> {
+        self.estimate
+    }
+
+    /// Looks at the stream once a turn; the feedback to send.
+    pub fn update(&mut self, sample: Sample) -> u32 {
+        if !sample.running {
+            self.window = None;
+            self.last = None;
+            return self.value;
+        }
+        let (ticks, frames) = (sample.guest_ticks, sample.output_frames);
+        match self.window {
+            Some((t0, f0)) if ticks >= t0 && frames >= f0 => {
+                let span = if self.estimate.is_some() {
+                    WINDOW_MICROFRAMES
+                } else {
+                    FIRST_WINDOW_MICROFRAMES
+                };
+                let elapsed = ticks - t0;
+                if elapsed >= span * GUEST_TICKS_PER_MICROFRAME {
+                    let measured = (u128::from(frames - f0) << 16)
+                        * u128::from(GUEST_TICKS_PER_MICROFRAME)
+                        / u128::from(elapsed);
+                    let measured = clamp(measured.min(u128::from(u32::MAX)) as i128);
+                    self.estimate = Some(match self.estimate {
+                        None => measured,
+                        Some(old) => {
+                            (i128::from(old) + (i128::from(measured) - i128::from(old)) / 4) as u32
+                        }
+                    });
+                    self.window = Some((ticks, frames));
+                }
+            }
+            _ => self.window = Some((ticks, frames)),
+        }
+        let consumed = self.last.map_or(0, |last| frames.saturating_sub(last));
+        self.last = Some(frames);
+        let error = TARGET_FRAMES as i128 - sample.backlog as i128;
+        let nominal = i128::from(FEEDBACK_NOMINAL);
+        let span = i128::from(FEEDBACK_SPAN);
+        // Anti-windup: the integral term alone stays within the span.
+        let bound = span * INTEGRAL_FRAMES2 / nominal;
+        self.integral = (self.integral + error * i128::from(consumed)).clamp(-bound, bound);
+        let proportional = error * nominal / PROPORTIONAL_FRAMES;
+        let integral = self.integral * nominal / INTEGRAL_FRAMES2;
+        let base = i128::from(self.estimate.unwrap_or(FEEDBACK_NOMINAL));
+        self.value = clamp(base + proportional + integral);
+        self.value
+    }
+}
+
+/// `value` held to [`FEEDBACK_SPAN`] of nominal.
+fn clamp(value: i128) -> u32 {
+    let nominal = i128::from(FEEDBACK_NOMINAL);
+    let span = i128::from(FEEDBACK_SPAN);
+    value.clamp(nominal - span, nominal + span) as u32
+}
+
+/// A 16.16 frames-per-microframe rate for the log:
+/// `0x00061eb8=48960.0Hz(+2.00%)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rate(pub u32);
+
+impl fmt::Display for Rate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tenths_hz = (u64::from(self.0) * MICROFRAMES * 10) >> 16;
+        write!(
+            f,
+            "{:#010x}={}.{}Hz({})",
+            self.0,
+            tenths_hz / 10,
+            tenths_hz % 10,
+            Deviation(self.0)
+        )
+    }
+}
+
+/// A 16.16 rate's distance from nominal, in percent to a hundredth:
+/// `+2.00%`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deviation(pub u32);
+
+impl fmt::Display for Deviation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let nominal = i64::from(FEEDBACK_NOMINAL);
+        let hundredths = (i64::from(self.0) - nominal) * 10_000 / nominal;
+        let sign = if hundredths < 0 { "-" } else { "+" };
+        let magnitude = hundredths.unsigned_abs();
+        write!(f, "{sign}{}.{:02}%", magnitude / 100, magnitude % 100)
+    }
+}
+
+/// How near an upload a FIFO error counts as near: within this many ms
+/// before the status read's window, as well as inside it.
+pub const UPLOAD_NEAR_MS: u64 = 10;
+
+/// The GPU's frame uploads as an audio turn sees them (`stela-boot`
+/// `gpu::display`): uploads finished, when the last one finished (host
+/// counter), and whether one runs now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Uploads {
+    pub count: u64,
+    pub last_end: u64,
+    pub busy: bool,
+}
+
+/// Whether the HDMI stream's FIFO errors cluster around the GPU's frame
+/// uploads (diagnostics only). Each turn that read the running stream's
+/// status has a window, from the previous such read to its own; it is near
+/// an upload when an upload ran in that window or ended within `near`
+/// counts before it. FIFO errors first seen in a turn count near or apart
+/// by its window, and every turn counts too, as the baseline: errors that
+/// do not care about uploads land near them in the share the turns do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FifoCorrelation {
+    /// FIFO errors seen in a turn near an upload, and in one apart.
+    pub near: u64,
+    pub apart: u64,
+    /// Turns near an upload, of all turns counted.
+    pub turns_near: u64,
+    pub turns: u64,
+    /// The previous read: its counter and the uploads finished by then.
+    last: Option<(u64, u64)>,
+}
+
+impl FifoCorrelation {
+    /// A turn read the stream's status at `now`, seeing `uploads` and
+    /// `errors` FIFO errors new since the last read; whether its window was
+    /// near an upload (`None` for the first read, which has no window).
+    pub fn turn(&mut self, now: u64, uploads: Uploads, errors: u64, near: u64) -> Option<bool> {
+        let (start, count) = self.last.replace((now, uploads.count))?;
+        let close = uploads.busy
+            || uploads.count != count
+            || (uploads.count != 0 && uploads.last_end.saturating_add(near) >= start);
+        self.turns += 1;
+        self.turns_near += u64::from(close);
+        if close {
+            self.near += errors;
+        } else {
+            self.apart += errors;
+        }
+        Some(close)
+    }
+
+    /// The stream's status went unread (it stopped): the next read starts
+    /// a window.
+    pub fn interrupt(&mut self) {
+        self.last = None;
+    }
+}
+
+impl fmt::Display for FifoCorrelation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "fifo_near_upload={} fifo_apart={} turns_near_upload={}/{}",
+            self.near, self.apart, self.turns_near, self.turns
+        )
     }
 }
 
@@ -344,6 +697,22 @@ impl Counters {
     }
 }
 
+/// The one-time line naming the speaker's endpoint mode.
+pub const fn endpoint_mode(asynchronous: bool) -> &'static str {
+    if asynchronous {
+        "GUEST AUDIO endpoint: asynchronous with explicit feedback (--guest-audio-async): \
+         isochronous OUT 0x01, up to 54 frames a 1 ms packet, paired with the isochronous IN \
+         feedback endpoint 0x81 (16.16 frames per microframe, every 1 ms); the feedback is the \
+         output's rate measured against the guest's time plus a PI loop on the backlog (target \
+         40 ms, cap 80 ms), within 5% of 48 kHz"
+    } else {
+        "GUEST AUDIO endpoint: adaptive, no feedback: the guest's clock paces its frames (up to 49 \
+         a 1 ms packet); the backlog fills to 40 ms before it plays, a dry one plays silence and \
+         more than 80 ms is dropped; the feedback the output's rate asks is reported unsent \
+         (--guest-audio-async sends it)"
+    }
+}
+
 /// The `GUEST AUDIO` line: the function's counts and controls beside the
 /// host's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,6 +730,22 @@ pub struct Report {
     /// 1/256 dB.
     pub volume: i16,
     pub host: Counters,
+    /// Since the last report period: silence played while the guest
+    /// streamed, and frames dropped (at the function's ring or past the
+    /// cap).
+    pub interval_silent: u64,
+    pub interval_dropped: u64,
+    /// The backlog's level over the period, `None` without a turn.
+    pub backlog: Option<Levels>,
+    /// The speaker's endpoint is asynchronous, so the feedback is sent.
+    pub asynchronous: bool,
+    /// The feedback (16.16 frames per microframe), and the output's rate
+    /// as measured against the guest's time.
+    pub feedback: u32,
+    pub measured: Option<u32>,
+    /// Packets that carried frames, and feedback packets the guest read.
+    pub packets: u64,
+    pub feedback_reads: u64,
 }
 
 impl fmt::Display for Report {
@@ -387,6 +772,34 @@ impl fmt::Display for Report {
             self.muted,
             tenths / 10,
             tenths % 10,
+        )?;
+        write!(
+            f,
+            " +silent={} +dropped={} backlog_ms=",
+            self.interval_silent, self.interval_dropped
+        )?;
+        match self.backlog {
+            Some(levels) => write!(f, "{levels}")?,
+            None => f.write_str("-")?,
+        }
+        write!(
+            f,
+            " feedback={}{} measured=",
+            Rate(self.feedback),
+            if self.asynchronous {
+                ""
+            } else {
+                "(unsent:adaptive)"
+            }
+        )?;
+        match self.measured {
+            Some(rate) => write!(f, "{}", Deviation(rate))?,
+            None => f.write_str("-")?,
+        }
+        write!(
+            f,
+            " packets={} feedback_reads={}",
+            self.packets, self.feedback_reads
         )
     }
 }
@@ -643,11 +1056,20 @@ mod tests {
         assert_eq!(pacer.due(9_010_000), 480);
     }
 
+    /// A playing backlog after it filled.
+    fn playing() -> Backlog {
+        let mut backlog = Backlog::default();
+        assert_eq!(backlog.take(0, TARGET_FRAMES, true), 0);
+        assert!(!backlog.filling());
+        backlog
+    }
+
     #[test]
-    fn a_step_plays_what_waits_pads_silence_and_trims_the_backlog() {
+    fn a_step_plays_what_waits_pads_silence_and_trims_past_the_cap() {
+        assert_eq!((TARGET_FRAMES, CAP_FRAMES), (1920, 3840));
         // Enough waiting: play what is owed, keep the rest.
         assert_eq!(
-            step(480, 600),
+            playing().step(480, 600, true),
             Step {
                 dropped: 0,
                 take: 480,
@@ -656,26 +1078,28 @@ mod tests {
         );
         // Too little: silence for the rest.
         assert_eq!(
-            step(480, 100),
+            playing().step(480, 100, true),
             Step {
                 dropped: 0,
                 take: 100,
                 silent: 380
             }
         );
-        // More than the backlog would remain: the oldest go first.
+        // More than the cap would remain: the oldest go first.
         assert_eq!(
-            step(480, 480 + BACKLOG_FRAMES + 7),
+            playing().step(480, 480 + CAP_FRAMES + 7, true),
             Step {
                 dropped: 7,
                 take: 480,
                 silent: 0
             }
         );
-        assert_eq!(step(0, 0), Step::default());
+        // Up to the cap waits: nothing dropped.
+        assert_eq!(playing().step(480, 480 + CAP_FRAMES, true).dropped, 0);
+        assert_eq!(playing().step(0, 0, true), Step::default());
         let mut counters = Counters::default();
-        counters.add(step(480, 100));
-        counters.add(step(480, 480 + BACKLOG_FRAMES + 7));
+        counters.add(playing().step(480, 100, true));
+        counters.add(playing().step(480, 480 + CAP_FRAMES + 7, true));
         assert_eq!(
             counters,
             Counters {
@@ -684,6 +1108,252 @@ mod tests {
                 trimmed: 7
             }
         );
+    }
+
+    /// A stream fills to the 40 ms target before it plays, and again after
+    /// it ran dry; jitter up to the target then never pads. A guest that
+    /// stopped streaming has its last frames played out.
+    #[test]
+    fn the_backlog_fills_to_its_target_then_rides_out_jitter() {
+        let mut backlog = Backlog::default();
+        assert!(backlog.filling());
+        // Filling: 10 ms periods of silence while the frames gather.
+        assert_eq!(
+            backlog.step(480, 1000, true),
+            Step {
+                dropped: 0,
+                take: 0,
+                silent: 480
+            }
+        );
+        assert_eq!(backlog.step(480, TARGET_FRAMES - 1, true).take, 0);
+        // At the target it plays.
+        assert_eq!(backlog.step(480, TARGET_FRAMES, true).take, 480);
+        // Bursty delivery: 0 to 30 ms a turn, 10 ms on average, against 10
+        // ms periods. The 40 ms backlog absorbs it: no silence.
+        let mut queued = TARGET_FRAMES - 480;
+        let mut silent = 0;
+        for turn in 0..1000 {
+            queued += [0, 1440, 0, 480, 0, 960, 0, 960][turn % 8];
+            let step = backlog.step(480, queued, true);
+            queued -= step.take + step.dropped;
+            silent += step.silent;
+        }
+        assert_eq!(silent, 0);
+        assert!(!backlog.filling());
+        // Run dry: what waits plays, then it fills again.
+        assert_eq!(backlog.step(480, 100, true).take, 100);
+        assert!(backlog.filling());
+        assert_eq!(backlog.step(480, 900, true).take, 0);
+        // The guest stopped: what it left plays out, without filling.
+        assert_eq!(backlog.step(480, 900, false).take, 480);
+        assert_eq!(backlog.step(480, 420, false).take, 420);
+        assert!(!backlog.filling());
+    }
+
+    #[test]
+    fn the_level_is_summed_up_per_report_period() {
+        let mut level = Level::default();
+        assert_eq!(level.take(), None);
+        for frames in [1920, 960, 2880, 1920] {
+            level.observe(frames);
+        }
+        let levels = level.take().unwrap();
+        assert_eq!(
+            levels,
+            Levels {
+                min: 960,
+                avg: 1920,
+                max: 2880
+            }
+        );
+        assert_eq!(levels.to_string(), "20.0/40.0/60.0");
+        assert_eq!(level.take(), None, "a new period");
+        level.observe(5);
+        assert_eq!(level.take().unwrap().to_string(), "0.1/0.1/0.1");
+    }
+
+    /// The sink of a simulation: 48 kHz of wall time, against a guest whose
+    /// time runs `ratio` of wall time (under 1: the engine held it while a
+    /// PE served), sending the feedback's frames per microframe of its
+    /// time, delivered to the host in bursts. Returns the feedback, the
+    /// mean backlog of the last 10 s, and the silence and drops of the
+    /// last 20 s, after `seconds`.
+    fn simulate(ratio: f64, seconds: u64) -> (u32, f64, u64, u64) {
+        const TURN_US: u64 = 5_000;
+        let mut feedback = Feedback::default();
+        let mut backlog = Backlog::default();
+        let mut queued = 0usize;
+        let (mut guest_ticks, mut guest_frames) = (0f64, 0f64);
+        let mut sink_owed = 0f64;
+        let mut output = 0u64;
+        let (mut level, mut levels) = (0f64, 0u64);
+        let (mut silent, mut dropped) = (0u64, 0u64);
+        let turns = seconds * 1_000_000 / TURN_US;
+        for turn in 0..turns {
+            // Turns 2 to 8 ms apart, 5 ms on average.
+            let wall_us = [2_000, 8_000, 5_000, 3_000, 7_000][(turn % 5) as usize] as f64;
+            let microframes = wall_us / 125.0 * ratio;
+            guest_ticks += microframes * GUEST_TICKS_PER_MICROFRAME as f64;
+            guest_frames += microframes * f64::from(feedback.value()) / 65536.0;
+            let delivered = guest_frames.floor();
+            guest_frames -= delivered;
+            queued += delivered as usize;
+            sink_owed += wall_us * RATE as f64 / 1e6;
+            let due = sink_owed.floor();
+            sink_owed -= due;
+            output += due as u64;
+            let step = backlog.step(due as u64, queued, true);
+            queued -= step.take + step.dropped;
+            feedback.update(Sample {
+                guest_ticks: guest_ticks as u64,
+                output_frames: output,
+                backlog: queued,
+                running: true,
+            });
+            if turn >= turns - 20_000_000 / TURN_US {
+                silent += step.silent;
+                dropped += step.dropped as u64;
+            }
+            if turn >= turns - 10_000_000 / TURN_US {
+                level += queued as f64;
+                levels += 1;
+            }
+        }
+        (feedback.value(), level / levels as f64, silent, dropped)
+    }
+
+    /// The feedback converges on what the output consumes per microframe
+    /// of the guest's time, for a guest 3.5% slow (audio9's case: guest
+    /// time held while PEs served) or 3% fast, and holds the backlog at
+    /// its 40 ms target with no silence and no drops; a guest further off
+    /// than 5% pins it at the bound.
+    #[test]
+    fn the_feedback_loop_converges_on_a_slow_or_fast_guest_clock() {
+        for ratio in [0.965, 1.03, 1.0] {
+            let (value, level, silent, dropped) = simulate(ratio, 60);
+            let ideal = f64::from(FEEDBACK_NOMINAL) / ratio;
+            let off = (f64::from(value) - ideal) / ideal;
+            assert!(off.abs() < 0.002, "ratio {ratio}: {value:#x} vs {ideal}");
+            assert!(
+                (level - TARGET_FRAMES as f64).abs() < 96.0,
+                "ratio {ratio}: level {level}"
+            );
+            assert_eq!((silent, dropped), (0, 0), "ratio {ratio}");
+        }
+        // 10% slow: the feedback stops at +5%, the rest still pads.
+        let (value, _, silent, _) = simulate(0.9, 30);
+        assert_eq!(value, FEEDBACK_NOMINAL + FEEDBACK_SPAN);
+        assert!(silent > 0);
+    }
+
+    #[test]
+    fn the_feedback_measures_the_output_against_the_guests_time() {
+        let mut feedback = Feedback::default();
+        assert_eq!(feedback.value(), 6 << 16);
+        let at = |ms: u64, frames: u64, backlog: usize| Sample {
+            guest_ticks: ms * 8 * GUEST_TICKS_PER_MICROFRAME,
+            output_frames: frames,
+            backlog,
+            running: true,
+        };
+        // On target: the measurement alone. 49000 frames in a second of
+        // guest time: 6.125 a microframe.
+        feedback.update(at(0, 0, TARGET_FRAMES));
+        assert_eq!(feedback.update(at(500, 24_500, TARGET_FRAMES)), 6 << 16);
+        assert_eq!(feedback.estimate(), None);
+        assert_eq!(feedback.update(at(1000, 49_000, TARGET_FRAMES)), 0x6_2000);
+        assert_eq!(feedback.estimate(), Some(0x6_2000));
+        // A break ends the measurement and freezes the value.
+        let stopped = Sample {
+            running: false,
+            ..at(5000, 0, 0)
+        };
+        assert_eq!(feedback.update(stopped), 0x6_2000);
+        // Later windows span 2 s and move the estimate a quarter of the
+        // way: 48000 frames a second now.
+        feedback.update(at(10_000, 100_000, TARGET_FRAMES));
+        feedback.update(at(11_000, 148_000, TARGET_FRAMES));
+        assert_eq!(feedback.estimate(), Some(0x6_2000));
+        feedback.update(at(12_000, 196_000, TARGET_FRAMES));
+        assert_eq!(feedback.estimate(), Some(0x6_1800));
+        // A backlog 20 ms short asks for more at once: 960/76800 = 1.25%.
+        let more = feedback.update(at(12_001, 196_048, TARGET_FRAMES - 960));
+        assert!(
+            more > 0x6_1800 + 4900 && more < 0x6_1800 + 5000,
+            "{more:#x}"
+        );
+        // An empty backlog asks for 2.5% more than the estimate; a full
+        // one would ask for far less, held at 5% under nominal.
+        let most = feedback.update(at(12_002, 196_096, 0));
+        assert!(
+            most > 0x6_1800 + 9800 && most < 0x6_1800 + 9900,
+            "{most:#x}"
+        );
+        assert_eq!(
+            feedback.update(at(12_003, 196_144, 100_000)),
+            FEEDBACK_NOMINAL - FEEDBACK_SPAN
+        );
+    }
+
+    #[test]
+    fn a_rate_is_printed_in_hz_and_percent_of_nominal() {
+        assert_eq!(Rate(6 << 16).to_string(), "0x00060000=48000.0Hz(+0.00%)");
+        assert_eq!(Rate(0x6_2000).to_string(), "0x00062000=49000.0Hz(+2.08%)");
+        assert_eq!(Rate(0x5_e000).to_string(), "0x0005e000=47000.0Hz(-2.08%)");
+        assert_eq!(
+            Rate(FEEDBACK_NOMINAL + FEEDBACK_SPAN).to_string(),
+            "0x00064ccc=50399.9Hz(+4.99%)"
+        );
+        assert_eq!(Deviation(FEEDBACK_NOMINAL - 3933).to_string(), "-1.00%");
+        assert_eq!(Deviation(FEEDBACK_NOMINAL - 1).to_string(), "+0.00%");
+    }
+
+    /// FIFO errors count near an upload when one ran in the window since
+    /// the last status read, or ended within 10 ms before it; every turn
+    /// counts as the baseline. A stop starts a new window.
+    #[test]
+    fn fifo_errors_are_counted_near_or_apart_from_uploads() {
+        const MS: u64 = 24_000;
+        let near = UPLOAD_NEAR_MS * MS;
+        let mut c = FifoCorrelation::default();
+        let none = Uploads::default();
+        // The first read has no window.
+        assert_eq!(c.turn(100 * MS, none, 1, near), None);
+        // No upload ever: apart.
+        assert_eq!(c.turn(105 * MS, none, 2, near), Some(false));
+        // One upload finished inside the window.
+        let one = Uploads {
+            count: 1,
+            last_end: 107 * MS,
+            busy: false,
+        };
+        assert_eq!(c.turn(110 * MS, one, 1, near), Some(true));
+        // It ended 3, then 8 ms before the window: still near.
+        assert_eq!(c.turn(115 * MS, one, 0, near), Some(true));
+        assert_eq!(c.turn(118 * MS, one, 0, near), Some(true));
+        // 11 ms before: apart.
+        assert_eq!(c.turn(130 * MS, one, 4, near), Some(false));
+        // One under way.
+        let busy = Uploads { busy: true, ..one };
+        assert_eq!(c.turn(135 * MS, busy, 3, near), Some(true));
+        assert_eq!(
+            c,
+            FifoCorrelation {
+                near: 4,
+                apart: 6,
+                turns_near: 4,
+                turns: 6,
+                last: Some((135 * MS, 1)),
+            }
+        );
+        assert_eq!(
+            c.to_string(),
+            "fifo_near_upload=4 fifo_apart=6 turns_near_upload=4/6"
+        );
+        c.interrupt();
+        assert_eq!(c.turn(500 * MS, busy, 9, near), None);
+        assert_eq!(c.turns, 6);
     }
 
     #[test]
@@ -701,23 +1371,47 @@ mod tests {
                 silent: 10,
                 trimmed: 4,
             },
+            interval_silent: 10,
+            interval_dropped: 3,
+            backlog: Some(Levels {
+                min: 960,
+                avg: 1920,
+                max: 2400,
+            }),
+            asynchronous: true,
+            feedback: 0x6_2000,
+            measured: Some(0x6_1800),
+            packets: 2000,
+            feedback_reads: 1990,
         };
         assert_eq!(
             report.to_string(),
             "GUEST AUDIO frames=96000 consumed=95000 silent=10 dropped=7 split=0 queued=240 \
-             bits=16 muted=false volume=-12.5dB"
+             bits=16 muted=false volume=-12.5dB +silent=10 +dropped=3 backlog_ms=20.0/40.0/50.0 \
+             feedback=0x00062000=49000.0Hz(+2.08%) measured=+1.56% packets=2000 \
+             feedback_reads=1990"
         );
         let unity = Report {
             volume: 0,
             muted: true,
             bits: 0,
+            backlog: None,
+            asynchronous: false,
+            measured: None,
             ..report
         };
         assert!(
             unity
                 .to_string()
-                .ends_with("bits=0 muted=true volume=0.0dB")
+                .contains("bits=0 muted=true volume=0.0dB +silent=10 +dropped=3 backlog_ms=- ")
         );
+        assert!(
+            unity
+                .to_string()
+                .contains("feedback=0x00062000=49000.0Hz(+2.08%)(unsent:adaptive) measured=- ")
+        );
+        assert!(endpoint_mode(true).contains("asynchronous with explicit feedback"));
+        assert!(endpoint_mode(false).starts_with("GUEST AUDIO endpoint: adaptive, no feedback"));
     }
 
     #[test]

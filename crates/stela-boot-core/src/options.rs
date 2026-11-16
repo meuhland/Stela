@@ -420,6 +420,11 @@ pub struct System {
     /// still taken and discarded (`--guest-audio-hdmi-tone`, which also
     /// gives the speaker and the HDMI output).
     pub guest_audio_hdmi_tone: bool,
+    /// Make the speaker's streaming endpoint asynchronous, with an explicit
+    /// feedback endpoint telling the guest the rate the host's output
+    /// consumes, instead of adaptive (`--guest-audio-async`, which also
+    /// gives the speaker). Off by default until a boot shows macOS takes it.
+    pub guest_audio_async: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -522,6 +527,7 @@ impl Default for System {
             guest_audio_hdmi: false,
             guest_audio_trust_quiesced: false,
             guest_audio_hdmi_tone: false,
+            guest_audio_async: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -956,13 +962,18 @@ impl fmt::Display for System {
                 stelanet && self.guest_network_stelanet_offloads == offloads,
             )?;
         }
-        line.flag("--guest-audio", self.guest_audio && !self.guest_audio_hdmi)?;
+        let asynchronous = self.guest_audio && self.guest_audio_async;
+        line.flag(
+            "--guest-audio",
+            self.guest_audio && !self.guest_audio_hdmi && !asynchronous,
+        )?;
         let hdmi = self.guest_audio && self.guest_audio_hdmi;
         let trust = hdmi && self.guest_audio_trust_quiesced;
         let tone = hdmi && self.guest_audio_hdmi_tone;
         line.flag("--guest-audio-hdmi", hdmi && !trust && !tone)?;
         line.flag("--guest-audio-hdmi-trust-quiesced", trust)?;
         line.flag("--guest-audio-hdmi-tone", tone)?;
+        line.flag("--guest-audio-async", asynchronous)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,
