@@ -5370,3 +5370,89 @@ fn a_heap_outlives_the_readers_of_its_resources() {
     let memory = device.memory();
     assert_eq!((memory.deferred, memory.pinned), (0, 0));
 }
+
+/// The lost device of run 20261116-171055: connection 45 made an automatic
+/// heap while serial 92379 ran, committed before the heap; serial 92380,
+/// another connection's, was committed while it lived; and its release by
+/// its own connection freed its memory "when serial 92378 completed", with
+/// both still running, as neither was a command buffer of its connection
+/// committed since it made the heap. The channel faulted in the freed range
+/// 11 ms later. Whole memory now goes only once every command buffer
+/// committed through its release that went to the GPU completes, whichever
+/// connection committed it, and the book says so.
+#[test]
+fn a_released_heap_waits_for_all_work_running_at_its_release() {
+    let mut device = device_on(MockBackend::new());
+    let timeline = device.timeline;
+    let earlier = device.commit_for(45, device.new_command_buffer()).unwrap();
+    let made = device.submitted_serial();
+    let private = options(StorageMode::Private);
+    let heap = device
+        .new_heap(&HeapDescriptor {
+            size: 458_752,
+            options: private,
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size64,
+        })
+        .unwrap();
+    device.book_holder(super::MemoryOwner::Heap(heap), 45);
+    let descriptor = TextureDescriptor {
+        options: private,
+        ..texture(PixelFormat::Rgba16Float, TextureUsage::SHADER_READ)
+    };
+    let placed = device.new_heap_texture(heap, &descriptor, None).unwrap();
+    let other = device.commit_for(1, device.new_command_buffer()).unwrap();
+    let before = memory_frees(&mut device);
+    release_as(&mut device, 45, made, |device| {
+        device.destroy_texture(placed)?;
+        device.destroy_heap(heap)
+    })
+    .unwrap();
+    device.poll().unwrap();
+    assert_eq!(
+        memory_frees(&mut device),
+        before,
+        "serials {earlier} and {other} still run"
+    );
+    device.backend().complete(timeline, earlier);
+    assert_eq!(device.poll(), Ok(earlier));
+    assert_eq!(
+        memory_frees(&mut device),
+        before,
+        "serial {other} of connection 1 still runs"
+    );
+    device.backend().complete(timeline, other);
+    assert_eq!(device.poll(), Ok(other));
+    assert_eq!(memory_frees(&mut device), before + 1);
+    // The memory book's line for the freed heap (upstream's report) needs
+    // the book's address-keyed records of 5f8b10d4/4e12261b, not taken here.
+    let _ = made;
+}
+
+/// Another connection's held work keeps no memory, as before, until it is
+/// submitted: only work on the GPU keeps memory past its connection's
+/// readers.
+#[test]
+fn held_work_of_another_connection_keeps_no_memory() {
+    let mut device = device_on(MockBackend::new());
+    let (event, held) = hold_for_event(&mut device, 1);
+    let made = device.submitted_serial();
+    let heap = device
+        .new_heap(&HeapDescriptor {
+            size: 1 << 16,
+            options: options(StorageMode::Private),
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size64,
+        })
+        .unwrap();
+    let before = memory_frees(&mut device);
+    release_as(&mut device, 2, made, |device| device.destroy_heap(heap)).unwrap();
+    assert_eq!(
+        memory_frees(&mut device),
+        before + 1,
+        "serial {held} is held"
+    );
+    device.set_signaled_value(event, 1).unwrap();
+    device.backend().finish();
+    device.poll().unwrap();
+}

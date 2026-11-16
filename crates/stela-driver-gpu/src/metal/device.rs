@@ -494,6 +494,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         !self.queue.reads(release)
     }
 
+    /// Whether `object`, which `release` released, may be destroyed now:
+    /// whole memory once no command buffer in flight may reach it
+    /// ([`queue::Queue::reaches_memory`]), anything else once none may read
+    /// it.
+    fn frees_object(&self, release: &pins::Release, object: Object) -> bool {
+        match object {
+            Object::Memory(_) => !self.queue.reaches_memory(release),
+            _ => self.frees(release),
+        }
+    }
+
     /// The deferred objects and bytes that only held work keeps.
     fn pinned(&self) -> (usize, u64) {
         self.deferred
@@ -515,7 +526,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             self.book.release(memory, self.submitted);
         }
         let release = self.release_now();
-        if !self.lost && self.frees(&release) {
+        if !self.lost && self.frees_object(&release, object) {
             self.destroy_now(object);
             self.allocated -= allocated;
         } else {

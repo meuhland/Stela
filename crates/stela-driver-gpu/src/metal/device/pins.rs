@@ -11,6 +11,17 @@
 //! connection. What the device shares among connections itself, and what
 //! it frees on its own, keeps the device-wide [`Scope::DEVICE`]: every
 //! command buffer committed through `r`.
+//!
+//! Freeing a whole allocation unmaps its GPU addresses, and a read of an
+//! unmapped address faults the channel and loses the device for every
+//! connection, where a Mac fails only the reading command buffer. Not every
+//! reference reaches the device: `useResource:`, `useHeap:` and residency
+//! sets send nothing, and argument buffers hold addresses and resource IDs
+//! the device never parses. So memory also waits for every command buffer
+//! of any connection committed through `r` that went to the GPU
+//! ([`Queue::reaches_memory`](super::queue::Queue::reaches_memory)): such
+//! work completes on its own, so this keeps no memory past work already
+//! running, while another connection's held work still keeps none of it.
 use alloc::{sync::Arc, vec::Vec};
 
 /// The connections whose command buffers may read a released object.

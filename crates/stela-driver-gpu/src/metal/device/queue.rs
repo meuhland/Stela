@@ -388,6 +388,17 @@ impl Queue {
             .any(|flight| release.read_by(flight.key, flight.serial))
     }
 
+    /// Whether a command buffer in flight may reach the memory `release`
+    /// frees: one that may read it ([`Self::reads`]), or any of any
+    /// connection committed through the release that went to the GPU, held
+    /// ones only once submitted ([`super::pins`]).
+    pub(super) fn reaches_memory(&self, release: &super::pins::Release) -> bool {
+        self.in_flight.iter().any(|flight| {
+            release.read_by(flight.key, flight.serial)
+                || (flight.serial <= release.serial && flight.track != Track::Held)
+        })
+    }
+
     /// The connections of unfinished command buffers that carry uploads or
     /// decodes of `texture`.
     pub(super) fn carriers(&self, texture: TextureId) -> impl Iterator<Item = u64> + '_ {
@@ -2107,7 +2118,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // when `completed` passed it while it was held.
         self.completed = self.completed.max(completed);
         // Each release waits only for the command buffers that may read it
-        // (`pins`): another connection's held work does not keep it.
+        // (`pins`), and whole memory for any that went to the GPU before it
+        // too: another connection's held work does not keep it.
         // A bounded retirement (the boot processor's look, whose guest
         // waits meanwhile) stops destroying once its budget is spent and
         // leaves the rest, in order, for the next.
@@ -2116,7 +2128,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         self.destruction_left = false;
         let mut kept = VecDeque::with_capacity(self.deferred.len());
         for (release, object, allocated) in core::mem::take(&mut self.deferred) {
-            let frees = !self.queue.reads(&release);
+            let frees = self.frees_object(&release, object);
             let spent = budget != 0 && self.timing.now().wrapping_sub(began) >= budget;
             if frees && !spent {
                 self.destroy_now(object);
