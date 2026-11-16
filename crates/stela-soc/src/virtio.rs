@@ -9,6 +9,7 @@
 //! board's DMA step, as StelaNet's frames move: the guest's notifications
 //! and the device's own [`VirtioDevice::due`] work bring the step about. The
 //! queues are split virtqueues ([`queue`]), shared with StelaNet.
+pub mod blk;
 pub mod console;
 pub mod mmio;
 pub mod queue;
