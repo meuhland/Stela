@@ -13,7 +13,10 @@
 //! [`read_entries`]) finds either the old content or the new. An update that
 //! replaces content and finds no room beside it first commits without the
 //! replaced blobs, then writes the replacement where they were: a cut
-//! between the two leaves that intermediate content, which is also whole.
+//! between the two leaves that intermediate content, which is also whole,
+//! but lacks what was replaced. [`plan_beside`] never takes that step: a
+//! blob with no room beside the committed ones is dropped, so a cut leaves
+//! the old content or the new and nothing less.
 //!
 //! The format knows nothing of what the blobs hold: each user names its own
 //! domain and kinds, and a key that a reader of another key ignores, so a
@@ -446,6 +449,31 @@ pub fn plan<'a>(
     file_bytes: u64,
     change: Change<'a>,
 ) -> Plan<'a> {
+    planned(current, domain, key, file_bytes, change, false)
+}
+
+/// [`plan`] in one commit: each new blob is placed beside every committed
+/// one or dropped, never where a replaced blob was after a commit without
+/// it. A cut anywhere leaves the old content or the new, so content that a
+/// replacement finds no room for is never lost on the way.
+pub fn plan_beside<'a>(
+    current: Option<&Commit>,
+    domain: [u8; 8],
+    key: [u8; 32],
+    file_bytes: u64,
+    change: Change<'a>,
+) -> Plan<'a> {
+    planned(current, domain, key, file_bytes, change, true)
+}
+
+fn planned<'a>(
+    current: Option<&Commit>,
+    domain: [u8; 8],
+    key: [u8; 32],
+    file_bytes: u64,
+    change: Change<'a>,
+    beside: bool,
+) -> Plan<'a> {
     let Change {
         mut replace,
         mut remove,
@@ -473,7 +501,12 @@ pub fn plan<'a>(
             .collect();
         let replaced =
             |entry: &Entry| replace.contains(&entry.kind) || remove.contains(&entry.offset);
-        let (first, second, dropped) = layout(committed, &replaced, &candidates, end, MAX_ENTRIES);
+        let (first, mut second, mut dropped) =
+            layout(committed, &replaced, &candidates, end, MAX_ENTRIES);
+        if beside {
+            dropped.extend(second.drain(..).map(|(index, _)| index));
+            dropped.sort_unstable();
+        }
         let short: Vec<u32> = replace
             .iter()
             .copied()

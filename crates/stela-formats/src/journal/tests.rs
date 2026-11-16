@@ -229,6 +229,70 @@ fn a_replacement_with_no_room_beside_the_old_goes_where_it_was() {
 }
 
 #[test]
+fn a_replacement_planned_beside_with_no_room_there_keeps_the_old_whole() {
+    // Room for 10 blocks: the old cache takes 6, its replacement 6, which
+    // fits only where the old one is.
+    let mut file = File::new(DATA_START + 10 * ALIGN);
+    let size = file.bytes.len() as u64;
+    let old = Change {
+        replace: vec![CACHE],
+        remove: Vec::new(),
+        blobs: blobs![(CACHE, blob(1, 6 * ALIGN as usize))],
+    };
+    let commit = run(&mut file, plan_beside(None, DOMAIN, KEY, size, old)).unwrap();
+    let new = Change {
+        replace: vec![CACHE],
+        remove: Vec::new(),
+        blobs: blobs![
+            (CACHE, blob(2, 6 * ALIGN as usize)),
+            (LOG, blob(3, 2 * ALIGN as usize)),
+        ],
+    };
+    let planned = plan_beside(commit.as_ref(), DOMAIN, KEY, size, new.clone());
+    // The cache is dropped and the old one kept; the log fits beside it.
+    assert_eq!(planned.dropped, vec![0]);
+    let commits = planned
+        .steps
+        .iter()
+        .filter(|step| matches!(step, Step::Commit(_)))
+        .count();
+    assert_eq!(commits, 1);
+    // Every cut leaves the old cache.
+    let total: u64 = planned
+        .steps
+        .iter()
+        .map(|step| match step {
+            Step::Data { blob, .. } => aligned(planned.blobs[*blob].length()),
+            Step::Commit(_) => SLOT_BYTES,
+            Step::Flush => 0,
+        })
+        .sum();
+    for cut in 0..=total / 1024 {
+        let mut cut_file = File::new(size);
+        cut_file.bytes.copy_from_slice(&file.bytes);
+        cut_file.left = Some(cut * 1024);
+        let planned = plan_beside(commit.as_ref(), DOMAIN, KEY, size, new.clone());
+        let _ = run(&mut cut_file, planned);
+        let found = sorted(content(&cut_file.bytes).unwrap().1);
+        assert!(
+            found.contains(&(CACHE, blob(1, 6 * ALIGN as usize))),
+            "cut {cut}"
+        );
+    }
+    // The same change planned otherwise drops the old cache first.
+    let replaced = plan(commit.as_ref(), DOMAIN, KEY, size, new);
+    assert!(replaced.dropped.is_empty());
+    run(&mut file, planned).unwrap();
+    assert_eq!(
+        sorted(content(&file.bytes).unwrap().1),
+        vec![
+            (CACHE, blob(1, 6 * ALIGN as usize)),
+            (LOG, blob(3, 2 * ALIGN as usize))
+        ]
+    );
+}
+
+#[test]
 fn a_replacement_that_can_never_fit_keeps_the_old_and_an_append_without_room_is_dropped() {
     let mut file = File::new(DATA_START + 4 * ALIGN);
     let size = file.bytes.len() as u64;
