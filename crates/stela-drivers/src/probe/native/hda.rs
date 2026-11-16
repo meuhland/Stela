@@ -191,15 +191,90 @@ pub enum HdmiStart {
     /// The stream alone, on the route as prepared (after an underrun or a
     /// transient codec fault).
     Stream,
-    /// The stream alone, after a pause: the sink came back with the same
-    /// ELD.
+    /// The route's verbs set again (no codec walk), then the stream, after
+    /// a readback rejected the route.
+    Reprogrammed,
+    /// The route's verbs set again and the stream started, after a pause:
+    /// the sink came back with the same ELD.
     Resumed,
+}
+
+/// Controller resets ([`Host::reset_hdmi`]) one playback may take in a
+/// boot: each allocates nothing new when the reset streams' ring and BDL
+/// fit the new stream, but a reset that keeps failing must end.
+pub const HDMI_RESETS: u8 = 3;
+/// The least time between the starts of two controller resets.
+pub const HDMI_RESET_SPACING_US: u64 = 10_000_000;
+
+/// Why [`Host::reset_hdmi`] did not reset the controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdmiResetRefusal {
+    /// All [`HDMI_RESETS`] were taken: the playback is given up.
+    Exhausted,
+    /// The last reset began less than [`HDMI_RESET_SPACING_US`] ago; this
+    /// much of the spacing remains.
+    TooSoon { wait_us: u64 },
+}
+
+/// A playback's controller resets: how many were taken, and when the last
+/// began. At most [`HDMI_RESETS`], [`HDMI_RESET_SPACING_US`] apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HdmiResets {
+    taken: u8,
+    last_us: Option<u64>,
+}
+
+impl HdmiResets {
+    /// The resets taken (admitted, whether they then succeeded or not).
+    pub fn taken(&self) -> u8 {
+        self.taken
+    }
+
+    /// Admits one more reset at `now_us` (a monotonic microsecond clock):
+    /// its number, from 1, or why not. A refusal changes nothing.
+    pub fn admit(&mut self, now_us: u64) -> Result<u8, HdmiResetRefusal> {
+        if self.taken >= HDMI_RESETS {
+            return Err(HdmiResetRefusal::Exhausted);
+        }
+        if let Some(last) = self.last_us {
+            let since = now_us.saturating_sub(last);
+            if since < HDMI_RESET_SPACING_US {
+                return Err(HdmiResetRefusal::TooSoon {
+                    wait_us: HDMI_RESET_SPACING_US - since,
+                });
+            }
+        }
+        self.taken += 1;
+        self.last_us = Some(now_us);
+        Ok(self.taken)
+    }
+}
+
+/// How [`Host::reset_hdmi`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdmiResetError {
+    /// No reset was made.
+    Refused(HdmiResetRefusal),
+    /// Reset `reset` (from 1) was made and failed at `error`; it counts.
+    Failed { reset: u8, error: RetirementError },
+}
+
+/// What [`Host::reset_hdmi`] did: the reset's number, the codecs the new
+/// link found, and whether the new stream took the retired one's ring and
+/// BDL (no new DMA memory).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HdmiReset {
+    pub reset: u8,
+    pub codecs: usize,
+    pub same_buffers: bool,
 }
 
 /// One HDMI/DP output the owner plays PCM to: a playback stream of the
 /// controller routed to one pin's device entry (`hda::hdmi`). The stream is
 /// allocated once; its route is prepared once and kept through stream
-/// restarts, and prepared again only after it was lost.
+/// restarts, and prepared again only after it was lost. A controller
+/// reset ([`Host::reset_hdmi`]) attaches the port and allocates the stream
+/// again.
 pub struct HdmiPlayback {
     port: hda::hdmi::HdmiPortId,
     stream: hda::StreamId,
@@ -208,9 +283,22 @@ pub struct HdmiPlayback {
     ring: usize,
     running: bool,
     without_eld: Option<audio::Error>,
+    /// What a controller reset attaches and allocates again.
+    target: (u8, u8, u8),
+    owner: alloc::sync::Arc<dyn hda::hdmi::DisplayAudioPort>,
+    format: audio::PcmFormat,
+    periods: usize,
+    /// The ring's device address, to tell whether a reset's new stream
+    /// took the same memory.
+    buffer_address: u64,
+    resets: HdmiResets,
 }
 
 impl HdmiPlayback {
+    /// The controller resets taken.
+    pub fn resets(&self) -> u8 {
+        self.resets.taken()
+    }
     /// With the route prepared on a sink whose ELD did not read or parse
     /// (`hda::hdmi::BASIC_AUDIO` only): why.
     pub fn without_eld(&self) -> Option<audio::Error> {
@@ -275,7 +363,7 @@ impl Host {
             ))?;
         let (controller, dma) = self.owner.controller()?;
         // SAFETY: forwarded owner contract.
-        let port = unsafe { controller.attach_hdmi_port(&graph, pin, device, owner) }?;
+        let port = unsafe { controller.attach_hdmi_port(&graph, pin, device, owner.clone()) }?;
         let stream = controller.allocate_stream(
             audio::Direction::Playback,
             format,
@@ -284,6 +372,7 @@ impl Host {
             dma,
         )?;
         let ring = controller.stream_buffer_bytes(stream)?;
+        let buffer_address = controller.stream_buffer_address(stream)?;
         Ok(HdmiPlayback {
             port,
             stream,
@@ -292,7 +381,96 @@ impl Host {
             ring,
             running: false,
             without_eld: None,
+            target: (codec, pin, device),
+            owner,
+            format,
+            periods,
+            buffer_address,
+            resets: HdmiResets::default(),
         })
+    }
+
+    /// Recover a playback whose controller needs a reset (`NeedsReset`:
+    /// a DMA descriptor error, a stream stop that was not acknowledged, a
+    /// route given up after [`hda::hdmi::HDMI_TRANSIENT_FAULTS`] faults, a
+    /// failed preparation): the controller's own reset
+    /// (`hda::Controller::reinitialize`, GCTL.CRST: every stream and the
+    /// command rings stopped, the link reset, the old route and port
+    /// retired), the codecs discovered again, the port attached again on
+    /// the new graph with the same owner, pin and device entry, and a new
+    /// stream allocated, on the retired stream's ring and BDL. The route is
+    /// not prepared: [`Self::start_hdmi`] prepares it.
+    ///
+    /// This is never a function-level reset (FLR) or a D3 transition of
+    /// the PCI function: those could clear what the GPU's firmware wrote
+    /// into the codec (the ELD, presence, ELD valid). CRST does not; the
+    /// claim already took the link through it before the ELD was read.
+    ///
+    /// At most [`HDMI_RESETS`] per playback and boot, at least
+    /// [`HDMI_RESET_SPACING_US`] apart by `now_us`; a refused reset changes
+    /// nothing, and a failed one counts.
+    pub fn reset_hdmi(
+        &mut self,
+        playback: &mut HdmiPlayback,
+        now_us: u64,
+    ) -> Result<HdmiReset, HdmiResetError> {
+        let reset = playback
+            .resets
+            .admit(now_us)
+            .map_err(HdmiResetError::Refused)?;
+        playback.running = false;
+        let failed = |error| HdmiResetError::Failed { reset, error };
+        let codecs = {
+            let (controller, _) = self.owner.controller().map_err(failed)?;
+            controller
+                .reinitialize()
+                .map_err(|error| failed(error.into()))?;
+            let discovery = controller
+                .discover_codecs()
+                .map_err(|failure| failed(failure.error.into()))?;
+            let mut codecs = Vec::new();
+            for graph in discovery.codecs {
+                let setup = controller.initialize_codec(&graph);
+                codecs.push(Codec { graph, setup });
+            }
+            self.codec_failures = discovery.failures;
+            codecs
+        };
+        self.codecs = codecs;
+        self.discovery_error = None;
+        let previous = playback.buffer_address;
+        // SAFETY: the owner was given for this controller's function, codec,
+        // pin and device entry for the boot (`Self::hdmi_playback`); the
+        // reset retired its old port after the route closed.
+        let fresh = unsafe {
+            self.hdmi_playback(
+                playback.target,
+                playback.owner.clone(),
+                playback.format,
+                playback.period,
+                playback.periods,
+            )
+        }
+        .map_err(failed)?;
+        let resets = playback.resets;
+        *playback = fresh;
+        playback.resets = resets;
+        Ok(HdmiReset {
+            reset,
+            codecs: self.codecs.len(),
+            same_buffers: playback.buffer_address == previous,
+        })
+    }
+
+    /// The next status read of the playback's stream reads its whole route
+    /// back (`hda::Controller::schedule_hdmi_readback`): once per service
+    /// turn, before the turn's refills; the others sense the pin only.
+    pub fn schedule_hdmi_readback(
+        &mut self,
+        playback: &HdmiPlayback,
+    ) -> Result<(), RetirementError> {
+        let (controller, _) = self.owner.controller()?;
+        Ok(controller.schedule_hdmi_readback(playback.port)?)
     }
 
     /// Start the playback. A route still prepared from an earlier start
@@ -308,7 +486,8 @@ impl Host {
     /// A sink away (no presence or no ELD_VALID) is `SinkUnavailable`: a
     /// prepared route stays paused for the next start. A sink whose ELD
     /// does not read or parse takes basic audio only
-    /// ([`HdmiPlayback::without_eld`]).
+    /// ([`HdmiPlayback::without_eld`]). `NeedsReset` asks for
+    /// [`Self::reset_hdmi`].
     pub fn start_hdmi(
         &mut self,
         playback: &mut HdmiPlayback,
@@ -321,6 +500,7 @@ impl Host {
                     playback.running = true;
                     return Ok(match restart {
                         hda::hdmi::HdmiRestart::Stream => HdmiStart::Stream,
+                        hda::hdmi::HdmiRestart::Reprogrammed => HdmiStart::Reprogrammed,
                         hda::hdmi::HdmiRestart::Resumed => HdmiStart::Resumed,
                     });
                 }
@@ -696,6 +876,50 @@ unsafe fn attach_with(
         codec_failures: discovery.codec_failures,
         discovery_error: discovery.discovery_error,
     })
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    const SECOND: u64 = 1_000_000;
+
+    #[test]
+    fn three_controller_resets_a_boot_at_least_ten_seconds_apart() {
+        let mut resets = HdmiResets::default();
+        // The first reset may come at once.
+        assert_eq!(resets.admit(5 * SECOND), Ok(1));
+        // The next only 10 s after it; a refusal changes nothing.
+        assert_eq!(
+            resets.admit(6 * SECOND),
+            Err(HdmiResetRefusal::TooSoon {
+                wait_us: 9 * SECOND
+            })
+        );
+        assert_eq!(
+            resets.admit(15 * SECOND - 1),
+            Err(HdmiResetRefusal::TooSoon { wait_us: 1 })
+        );
+        assert_eq!(resets.taken(), 1);
+        assert_eq!(resets.admit(15 * SECOND), Ok(2));
+        // A clock that went back waits the whole spacing.
+        assert_eq!(
+            resets.admit(SECOND),
+            Err(HdmiResetRefusal::TooSoon {
+                wait_us: HDMI_RESET_SPACING_US
+            })
+        );
+        assert_eq!(resets.admit(40 * SECOND), Ok(3));
+        // After the third, never again, however long after.
+        for later in [41, 50, 1_000_000] {
+            assert_eq!(
+                resets.admit(later * SECOND),
+                Err(HdmiResetRefusal::Exhausted)
+            );
+        }
+        assert_eq!(resets.taken(), HDMI_RESETS);
+        assert_eq!((HDMI_RESETS, HDMI_RESET_SPACING_US), (3, 10 * SECOND));
+    }
 }
 
 #[cfg(test)]

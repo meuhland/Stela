@@ -224,9 +224,21 @@ struct Route {
     format: PcmFormat,
     map: ChannelMap,
     digital: u8,
+    /// The infoframe's connection type, for [`Controller::hdmi_program`].
+    connection: Connection,
     generation: u64,
     prepared: bool,
     progress: Option<playback::Progress>,
+    /// The next status read reads the whole route back
+    /// ([`Controller::schedule_hdmi_readback`]); a start always does, and
+    /// other status reads read only the pin sense.
+    verify: bool,
+    /// A readback rejected the route: the next restart sets the route's
+    /// verbs again ([`Controller::hdmi_program`]) before its readback.
+    reprogram: bool,
+    /// The route's verbs were just set again: a rejected readback now
+    /// counts toward [`HDMI_TRANSIENT_FAULTS`].
+    reprogrammed: bool,
     /// The stream stopped because the pin sensed no sink with a valid ELD
     /// (a monitor asleep or unplugged); the route stays prepared, and
     /// [`Controller::restart_hdmi`] resumes it once the sink is back with
@@ -234,7 +246,9 @@ struct Route {
     paused: bool,
     /// Transient codec faults in a row, each of which stopped only the
     /// stream; a refilled period clears them. Past
-    /// [`HDMI_TRANSIENT_FAULTS`] the route is given up (`NeedsReset`).
+    /// [`HDMI_TRANSIENT_FAULTS`] the route is given up (`NeedsReset`). A
+    /// rejected readback counts only once the route's verbs were set again
+    /// and it still reads back wrong.
     faults: u8,
 }
 /// How a route's runtime check failed, and so what it stops.
@@ -481,11 +495,15 @@ pub const HDMI_TRANSIENT_FAULTS: u8 = 8;
 /// read again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HdmiRestart {
-    /// The stream alone, after a stream-level stop (an underrun, a
-    /// transient codec fault).
+    /// The stream alone, after a stream-level stop (an underrun, a DMA
+    /// FIFO error, a transient codec fault).
     Stream,
+    /// The route's verbs set again ([`Controller::hdmi_program`], no graph
+    /// walk), then the stream, after a readback rejected the route.
+    Reprogrammed,
     /// The stream, after a pause: the sink came back with the ELD the
-    /// route was prepared for.
+    /// route was prepared for, and the route's verbs were set again, as
+    /// Linux sets the infoframe again when ELD_VALID returns.
     Resumed,
 }
 pub(super) struct Port {
@@ -1391,78 +1409,19 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             format,
             map: map.clone(),
             digital,
+            connection,
             generation: snapshot.state.generation,
             prepared: false,
             progress: None,
+            verify: false,
+            reprogram: false,
+            reprogrammed: false,
             paused: false,
             faults: 0,
         });
         let result = (|| {
             self.hdmi_effect(index, Some(format))?;
-            let group = graph
-                .groups
-                .iter()
-                .find(|g| g.widgets.iter().any(|w| w.node == pin))
-                .ok_or(Error::InvalidCodecGraph)?;
-            self.power_d0(graph.address, group.node)?;
-            for node in [converter, pin] {
-                if graph.widget(node).unwrap().power_states.is_some() {
-                    self.power_d0(graph.address, node)?;
-                }
-            }
-            self.route_control(graph.address, pin, 0x701, 0xf01, mux)?;
-            self.route_control(graph.address, pin, 0x707, 0xf07, 0)?;
-            self.hdmi_digital_control(graph.address, converter, digital)?;
-            self.route_control(graph.address, converter, 0x72d, 0xf2d, format.channels - 1)?;
-            for slot in map.slots {
-                self.verb(Verb::short(graph.address, pin, 0x734, slot)?)?;
-            }
-            // NVIDIA stereo ignores ASP remapping; the fixed FL/FR map is
-            // validated above. Wider maps must read back every slot.
-            if format.channels > 2 {
-                for slot in map.slots {
-                    let value = self.verb(Verb::short(graph.address, pin, 0xf34, slot & 15)?)?;
-                    if value & 0xf0 != u32::from(slot & 0xf0) || value == u32::MAX {
-                        let expected = Expected::Masked {
-                            mask: 0xf0,
-                            value: u32::from(slot & 0xf0),
-                        };
-                        let payload = u16::from(slot & 15);
-                        return Err(self.rejected(
-                            graph.address,
-                            pin,
-                            0xf34,
-                            payload,
-                            expected,
-                            value,
-                        ));
-                    }
-                }
-            }
-            if graph.widget(pin).unwrap().output_amplifier.is_some() {
-                self.verb(Verb::long(graph.address, pin, 3, 0xb000)?)?;
-                for channel in [0x8000, 0xa000] {
-                    let read = self.verb(Verb::long(graph.address, pin, 0xb, channel)?)?;
-                    if read & 0xff != 0 {
-                        let expected = Expected::Masked {
-                            mask: 0xff,
-                            value: 0,
-                        };
-                        return Err(self.rejected(
-                            graph.address,
-                            pin,
-                            0xb,
-                            channel,
-                            expected,
-                            read,
-                        ));
-                    }
-                }
-            }
-            self.hdmi_packet(graph.address, pin, connection, &map)?;
-            self.route_control(graph.address, pin, 0x707, 0xf07, 0x40)?;
-            self.hdmi_long_control(graph.address, converter, 2, 0xa, format.encode()?)?;
-            self.route_control(graph.address, converter, 0x706, 0xf06, stream.tag() << 4)?;
+            self.hdmi_program(index)?;
             if self.hdmi_observe(index)? != snapshot.state {
                 return Err(Error::SinkChanged);
             }
@@ -1479,6 +1438,109 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.routing_failed = true;
             self.hdmi_record(index, error)
         })
+    }
+    /// Set the route's codec state at `index` as [`Self::prepare_hdmi`]
+    /// sets it, each set verb with its readback: the device entry, the
+    /// function group, converter and pin in D0, the connection select, pin
+    /// control off, the digital converter (DIG1), the channel count and
+    /// mapping, the pin's amplifier unmuted, the audio infoframe (stop,
+    /// write, verify, transmit), pin control on, then the converter's
+    /// format and stream tag. Nothing else: no graph walk, connection list,
+    /// ELD or DIP size read, and no call to the display owner. Linux
+    /// update_eld sets the infoframe again in the same way when a sink's
+    /// ELD becomes valid again. Called only with the stream stopped.
+    fn hdmi_program(&mut self, index: usize) -> Result<(), Error> {
+        self.minimum_guard()?;
+        let port = self.hdmi_ports[index].as_ref().unwrap();
+        let route = port.route.as_ref().ok_or(Error::SinkUnavailable)?;
+        let (codec, pin) = (port.graph.address, port.pin);
+        let group = port
+            .graph
+            .groups
+            .iter()
+            .find(|g| g.widgets.iter().any(|w| w.node == pin))
+            .ok_or(Error::InvalidCodecGraph)?
+            .node;
+        let powered = |node| {
+            port.graph
+                .widget(node)
+                .is_some_and(|w| w.power_states.is_some())
+        };
+        let (converter, mux, digital, format, map, connection, tag) = (
+            route.converter,
+            route.mux,
+            route.digital,
+            route.format,
+            route.map.clone(),
+            route.connection,
+            route.stream.tag(),
+        );
+        let (converter_powered, pin_powered) = (powered(converter), powered(pin));
+        let pin_amplified = port
+            .graph
+            .widget(pin)
+            .is_some_and(|w| w.output_amplifier.is_some());
+        self.hdmi_select_port(index)?;
+        self.power_d0(codec, group)?;
+        if converter_powered {
+            self.power_d0(codec, converter)?;
+        }
+        if pin_powered {
+            self.power_d0(codec, pin)?;
+        }
+        self.route_control(codec, pin, 0x701, 0xf01, mux)?;
+        self.route_control(codec, pin, 0x707, 0xf07, 0)?;
+        self.hdmi_digital_control(codec, converter, digital)?;
+        self.route_control(codec, converter, 0x72d, 0xf2d, format.channels - 1)?;
+        for slot in map.slots {
+            self.verb(Verb::short(codec, pin, 0x734, slot)?)?;
+        }
+        // NVIDIA stereo ignores ASP remapping; the fixed FL/FR map is
+        // validated at prepare. Wider maps must read back every slot.
+        if format.channels > 2 {
+            for slot in map.slots {
+                let value = self.verb(Verb::short(codec, pin, 0xf34, slot & 15)?)?;
+                if value & 0xf0 != u32::from(slot & 0xf0) || value == u32::MAX {
+                    let expected = Expected::Masked {
+                        mask: 0xf0,
+                        value: u32::from(slot & 0xf0),
+                    };
+                    let payload = u16::from(slot & 15);
+                    return Err(self.rejected(codec, pin, 0xf34, payload, expected, value));
+                }
+            }
+        }
+        if pin_amplified {
+            self.verb(Verb::long(codec, pin, 3, 0xb000)?)?;
+            for channel in [0x8000, 0xa000] {
+                let read = self.verb(Verb::long(codec, pin, 0xb, channel)?)?;
+                if read & 0xff != 0 {
+                    let expected = Expected::Masked {
+                        mask: 0xff,
+                        value: 0,
+                    };
+                    return Err(self.rejected(codec, pin, 0xb, channel, expected, read));
+                }
+            }
+        }
+        self.hdmi_packet(codec, pin, connection, &map)?;
+        self.route_control(codec, pin, 0x707, 0xf07, 0x40)?;
+        self.hdmi_long_control(codec, converter, 2, 0xa, format.encode()?)?;
+        self.route_control(codec, converter, 0x706, 0xf06, tag << 4)
+    }
+    /// The next status read of the port's stream reads its whole route
+    /// back (mux, pin control, stream tag, channel count, infoframe
+    /// transmit, digital converter, slots, format), once; other status
+    /// reads check only the pin sense, and a start always reads the whole
+    /// route. The owner calls this once per service turn: a route rejected
+    /// between turns is caught at the next one, at a few verbs a turn
+    /// rather than eight at every status read. Nothing without a route.
+    pub fn schedule_hdmi_readback(&mut self, id: HdmiPortId) -> Result<(), Error> {
+        let index = self.hdmi_index(id)?;
+        if let Some(route) = self.hdmi_ports[index].as_mut().unwrap().route.as_mut() {
+            route.verify = true;
+        }
+        Ok(())
     }
     /// Standard IEC958 digital-output enable, with live sink/route
     /// validation. This does not change coding type, PCM format, rate or GPU
@@ -1498,7 +1560,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             (route.digital & !1) | u8::from(enabled),
         );
         self.stream(stream)?;
-        self.hdmi_runtime(stream)?;
+        self.hdmi_runtime(stream, true)?;
         self.hdmi_ports[index]
             .as_mut()
             .unwrap()
@@ -1709,6 +1771,14 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 }
                 let route = self.hdmi_ports[index].as_mut().unwrap().route.as_mut();
                 let faults = route.map_or(0, |route| {
+                    if error == Error::RouteRejected {
+                        // The restart sets the route's verbs again first;
+                        // only a readback still wrong after that counts.
+                        route.reprogram = true;
+                        if !route.reprogrammed {
+                            return route.faults;
+                        }
+                    }
                     route.faults = route.faults.saturating_add(1);
                     route.faults
                 });
@@ -1763,7 +1833,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// control, format), then the stream descriptor's reset and re-arm on
     /// the same converter, stream tag and format. Neither the codec graph
     /// nor a connection list is read; the ELD is read only when resuming
-    /// from a pause.
+    /// from a pause. On a resume, and after a readback rejected the route,
+    /// the route's verbs are set again first ([`Self::hdmi_program`]): a
+    /// rejected readback counts toward [`HDMI_TRANSIENT_FAULTS`] only when
+    /// it is still wrong right after that.
     ///
     /// `SinkUnavailable`: no prepared route, or the sink is still away (the
     /// route stays paused). `SinkChanged`: the sink came back with another
@@ -1778,8 +1851,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         let port = self.hdmi_ports[index].as_ref().unwrap();
         let (codec, pin) = (port.graph.address, port.pin);
-        let (stream, paused) = match port.route.as_ref() {
-            Some(route) if route.prepared => (route.stream, route.paused),
+        let (stream, paused, reprogram) = match port.route.as_ref() {
+            Some(route) if route.prepared => (route.stream, route.paused, route.reprogram),
             _ => return Err(Error::SinkUnavailable),
         };
         if self.stream(stream)?.running {
@@ -1827,6 +1900,24 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 route.paused = false;
             }
         }
+        // Back from a pause (the display side may have reset what it
+        // shares with the codec), or after a rejected readback: the route's
+        // verbs are set again, with no graph walk, before the start's
+        // readback; from here a rejected readback counts.
+        if paused || reprogram {
+            let route = self.hdmi_ports[index].as_mut().unwrap().route.as_mut();
+            if let Some(route) = route {
+                route.reprogrammed = true;
+            }
+            if let Err(error) = self.hdmi_program(index) {
+                let (error, kind) = match error {
+                    // As a resume's readback below: prepare it again.
+                    Error::RouteRejected if paused => (Error::SinkChanged, RuntimeFault::Lost),
+                    error => (error, RuntimeFault::of(error)),
+                };
+                return Err(self.hdmi_runtime_fault(index, error, kind));
+            }
+        }
         // The ring restarts from its start: silence until refilled.
         self.streams[usize::from(stream.descriptor_index())]
             .as_mut()
@@ -1834,8 +1925,16 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             .buffer
             .bytes_mut()
             .fill(0);
-        match self.start(stream) {
+        let started = self.start(stream);
+        if started.is_ok()
+            && let Some(route) = self.hdmi_ports[index].as_mut().unwrap().route.as_mut()
+        {
+            route.reprogram = false;
+            route.reprogrammed = false;
+        }
+        match started {
             Ok(()) if paused => Ok(HdmiRestart::Resumed),
+            Ok(()) if reprogram => Ok(HdmiRestart::Reprogrammed),
             Ok(()) => Ok(HdmiRestart::Stream),
             // Back from a pause, the codec no longer holds the route as
             // prepared (the display side may have reset it): prepare it
@@ -1846,15 +1945,20 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Err(error) => Err(error),
         }
     }
-    pub(super) fn hdmi_runtime(&mut self, id: StreamId) -> Result<(), Error> {
+    /// The route's runtime check before a start and at each status read:
+    /// the display owner's state and the pin sense always (a sink away
+    /// pauses the route); with `full`, or when the owner scheduled it
+    /// ([`Self::schedule_hdmi_readback`]), the whole route read back.
+    pub(super) fn hdmi_runtime(&mut self, id: StreamId, full: bool) -> Result<(), Error> {
         self.minimum_guard()?;
         let Some(index) = self.hdmi_stream_port(id) else {
             return Ok(());
         };
         let mut absent = false;
         let result = (|| {
-            let port = self.hdmi_ports[index].as_ref().unwrap();
-            let route = port.route.as_ref().unwrap();
+            let port = self.hdmi_ports[index].as_mut().unwrap();
+            let route = port.route.as_mut().unwrap();
+            let full = full || core::mem::take(&mut route.verify);
             let (codec, pin, cvt, mux, digital, format, generation, prepared) = (
                 port.graph.address,
                 port.pin,
@@ -1882,6 +1986,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 // The monitor sleeps or was unplugged: pause.
                 absent = true;
                 return Err(Error::SinkUnavailable);
+            }
+            if !full {
+                return Ok(());
             }
             for (node, get, expected) in [
                 (pin, 0xf01, u32::from(mux)),

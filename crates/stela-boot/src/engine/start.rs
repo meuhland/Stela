@@ -1218,9 +1218,13 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
                 host_input,
                 host_usb,
                 host_bluetooth,
-                guest_audio: options
-                    .guest_audio
-                    .then(|| guest_audio::GuestAudio::new(display_audio, handoff.root)),
+                guest_audio: options.guest_audio.then(|| {
+                    guest_audio::GuestAudio::new(
+                        display_audio,
+                        handoff.root,
+                        options.guest_audio_hdmi_tone,
+                    )
+                }),
                 guest_network,
                 host_nor,
                 host_disks,

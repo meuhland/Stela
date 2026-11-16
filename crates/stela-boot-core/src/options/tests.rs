@@ -574,4 +574,36 @@ fn guest_audio_is_off_by_default_and_round_trips() {
             .to_string(),
         trusted
     );
+    assert!(!options.guest_audio_hdmi_tone);
+}
+
+#[test]
+fn the_hdmi_test_tone_implies_the_hdmi_output_and_round_trips() {
+    // The tone implies the speaker and the HDMI output, and is written
+    // alone; it is off by default.
+    assert!(!round_trip("--system --guest-audio-hdmi").guest_audio_hdmi_tone);
+    let line = "--system --guest-audio-hdmi-tone";
+    let options = round_trip(line);
+    assert!(options.guest_audio && options.guest_audio_hdmi && options.guest_audio_hdmi_tone);
+    assert!(!options.guest_audio_trust_quiesced);
+    assert_eq!(options.to_string(), line);
+    for text in [
+        "--system --guest-audio --guest-audio-hdmi-tone",
+        "--system --guest-audio-hdmi --guest-audio-hdmi-tone",
+        "--system --guest-audio-hdmi-tone --guest-audio-hdmi",
+        "--system --guest-audio-hdmi-tone --guest-audio-hdmi-tone",
+    ] {
+        assert_eq!(System::parse(text).unwrap().to_string(), line, "{text}");
+    }
+    // With the quiesced-state claim: both written, the HDMI flag implied.
+    let both = "--system --guest-audio-hdmi-trust-quiesced --guest-audio-hdmi-tone";
+    let options = round_trip(both);
+    assert!(options.guest_audio_trust_quiesced && options.guest_audio_hdmi_tone);
+    assert_eq!(options.to_string(), both);
+    assert_eq!(
+        System::parse("--system --guest-audio-hdmi-tone --guest-audio-hdmi-trust-quiesced")
+            .unwrap()
+            .to_string(),
+        both
+    );
 }

@@ -294,12 +294,20 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if count > 256 {
             return Err(Error::InvalidBuffer);
         }
-        let mut buffer = allocator
-            .allocate(bytes, 4096)
-            .map_err(|_| Error::NoDmaMemory)?;
-        let mut bdl = allocator
-            .allocate(4096, 128)
-            .map_err(|_| Error::NoDmaMemory)?;
+        // A ring and BDL that a reset's retired stream left (`reinitialize`)
+        // first: the boot's allocator never takes memory back.
+        let mut buffer = match self.take_spare_dma(bytes, 4096) {
+            Some(buffer) => buffer,
+            None => allocator
+                .allocate(bytes, 4096)
+                .map_err(|_| Error::NoDmaMemory)?,
+        };
+        let mut bdl = match self.take_spare_dma(4096, 128) {
+            Some(bdl) => bdl,
+            None => allocator
+                .allocate(4096, 128)
+                .map_err(|_| Error::NoDmaMemory)?,
+        };
         Self::check_dma(&buffer, 4096, self.capabilities.dma_address_bits)?;
         Self::check_dma(&bdl, 128, self.capabilities.dma_address_bits)?;
         if buffer.len() != bytes || bdl.len() < 4096 {
@@ -352,6 +360,29 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         Ok(id)
     }
 
+    /// A buffer of exactly `bytes` at `align` that a stream retired by a
+    /// controller reset left ([`Self::reinitialize`]): allocated for this
+    /// controller's requester, and no engine can reach it since every DMA
+    /// stop was acknowledged and the link reset.
+    fn take_spare_dma(&mut self, bytes: usize, align: u64) -> Option<DmaBuffer> {
+        let index = self
+            .spare_dma
+            .iter()
+            .position(|b| b.len() == bytes && b.bus_address() % align == 0)?;
+        Some(self.spare_dma.swap_remove(index))
+    }
+
+    /// The streams a controller reset retires: their ring and BDL are kept
+    /// for the next [`Self::allocate_stream`] of the same sizes.
+    pub(super) fn retire_streams(&mut self) {
+        for stream in self.streams.iter_mut() {
+            if let Some(stream) = stream.take() {
+                self.spare_dma.push(stream.buffer);
+                self.spare_dma.push(stream._bdl);
+            }
+        }
+    }
+
     pub fn stream_direction(&self, id: StreamId) -> Result<Direction, Error> {
         self.minimum_guard()?;
         Ok(self.stream(id)?.direction)
@@ -379,6 +410,12 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     pub fn stream_buffer_bytes(&self, id: StreamId) -> Result<usize, Error> {
         self.minimum_guard()?;
         Ok(self.stream(id)?.buffer.len())
+    }
+    /// The ring's device address, for the owner's log: a stream allocated
+    /// after a reset on the retired stream's ring shows the same one.
+    pub fn stream_buffer_address(&self, id: StreamId) -> Result<u64, Error> {
+        self.minimum_guard()?;
+        Ok(self.stream(id)?.buffer.bus_address())
     }
 
     /// Direct PCM access requires a stopped stream. The explicit HDMI owner
@@ -458,8 +495,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         // An HDMI route's runtime check handles its own failure: a sink
         // away pauses the route, a transient codec fault stops the stream
-        // and counts, anything else closes the route. Nothing started.
-        self.hdmi_runtime(id)?;
+        // and counts, anything else closes the route. Nothing started. A
+        // start always reads the whole route back.
+        self.hdmi_runtime(id, true)?;
         if let Err(error) = self.hdmi_before_start(id) {
             if let Some(index) = self.hdmi_stream_port(id) {
                 self.hdmi_start_failed(index, id, error);
@@ -515,16 +553,31 @@ impl<R: Registers, T: Timer> Controller<R, T> {
 
     pub fn status(&mut self, id: StreamId) -> Result<StreamStatus, Error> {
         self.minimum_guard()?;
-        self.hdmi_runtime(id)?;
+        // An HDMI route's pin sense at each read; its whole readback only
+        // when its owner scheduled one (`schedule_hdmi_readback`).
+        self.hdmi_runtime(id, false)?;
         let running = self.stream(id)?.running;
         let base = stream_base(id.index);
         let status = self.registers.read8(base + SD_STS);
         if status & (SD_FIFO_ERROR | SD_DESC_ERROR) != 0 {
+            let error = Error::StreamDma { status };
+            // A FIFO error alone on an HDMI route's stream: its DMA fell
+            // behind the FIFO (a memory read stall), which Linux's
+            // azx_interrupt acknowledges and plays on. Stop the stream
+            // only, as an underrun; the route stays prepared for
+            // `restart_hdmi`. A stop that is not acknowledged still
+            // poisons the stream and fails routing (`hdmi_stop_stream`).
+            if status & SD_DESC_ERROR == 0
+                && let Some(index) = self.hdmi_stream_port(id)
+            {
+                return Err(self.hdmi_stream_fault(index, error));
+            }
+            // A descriptor error (a BDL or buffer fetch failed), or a
+            // FIFO error elsewhere: a controller reset condition.
             let _ = self.stop_descriptor(id.index);
             let stream = self.streams[usize::from(id.index)].as_mut().unwrap();
             stream.running = false;
             stream.poisoned = true;
-            let error = Error::StreamDma { status };
             if let Some(index) = self.hdmi_stream_port(id) {
                 self.hdmi_start_failed(index, id, error);
             }
