@@ -486,15 +486,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         ))
     }
 
-    /// The walk of the page of `pc` the fetch cache holds for the current
-    /// EL in the current epoch, if it holds one: what a fetch of the page
-    /// translated through now.
-    pub(super) fn cached_fetch(&self, pc: u64) -> Option<FetchEntry> {
+    /// Whether the walk of the page of `pc` that the fetch cache holds for
+    /// the current EL ended in a global leaf; true when the cache does not
+    /// hold it, which only makes more TLBIs reach the page's ITLB entry.
+    pub(super) fn fetched_global(&self, pc: u64) -> bool {
         let page = pc & !(FETCH_PAGE - 1);
         let slot = (page / FETCH_PAGE) as usize % FETCH_CACHE;
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
-        self.fetch[slot].filter(|entry| {
-            entry.page == page && entry.el == el && entry.epoch == self.fetch_epoch(chain::half(pc))
+        self.fetch[slot].is_none_or(|entry| {
+            entry.page != page
+                || entry.el != el
+                || entry.epoch != self.fetch_epoch(chain::half(pc))
+                || entry.global
         })
     }
 

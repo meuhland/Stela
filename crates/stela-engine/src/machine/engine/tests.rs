@@ -3688,9 +3688,7 @@ fn block_entries_survive_a_tlbi_all() {
             _ => panic!("a block"),
         };
     let blocks = [BASE, BASE + 4, BASE + 8].map(|pc| fetch(&mut machine, pc));
-    // The page's leaf is global: its entry is in the context every address
-    // space shares, the upper half's (`itlb_context`).
-    let before = machine.chain.contexts()[1];
+    let before = machine.chain.contexts()[chain::half(BASE)];
     let key = target_key(&machine, BASE);
     machine.tlb_maintained(Reach::All, Everywhere::All, None);
     // Each page translates at its fetch, not ahead (`refill_pages`).
@@ -3698,7 +3696,7 @@ fn block_entries_survive_a_tlbi_all() {
     let [found, translated] = [machine.statistics.fetches[0], machine.statistics.fetches[1]];
     let (fills, entries) = (machine.statistics.itlb[0], table_entries(&machine));
     assert_eq!(fetch(&mut machine, BASE), blocks[0]);
-    let after = machine.chain.contexts()[1];
+    let after = machine.chain.contexts()[chain::half(BASE)];
     assert_ne!(after, before);
     assert_eq!(target_key(&machine, BASE), key);
     // One translation of the page, then each block from the table.
@@ -3795,9 +3793,7 @@ fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
     };
     let page = BASE & !(FETCH_PAGE - 1);
     fetch(&mut machine);
-    // The page's leaf is global: its entry is in the context every address
-    // space shares, the upper half's (`itlb_context`).
-    let context = machine.chain.contexts()[1];
+    let context = machine.chain.contexts()[chain::half(BASE)];
     let (expected, mut refills) = (misses(&machine), refilled(&machine));
     for epoch in [false, true] {
         machine.forget_lookups(Reach::Containing(BASE), None);
@@ -3809,7 +3805,7 @@ fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
             assert_ne!(machine.translation_generation, generation);
         }
         fetch(&mut machine);
-        assert_eq!(machine.chain.contexts()[1], context);
+        assert_eq!(machine.chain.contexts()[chain::half(BASE)], context);
         assert_eq!(misses(&machine), expected);
         refills += 1;
         assert_eq!(refilled(&machine), refills);
@@ -3821,7 +3817,7 @@ fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
     // The page translates at its fetch, not ahead (`refill_pages`).
     machine.pending_refills.clear();
     fetch(&mut machine);
-    assert_ne!(machine.chain.contexts()[1], context);
+    assert_ne!(machine.chain.contexts()[chain::half(BASE)], context);
     let mut expected = expected;
     expected[ItlbMiss::Context as usize] += 1;
     assert_eq!(misses(&machine), expected);
@@ -3881,22 +3877,14 @@ pub(super) fn tlbi_page<D: Devices>(machine: &mut Machine<FakeHost, D>, va: u64)
     machine.tlb_maintained(reach, Everywhere::Addresses(reach), None);
 }
 
-/// Two address spaces that map one frame at one PC, each privately (nG),
-/// share its block and its block table entry: the second translates the
-/// page once and finds the entry the first recorded, compiling nothing.
-/// (A global page's one ITLB entry serves both:
-/// `address_spaces_share_their_global_pages_entries`.)
+/// Two address spaces that map one frame at one PC share its block and
+/// its block table entry: the second translates the page once and finds
+/// the entry the first recorded, compiling nothing.
 #[test]
 fn two_address_spaces_mapping_one_frame_share_an_entry() {
     const RET: u32 = 0xd65f_03c0;
-    const NG: u64 = 1 << 11;
-    let private = |machine: &mut Machine<FakeHost, NoDevices>, space: usize| {
-        paged_space(machine, space, &[BASE]);
-        let [_, _, l3] = SPACES_TABLES[space];
-        write_entry(machine, l3, page_descriptor(BASE, false) | NG);
-    };
     let mut machine = machine(&[RET]);
-    private(&mut machine, 0);
+    paged_space(&mut machine, 0, &[BASE]);
     let Ok(Fetched::Block(block)) = machine.fetch_block(BASE, false) else {
         panic!("a block");
     };
@@ -3907,7 +3895,7 @@ fn two_address_spaces_mapping_one_frame_share_an_entry() {
         machine.block_key(BASE, machine.code.blocks[block].variant)
     );
     let (fetches, entries) = (machine.statistics.fetches, table_entries(&machine));
-    private(&mut machine, 1);
+    paged_space(&mut machine, 1, &[BASE]);
     assert!(
         matches!(machine.fetch_block(BASE, false), Ok(Fetched::Block(index)) if index == block)
     );
@@ -3916,16 +3904,17 @@ fn two_address_spaces_mapping_one_frame_share_an_entry() {
     assert_eq!(machine.statistics.fetches[1], fetches[1] + 1);
     assert_eq!(machine.statistics.fetches[4], fetches[4]);
     assert_eq!(table_entries(&machine), entries);
-    // The ITLB holds the page in both contexts, with the one key.
+    // The ITLB holds the page in both contexts, with the one key and the
+    // mark of its global leaf.
     for context in [first, second] {
         let held = machine.itlb.entry(machine.itlb.page_slot(BASE, context));
-        assert_eq!(held, chain::LookupEntry::page(BASE, context, key));
+        assert_eq!(held, chain::LookupEntry::global_page(BASE, context, key));
     }
     // An IC IVAU of the frame forgets the entry for both: the next fetch
     // in either compiles the page again.
     machine.invalidate_code_page(BASE);
     assert_eq!(table_entries(&machine), entries - 1);
-    private(&mut machine, 0);
+    paged_space(&mut machine, 0, &[BASE]);
     assert!(
         matches!(machine.fetch_block(BASE, false), Ok(Fetched::Block(index)) if index != block)
     );
