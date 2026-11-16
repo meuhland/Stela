@@ -4790,14 +4790,6 @@
   },
   {
     "package": "stela-engine",
-    "test": "raised_timer_write_costs",
-    "source": "crates/stela-engine/src/machine/engine/tests/timer_native.rs",
-    "kind": "manual",
-    "inputs": [],
-    "reason": "host timing measurement; run on request"
-  },
-  {
-    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",
