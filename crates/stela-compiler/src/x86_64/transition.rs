@@ -55,15 +55,6 @@ pub const EXCEPTION_RETURN: usize = 1;
 pub const GUARDED_ENTER: usize = 2;
 pub const GUARDED_EXIT: usize = 3;
 pub const KINDS: usize = 4;
-/// The record slot of an ERET that returns to the EL it leaves (EL2 to
-/// EL2), beside [`EXCEPTION_RETURN`]'s slot for returns to a lower EL: a
-/// kernel returns from its own exceptions and to its processes in turn, and
-/// one record of the two would hold for neither ([`exception_return_thunk`]).
-/// Counted as [`EXCEPTION_RETURN`].
-pub const RETURN_WITHIN: usize = KINDS;
-/// The records a [`Table`] keeps per state: one per kind and
-/// [`RETURN_WITHIN`].
-pub const SLOTS: usize = KINDS + 1;
 /// The PE states a [`Table`] keeps records for (the engine's mirror states).
 pub const STATES: usize = 8;
 
@@ -196,8 +187,7 @@ pub struct Table {
     pub stale_contexts: u64,
     /// Native completions of each kind since the engine last took them.
     pub counts: [u64; KINDS],
-    /// Each state's record of each kind, and of [`RETURN_WITHIN`].
-    pub records: [[Record; SLOTS]; STATES],
+    pub records: [[Record; KINDS]; STATES],
     /// The transitions this run continued through under [`CHAIN_LOGGED`],
     /// the first `logged` of `log`.
     pub logged: u64,
@@ -212,7 +202,7 @@ impl Default for Table {
             contexts_generation: 1,
             stale_contexts: 0,
             counts: [0; KINDS],
-            records: [[Record::default(); SLOTS]; STATES],
+            records: [[Record::default(); KINDS]; STATES],
             logged: 0,
             log: [Segment::default(); LOG],
         }
@@ -242,7 +232,7 @@ impl Table {
     }
 
     /// Every record stops holding but those of the `kept` kinds that held,
-    /// which hold in the new generation. ([`RETURN_WITHIN`] is ERET's.)
+    /// which hold in the new generation.
     pub fn forget_but(&mut self, kept: &[usize]) {
         let (old, new) = (self.generation, self.generation.wrapping_add(1).max(1));
         for records in &mut self.records {
@@ -326,19 +316,18 @@ const KEEP_ENTRIES: u64 = 1 << 63;
 const STAC: [u8; 3] = [0x0f, 0x01, 0xcb];
 const CLAC: [u8; 3] = [0x0f, 0x01, 0xca];
 
-/// RDX at the record of `slot` (a kind or [`RETURN_WITHIN`]) for the state
-/// word, RCX at the table, and the branches to `misses` when it does not
-/// hold for this frame.
-fn locate(asm: &mut Asm<'_>, places: &Places, slot: usize, misses: &mut Vec<Patch>) {
+/// RDX at the record of `kind` for the state word, RCX at the table, and
+/// the branches to the original exit when it does not hold for this frame.
+fn locate(asm: &mut Asm<'_>, places: &Places, kind: usize, misses: &mut Vec<Patch>) {
     use Gpr::{Rax, Rcx, Rdi, Rdx};
     use Size::Qword;
     asm.place(Rdx, places.state);
     asm.mov_load(Qword, Rdx, Mem::base(Rdx, 0));
     asm.alu_imm8(Alu::And, Qword, Rdx, (STATES - 1) as i8);
-    asm.imul_imm32(Qword, Rdx, Rdx, (SLOTS * RECORD_BYTES) as i32);
+    asm.imul_imm32(Qword, Rdx, Rdx, (KINDS * RECORD_BYTES) as i32);
     asm.place(Rcx, places.table);
     asm.alu(Alu::Add, Qword, Rdx, Rcx);
-    asm.alu_imm32(Alu::Add, Qword, Rdx, (RECORDS + slot * RECORD_BYTES) as i32);
+    asm.alu_imm32(Alu::Add, Qword, Rdx, (RECORDS + kind * RECORD_BYTES) as i32);
     asm.mov_load(
         Qword,
         Rax,
@@ -1001,66 +990,49 @@ pub fn supervisor_call_thunk(
 /// (`Record::reservation`). PSTATE's operands come from SPSR, the PC
 /// from ELR with its tag removed where the record says, the SP moves, the
 /// frame's local monitor clears and the event register is set.
-///
-/// The record is the state's [`EXCEPTION_RETURN`] one, or else its
-/// [`RETURN_WITHIN`] one: SPSR's mode, which each record fixes, tells
-/// which of the two a return may complete from, so a kernel's returns to
-/// its processes and from its own exceptions both complete.
 pub fn exception_return_thunk(pc: GuestAddress, places: &Places, ending: u32) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::{Byte, Dword, Qword};
-    let mut code = Vec::with_capacity(1024);
+    let mut code = Vec::with_capacity(640);
     let mut misses = Vec::new();
     let mut asm = Asm::new(&mut code);
     check_deadline(&mut asm, places, &mut misses);
+    locate(&mut asm, places, EXCEPTION_RETURN, &mut misses);
     check_epoch(&mut asm, &mut misses);
     asm.place(Rcx, places.monitor);
     asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
     misses.push(asm.jcc(Cond::Ne));
-    // Each record's own checks, which write nothing but the record's
-    // `vector`: RDX at the record and RAX the SPSR where it holds.
-    let attempt = |asm: &mut Asm<'_>, slot: usize, misses: &mut Vec<Patch>| {
-        locate(asm, places, slot, misses);
-        asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, reservation)));
-        asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
-        misses.push(asm.jcc(Cond::Ne));
-        check_host(asm, misses);
-        // The target: ELR, its top byte bit 55's copy where the half's TBI
-        // applies.
-        asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
-        asm.mov_load(Qword, Rcx, Mem::base(Rcx, 0));
-        asm.mov(Qword, Rax, Rcx);
-        asm.shift_imm(ShiftOp::Shr, Qword, Rax, 55);
-        asm.alu_imm8(Alu::And, Dword, Rax, 1);
-        let upper = asm.jcc8(Cond::Ne);
-        asm.alu_imm8(Alu::Cmp, Qword, record_field(offset_of!(Record, untag)), 0);
-        let lower_kept = asm.jcc8(Cond::E);
-        let lower_untag = asm.jmp8();
-        asm.bind(upper);
-        asm.alu_imm8(
-            Alu::Cmp,
-            Qword,
-            record_field(offset_of!(Record, untag) + 8),
-            0,
-        );
-        let upper_kept = asm.jcc8(Cond::E);
-        asm.bind(lower_untag);
-        asm.shift_imm(ShiftOp::Shl, Qword, Rcx, 8);
-        asm.shift_imm(ShiftOp::Sar, Qword, Rcx, 8);
-        asm.bind(lower_kept);
-        asm.bind(upper_kept);
-        asm.mov_store(Qword, record_field(offset_of!(Record, vector)), Rcx);
-        check_pointer(asm, places, misses);
-        check_return_state(asm, misses);
-    };
-    let mut other = Vec::new();
-    attempt(&mut asm, EXCEPTION_RETURN, &mut other);
-    let found = asm.jmp();
-    for miss in other {
-        asm.bind(miss);
-    }
-    attempt(&mut asm, RETURN_WITHIN, &mut misses);
-    asm.bind(found);
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, reservation)));
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    misses.push(asm.jcc(Cond::Ne));
+    check_host(&mut asm, &mut misses);
+    // The target: ELR, its top byte bit 55's copy where the half's TBI
+    // applies.
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
+    asm.mov_load(Qword, Rcx, Mem::base(Rcx, 0));
+    asm.mov(Qword, Rax, Rcx);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rax, 55);
+    asm.alu_imm8(Alu::And, Dword, Rax, 1);
+    let upper = asm.jcc8(Cond::Ne);
+    asm.alu_imm8(Alu::Cmp, Qword, record_field(offset_of!(Record, untag)), 0);
+    let lower_kept = asm.jcc8(Cond::E);
+    let lower_untag = asm.jmp8();
+    asm.bind(upper);
+    asm.alu_imm8(
+        Alu::Cmp,
+        Qword,
+        record_field(offset_of!(Record, untag) + 8),
+        0,
+    );
+    let upper_kept = asm.jcc8(Cond::E);
+    asm.bind(lower_untag);
+    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, 8);
+    asm.shift_imm(ShiftOp::Sar, Qword, Rcx, 8);
+    asm.bind(lower_kept);
+    asm.bind(upper_kept);
+    asm.mov_store(Qword, record_field(offset_of!(Record, vector)), Rcx);
+    check_pointer(&mut asm, places, &mut misses);
+    check_return_state(&mut asm, &mut misses);
     restore_pstate(&mut asm, places);
     swap_pointer(&mut asm, places);
     swap_stack(&mut asm);
@@ -1617,88 +1589,6 @@ mod tests {
                 assert_eq!((rig.words.state, rig.state.sp), (6, 0x7000));
                 assert_eq!(rig.jump_serial(), 1);
             }
-        }
-    }
-
-    /// SPSR's bits an ERET record fixes: all but NZCV, A, I, F, DIT, UAO
-    /// and SSBS.
-    const RETURN_CHECKED: u64 = !(0xf << 28 | 7 << 6 | 1 << 24 | 1 << 23 | 1 << 12);
-    const USER: u64 = 0x0000_0001_0000_4000;
-
-    /// A rig at EL2 (state 2) with an ERET record to EL0 (state 0) for
-    /// SPSR EL0t and one within EL2 for EL2h, each record's event register
-    /// a bank word ERET leaves alone.
-    fn returning() -> Rig {
-        let mut rig = Rig::new();
-        rig.bank.stacks = [0, 0x9000];
-        rig.words.lines_until = u64::MAX;
-        rig.words.state = 2;
-        rig.words.selected = 1;
-        rig.state.daif = 0xf;
-        rig.state.sp = 0x7000;
-        rig.state.exclusive_bytes = 8;
-        let words = &*rig.words as *const Words as u64;
-        let bank = &mut *rig.bank as *mut Bank;
-        // SAFETY: field addresses of the live bank box, never read here.
-        let events = unsafe { [&raw mut (*bank).esr as u64, &raw mut (*bank).aspsr as u64] };
-        for (slot, mode, to, event) in [
-            (EXCEPTION_RETURN, 0, 0, events[0]),
-            (RETURN_WITHIN, 0b1001, 2, events[1]),
-        ] {
-            let record = rig.record(2, slot, to);
-            record.selected = 1;
-            record.check_mask = RETURN_CHECKED;
-            record.check = mode;
-            record.target = &raw const record.vector as u64;
-            // A word that reads zero, and the byte the return sets.
-            record.reservation = words + offset_of!(Words, monitor) as u64;
-            record.event = event;
-        }
-        rig
-    }
-
-    /// ERET completes from the record whose mode SPSR names, the EL0
-    /// one or the one within EL2, in either order; a mode neither record
-    /// names, or an unmasked interrupt waiting, exits with nothing written.
-    #[test]
-    fn exception_return_completes_from_the_record_of_its_mode() {
-        let thunk = exception_return_thunk(PC, &PLACES, 0);
-        for (mode, elr, to) in [(0, USER, 0), (0b1001, RETURN, 2), (0, USER, 0)] {
-            let mut rig = returning();
-            rig.bank.spsr = 0x4000_0000 | (0b0010 << 6) | mode;
-            rig.bank.elr = elr;
-            let exit = rig.run(&thunk);
-            assert_eq!(
-                exit,
-                Exit {
-                    pc: elr,
-                    kind: ExitKind::Return as u64,
-                },
-                "mode {mode:#b}"
-            );
-            assert_eq!(rig.state.nzcv, 0x4000_0000);
-            assert_eq!(rig.state.daif, 0b0010);
-            assert_eq!(rig.words.selected, mode & 1);
-            assert_eq!(rig.state.exclusive_bytes, 0);
-            // The event register of the record it completed from.
-            assert_eq!((rig.bank.esr, rig.bank.aspsr), (1 - to / 2, to / 2));
-            rig.committed(EXCEPTION_RETURN, to);
-        }
-        let misses: [fn(&mut Rig); 4] = [
-            |rig| rig.bank.spsr |= 0b1000,
-            |rig| rig.bank.spsr |= 0b0101,
-            |rig| rig.state.pending = 0b01,
-            |rig| rig.table.records[2][RETURN_WITHIN].frame += 8,
-        ];
-        for (index, miss) in misses.into_iter().enumerate() {
-            let mut rig = returning();
-            rig.bank.spsr = if index == 3 { 0b1001 } else { 0 };
-            rig.bank.elr = RETURN;
-            miss(&mut rig);
-            assert_eq!(rig.run(&thunk), MISS, "case {index}");
-            assert_eq!((rig.state.daif, rig.state.sp), (0xf, 0x7000));
-            assert_eq!((rig.words.state, rig.state.exclusive_bytes), (2, 8));
-            assert_eq!(rig.table.counts, [0; KINDS]);
         }
     }
 

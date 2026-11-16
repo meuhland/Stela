@@ -4782,14 +4782,6 @@
   },
   {
     "package": "stela-engine",
-    "test": "eret_alternating_costs",
-    "source": "crates/stela-engine/src/machine/engine/tests/native_exceptions.rs",
-    "kind": "manual",
-    "inputs": [],
-    "reason": "host timing measurement; run on request"
-  },
-  {
-    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",
