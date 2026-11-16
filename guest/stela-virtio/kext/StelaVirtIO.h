@@ -7,7 +7,8 @@
  *    └─ StelaVirtIOMMIOTransport   maps the page, takes the interrupt
  *        └─ StelaVirtIODevice      the nub, VirtIODeviceID = n
  *            ├─ StelaVirtIOEntropy (n = 4)
- *            └─ StelaVirtIOConsole (n = 3, Console.h)
+ *            ├─ StelaVirtIOConsole (n = 3, Console.h)
+ *            └─ StelaVirtIOSound (n = 25, Sound.h): IOAudioFamily
  *
  * The transport resets the device and acknowledges it, then publishes one
  * nub; a driver matches the nub by its personality's VirtIODeviceID

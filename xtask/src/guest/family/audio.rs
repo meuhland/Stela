@@ -117,6 +117,49 @@ mod tests {
         );
     }
 
+    /// The kext's sound driver: the device's and the engine's vtables, slot
+    /// by slot, and its overrides where the kernel calls them.
+    #[test]
+    fn the_sound_driver_overrides_the_kernels_slots() {
+        let source = crate::tools::root().join("guest/stela-virtio/kext/Sound.cpp");
+        let vtables = object_vtables(&compile(&source, &directory())).unwrap();
+        let manifest = committed();
+        check_probe(&vtables, &manifest, "StelaVirtIOSound", "IOAudioDevice").unwrap();
+        check_probe(
+            &vtables,
+            &manifest,
+            "StelaVirtIOSoundEngine",
+            "IOAudioEngine",
+        )
+        .unwrap();
+        let engine = &vtables["__ZTV22StelaVirtIOSoundEngine"];
+        let own = |slot: usize, method: &str| {
+            assert_eq!(
+                engine[slot].as_deref(),
+                Some(format!("__ZN22StelaVirtIOSoundEngine{method}").as_str()),
+                "slot {slot}"
+            );
+        };
+        own(322, "12initHardwareEP9IOService");
+        own(333, "21getCurrentSampleFrameEv");
+        own(338, "23performAudioEngineStartEv");
+        own(339, "22performAudioEngineStopEv");
+        own(
+            351,
+            "17clipOutputSamplesEPKvPvjjPK20_IOAudioStreamFormatP13IOAudioStream",
+        );
+        own(389, "33driverDesiresHiResSampleIntervalsEv");
+        let device = &vtables["__ZTV16StelaVirtIOSound"];
+        assert_eq!(
+            device[304].as_deref(),
+            Some("__ZN16StelaVirtIOSound12initHardwareEP9IOService")
+        );
+        assert_eq!(
+            device[77].as_deref(),
+            Some("__ZN16StelaVirtIOSound4initEP12OSDictionary")
+        );
+    }
+
     /// Two of the engine's latency setters swapped: the probe's vtable
     /// shows it at both slots.
     #[test]
