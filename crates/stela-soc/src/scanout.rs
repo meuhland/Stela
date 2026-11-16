@@ -212,6 +212,12 @@ pub trait Scanout {
     fn set_power(&mut self, _on: bool) -> Result<()> {
         Err(refuse!("the host scanout cannot turn its monitor off"))
     }
+    /// Whether the sink shows nothing of the last frame presented, as a
+    /// display it took after that frame: the owner then presents the frame
+    /// on screen again, whole, without waiting for a new one.
+    fn wants_frame(&self) -> bool {
+        false
+    }
 }
 
 /// The smallest range of rows holding both `a` and `b`; an empty range adds

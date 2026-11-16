@@ -80,9 +80,14 @@ struct KmsScanout {
     display: Option<(String, Display<Node>)>,
     /// Without a display: the GPUs' open nodes to look on.
     waiting: Vec<(String, c_int)>,
-    /// A frame was presented: a display taken later waits for the next
-    /// one rather than showing Stela's console.
+    /// A frame was presented: a display taken later shows the guest's
+    /// frames rather than Stela's console.
     presented: bool,
+    /// A display was taken after a frame was presented and has shown none
+    /// yet: the DCP model presents the frame on screen again, whole
+    /// ([`Scanout::wants_frame`]), as macOS draws nothing new on a still
+    /// screen until input.
+    blank: bool,
     /// The counter at which the next look is due, and the looks so far.
     next_look: u64,
     looks: u32,
@@ -117,6 +122,7 @@ impl Scanout for KmsScanout {
         console::release();
         let presented = display.present(rows);
         note_flips(&mut self.flips_seen, display);
+        self.blank &= presented.is_err();
         finish_present(display, presented)
     }
 
@@ -136,6 +142,7 @@ impl Scanout for KmsScanout {
         console::release();
         let presented = prepared.present();
         note_flips(&mut self.flips_seen, display);
+        self.blank &= presented.is_err();
         finish_present(display, presented)?;
         Ok(true)
     }
@@ -162,6 +169,10 @@ impl Scanout for KmsScanout {
     /// Display sleep turns the outputs off, and a wake lights them again;
     /// where a request must wait, the next flush on the boot CPU does it.
     /// With no display taken nothing of this scanout is lit.
+    fn wants_frame(&self) -> bool {
+        self.blank
+    }
+
     fn set_power(&mut self, on: bool) -> Result<()> {
         let Some((_, display)) = &mut self.display else {
             return Ok(());
@@ -190,6 +201,7 @@ impl KmsScanout {
             display: None,
             waiting: Vec::new(),
             presented: false,
+            blank: false,
             next_look: host::rdtsc().saturating_add(tsc_hz.saturating_mul(LOOK_SECONDS)),
             looks: 0,
             tsc_hz,
@@ -245,12 +257,13 @@ impl KmsScanout {
                     report_outputs(name, &display);
                     let screen = screen(&display);
                     match self.presented {
-                        // The guest's next frame shows here, and a stop's
-                        // reason.
+                        // The guest's frame on screen shows here at once,
+                        // presented again, and a stop's reason.
                         true => console::parked_on(screen),
                         false => crate::status::take_screen(Some(screen)),
                     }
                     self.flips_seen = display.flips();
+                    self.blank = self.presented;
                     let (name, _) = self.waiting.swap_remove(index);
                     for (_, fd) in self.waiting.drain(..) {
                         client::close_descriptor(fd);

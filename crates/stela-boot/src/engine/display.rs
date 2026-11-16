@@ -391,6 +391,10 @@ impl Scanout for MirroredScanout {
     fn flush(&mut self) -> Result<()> {
         timed(|| self.scanout.flush())
     }
+
+    fn wants_frame(&self) -> bool {
+        self.scanout.wants_frame()
+    }
 }
 
 impl GopScanout {

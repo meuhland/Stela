@@ -511,6 +511,10 @@ pub struct Methods {
     /// Slots that swaps dropped without a present (an abort or a shutdown)
     /// had set: their surfaces may differ from what is on screen.
     unshown: u32,
+    /// A present of the frame on screen again, which the scanout asked for
+    /// ([`Scanout::wants_frame`]), failed: it is not tried again until a
+    /// swap is presented.
+    repaint_refused: bool,
     /// The one mode, or why the scanout's mode cannot be advertised.
     advertised: Result<Advertised>,
     /// Why the last call refused, with the tag and its interface row.
@@ -681,6 +685,7 @@ impl Methods {
             compose_stall_reported: false,
             shown: None,
             unshown: 0,
+            repaint_refused: false,
             advertised,
             last_refusal: None,
             unmodeled: BTreeSet::new(),
@@ -827,7 +832,33 @@ impl Methods {
     /// open. A vblank that finds none ready closes its latch: the monitor
     /// repeats its frame, and a swap that becomes ready later waits for the
     /// next vblank.
+    /// Also true when the scanout shows nothing of the frame on screen, as
+    /// a display it took after that frame was presented: the frame is then
+    /// presented again, whole ([`Self::repaint_wanted`]).
     pub fn frame_ready(&mut self, now: u64) -> bool {
+        self.swap_ready(now) || self.repaint_wanted()
+    }
+
+    /// Whether the scanout wants the frame on screen presented again, whole,
+    /// with no swap: it took a display after that frame was presented, so
+    /// the display shows nothing of it. macOS draws nothing new on a still
+    /// screen until input, so waiting for the next swap would leave the
+    /// display dark until then.
+    fn repaint_wanted(&self) -> bool {
+        self.shown.is_some()
+            && !self.repaint_refused
+            && self.composing.is_none()
+            && !self.shut_down
+            && self.display.borrow().active()
+            && self
+                .scanout
+                .as_ref()
+                .is_some_and(|scanout| scanout.wants_frame())
+    }
+
+    /// Whether the last vblank latches a swap at counter `now`
+    /// ([`Self::frame_ready`]).
+    fn swap_ready(&mut self, now: u64) -> bool {
         if self.latched.is_none() {
             return false;
         }
@@ -874,6 +905,7 @@ impl Methods {
         let wanted = self.vsyncs()
             || (!self.frames.is_empty() && self.display.borrow().active())
             || self.display.borrow().active() != self.sink_powered
+            || self.repaint_wanted()
             || self
                 .scanout
                 .as_ref()
@@ -912,7 +944,7 @@ impl Methods {
         self.next_refresh = due + self.refresh_ticks;
         // The latch takes only what is ready at its vblank.
         self.latched = Some(due);
-        self.frame_ready(now);
+        self.swap_ready(now);
         if self.vsyncs() {
             self.refresh = Some(due);
         }
@@ -1008,13 +1040,17 @@ impl Methods {
             .scanout
             .as_mut()
             .expect("no batch while a compose has the scanout");
-        scanout::present(
+        let presented = scanout::present(
             scanout.as_mut(),
             &batch.layers,
             batch.damage.clone(),
             read,
             &mut self.frame,
-        )?;
+        );
+        if batch.count == 0 {
+            return self.repainted(presented);
+        }
+        presented?;
         // Both the surface DMA and host sink can refuse. The submitted swaps
         // own their surfaces until presentation succeeds, or the AP explicitly
         // aborts/shuts down; neither failure consumes them or queues D594.
@@ -1030,8 +1066,17 @@ impl Methods {
             return None;
         }
         self.refresh(now);
-        if !self.frame_ready(now) {
-            return None;
+        if !self.swap_ready(now) {
+            // The frame on screen again, whole, completing no swap.
+            let planes = self.shown.filter(|_| self.repaint_wanted())?;
+            return Some(Batch {
+                now,
+                due: now,
+                count: 0,
+                planes,
+                layers: planes.iter().flatten().copied().collect(),
+                damage: None,
+            });
         }
         let due = self.latched.expect("a ready frame has an open latch");
         let count = self.ready_swaps(now);
@@ -1147,9 +1192,30 @@ impl Methods {
             self.in_place = true;
             return Ok(false);
         }
+        if batch.count == 0 {
+            return self.repainted(result).map(|()| false);
+        }
         result?;
         self.presented(batch);
         Ok(true)
+    }
+
+    /// Finish a present of the frame on screen again: it completes no swap.
+    /// A failure is reported once and not tried again until a swap is
+    /// presented; the display shows that swap whole, as a display that holds
+    /// none of the frame on screen asks every row.
+    fn repainted(&mut self, presented: Result<()>) -> Result<()> {
+        match presented {
+            Ok(()) => self.unshown = 0,
+            Err(reason) => {
+                self.repaint_refused = true;
+                self.refusal(format!(
+                    "DCP could not show the frame on screen again on a display taken after it: \
+                     {reason}; the display shows the next swap"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Finish the present of `batch`, whose rows the scanout now holds:
@@ -1178,6 +1244,7 @@ impl Methods {
         PRESENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
         self.shown = Some(planes);
         self.unshown = 0;
+        self.repaint_refused = false;
         let waiting = self.frames.len();
         let batch: Vec<Frame> = self.frames.drain(..count).collect();
         let (shown, merged) = batch.split_last().expect("a latched batch is not empty");

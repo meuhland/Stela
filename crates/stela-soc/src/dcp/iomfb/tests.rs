@@ -2594,3 +2594,93 @@ fn display_sleep_follows_the_controllers_sleep_and_a_refusing_sink_is_reported_o
     assert_eq!(reported.len(), 1, "{reported:?}");
     assert!(reported[0].contains("no power control"), "{reported:?}");
 }
+
+/// A screen that may have taken its display after the frames presented so
+/// far, and shows none of them until its next present: its wish for the
+/// frame on screen, and the size of each present.
+#[derive(Clone, Default)]
+struct LateScreen(Rc<RefCell<(bool, Vec<usize>)>>);
+impl Scanout for LateScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, rows: &[u8]) -> Result<()> {
+        let mut state = self.0.borrow_mut();
+        state.0 = false;
+        state.1.push(rows.len());
+        Ok(())
+    }
+    fn wants_frame(&self) -> bool {
+        self.0.borrow().0
+    }
+}
+
+#[test]
+fn a_display_taken_after_the_frame_on_screen_shows_it_without_a_new_swap() {
+    let screen = LateScreen::default();
+    let state = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(1);
+        true
+    };
+    // Nothing is on screen yet, so nothing is shown again.
+    state.borrow_mut().0 = true;
+    methods.refresh(0);
+    assert!(!methods.frame_ready(0));
+    state.borrow_mut().0 = false;
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(period, fill).unwrap();
+    assert_eq!(state.borrow().1, [32]);
+    let completed = methods.completed.len();
+    // A display taken now asks for the frame on screen: the next look shows
+    // it again, whole, and completes no swap.
+    state.borrow_mut().0 = true;
+    assert!(methods.refresh_deadline().is_some());
+    assert!(methods.frame_ready(period + 1));
+    methods.present(period + 1, fill).unwrap();
+    assert_eq!(state.borrow().1, [32, 32]);
+    assert_eq!(methods.completed.len(), completed);
+    assert!(!methods.frame_ready(period + 2));
+    assert!(methods.last_refusal.is_none(), "{:?}", methods.last_refusal);
+}
+
+#[test]
+fn a_frame_on_screen_that_cannot_be_read_again_waits_for_the_next_swap() {
+    let screen = LateScreen::default();
+    let state = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(1);
+        true
+    };
+    methods.refresh(0);
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(period, fill).unwrap();
+    // The surface is gone: the present is not an error, is said once, and
+    // is not tried again while the display waits.
+    state.borrow_mut().0 = true;
+    methods.present(period + 1, |_, _| false).unwrap();
+    assert_eq!(state.borrow().1, [32]);
+    assert!(!methods.frame_ready(period + 2));
+    assert!(
+        methods
+            .last_refusal
+            .as_deref()
+            .is_some_and(|text| text.contains("the display shows the next swap")),
+        "{:?}",
+        methods.last_refusal
+    );
+    // The next swap shows whole, and a later display taken late is shown
+    // the frame on screen again.
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(2 * period, fill).unwrap();
+    assert_eq!(state.borrow().1, [32, 32]);
+    state.borrow_mut().0 = true;
+    assert!(methods.frame_ready(2 * period + 1));
+}
