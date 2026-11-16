@@ -77,6 +77,9 @@
 //! virtual method; inference: its clock at the dispatch), which the library
 //! then shifts as if it were the coprocessor's: Core Animation's display
 //! timeline sat 5.2 ms after the model's vblanks in the run measured.
+//! Its third value is the refresh period in counter ticks: sent as zero,
+//! the kernel's dispatch asks a method of its own for one, a 60 Hz period
+//! whatever the scanout runs.
 //!
 //! Frame info: `A033` counts the AP's clients per frame-info key. While any
 //! client asks, each displayed swap sends `D589 swap_info_notify_dispatch`
@@ -2151,6 +2154,7 @@ impl Service for Methods {
             let mut input = alloc::vec![0u8; size_of::<[u64; 3]>()];
             input[..8].copy_from_slice(&counter.to_le_bytes());
             input[8..16].copy_from_slice(&counter.to_le_bytes());
+            input[16..24].copy_from_slice(&self.refresh_ticks.to_le_bytes());
             return Some(Callback {
                 tag: SWAP_NOTIFY,
                 input,

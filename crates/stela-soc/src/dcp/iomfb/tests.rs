@@ -1037,8 +1037,23 @@ fn a_vsync_carries_its_vblanks_time_as_the_coprocessor_timestamp_the_ap_converts
     let vblank = (1000 + REFRESH_TICKS).to_le_bytes();
     assert_eq!(callback.input[..8], vblank);
     assert_eq!(callback.input[8..16], vblank);
-    // The third value stays the AP's to fill.
-    assert_eq!(callback.input[16..], [0; 8]);
+    // The third value is the refresh period in counter ticks: sent as 0,
+    // the kernel's dispatch (`swap_notify_dispatch_gated`, 26A434
+    // 0xfffffe0009ab3764) asks a method of its own for a 60 Hz period.
+    assert_eq!(callback.input[16..], REFRESH_TICKS.to_le_bytes());
+}
+
+#[test]
+fn a_fast_displays_vsync_carries_its_own_refresh_period() {
+    let mut methods = Methods::new(Box::new(FastScreen(240_000)), interface());
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    methods.refresh(1000);
+    let callback = methods.take_callback().unwrap();
+    assert_eq!(callback.tag, SWAP_NOTIFY);
+    // 24 MHz / 240 Hz.
+    assert_eq!(callback.input[16..], 100_000u64.to_le_bytes());
 }
 
 #[test]
@@ -2630,7 +2645,7 @@ fn an_abort_never_waits_for_good_for_a_compose_that_does_not_run() {
 
 #[test]
 fn a_refresh_that_cannot_be_advertised_is_published_at_the_usual_rate_and_said() {
-    // 1920x1080 at 2000 Hz has no detailed timing.
+    // 1920x1080 at 2000 Hz has no timing record: its clock passes 4.29 GHz.
     assert!(Advertised::at(FULL_HD, 2_000_000).is_err());
     let methods = Methods::new(Box::new(FastScreen(2_000_000)), interface());
     let advertised = methods.advertised.as_ref().unwrap();
