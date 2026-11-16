@@ -1,8 +1,8 @@
 //! The ARM64e macOS components Stela installs in the guest, built with the
 //! host's clang against xnu's open-source headers: no macOS SDK.
 //!
-//! The StelaGPU kext compiles to relocatable objects beside its
-//! `Info.plist` in `target/guest/StelaGPU.kext`, whose final link is against
+//! Each kext of [`KEXTS`] compiles to relocatable objects beside its
+//! `Info.plist` in `target/guest/<name>.kext`, whose final link is against
 //! one boot kernel collection. The Metal plugin links here, into
 //! `target/guest/StelaGPU.bundle`. No released `ld64.lld` links arm64e's
 //! authenticated pointers, so `stela-loader` links both. The kext also
@@ -36,6 +36,17 @@ const BUNDLE_EXECUTABLE: &str = "Contents/MacOS/StelaGPU";
 /// The Metal plugin's slices: Metal loads it into processes of either.
 const BUNDLE_TARGETS: [(&str, &str); 2] = [("arm64", "arm64-apple-macos27.0"), ("arm64e", TARGET)];
 
+/// The kexts [`run`] builds, each from `guest/<component>/kext` with the
+/// sources every kext shares ([`COMMON`]) into `target/guest/<name>.kext`,
+/// and embedded for `stela.efi` as `target/guest/<name>.kext.rs`.
+pub const KEXTS: [(&str, &str); 1] = [("stela-gpu", GPU_KEXT)];
+/// The kext that carries the Metal plugin, StelaVT and Stela.app, whose code
+/// the boot's trust cache lists.
+const GPU_KEXT: &str = "StelaGPU";
+/// Sources compiled into every kext: the runtime (`kmod_info`, static
+/// destructors), one copy per kext.
+const COMMON: &str = "guest/common";
+
 /// Builds every guest component.
 pub fn run() -> Result<()> {
     let root = tools::root();
@@ -60,7 +71,34 @@ pub fn run() -> Result<()> {
     )?;
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
     fs::write(include.join("stela/compression.h"), compression::header()?)?;
-    let kext = build_kext(&component, &output, &xnu, &include)?;
+    let common = root.join(COMMON);
+    for (directory, name) in KEXTS {
+        let kext = build_kext(
+            &root.join("guest").join(directory),
+            name,
+            &common,
+            &output,
+            &xnu,
+            &include,
+        )?;
+        let code = if name == GPU_KEXT {
+            gpu_code(&component, &bundle)?
+        } else {
+            Vec::new()
+        };
+        if !code.is_empty() {
+            fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
+        }
+        embed_kext(&kext, &code, &output.join(format!("{name}.kext.rs")))?;
+        println!("{name} kext: {}", kext.display());
+    }
+    stela_cli::gpu::Payload::write(&output)?;
+    Ok(())
+}
+
+/// The code the StelaGPU kext installs: the Metal plugin `bundle`'s
+/// executable, and StelaVT when the tree has it prebuilt.
+fn gpu_code(component: &Path, bundle: &Path) -> Result<Vec<CodeHash>> {
     let mut code = stela_loader::plugin::code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?)?;
     // StelaVT, the H.264 encoder the Metal plugin registers in processes with
     // VideoToolbox (bundle/VideoEncoder.m), is prebuilt on macOS against x264
@@ -74,11 +112,7 @@ pub fn run() -> Result<()> {
         )?)?);
         println!("StelaVT code: {}", encoder.display());
     }
-    fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
-    embed_kext(&kext, &code, &output.join("StelaGPU.kext.rs"))?;
-    stela_cli::gpu::Payload::write(&output)?;
-    println!("StelaGPU kext: {}", kext.display());
-    Ok(())
+    Ok(code)
 }
 
 /// `stela/app.h`: the Stela.app package [`app::locate`] finds, or a build
@@ -189,11 +223,18 @@ const BUNDLE_FLAGS: &[&str] = &[
     "-nostdinc",
 ];
 
-/// Compiles each source of `<component>/kext` into `<output>/StelaGPU.kext`
-/// beside its `Info.plist`.
-fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Result<PathBuf> {
+/// Compiles each source of `<component>/kext`, and each of `common`, into
+/// `<output>/<name>.kext` beside its `Info.plist`.
+fn build_kext(
+    component: &Path,
+    name: &str,
+    common: &Path,
+    output: &Path,
+    xnu: &Path,
+    include: &Path,
+) -> Result<PathBuf> {
     let source = component.join("kext");
-    let bundle = output.join("StelaGPU.kext");
+    let bundle = output.join(format!("{name}.kext"));
     if bundle.exists() {
         fs::remove_dir_all(&bundle)?;
     }
@@ -202,27 +243,52 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
     let (identifier, version) = identity(&info)?;
     fs::write(bundle.join("Info.plist"), &info)?;
     let clang = &crate::clang::toolset()?.clangxx;
-    for entry in fs::read_dir(&source)? {
-        let path = entry?.path();
-        if path.extension().is_none_or(|extension| extension != "cpp") {
-            continue;
-        }
+    let sources = kext_sources(&source, common)?;
+    for path in &sources {
         let object = bundle.join(path.file_stem().unwrap()).with_extension("o");
         let mut command = Command::new(clang);
         command
             .args(KEXT_FLAGS)
             .arg(format!("--target={TARGET}"))
             .arg(format!("-DSTELA_KEXT_IDENTIFIER=\"{identifier}\""))
-            .arg(format!("-DSTELA_KEXT_VERSION=\"{version}\""))
-            .arg("-I")
-            .arg(component.join("include"));
+            .arg(format!("-DSTELA_KEXT_VERSION=\"{version}\""));
+        let headers = component.join("include");
+        if headers.is_dir() {
+            command.arg("-I").arg(headers);
+        }
         for headers in XNU_HEADERS {
             command.arg("-isystem").arg(xnu.join(headers));
         }
         command.arg("-isystem").arg(include);
-        exec(command.arg("-c").arg(&path).arg("-o").arg(&object))?;
+        exec(command.arg("-c").arg(path).arg("-o").arg(&object))?;
     }
     Ok(bundle)
+}
+
+/// The C++ sources of a kext's `source` directory and of `common`, in name
+/// order; two with one name would build one object, so they are refused.
+fn kext_sources(source: &Path, common: &Path) -> Result<Vec<PathBuf>> {
+    let mut sources = Vec::new();
+    for directory in [source, common] {
+        for entry in
+            fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_some_and(|extension| extension == "cpp") {
+                sources.push(path);
+            }
+        }
+    }
+    sources.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for pair in sources.windows(2) {
+        ensure!(
+            pair[0].file_name() != pair[1].file_name(),
+            "{} and {} build the same object",
+            pair[0].display(),
+            pair[1].display()
+        );
+    }
+    Ok(sources)
 }
 
 /// Where the kext installs the sandbox patcher and its launchd job
@@ -553,6 +619,32 @@ mod tests {
         let identity = identity(info).unwrap();
         assert_eq!(identity, ("com.stela.Test".into(), "1.2.3".into()));
         assert!(super::identity(&info.replace("1.2.3", "1\"2")).is_err());
+    }
+
+    #[test]
+    fn every_kext_compiles_the_common_sources_once() {
+        let root = crate::tools::root();
+        let common = root.join(COMMON);
+        for (directory, _) in KEXTS {
+            let sources =
+                kext_sources(&root.join("guest").join(directory).join("kext"), &common).unwrap();
+            assert_eq!(
+                sources
+                    .iter()
+                    .filter(|path| path.file_name().unwrap() == "runtime.cpp")
+                    .count(),
+                1,
+                "{directory}"
+            );
+        }
+        let kext = tempfile::tempdir().unwrap();
+        fs::write(kext.path().join("runtime.cpp"), "").unwrap();
+        fs::write(kext.path().join("notes.txt"), "").unwrap();
+        let error = kext_sources(kext.path(), &common).unwrap_err();
+        assert!(
+            error.to_string().contains("build the same object"),
+            "{error}"
+        );
     }
 
     #[test]
