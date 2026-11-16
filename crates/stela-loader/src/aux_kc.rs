@@ -22,6 +22,7 @@
 mod boot;
 mod commands;
 mod fixups;
+pub mod itanium;
 mod plist;
 mod prelink;
 mod receipt;
@@ -225,6 +226,13 @@ pub fn link_dropping(
         }
     }
     Err(refusal)
+}
+
+/// What linking `kext` against `boot` checked of the vtable slots its
+/// classes override ([`unit::Overrides`]), or why it cannot be linked.
+pub fn overrides(boot: &[u8], kext: &Kext<'_>) -> Result<unit::Overrides> {
+    let boot = BootCollection::parse(boot)?;
+    Ok(Unit::new(kext, &boot)?.overrides)
 }
 
 /// Links `kexts` against the boot collection `boot` into an auxiliary

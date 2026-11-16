@@ -111,6 +111,24 @@ struct Vtable {
     end: u64,
 }
 
+/// What the link checked of the vtable slots a kext's classes override in
+/// a boot-collection superclass: each override's method name, `const` and
+/// parameters against the method the kernel's class has in that slot
+/// ([`super::itanium`]). Slots the check cannot judge are counted, not
+/// refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Overrides {
+    /// Overrides whose method is the kernel's slot's.
+    pub matched: usize,
+    /// The kernel's slot is pure virtual: no name to compare.
+    pub pure: usize,
+    /// No exported symbol names the kernel's slot, or the slot is past the
+    /// superclass's vtable (a virtual the kext's class adds).
+    pub unnamed: usize,
+    /// A name the demangler does not cover.
+    pub unparsed: usize,
+}
+
 /// What a pointer-sized slot holds.
 enum Slot {
     Fixup(Pointer),
@@ -152,6 +170,8 @@ pub struct Unit<'a> {
     /// Vtable slots bound to the superclass's entry rather than the symbol
     /// the object names, by (object, section, relocation offset).
     inherited: BTreeMap<(usize, usize, u64), Value>,
+    /// What the check of overridden slots found.
+    pub overrides: Overrides,
     /// Each region's addresses, assigned by the collection's layout; the
     /// `__TEXT` region starts with the kext's Mach-O header.
     pub ranges: [Range<u64>; 4],
@@ -195,6 +215,7 @@ impl<'a> Unit<'a> {
             got_section: None,
             stub_sections: None,
             inherited: BTreeMap::new(),
+            overrides: Overrides::default(),
             ranges: Default::default(),
         };
         unit.place().within(context)?;
@@ -691,15 +712,99 @@ impl<'a> Unit<'a> {
     /// override methods, or fill reserved slots, that the kext's headers say
     /// they inherit. A method in a slot the kernel still reserves means the
     /// kext was built for a newer kernel, and is refused.
+    ///
+    /// Each slot the kext's class overrides is checked against the method
+    /// the kernel's superclass has there, by the symbols exported at its
+    /// address: a method of another name or parameters means the kext's
+    /// header has the virtual methods in another order than this kernel,
+    /// and is refused ([`Overrides`]).
     fn inherit(&mut self, boot: &BootCollection<'_>) -> Result<()> {
         let vtables = self.vtables();
+        let mut named: BTreeMap<u64, Vec<&'a str>> = BTreeMap::new();
+        for (&name, &address) in &self.imports {
+            named.entry(address).or_default().push(name);
+        }
         let mut done = BTreeSet::new();
         let mut names: Vec<&String> = vtables.keys().collect();
         names.sort();
+        let mut lengths = BTreeMap::new();
         for name in names {
-            self.inherit_vtable(name, &vtables, boot, &mut done)?;
+            self.inherit_vtable(name, &vtables, boot, &named, &mut lengths, &mut done)?;
         }
         Ok(())
+    }
+
+    /// The slots of the boot collection's vtable at `address`: up to a null
+    /// slot or the next exported symbol, which is where the next vtable or
+    /// datum starts.
+    fn boot_slots(
+        boot: &BootCollection<'_>,
+        address: u64,
+        named: &BTreeMap<u64, Vec<&str>>,
+    ) -> u64 {
+        let mut slots = 0;
+        while slots < 4096 {
+            let at = address + 16 + 8 * slots;
+            if slots > 0 && named.contains_key(&at) {
+                break;
+            }
+            match boot.pointer(at) {
+                Ok(Some(_)) => slots += 1,
+                _ => break,
+            }
+        }
+        slots
+    }
+
+    /// Checks the kext's `symbol`, overriding `parent`'s slot at `offset`, whose
+    /// method there is at `inherited`, against the names exported there.
+    fn check_override(
+        &mut self,
+        name: &str,
+        parent: &str,
+        symbol: &str,
+        offset: u64,
+        inherited: Option<u64>,
+        named: &BTreeMap<u64, Vec<&str>>,
+    ) -> Result<()> {
+        let theirs = inherited.and_then(|address| named.get(&address));
+        let Some(theirs) = theirs.filter(|theirs| !theirs.is_empty()) else {
+            self.overrides.unnamed += 1;
+            return Ok(());
+        };
+        if theirs.contains(&"___cxa_pure_virtual") {
+            self.overrides.pure += 1;
+            return Ok(());
+        }
+        let Some(own) = super::itanium::signature(symbol) else {
+            self.overrides.unparsed += 1;
+            return Ok(());
+        };
+        let mut judged = false;
+        for their in theirs {
+            if let Some(signature) = super::itanium::signature(their) {
+                if signature == own {
+                    self.overrides.matched += 1;
+                    return Ok(());
+                }
+                judged = true;
+            }
+        }
+        if !judged {
+            self.overrides.unparsed += 1;
+            return Ok(());
+        }
+        let theirs = theirs.join(" or ");
+        Err(refuse!(
+            "{name} puts {symbol} at vtable offset {offset:#x}, where {parent} has {theirs} in \
+             this kernel: the kext's header declares the virtual methods in another order",
+            name,
+            symbol,
+            offset,
+            parent,
+            theirs
+        )
+        .into())
     }
 
     /// The kext's vtables by name, each ending at the next symbol in its
@@ -753,6 +858,8 @@ impl<'a> Unit<'a> {
         name: &str,
         vtables: &BTreeMap<String, Vtable>,
         boot: &BootCollection<'_>,
+        named: &BTreeMap<u64, Vec<&str>>,
+        lengths: &mut BTreeMap<u64, u64>,
         done: &mut BTreeSet<String>,
     ) -> Result<()> {
         if !done.insert(name.to_owned()) {
@@ -762,7 +869,7 @@ impl<'a> Unit<'a> {
             return Ok(());
         };
         let parent_address = if vtables.contains_key(&parent) {
-            self.inherit_vtable(&parent, vtables, boot, done)?;
+            self.inherit_vtable(&parent, vtables, boot, named, lengths, done)?;
             None
         } else {
             Some(*self.imports.get(parent.as_str()).ok_or_else(|| {
@@ -784,18 +891,37 @@ impl<'a> Unit<'a> {
             })
             .copied()
             .collect();
+        let input_address = input.address;
         for relocation in slots {
             let Target::Symbol(index) = relocation.target else {
                 continue;
             };
-            let symbol = &self.objects[vtable.object].symbols[index].name;
+            let symbol = self.objects[vtable.object].symbols[index].name.clone();
+            let offset = input_address + relocation.offset - vtable.start;
+            let slot = offset / 8;
             // The class overrides the slot, or it is null or pure.
             let child = self.resolve(vtable.object, relocation.target)?;
-            if !matches!(child, Value::Boot(_)) || symbol == "___cxa_pure_virtual" {
+            if symbol == "___cxa_pure_virtual" {
                 continue;
             }
-            let offset = input.address + relocation.offset - vtable.start;
-            let slot = offset / 8;
+            if !matches!(child, Value::Boot(_)) {
+                // Slots past the two header words, within the kernel
+                // superclass's vtable, are checked by method.
+                if let Some(address) = parent_address
+                    && offset >= 16
+                {
+                    let length = *lengths
+                        .entry(address)
+                        .or_insert_with(|| Self::boot_slots(boot, address, named));
+                    let inherited = if (offset - 16) / 8 < length {
+                        boot.pointer(address + offset).ok().flatten()
+                    } else {
+                        None
+                    };
+                    self.check_override(name, &parent, &symbol, offset, inherited, named)?;
+                }
+                continue;
+            }
             let inherited = match parent_address {
                 Some(address) => boot.pointer(address + offset)?.map(Value::Boot),
                 None => self.slot_value(&vtables[&parent], offset)?,

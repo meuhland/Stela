@@ -21,6 +21,8 @@ const BASE_A: u64 = BASE + 0x4a00;
 const PARENT_A: u64 = BASE + 0x4a10;
 const RESERVED: u64 = BASE + 0x4a20;
 const BASE_B: u64 = BASE + 0x4a30;
+const PARENT_D1: u64 = BASE + 0x4a40;
+const PARENT_D0: u64 = BASE + 0x4a50;
 
 pub(crate) fn words(values: &[u32]) -> Vec<u8> {
     values
@@ -51,6 +53,8 @@ fn boot_collection() -> Vec<u8> {
         ("__ZN6Parent1aEv", exported, PARENT_A),
         ("__ZN4Base10_RESERVED0Ev", exported, RESERVED),
         ("__ZN4Base1bEv", exported, BASE_B),
+        ("__ZN6ParentD1Ev", exported, PARENT_D1),
+        ("__ZN6ParentD0Ev", exported, PARENT_D0),
     ];
     let mut table = Vec::new();
     let mut strings = vec![b' ', 0];
@@ -85,8 +89,8 @@ fn boot_collection() -> Vec<u8> {
     for target in [
         None,
         None,
-        Some(PARENT_A),
-        Some(PARENT_A),
+        Some(PARENT_D1),
+        Some(PARENT_D0),
         Some(PARENT_A),
         Some(RESERVED),
     ] {
@@ -893,6 +897,86 @@ fn a_method_in_a_slot_the_kernel_reserves_is_refused() {
     );
 }
 
+/// A kext class `Child : Parent` that overrides the slot where `Parent`
+/// has `a` with its own method `own`, and whose method `extra` is a virtual
+/// it adds past `Parent`'s vtable.
+fn override_object(own: &'static str, extra: &'static str) -> Vec<u8> {
+    let vtable = [
+        vec![0; 16],
+        [
+            auth(0, 0x11),
+            auth(0, 0x22),
+            auth(0, 0x33),
+            auth(0, 0x44),
+            auth(0, 0x55),
+        ]
+        .concat(),
+        vec![0; 8],
+    ]
+    .concat();
+    let auth_pointer = macho::ARM64_RELOC_AUTHENTICATED_POINTER;
+    let ret = 0xd65f_03c0;
+    let sections = [
+        InputSection::new("__TEXT", "__text", CODE, words(&[ret, ret, ret, ret])),
+        InputSection::new("__DATA", "__data", 0, vec![0; 8]),
+        InputSection::new("__DATA", "__const", 0, vtable)
+            .relocate(0x10, 3, auth_pointer, 3)
+            .relocate(0x18, 4, auth_pointer, 3)
+            .relocate(0x20, 5, auth_pointer, 3)
+            .relocate(0x28, 6, auth_pointer, 3)
+            .relocate(0x30, 7, auth_pointer, 3)
+            .relocate(0x38, 8, macho::ARM64_RELOC_UNSIGNED, 3),
+    ];
+    let symbols = [
+        defined("_kmod_info", true, 1, 0),
+        defined("__ZTV5Child", true, 2, 0),
+        defined("__ZN5Child10superClassE", true, 2, 0x38),
+        defined("__ZN5ChildD1Ev", true, 0, 0),
+        defined("__ZN5ChildD0Ev", true, 0, 4),
+        defined(own, true, 0, 8),
+        undefined("__ZN4Base10_RESERVED0Ev", false),
+        defined(extra, true, 0, 12),
+        undefined("__ZN6Parent10gMetaClassE", false),
+    ];
+    object_file(&sections, &symbols)
+}
+
+#[test]
+fn an_override_must_be_the_method_the_kernel_has_in_its_slot() -> Result<()> {
+    // `a` over `a`, and the destructors over the destructors; the added
+    // virtual is past Parent's vtable, so nothing judges it.
+    let object = override_object("__ZN5Child1aEv", "__ZN5Child5extraEv");
+    let checked = overrides(&boot_collection(), &kext(vec![&object]))?;
+    assert_eq!(
+        checked,
+        unit::Overrides {
+            matched: 3,
+            unnamed: 1,
+            ..Default::default()
+        }
+    );
+    link(&boot_collection(), &[kext(vec![&object])])?;
+    // Another method in a's slot: the kext's header has another order.
+    for wrong in ["__ZN5Child1bEv", "__ZN5Child1aEi", "__ZNK5Child1aEv"] {
+        let object = override_object(wrong, "__ZN5Child5extraEv");
+        let error = link(&boot_collection(), &[kext(vec![&object])]).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&format!("puts {wrong} at vtable offset 0x20"))
+                && error.contains("__ZN6Parent1aEv")
+                && error.contains("another order"),
+            "{error}"
+        );
+    }
+    // A name the demangler does not cover is counted, not refused.
+    let object = override_object("__ZN5Child1aET_", "__ZN5Child5extraEv");
+    assert_eq!(
+        overrides(&boot_collection(), &kext(vec![&object]))?.unparsed,
+        1
+    );
+    Ok(())
+}
+
 /// A second kext, `com.stela.Other`, whose class `Other : Parent` inherits
 /// `Base::a` and the reserved slot, and which calls `_IOLog`.
 fn other_object() -> Vec<u8> {
@@ -1195,7 +1279,16 @@ fn a_built_kext_links_against_a_real_boot_collection() {
         .collect();
     let linked = link(&boot, &kexts).unwrap_or_else(|error| panic!("{error:#}"));
     for kext in &kexts {
-        std::eprintln!("{}: {} objects", kext.bundle_name(), kext.objects.len());
+        let checked = overrides(&boot, kext).unwrap();
+        std::eprintln!(
+            "{}: {} objects; overridden slots: {} matched, {} pure, {} unnamed, {} unparsed",
+            kext.bundle_name(),
+            kext.objects.len(),
+            checked.matched,
+            checked.pure,
+            checked.unnamed,
+            checked.unparsed
+        );
     }
     std::eprintln!(
         "linked {} into {} bytes",
