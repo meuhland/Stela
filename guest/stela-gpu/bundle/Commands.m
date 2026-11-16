@@ -326,12 +326,8 @@ static void name_functions(id object, NSMutableSet *seen, NSMutableString *names
 	if (status != StelaStatusOk && status != StelaStatusDeviceLost) {
 		[self reportRefusal:&failure];
 	}
-	if (!_retains) {
-		os_unfair_lock_lock(&_referencesLock);
-		[_retained removeAllObjects];
-		os_unfair_lock_unlock(&_referencesLock);
-	}
 	if (status != StelaStatusOk) {
+		[self dropUnretained];
 		_kernelEnd = host_time();
 		[_device failed:self with:failure];
 		return;
@@ -339,8 +335,22 @@ static void name_functions(id object, NSMutableSet *seen, NSMutableString *names
 	stela_stream_free(&_stream);
 	_serial = serial.value;
 	_kernelEnd = host_time();
+	/* Noted first: a pooled buffer released with the references defers its
+	 * place's reuse past every serial noted, this one included. */
 	[_device noteSubmitted:_serial];
+	[self dropUnretained];
 	[_device track:self];
+}
+
+/* A buffer without retained references keeps its objects only until the
+ * service took its stream. */
+- (void)dropUnretained
+{
+	if (!_retains) {
+		os_unfair_lock_lock(&_referencesLock);
+		[_retained removeAllObjects];
+		os_unfair_lock_unlock(&_referencesLock);
+	}
 }
 
 /* On the device's queue, ahead of completion. */
