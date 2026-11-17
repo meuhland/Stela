@@ -72,9 +72,14 @@ impl Geometry {
         u64::from(self.pitch) * u64::from(self.coded_height)
     }
 
-    /// NV12: the luma, then half as much interleaved chroma.
+    /// NV12: the luma, then half as many rows of interleaved chroma, which
+    /// a block-linear plane lays out in whole blocks of 16 rows: a coded
+    /// height that is an odd number of 16s (720, 1200) gives the chroma a
+    /// last block only half of whose rows the picture fills. 1920x1088 has
+    /// none.
     pub fn surface_bytes(&self) -> u64 {
-        self.luma_bytes() * 3 / 2
+        let chroma_rows = u64::from(self.coded_height / 2).next_multiple_of(16);
+        self.luma_bytes() + u64::from(self.pitch) * chroma_rows
     }
 
     pub fn mb_width(&self) -> u32 {
