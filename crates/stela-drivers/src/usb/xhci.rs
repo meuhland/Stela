@@ -392,6 +392,11 @@ struct Transfer {
     is_in: bool,
     /// A failed cancellation leaves hardware ownership unresolved.
     poisoned: bool,
+    /// The controller refused this Halted endpoint's Reset Endpoint with a
+    /// USB Transaction Error, as QEMU's xHCI does once a passed-through
+    /// device left the bus: only Disable Slot retires it
+    /// ([`Controller::departed_endpoint`]).
+    departed: bool,
     /// Only an acknowledged Configure Endpoint permits transfer submission.
     enabled: bool,
     /// Bulk and interrupt TDs submitted and not yet completed or cancelled.

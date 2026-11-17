@@ -511,6 +511,7 @@ impl Controller {
             iso: None,
             is_in: false,
             poisoned: false,
+            departed: false,
             enabled: true,
             in_flight: 0,
             stopped: false,
