@@ -37,7 +37,10 @@ public:
 	/* Takes a plugin's kStelaGPUPluginReportKey alone, to log it once. */
 	IOReturn setProperties(OSObject *properties) override;
 
-	/* Opens a gate connection, answering its gate page, 0 when none is free. */
+	/*
+	 * Opens a gate connection, answering its gate page; 0 when none is free,
+	 * the host's GPU service refused it, or the kext is stopping.
+	 */
 	uint64_t openGate();
 	/* Closes the connection of gate page `page`. */
 	void closeGate(uint64_t page);
