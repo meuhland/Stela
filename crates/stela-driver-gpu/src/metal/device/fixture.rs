@@ -144,6 +144,8 @@ impl Outside for MockOutside {
 pub(crate) struct MockBackend {
     pub(crate) idle_calls: usize,
     pub(crate) idle_error: Option<Error>,
+    /// What each idle step answers, in order; idle once used up.
+    pub(crate) idle_steps: alloc::collections::VecDeque<crate::metal::vulkan::backend::IdleStep>,
     pub(crate) semaphore_error: Option<Error>,
     /// Timeline values the device told the backend passed without a query,
     /// in order.
@@ -276,6 +278,12 @@ impl Backend for MockBackend {
     fn acknowledge_idle(&mut self) -> Result<()> {
         self.idle_calls += 1;
         self.idle_error.map_or(Ok(()), Err)
+    }
+
+    fn idle_step(&mut self) -> crate::metal::vulkan::backend::IdleStep {
+        self.idle_steps
+            .pop_front()
+            .unwrap_or(crate::metal::vulkan::backend::IdleStep::Idle)
     }
 
     fn physical_device(&self) -> &PhysicalDevice {

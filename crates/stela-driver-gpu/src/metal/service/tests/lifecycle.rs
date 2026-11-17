@@ -244,3 +244,48 @@ fn a_device_that_does_not_reopen_stays_lost() {
     assert_eq!(service.connect().unwrap_err().status, Status::DeviceLost);
     assert!(service.refused.pop().unwrap().contains("did not reopen"));
 }
+
+/// A replaced lost device is dropped only once its backend's idle steps
+/// end, one step per call that may recover, so no call holds its
+/// processor for the whole idle bound.
+#[test]
+fn a_replaced_device_retires_one_idle_step_per_call() {
+    use crate::metal::vulkan::backend::IdleStep;
+    let mut service = service().with_reopen(Box::new(|| Ok(device_on(MockBackend::new()))));
+    service.device().backend().idle_steps.extend([
+        IdleStep::Waiting,
+        IdleStep::Waiting,
+        IdleStep::Idle,
+    ]);
+    let first = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(first).unwrap();
+    assert!(!service.device().is_lost());
+    assert_eq!(service.retiring_devices(), 1);
+    // Each later call steps once: waiting, waiting, then idle and dropped.
+    let next = connect(&mut service);
+    assert_eq!(service.retiring_devices(), 1);
+    service.disconnect(next).unwrap();
+    assert_eq!(service.retiring_devices(), 1);
+    connect(&mut service);
+    assert_eq!(service.retiring_devices(), 0);
+}
+
+/// An unproven idle step drops the lost device at once: its backend keeps
+/// what work may still use without waiting again.
+#[test]
+fn an_unproven_replaced_device_is_dropped_at_its_step() {
+    use crate::metal::vulkan::backend::IdleStep;
+    let mut service = service().with_reopen(Box::new(|| Ok(device_on(MockBackend::new()))));
+    service
+        .device()
+        .backend()
+        .idle_steps
+        .push_back(IdleStep::Unproven);
+    let first = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(first).unwrap();
+    assert_eq!(service.retiring_devices(), 1);
+    connect(&mut service);
+    assert_eq!(service.retiring_devices(), 0);
+}

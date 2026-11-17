@@ -89,7 +89,10 @@ unsafe extern "system" fn wait_timeline(
         (7, 3),
         "each timeline's last value"
     );
-    assert_eq!(timeout, IDLE_WAIT_NS);
+    assert!(
+        matches!(timeout, 0 | IDLE_STEP_NS | IDLE_WAIT_NS),
+        "{timeout}"
+    );
     calls.timeline.fetch_add(1, Ordering::Relaxed);
     if calls.hung {
         vk::Result::TIMEOUT
@@ -219,6 +222,8 @@ fn backend(device: ash::Device, drops: &Arc<AtomicUsize>) -> NativeBackend {
         premade: Default::default(),
         ticks: crate::metal::timing::no_clock,
         split: [0; 3],
+        idle: Default::default(),
+        idle_waited: 0,
     }
 }
 
@@ -510,4 +515,62 @@ fn a_freed_import_is_taken_back_for_the_same_guest_ram_only() {
         "every older one goes for the bytes"
     );
     assert_eq!(cache.drain().count(), 1);
+}
+
+/// A backend about to be dropped proves its queue idle in steps of at most
+/// one short wait each, under the processor's half second, and the steps
+/// together wait no longer than the idle bound. Once a step ends the proof,
+/// dropping waits for nothing.
+#[test]
+fn idle_steps_wait_briefly_each_and_end_at_the_idle_bound() {
+    let steps = (IDLE_WAIT_NS / IDLE_STEP_NS) as usize;
+    const _: () = assert!(IDLE_STEP_NS < 250_000_000);
+    // A hung channel: the timeline never reaches its last value.
+    let calls = Calls {
+        hung: true,
+        ..Calls::new(vk::Result::SUCCESS)
+    };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut stepped = backend(device(&calls), &drops);
+    in_flight(&mut stepped);
+    for _ in 1..steps {
+        assert_eq!(stepped.idle_step(), IdleStep::Waiting);
+    }
+    assert_eq!(stepped.idle_step(), IdleStep::Unproven);
+    assert_eq!(stepped.idle_step(), IdleStep::Unproven, "sticky");
+    // Two timeline waits a step (a poll, then the short wait) until the
+    // bound; no queue idle wait.
+    assert_eq!(calls.timeline.load(Ordering::Relaxed), 2 * steps);
+    assert_eq!(calls.waits.load(Ordering::Relaxed), 0);
+    drop(stepped);
+    assert_eq!(calls.timeline.load(Ordering::Relaxed), 2 * steps);
+    assert_eq!(drops.load(Ordering::Relaxed), 0, "the export owner stays");
+
+    // The host ends each queue idle wait at its bound.
+    let calls = Calls::new(vk::Result::TIMEOUT);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut stepped = backend(device(&calls), &drops);
+    in_flight(&mut stepped);
+    for _ in 1..steps {
+        assert_eq!(stepped.idle_step(), IdleStep::Waiting);
+    }
+    assert_eq!(stepped.idle_step(), IdleStep::Unproven);
+    assert_eq!(calls.waits.load(Ordering::Relaxed), steps);
+    drop(stepped);
+    assert_eq!(calls.waits.load(Ordering::Relaxed), steps);
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+    // A drained queue is idle at the first step.
+    let calls = Calls::new(vk::Result::SUCCESS);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut stepped = ManuallyDrop::new(backend(device(&calls), &drops));
+    in_flight(&mut stepped);
+    assert_eq!(stepped.idle_step(), IdleStep::Idle);
+    assert_eq!(stepped.idle_step(), IdleStep::Idle);
+    assert_eq!(calls.waits.load(Ordering::Relaxed), 1);
+    // SAFETY: as in the tests above; the fake buffers own nothing.
+    unsafe {
+        ManuallyDrop::drop(&mut stepped.exporter);
+        ManuallyDrop::drop(&mut stepped._entry);
+    }
 }

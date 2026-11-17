@@ -37,8 +37,8 @@ use super::{
     vulkan::{
         SampleCounts,
         backend::{
-            Backend, BufferAllocation, Descriptor, MemoryBlocks, Object, Outside, PreparedImport,
-            Requirements, requirements,
+            Backend, BufferAllocation, Descriptor, IdleStep, MemoryBlocks, Object, Outside,
+            PreparedImport, Requirements, requirements,
         },
         command::{BufferImageCopy, Command, Subresource},
         object::{
@@ -376,6 +376,24 @@ const RECLAIM_AFTER: usize = 64;
 /// it, 10 s later. Work unfinished by then is not proven stopped.
 const IDLE_WAIT_NS: u64 = 1_000_000_000;
 
+/// The longest one [`Backend::idle_step`] waits: under a quarter of the
+/// half second XNU allows a processor out of its guest. The host ends a
+/// queue idle wait a held processor posts at about this bound too, which
+/// a step counts as waited when it does.
+const IDLE_STEP_NS: u64 = 200_000_000;
+
+/// What the idle steps proved before the backend is dropped.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum IdleProof {
+    /// No step ran: dropping waits as an idle proof does.
+    #[default]
+    Unknown,
+    /// The queue drained: dropping waits for nothing and frees.
+    Idle,
+    /// Not proven: dropping waits for nothing and keeps everything.
+    Unproven,
+}
+
 /// Command buffers of one submission, freed once the queue's timeline
 /// passes `value`.
 #[derive(Debug)]
@@ -544,6 +562,9 @@ pub struct NativeBackend {
     /// `submit` it timed since the device took them.
     ticks: fn() -> u64,
     split: [u64; 3],
+    /// What [`Backend::idle_step`] proved, and how long its steps waited.
+    idle: IdleProof,
+    idle_waited: u64,
 }
 
 impl NativeBackend {
@@ -788,6 +809,8 @@ impl NativeBackend {
             premade: premade::Premade::default(),
             ticks: super::timing::no_clock,
             split: [0; 3],
+            idle: IdleProof::Unknown,
+            idle_waited: 0,
         };
         // Dropping a partly built backend destroys what was created.
         let kernels = kernels?;
@@ -1764,6 +1787,15 @@ impl NativeBackend {
     /// the last value each of their timelines reaches. `DeviceLost` when
     /// they do not finish in time.
     fn wait_submitted(&self, timeout: u64) -> Result<()> {
+        match self.reach_submitted(timeout)? {
+            true => Ok(()),
+            false => Err(Error::DeviceLost),
+        }
+    }
+
+    /// Waits up to `timeout` ns for the last value of each timeline in
+    /// flight: whether all were reached.
+    fn reach_submitted(&self, timeout: u64) -> Result<bool> {
         let mut last: Vec<(vk::Semaphore, u64)> = Vec::new();
         for entry in &self.in_flight {
             if entry.timeline == vk::Semaphore::null() {
@@ -1778,7 +1810,7 @@ impl NativeBackend {
             }
         }
         if last.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let (semaphores, values): (Vec<_>, Vec<_>) = last.into_iter().unzip();
         let info = vk::SemaphoreWaitInfo::default()
@@ -1786,9 +1818,41 @@ impl NativeBackend {
             .values(&values);
         // SAFETY: the timelines are alive while submissions use them.
         match unsafe { self.device.wait_semaphores(&info, timeout) } {
-            Ok(()) => Ok(()),
-            Err(vk::Result::TIMEOUT) => Err(Error::DeviceLost),
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
             Err(error) => Err(failure(error)),
+        }
+    }
+
+    /// [`Backend::idle_step`]: first the queue's own timelines, then the
+    /// driver's queue idle wait, one wait a step.
+    fn step_idle(&mut self) -> IdleStep {
+        let waited = |backend: &mut Self| {
+            backend.idle_waited = backend.idle_waited.saturating_add(IDLE_STEP_NS);
+            if backend.idle_waited >= IDLE_WAIT_NS {
+                IdleStep::Unproven
+            } else {
+                IdleStep::Waiting
+            }
+        };
+        match self.reach_submitted(0) {
+            Ok(true) => {}
+            Ok(false) => {
+                return match self.reach_submitted(IDLE_STEP_NS) {
+                    // The next step proves the queue idle.
+                    Ok(true) => IdleStep::Waiting,
+                    Ok(false) => waited(self),
+                    Err(_) => IdleStep::Unproven,
+                };
+            }
+            Err(_) => return IdleStep::Unproven,
+        }
+        // SAFETY: the device belongs to this backend and no caller submits
+        // to it now: it is about to be dropped.
+        match unsafe { self.device.device_wait_idle() } {
+            Ok(()) => IdleStep::Idle,
+            Err(vk::Result::TIMEOUT) => waited(self),
+            Err(_) => IdleStep::Unproven,
         }
     }
 
@@ -1845,12 +1909,19 @@ impl Drop for NativeBackend {
         // An error is not evidence that queued DMA stopped, nor is work that
         // does not finish in time. Keep every native handle, the driver's
         // code and the exporter on that uncertain path.
-        if self.wait_submitted(IDLE_WAIT_NS).is_err() {
-            return;
-        }
-        // SAFETY: the device belongs to this backend and no caller uses it now.
-        if unsafe { self.device.device_wait_idle() }.is_err() {
-            return;
+        match self.idle {
+            IdleProof::Idle => {}
+            IdleProof::Unproven => return,
+            IdleProof::Unknown => {
+                if self.wait_submitted(IDLE_WAIT_NS).is_err() {
+                    return;
+                }
+                // SAFETY: the device belongs to this backend and no caller
+                // uses it now.
+                if unsafe { self.device.device_wait_idle() }.is_err() {
+                    return;
+                }
+            }
         }
         self.store.idle(&self.device);
         // Images jobs made that no call took; the device is idle.
@@ -2370,6 +2441,20 @@ fn raw<T: vk::Handle>(handle: T) -> u64 {
 }
 
 impl Backend for NativeBackend {
+    fn idle_step(&mut self) -> IdleStep {
+        let step = match self.idle {
+            IdleProof::Idle => IdleStep::Idle,
+            IdleProof::Unproven => IdleStep::Unproven,
+            IdleProof::Unknown => self.step_idle(),
+        };
+        self.idle = match step {
+            IdleStep::Idle => IdleProof::Idle,
+            IdleStep::Unproven => IdleProof::Unproven,
+            IdleStep::Waiting => IdleProof::Unknown,
+        };
+        step
+    }
+
     fn acknowledge_idle(&mut self) -> Result<()> {
         self.wait_submitted(IDLE_WAIT_NS)?;
         // SAFETY: this backend exclusively owns the device. The Metal owner

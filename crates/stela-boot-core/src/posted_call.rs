@@ -15,15 +15,33 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const WITHDRAW_MS: u64 = 300;
 /// How long a posted call a task performs may run before the boot stops.
 pub const STOP_MS: u64 = 10_000;
-/// The longest a posted DRM fence wait may wait: the bound of the GPU
+/// The longest a posted DRM fence wait may wait in a deferred job's slice,
+/// which gives its processor back while it waits: the bound of the GPU
 /// backend's own idle waits. A wait asking for longer, as Mesa's
-/// `vkQueueWaitIdle` does with no timeout, ends at this bound with
-/// `ETIME`, its caller's answer for a wait that timed out. Linux sleeps in
-/// such a wait until the fence signals, which on a channel that hangs
-/// without a channel error is when the scheduler's 10 s job timeout kills
-/// the channel; that is [`STOP_MS`] after the post at the earliest, so a
-/// guest processor spinning on it would always reach the stop first.
+/// `vkQueueWaitIdle` does with no timeout, ends at its bound with `ETIME`,
+/// its caller's answer for a wait that timed out. Linux sleeps in such a
+/// wait until the fence signals, which on a channel that hangs without a
+/// channel error is when the scheduler's 10 s job timeout kills the
+/// channel; that is [`STOP_MS`] after the post at the earliest, so a guest
+/// processor spinning on it would always reach the stop first.
 pub const WAIT_MS: u64 = 1_000;
+/// The longest a posted DRM fence wait may hold its processor anywhere
+/// else, in one exit: under half of XNU's half second. A fence wait no
+/// task took by then is withdrawn and answered `ETIME` too. A caller that
+/// needs longer waits again from a later exit, as the GPU backend's idle
+/// steps do.
+pub const HELD_WAIT_MS: u64 = 200;
+
+/// When a posted call `request` no task took is withdrawn: a fence wait at
+/// [`HELD_WAIT_MS`], as it never holds its processor longer, any other at
+/// [`WITHDRAW_MS`].
+pub const fn withdraw_ms(request: u32) -> u64 {
+    if wait_timeout_offset(request).is_some() {
+        HELD_WAIT_MS
+    } else {
+        WITHDRAW_MS
+    }
+}
 
 /// `DRM_IOCTL_SYNCOBJ_WAIT`: `struct drm_syncobj_wait`, 40 bytes.
 pub const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
@@ -44,10 +62,11 @@ pub const fn wait_timeout_offset(request: u32) -> Option<usize> {
 }
 
 /// The deadline a posted fence wait asking for `timeout` (absolute, in the
-/// monotonic clock that reads `now` nanoseconds) runs to instead: None when
-/// it ends within [`WAIT_MS`] already, polls, or has passed.
-pub const fn bounded_wait_deadline(timeout: i64, now: u64) -> Option<i64> {
-    let bound = now.saturating_add(WAIT_MS * 1_000_000);
+/// monotonic clock that reads `now` nanoseconds) runs to instead, `bound_ms`
+/// ([`WAIT_MS`] or [`HELD_WAIT_MS`]) from `now`: None when it ends within
+/// that already, polls, or has passed.
+pub const fn bounded_wait_deadline(timeout: i64, now: u64, bound_ms: u64) -> Option<i64> {
+    let bound = now.saturating_add(bound_ms * 1_000_000);
     let bound = if bound > i64::MAX as u64 {
         i64::MAX
     } else {
@@ -132,23 +151,35 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_wait_ends_before_the_stop() {
+    fn a_fence_wait_ends_before_the_stop_and_a_held_one_within_xnus_bound() {
         const _: () = assert!(WITHDRAW_MS + WAIT_MS < STOP_MS);
+        // Withdrawn or ended at the same bound: a held processor spends
+        // at most this in one fence wait, half of XNU's half second.
+        const _: () = assert!(HELD_WAIT_MS <= 250 && HELD_WAIT_MS < WITHDRAW_MS);
     }
 
     #[test]
     fn a_fence_wait_without_a_timeout_ends_at_the_bound() {
         let now = 5_000_000_000;
-        let bound = (now + WAIT_MS * 1_000_000) as i64;
-        // Mesa's vkQueueWaitIdle: UINT64_MAX, i64::MAX once converted.
-        assert_eq!(bounded_wait_deadline(i64::MAX, now), Some(bound));
-        assert_eq!(bounded_wait_deadline(bound + 1, now), Some(bound));
-        assert_eq!(bounded_wait_deadline(bound, now), None);
-        assert_eq!(bounded_wait_deadline(now as i64 + 1, now), None);
-        // A poll or a passed deadline stays as it is.
-        assert_eq!(bounded_wait_deadline(0, now), None);
-        assert_eq!(bounded_wait_deadline(-1, now), None);
-        assert_eq!(bounded_wait_deadline(i64::MAX, u64::MAX), None);
+        for bound_ms in [WAIT_MS, HELD_WAIT_MS] {
+            let bound = (now + bound_ms * 1_000_000) as i64;
+            // Mesa's vkQueueWaitIdle: UINT64_MAX, i64::MAX once converted.
+            assert_eq!(bounded_wait_deadline(i64::MAX, now, bound_ms), Some(bound));
+            assert_eq!(bounded_wait_deadline(bound + 1, now, bound_ms), Some(bound));
+            assert_eq!(bounded_wait_deadline(bound, now, bound_ms), None);
+            assert_eq!(bounded_wait_deadline(now as i64 + 1, now, bound_ms), None);
+            // A poll or a passed deadline stays as it is.
+            assert_eq!(bounded_wait_deadline(0, now, bound_ms), None);
+            assert_eq!(bounded_wait_deadline(-1, now, bound_ms), None);
+            assert_eq!(bounded_wait_deadline(i64::MAX, u64::MAX, bound_ms), None);
+        }
+    }
+
+    #[test]
+    fn a_fence_wait_no_task_took_is_withdrawn_at_the_held_bound() {
+        assert_eq!(withdraw_ms(SYNCOBJ_WAIT), HELD_WAIT_MS);
+        assert_eq!(withdraw_ms(SYNCOBJ_TIMELINE_WAIT), HELD_WAIT_MS);
+        assert_eq!(withdraw_ms(0xc030_6480), WITHDRAW_MS);
     }
 
     #[test]

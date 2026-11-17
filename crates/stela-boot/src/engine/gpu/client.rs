@@ -9,9 +9,10 @@
 //! Each wait is bounded ([`posted_call`]): a call no task took in time is
 //! withdrawn and answered `ETIMEDOUT`, and one a task performs too long stops
 //! the boot, naming it, as a processor held out of its guest for long makes
-//! XNU panic. A fence wait asking for longer than
-//! [`posted_call::WAIT_MS`] runs to that bound and answers `ETIME`, so a
-//! wait on a channel that hangs ends before the stop.
+//! XNU panic. A fence wait runs at most [`posted_call::HELD_WAIT_MS`] where
+//! its processor waits for it, or [`posted_call::WAIT_MS`] in a deferred
+//! job's slice, and answers `ETIME` past that, so a wait on a channel that
+//! hangs ends before the stop and within XNU's bound.
 //!
 //! A thread Mesa starts is a Linux task too, as Linux's own kthreads are, so it
 //! makes its calls in place and sleeps in Linux. It runs Mesa on a stack of its
@@ -948,16 +949,27 @@ fn submit(operation: Operation) -> i64 {
         return result;
     }
     let code = request_code(&operation);
+    // A job's slice gives its processor back while a call waits.
+    let bound_ms = if super::slice::can_end() {
+        posted_call::WAIT_MS
+    } else {
+        posted_call::HELD_WAIT_MS
+    };
     let bounded = match operation {
         Operation::Control {
             request, argument, ..
         } => {
             // SAFETY: the caller's argument of its request.
-            unsafe { bound_wait(request, argument) }
+            unsafe { bound_wait(request, argument, bound_ms) }
         }
         _ => None,
     };
-    let result = perform_posted(gpu, operation, code);
+    let fence = posted_call::wait_timeout_offset(code).is_some();
+    let mut result = perform_posted(gpu, operation, code);
+    // A fence wait withdrawn at its bound timed out, as Linux answers one.
+    if fence && result == ETIMEDOUT {
+        result = ETIME;
+    }
     if let Some((field, asked)) = bounded {
         // SAFETY: as in `bound_wait`; Linux's wait does not write it.
         unsafe { field.write_unaligned(asked) };
@@ -965,10 +977,9 @@ fn submit(operation: Operation) -> i64 {
             let count = BOUNDED.fetch_add(1, Ordering::Relaxed) + 1;
             if count.is_power_of_two() {
                 output::arguments(format_args!(
-                    "GPU fence wait {code:#x} on PE {} asked for more than {} ms and ended \
-                     at that bound with ETIME ({count} bounded)\n",
+                    "GPU fence wait {code:#x} on PE {} asked for more than {bound_ms} ms and \
+                     ended at that bound with ETIME ({count} bounded)\n",
                     host::processor(),
-                    posted_call::WAIT_MS
                 ));
             }
         }
@@ -980,14 +991,18 @@ fn submit(operation: Operation) -> i64 {
 /// report of the first and of each power of two after it.
 static BOUNDED: AtomicU64 = AtomicU64::new(0);
 
-/// Bounds a posted fence wait that asks for longer than
-/// [`posted_call::WAIT_MS`] to that, as its poster spins until it ends: its
-/// timeout field and the timeout it asked for, which the caller's argument
-/// gets back after the call. None for any other call.
+/// Bounds a posted fence wait that asks for longer than `bound_ms` to that,
+/// as its poster spins until it ends: its timeout field and the timeout it
+/// asked for, which the caller's argument gets back after the call. None
+/// for any other call.
 ///
 /// # Safety
 /// `argument` is the caller's argument of `request`, valid for its size.
-unsafe fn bound_wait(request: u32, argument: *mut c_void) -> Option<(*mut i64, i64)> {
+unsafe fn bound_wait(
+    request: u32,
+    argument: *mut c_void,
+    bound_ms: u64,
+) -> Option<(*mut i64, i64)> {
     let offset = posted_call::wait_timeout_offset(request)?;
     if argument.is_null() {
         return None;
@@ -995,7 +1010,7 @@ unsafe fn bound_wait(request: u32, argument: *mut c_void) -> Option<(*mut i64, i
     let field = argument.cast::<u8>().wrapping_add(offset).cast::<i64>();
     // SAFETY: the request's argument holds its timeout at `offset`.
     let asked = unsafe { field.read_unaligned() };
-    let deadline = posted_call::bounded_wait_deadline(asked, now_ns())?;
+    let deadline = posted_call::bounded_wait_deadline(asked, now_ns(), bound_ms)?;
     // SAFETY: as above.
     unsafe { field.write_unaligned(deadline) };
     Some((field, asked))
@@ -1029,7 +1044,7 @@ static WITHDRAWN: AtomicU64 = AtomicU64::new(0);
 
 /// Posts `request` and waits for its result, within the bounds of
 /// [`posted_call`]: None when it was withdrawn, no task having taken it by
-/// [`posted_call::WITHDRAW_MS`]; it then stays with the task that meets it,
+/// [`posted_call::withdraw_ms`]; it then stays with the task that meets it,
 /// which never performs it, and the guest call it was made for is made
 /// again if it fails and may be ([`super::gate::defer_for_wait`]).
 /// A call a task performs past that is reported and waited for, and one
@@ -1042,7 +1057,7 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
     let posted = request.posted;
     let ms = || host::rdtsc().wrapping_sub(posted) / millis;
     let done = || request.done.load(Ordering::Acquire) != 0;
-    let withdraw_at = posted.saturating_add(posted_call::WITHDRAW_MS * millis);
+    let withdraw_at = posted.saturating_add(posted_call::withdraw_ms(code) * millis);
     wait(gpu, request, withdraw_at);
     if !done() {
         if request.withdrawable() && request.claim.withdraw() {
@@ -1053,9 +1068,14 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
             if count.is_power_of_two() {
                 output::arguments(format_args!(
                     "GPU call {code:#x} withdrawn after {} ms on PE {}: no task took it; \
-                     answered ETIMEDOUT, {} ({count} withdrawn)\n",
+                     answered {}, {} ({count} withdrawn)\n",
                     ms(),
                     host::processor(),
+                    if posted_call::wait_timeout_offset(code).is_some() {
+                        "ETIME"
+                    } else {
+                        "ETIMEDOUT"
+                    },
                     if again {
                         "and the guest call runs again if it fails"
                     } else {

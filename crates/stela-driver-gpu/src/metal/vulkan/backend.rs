@@ -165,6 +165,17 @@ pub enum Object {
     ExecutionSet(ExecutionSet),
 }
 
+/// What one [`Backend::idle_step`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleStep {
+    /// Nothing queued can reach the backend's resources.
+    Idle,
+    /// Work may still run; step again later.
+    Waiting,
+    /// The bound passed or the driver failed: nothing is proven stopped.
+    Unproven,
+}
+
 pub trait Backend {
     fn physical_device(&self) -> &PhysicalDevice;
 
@@ -177,6 +188,18 @@ pub trait Backend {
         Err(crate::metal::error::Error::Unsupported(
             "GPU idle acknowledgement",
         ))
+    }
+
+    /// One step of proving that no queued GPU operation can still access a
+    /// backend that is about to be dropped, for a caller whose processor
+    /// takes no guest interrupt meanwhile: each step waits at most once and
+    /// briefly, and the steps together wait no longer than the backend's own
+    /// idle bound. Once a step answers [`IdleStep::Idle`] or
+    /// [`IdleStep::Unproven`], dropping the backend waits for nothing: an
+    /// unproven backend keeps what work may still use. A backend that tracks
+    /// no work is idle.
+    fn idle_step(&mut self) -> IdleStep {
+        IdleStep::Idle
     }
 
     /// Memory of its own, zeroed before the host or the GPU reaches it.
