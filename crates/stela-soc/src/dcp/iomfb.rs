@@ -469,6 +469,16 @@ pub fn moved_presents() -> u64 {
     MOVED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Presents of a swap since boot, moved or not: the frames macOS drew that
+/// reached the scanout, which a pointer's motion or a key is answered by
+/// whether macOS moves a layer for its pointer or draws it into the frame.
+static PRESENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Presents of a swap since boot ([`PRESENTS`]).
+pub fn presents() -> u64 {
+    PRESENTS.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Whether `next` shows a layer of `shown` at another place with the same
 /// size: a moved pointer, or any layer moved whole.
 fn moved(
@@ -1564,6 +1574,7 @@ impl Methods {
             self.pacing.moved += 1;
             MOVED.fetch_add(1, core::sync::atomic::Ordering::Release);
         }
+        PRESENTS.fetch_add(1, core::sync::atomic::Ordering::Release);
         self.shown = Some(planes);
         self.unshown = 0;
         self.repaint_refused = false;
