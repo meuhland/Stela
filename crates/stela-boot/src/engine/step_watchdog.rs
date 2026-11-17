@@ -101,9 +101,15 @@ fn amd_select(interrupt: bool) -> u64 {
     AMD_CYCLES | AMD_OS | AMD_ENABLE | if interrupt { AMD_INT } else { 0 }
 }
 
-/// Find a free cycle counter this processor implements and counts with,
-/// and its width, or why there is none.
-fn probe() -> Result<(u8, u32), &'static str> {
+/// Find the cycle counter this processor implements and counts with, its
+/// width and whether the firmware left it enabled, or why there is none.
+/// A counter the firmware left enabled is taken all the same: nothing of
+/// the firmware's runs on this processor after its boot services end but
+/// system management mode, and Linux takes such a counter too, with one
+/// line (`check_hw_exists`: "the BIOS has corrupted hw-PMU resources").
+/// Refusing it left the PCs whose firmware does that with no step watchdog
+/// at all, so a step that never returned there left no stop.
+fn probe() -> Result<(u8, u32, bool), &'static str> {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     let vendor = __cpuid(0);
     let vendor = (vendor.ebx, vendor.edx, vendor.ecx);
@@ -119,21 +125,15 @@ fn probe() -> Result<(u8, u32), &'static str> {
             return Err("no Intel fixed core cycle counter");
         }
         let control = pmu::read(INTEL_FIXED_CTR_CTRL).ok_or("fixed counter control refused")?;
-        if control & INTEL_FIXED1_FIELD != 0 {
-            return Err("the fixed core cycle counter is in use");
-        }
-        Ok((INTEL_FIXED, width))
+        Ok((INTEL_FIXED, width, control & INTEL_FIXED1_FIELD != 0))
     } else if vendor == (0x6874_7541, 0x6974_6e65, 0x444d_4163) {
         let select = pmu::read(AMD_CTL0).ok_or("core counter 0 refused")?;
-        if select & AMD_ENABLE != 0 {
-            return Err("core counter 0 is in use");
-        }
         let extended = __cpuid(0x8000_0000).eax;
         AMD_GLOBAL.store(
             extended >= 0x8000_0022 && __cpuid(0x8000_0022).eax & 1 != 0,
             Ordering::Relaxed,
         );
-        Ok((AMD_CORE, 48))
+        Ok((AMD_CORE, 48, select & AMD_ENABLE != 0))
     } else {
         Err("no known core cycle counter")
     }
@@ -221,7 +221,7 @@ fn interrupt(counter: u8) -> bool {
 pub(super) unsafe fn install(tsc_hz: u64) {
     TSC_HZ.store(tsc_hz, Ordering::Relaxed);
     ALONE.store(super::host::local::processor(), Ordering::Relaxed);
-    let found = probe().and_then(|(counter, width)| {
+    let found = probe().and_then(|(counter, width, taken)| {
         let start = decide::start_value(tsc_hz, width).ok_or("the limit does not fit its width")?;
         // A counter a hypervisor accepts but never advances raises nothing.
         if !count(counter, start) {
@@ -240,10 +240,10 @@ pub(super) unsafe fn install(tsc_hz: u64) {
         if !counted {
             return Err("the counter does not count from a full-width start");
         }
-        Ok((counter, start))
+        Ok((counter, start, taken))
     });
     match found {
-        Ok((counter, start)) => {
+        Ok((counter, start, taken)) => {
             let apic = apic();
             SAVED_LVT.store(apic.read(LVT_PERFORMANCE), Ordering::Relaxed);
             apic.write(LVT_PERFORMANCE, LVT_NMI);
@@ -252,12 +252,17 @@ pub(super) unsafe fn install(tsc_hz: u64) {
             COUNTER.store(counter, Ordering::Release);
             output::arguments(format_args!(
                 "STEP WATCHDOG on: a Linux step that does not return within {} s stops the boot \
-                 ({})\n",
+                 ({}{})\n",
                 decide::LIMIT_SECONDS,
                 if counter == INTEL_FIXED {
                     "Intel fixed counter 1"
                 } else {
                     "AMD core counter 0"
+                },
+                if taken {
+                    ", which the firmware left enabled and Stela took, as Linux does"
+                } else {
+                    ""
                 }
             ));
         }
