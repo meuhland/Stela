@@ -742,12 +742,10 @@ fn real_gpu_and_nvme_capability_lists_are_stopped_unless_an_interrupt_is_enabled
         validate_stopped(&mut disk),
         Err(ClaimError::Active { offset: 0xb2 })
     );
+    // Transactions Pending is a status the claim is not refused on.
     let mut disk = nvme();
     disk.config().write16(0x7a, 1 << 5).unwrap();
-    assert_eq!(
-        validate_stopped(&mut disk),
-        Err(ClaimError::Active { offset: 0x7a })
-    );
+    assert_eq!(validate_stopped(&mut disk), Ok(()));
 }
 
 /// A PCIe root port and a switch downstream port list SSVID, HyperTransport,
@@ -833,16 +831,15 @@ fn real_port_capability_lists_pass_and_ports_stay_on_their_own_path() {
 }
 
 /// A conventional function's Advanced Features report Transactions Pending
-/// as PCI Express Device Status does, and refuse the claim the same way.
+/// as PCI Express Device Status does: a status no claim is refused on.
 #[test]
-fn advanced_features_transactions_pending_refuse_a_stopped_claim() {
+fn advanced_features_transactions_pending_do_not_refuse_a_stopped_claim() {
+    /// PCI Advanced Features (`PCI_CAP_ID_AF`).
+    const AF: u16 = 0x13;
     let mut function = listed(0x04_0300, 0, &[(0x50, PM, 3), (0x60, AF, 6 | 3 << 8)], &[]);
     assert_eq!(validate_stopped(&mut function), Ok(()));
     function.config().write16(0x64, 1 << 8).unwrap();
-    assert_eq!(
-        validate_stopped(&mut function),
-        Err(ClaimError::Active { offset: 0x64 })
-    );
+    assert_eq!(validate_stopped(&mut function), Ok(()));
 }
 
 /// A CXL device DVSEC with Cache_Enable lets the function read host memory
@@ -878,24 +875,48 @@ fn cxl_cache_enable_refuses_and_other_dvsecs_are_ignored() {
     );
 }
 
+/// Linux's `pci_wait_for_pending_transaction` waits a bounded time and its
+/// callers carry on: a Transactions Pending bit that stays set for the whole
+/// wait is returned with the value read, for the caller's report, and
+/// refuses neither the wait nor a later claim of the function, whose Bus
+/// Master bit is what keeps it from sending requests.
 #[test]
-fn pcie_pending_transactions_refuse_a_stopped_claim_and_bounded_wait() {
+fn pcie_pending_transactions_end_a_bounded_wait_reported_and_do_not_refuse_a_claim() {
     let mut function = endpoint();
     cap(&mut function, 0x40, PCIE, 0);
     function.config().write16(0x42, 2).unwrap();
-    function.config().write16(0x4a, 1 << 5).unwrap();
+    function.config().write16(0x4a, 1 << 5 | 1).unwrap();
     let mut checks = 0;
     assert_eq!(
         wait_for_pending_transactions(&*function.config(), || {
             checks += 1;
             checks >= 4
         }),
-        Err(ClaimError::Active { offset: 0x4a })
+        Ok(Some(StillPending {
+            offset: 0x4a,
+            status: 1 << 5 | 1
+        }))
     );
+    assert_eq!(checks, 4);
+    assert_eq!(validate_stopped(&mut function), Ok(()));
+    // A function that mastered again is still refused.
+    function
+        .config()
+        .write16(
+            regs::COMMAND,
+            regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
+        )
+        .unwrap();
     assert_eq!(
         validate_stopped(&mut function),
-        Err(ClaimError::Active { offset: 0x4a })
+        Err(ClaimError::Active {
+            offset: regs::COMMAND
+        })
     );
+    function
+        .config()
+        .write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)
+        .unwrap();
     function.config().write16(0x4a, u16::MAX).unwrap();
     assert_eq!(
         wait_for_pending_transactions(&*function.config(), || true),
@@ -905,7 +926,7 @@ fn pcie_pending_transactions_refuse_a_stopped_claim_and_bounded_wait() {
     assert_eq!(validate_stopped(&mut function), Ok(()));
     assert_eq!(
         wait_for_pending_transactions(&*function.config(), || panic!("idle status needs no wait")),
-        Ok(())
+        Ok(None)
     );
 }
 
@@ -973,7 +994,7 @@ fn pcie_pending_wait_observes_completion_before_admitting_the_requester() {
             checks += 1;
             checks >= 4
         }),
-        Ok(())
+        Ok(None)
     );
     assert_eq!(validate_stopped(&mut function), Ok(()));
 }

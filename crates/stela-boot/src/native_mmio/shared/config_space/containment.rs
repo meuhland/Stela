@@ -416,9 +416,10 @@ impl ContainmentError {
     /// Whether this refusal concerns the function alone, as Linux carries
     /// on past each: a stop control that does not read back (INTx Disable,
     /// Bus Master, a capability's enable, Secondary Bus Reset), a control
-    /// left in a state Stela does not change, or transactions still
-    /// pending after the wait, or a capability its plan left as found
-    /// (`Plan::refusal`), or a bridge whose bus numbers are not used. A
+    /// left in a state Stela does not change, or a capability its plan
+    /// left as found (`Plan::refusal`), or a bridge whose bus numbers are
+    /// not used. Transactions still pending after the wait refuse nothing
+    /// (`Source::contain_slot`). A
     /// configuration space that cannot be mapped or owned, or a header that
     /// changed, still stops the whole fabric.
     fn per_function(&self) -> bool {
@@ -522,7 +523,7 @@ const BRIDGE_CONTROL: u16 = 0x3e;
 
 /// How long a stopped function may keep Transactions Pending set: Linux's
 /// `pci_wait_for_pending_transaction` polls at 0, 100, 300 and 700 ms and
-/// then carries on.
+/// then carries on, as the takeover does ([`Source::contain_slot`]).
 const PENDING_TRANSACTIONS_MS: u64 = 700;
 
 fn check_command(
@@ -1447,23 +1448,23 @@ impl Source {
             // A function stopped and sealed with a capability its plan left
             // as found (`Plan::refusal`), or a bridge whose bus numbers are
             // not used, is refused alone.
-            let result =
-                self.contain_slot(prepared, header, &plan, tsc_hz)
-                    .and_then(|parked| match (misconfigured, plan.refusal()) {
-                        (Some(reason), _) => Err(SlotRefusal::left(
-                            ContainmentError {
-                                address: None,
-                                cause: Cause::BridgeBuses {
-                                    buses: header.bridge.unwrap_or(0),
-                                    reason,
-                                },
-                                effect: ConfigEffect::None,
+            let result = self
+                .contain_slot(address, prepared, header, &plan, tsc_hz)
+                .and_then(|parked| match (misconfigured, plan.refusal()) {
+                    (Some(reason), _) => Err(SlotRefusal::left(
+                        ContainmentError {
+                            address: None,
+                            cause: Cause::BridgeBuses {
+                                buses: header.bridge.unwrap_or(0),
+                                reason,
                             },
-                            parked,
-                        )),
-                        (None, Some(cause)) => Err(SlotRefusal::left(cause, parked)),
-                        (None, None) => Ok(parked),
-                    });
+                            effect: ConfigEffect::None,
+                        },
+                        parked,
+                    )),
+                    (None, Some(cause)) => Err(SlotRefusal::left(cause, parked)),
+                    (None, None) => Ok(parked),
+                });
             let mut cohort = self.pci_slots.0.borrow_mut();
             let Cohort::Incomplete(fabric) = &mut *cohort else {
                 unreachable!("exclusive containment owns the incomplete fabric");
@@ -1649,6 +1650,7 @@ impl Source {
 
     fn contain_slot(
         &self,
+        address: Address,
         prepared: PreparedConfig<PrepublicationGrant>,
         header: Header,
         plan: &Plan,
@@ -1677,9 +1679,25 @@ impl Source {
         let acknowledge = (|| -> Result<(), ClaimError> {
             let started = crate::apic::rdtsc();
             let limit = (tsc_hz / 1_000 * PENDING_TRANSACTIONS_MS).max(1);
-            wait_for_pending_transactions(&config, || {
+            let pending = wait_for_pending_transactions(&config, || {
                 crate::apic::rdtsc().wrapping_sub(started) >= limit
             })?;
+            // Reported once, with what was read and how long it was waited
+            // for; the function is then sealed and driven like any other.
+            // Its Bus Master bit, cleared and read back by the plan and
+            // sealed below, is what stops its requests. The bit says only
+            // that it still awaits answers to requests sent before that.
+            if let Some(still) = pending {
+                crate::output::arguments(format_args!(
+                    "HOST PCI {address} still shows Transactions Pending {} ms after its stop \
+                     (register {:#x} reads {:#06x}) with Bus Master off; carried on as Linux \
+                     does: it can send no new request, and the answers it waits for go to the \
+                     function, not to memory\n",
+                    crate::apic::rdtsc().wrapping_sub(started) / (tsc_hz / 1_000).max(1),
+                    still.offset,
+                    still.status
+                ));
+            }
             // Stopped controls read back, and Bus Master is sealed: clear,
             // or proven hard-wired on a root-bus host or ISA bridge.
             plan.seal(&mut config)?;

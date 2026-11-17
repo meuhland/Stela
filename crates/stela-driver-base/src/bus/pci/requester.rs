@@ -30,11 +30,10 @@ const MSI: u16 = 5;
 const MSI_EXTENDED_DATA_ENABLE: u16 = 1 << 10;
 const PCIE: u16 = 0x10;
 const MSIX: u16 = 0x11;
-/// PCI Advanced Features, and its `PCI_AF_STATUS` word with `PCI_AF_STATUS_TP`
-/// read through the control byte before it.
-const AF: u16 = 0x13;
-const AF_CONTROL: u16 = 4;
-const AF_TRANSACTIONS_PENDING: u16 = 1 << 8;
+/// PCI Express Device Status, from the capability, and its Transactions
+/// Pending bit (`PCI_EXP_DEVSTA_TRPND`).
+const PCIE_DEVICE_STATUS: u16 = 10;
+const PCIE_TRANSACTIONS_PENDING: u16 = 1 << 5;
 const ATS: u16 = 0xf;
 const PRI: u16 = 0x13;
 const PASID: u16 = 0x1b;
@@ -272,14 +271,32 @@ impl From<CapabilityError> for ClaimError {
     }
 }
 
+/// A stopped function whose Transactions Pending bit stayed set for the
+/// whole wait ([`wait_for_pending_transactions`]): the status register and
+/// the value last read from it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StillPending {
+    pub offset: u16,
+    pub status: u16,
+}
+
 /// Wait for PCIe outstanding transactions to finish before changing DMA
 /// ownership. `expired` uses the caller's retained clock/deadline. An idle
 /// status is only a configuration observation; engine, IRQ and worker
 /// quiescence remain the stopped requester's independent producer obligations.
+///
+/// A bit still set when the wait expires is returned, not refused, as
+/// Linux's `pci_wait_for_pending_transaction` callers warn and carry on
+/// (`pcie_flr`, `pci_af_flr`). Transactions Pending is a status, not a
+/// control: it says the function still waits for completions of non-posted
+/// requests it sent before its Bus Master bit was cleared. Those completions
+/// carry data to the function, never into memory, and with Bus Master clear
+/// it sends no new request, so what is lost by carrying on is only the
+/// observation that every old request was answered. The caller reports it.
 pub fn wait_for_pending_transactions<C: ConfigSpace>(
     config: &C,
     mut expired: impl FnMut() -> bool,
-) -> Result<(), ClaimError> {
+) -> Result<Option<StillPending>, ClaimError> {
     let mut express = None;
     for entry in config.capabilities() {
         let entry = entry?;
@@ -290,16 +307,19 @@ pub fn wait_for_pending_transactions<C: ConfigSpace>(
         }
     }
     let Some(express) = express else {
-        return Ok(());
+        return Ok(None);
     };
-    let status = express + 10;
-    while read16(config, status)? & (1 << 5) != 0 {
+    let offset = express + PCIE_DEVICE_STATUS;
+    loop {
+        let status = read16(config, offset)?;
+        if status & PCIE_TRANSACTIONS_PENDING == 0 {
+            return Ok(None);
+        }
         if expired() {
-            return Err(ClaimError::Active { offset: status });
+            return Ok(Some(StillPending { offset, status }));
         }
         core::hint::spin_loop();
     }
-    Ok(())
 }
 
 // Which capabilities a stopped function is checked on. Linux validates no
@@ -310,10 +330,8 @@ pub fn wait_for_pending_transactions<C: ConfigSpace>(
 //
 // Checked, standard list:
 // - MSI and MSI-X: an enabled one is an interrupt source of its own.
-// - PCI Express: Device Control's Enable No Snoop and Device Status's
-//   Transactions Pending, and the port type, which must be an endpoint's.
-// - Advanced Features: its Transactions Pending, the conventional twin of the
-//   PCI Express one.
+// - PCI Express: Device Control's Enable No Snoop, and the port type, which
+//   must be an endpoint's.
 // Checked, extended list:
 // - SR-IOV: VF Enable makes virtual functions, each a requester of its own.
 // - ATS, PRI and PASID: their enables let the function translate and fault
@@ -322,6 +340,15 @@ pub fn wait_for_pending_transactions<C: ConfigSpace>(
 //   CXL.cache, which Bus Master does not gate.
 //
 // Ignored, because they can make no request or interrupt of their own:
+// - Transactions Pending, in PCI Express Device Status and in Advanced
+//   Features: a status, not a control. It reports non-posted requests the
+//   function sent before it was stopped and still awaits completions for;
+//   Bus Master, checked above, is what keeps it from sending more. Linux
+//   never reads it at a driver's claim, and where it waits for it before a
+//   reset it warns and carries on (`pci_wait_for_pending_transaction`). The
+//   takeover waits the same bounded time and reports a bit that stays set
+//   ([`wait_for_pending_transactions`]); refusing the claim on it left a
+//   function whose bit never clears without a driver.
 // - Power management: a function in D1 to D3hot cannot master at all, and in
 //   D0 Bus Master gates it. PME is a message to the root port, which raises
 //   the interrupt under its own PME Interrupt Enable; a port is never claimed
@@ -400,10 +427,6 @@ fn standard<C: ConfigSpace>(config: &C, status: u16) -> Result<(), ClaimError> {
                     return Err(ClaimError::UnsupportedPcieType(kind));
                 }
                 inactive(config, offset + 8, 1 << 11)?;
-                inactive(config, offset + 10, 1 << 5)?;
-            }
-            AF => {
-                inactive(config, offset + AF_CONTROL, AF_TRANSACTIONS_PENDING)?;
             }
             _ => continue,
         }
