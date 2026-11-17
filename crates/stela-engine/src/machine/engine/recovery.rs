@@ -190,6 +190,11 @@ impl<'a> Template<'a> {
             Self::Stored { entry, .. } => entry.cold,
         }
     }
+    /// Whether it was compiled in this boot, here or by another PE, not
+    /// relocated from a stored entry.
+    pub(super) fn fresh(&self) -> bool {
+        matches!(self, Self::Compiled(_))
+    }
     /// Whether its code holds no guest address that moves with its page:
     /// it records relocations, and none (page-relative code, whose fields
     /// hold page offsets), so it runs at any page that maps its frame.

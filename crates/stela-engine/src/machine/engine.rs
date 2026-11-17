@@ -16,8 +16,9 @@ use mirrors::*;
 use reports::*;
 pub use reports::{
     Alias, DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS,
-    MailWait, Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
-    Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit,
+    MailWait, Occupancy, PeState, Requirement, RequirementKind, Reset, SHARED_LOGGED, SharedEvent,
+    SharedLimits, Statistics, Stop, Surveyed, Suspension, TRACE_HITS, TraceHit, WATCH_HITS,
+    WatchHit,
 };
 mod amx;
 mod apple_maintenance;
@@ -1050,6 +1051,15 @@ pub struct Machine<H: Host, D: Devices> {
     /// frame (`--shared-aliases`, [`Block::shared`]): off unless asked for,
     /// and only with [`Self::page_relative`].
     shared_aliases: bool,
+    /// Bisection limits on them ([`SharedLimits`]).
+    shared_limits: SharedLimits,
+    /// Alias PCs this PE checked ([`SharedLimits::verify`]), with the PC of
+    /// the block checked there, and whether it ran there; those refused
+    /// get blocks of their own ([`Self::aliases_at`]).
+    shared_verified: BTreeMap<(u64, u64), bool>,
+    shared_refused: alloc::collections::BTreeSet<u64>,
+    /// Alias hits reported ([`SharedLimits::log`]).
+    shared_logged: u32,
     /// The guest page the last native run ended in
     /// (`GuestState::page_base` at its exit), or of the block fetched
     /// since, which runs there: where its block runs, for a shared block,
@@ -1516,6 +1526,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             table_insert_throttled: false,
             page_relative: false,
             shared_aliases: false,
+            shared_limits: SharedLimits::default(),
+            shared_verified: BTreeMap::new(),
+            shared_refused: alloc::collections::BTreeSet::new(),
+            shared_logged: 0,
             ran_page: 0,
             event_sample: None,
             debug: None,

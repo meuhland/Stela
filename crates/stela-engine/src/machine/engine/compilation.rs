@@ -206,14 +206,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.entered(entry.block);
             return Ok(Fetched::Block(entry.block));
         }
-        let indexed = self
+        let mut indexed = self
             .known_variant(variant)
             .and_then(|id| self.code.find(pc, physical, id, aliases));
-        self.statistics.fetches[if indexed.is_some() { 3 } else { 4 }] += 1;
-        // A shared block installed for another page: an install avoided.
-        if indexed.is_some_and(|index| self.code.blocks[index].pc != pc) {
-            self.statistics.aliases[Alias::Hits as usize] += 1;
+        // A shared block installed for another page: an install avoided,
+        // unless the alias is refused ([`SharedLimits::verify`]), which
+        // then compiles a block of its own.
+        if let Some(index) = indexed
+            && self.code.blocks[index].pc != pc
+        {
+            if self.alias_allowed(index, pc, physical) {
+                self.statistics.aliases[Alias::Hits as usize] += 1;
+            } else {
+                indexed = None;
+            }
         }
+        self.statistics.fetches[if indexed.is_some() { 3 } else { 4 }] += 1;
         let index = match indexed {
             Some(index) => index,
             None => {
@@ -569,6 +577,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let block = &self.code.blocks[index];
         let (physical, variant_id) = (block.physical, block.variant);
+        // With `--shared-no-table` an alias PC's fetches all come here.
+        if self.shared_limits.no_table && block.shared && block.pc != pc {
+            return Remember::Excluded;
+        }
         let (at, tag) = self.remembered_at(pc, target.key, index);
         let first = self.remembered[at] != tag;
         let free = first && !self.table_insert_throttled;
@@ -1336,6 +1348,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             && !variant.translated
             && !variant.timing
             && compiled.page_independent()
+            && (compiled.fresh() || !self.shared_limits.fresh_only)
             && !self.page_has_device_sites(physical)
             && code_bytes
                 .len()

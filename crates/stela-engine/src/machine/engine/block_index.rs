@@ -97,6 +97,7 @@ fn shared_in(
     pc: u64,
     offset: u16,
     variant: VariantId,
+    exact: bool,
 ) -> Option<usize> {
     let mut run = 0;
     while run < entries.len() {
@@ -110,7 +111,10 @@ fn shared_in(
             .map(|entry| entry.slot as usize)
             .find(|&slot| {
                 let block = &blocks[slot];
-                block.shared && block.variant == variant && same_offset_and_half(block.pc, pc)
+                block.shared
+                    && block.variant == variant
+                    && same_offset_and_half(block.pc, pc)
+                    && (!exact || block.pc == pc)
             });
         if found.is_some() {
             return found;
@@ -138,6 +142,9 @@ pub(super) struct BlockIndex {
     free: Vec<u32>,
     /// Recently found pages and their [`Self::entries`].
     front: Box<[(u64, u32)]>,
+    /// Shared blocks serve the PC they were installed for alone
+    /// (`--shared-own-pc`).
+    exact: bool,
 }
 
 fn split(physical: u64) -> (u64, u16) {
@@ -161,7 +168,15 @@ impl BlockIndex {
             entries: Vec::new(),
             free: Vec::new(),
             front: vec![(NO_FRAME, 0); FRONT].into_boxed_slice(),
+            exact: false,
         }
+    }
+
+    /// Let shared blocks serve the PC they were installed for alone
+    /// (`--shared-own-pc`), the finder's too.
+    pub(super) fn set_exact(&mut self, exact: bool) {
+        self.exact = exact;
+        self.finder.exact.store(exact, Ordering::Relaxed);
     }
 
     /// The cache slot of the page at `frame`.
@@ -213,7 +228,9 @@ impl BlockIndex {
         if own.is_some() || !aliases {
             return own;
         }
-        shared_in(blocks, entries, pc, offset, variant)
+        let exact = self.exact;
+        let entries = self.list(frame)?;
+        shared_in(blocks, entries, pc, offset, variant, exact)
     }
 
     /// The shared block at `physical` in `variant` that serves `pc`
@@ -227,8 +244,9 @@ impl BlockIndex {
         variant: VariantId,
     ) -> Option<usize> {
         let (frame, offset) = split(physical);
+        let exact = self.exact;
         let entries = self.list(frame)?;
-        shared_in(blocks, entries, pc, offset, variant)
+        shared_in(blocks, entries, pc, offset, variant, exact)
     }
 
     /// Whether the block in `slot` is the one the index holds for its key.
@@ -580,6 +598,8 @@ pub(super) struct Finder {
     /// A shared block was listed ([`SHARED_PC`]): a fetch that finds no
     /// block of its own PC looks there too.
     shares: AtomicBool,
+    /// [`BlockIndex::exact`].
+    exact: AtomicBool,
 }
 
 impl Finder {
@@ -599,6 +619,7 @@ impl Finder {
             partial: AtomicBool::new(false),
             pages: AtomicUsize::new(0),
             shares: AtomicBool::new(false),
+            exact: AtomicBool::new(false),
         }
     }
 
@@ -635,11 +656,13 @@ impl Finder {
         if own.is_some() || !aliases || !self.shares.load(Ordering::Relaxed) {
             return Some(own);
         }
+        let exact = self.exact.load(Ordering::Relaxed);
         self.walk(blocks, physical, SHARED_PC, |block| {
             block.shared
                 && block.physical == physical
                 && block.variant == variant
                 && same_offset_and_half(block.pc, pc)
+                && (!exact || block.pc == pc)
         })
     }
 

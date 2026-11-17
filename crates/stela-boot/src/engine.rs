@@ -786,7 +786,39 @@ fn allowance(counter: &AtomicU64, limit: u64) -> u64 {
     counter.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The engine's limits on shared alias blocks for the `--shared-*` bits
+/// (`options::SHARED_LIMITS`).
+pub(crate) fn shared_limits(bits: u16) -> stela_engine::machine::SharedLimits {
+    let bit = |at: u16| bits & 1 << at != 0;
+    stela_engine::machine::SharedLimits {
+        el0_only: bit(0),
+        el1_only: bit(1),
+        no_links: bit(2),
+        no_cells: bit(3),
+        no_table: bit(4),
+        own_pc: bit(5),
+        verify: bit(6),
+        log: bit(7),
+        fresh_only: bit(8),
+    }
+}
+
 pub(crate) fn report(event: &Event) {
+    // Shared alias diagnostics come at once, unthrottled: a crash capture
+    // then shows the last ones.
+    if let Event::Shared(shared) = event {
+        match shared.mismatch {
+            None => output::arguments(format_args!(
+                "SHARED HIT pe={} el={} pc={:#x} installed_pc={:#x} page_base={:#x}\n",
+                shared.pe, shared.el, shared.pc, shared.installed_pc, shared.page_base
+            )),
+            Some(why) => output::arguments(format_args!(
+                "SHARED MISMATCH pe={} el={} pc={:#x} installed={:#x} why={why}\n",
+                shared.pe, shared.el, shared.pc, shared.installed_pc
+            )),
+        }
+        return;
+    }
     // Explicit monitor traces bypass the ordinary progress-event limit
     // without consuming its reporting allowance.
     if let Event::Monitor(trace) = event {
@@ -841,7 +873,9 @@ pub(crate) fn report(event: &Event) {
         return;
     }
     match event {
-        Event::Monitor(_) => unreachable!("monitor traces are emitted before event throttling"),
+        Event::Monitor(_) | Event::Shared(_) => {
+            unreachable!("monitor and shared traces are emitted before event throttling")
+        }
         Event::Exception {
             vector,
             from_el,
@@ -1215,14 +1249,21 @@ fn run_machine<H: Host>(
         output::arguments(format_args!("ENGINE page-relative code\n"));
     }
     machine.set_shared_aliases(options.shared_aliases);
+    machine.set_shared_limits(shared_limits(options.shared_limits));
     if options.shared_aliases {
         output::arguments(format_args!(
-            "ENGINE shared aliases {}\n",
+            "ENGINE shared aliases {}{}\n",
             if machine.shared_aliases() {
                 "on"
             } else {
                 "off: they need --page-relative"
-            }
+            },
+            stela_boot_core::options::SHARED_LIMITS
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| options.shared_limits & 1 << bit != 0)
+                .map(|(_, name)| alloc::format!(" {name}"))
+                .collect::<String>()
         ));
     }
     if options.profile {

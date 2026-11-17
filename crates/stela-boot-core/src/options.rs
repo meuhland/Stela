@@ -33,6 +33,23 @@ pub const VERIFY_ON_READ: &str = "--verify-on-read";
 pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const NATIVE_CORES: &str = "--native-cores";
+/// The limits on shared alias blocks (`--shared-aliases`), by bit of
+/// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
+/// in a page from or into one, no cell link out of its page, no block
+/// table entry at an alias PC; serve the installed PC alone; check each
+/// alias PC first; report the first alias hits at EL0; share only blocks
+/// compiled in this boot.
+pub const SHARED_LIMITS: [&str; 9] = [
+    "--shared-el0",
+    "--shared-el1",
+    "--shared-no-links",
+    "--shared-no-cells",
+    "--shared-no-table",
+    "--shared-own-pc",
+    "--shared-verify",
+    "--shared-log",
+    "--shared-fresh",
+];
 pub const GUEST_PES: &str = "--guest-pes";
 /// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
 /// place of the monitor's preferred mode: for a capture device that cannot
@@ -353,6 +370,8 @@ pub struct System {
     /// frame (`--shared-aliases`, with `--page-relative`): a fetch at
     /// another page runs it there instead of installing a copy.
     pub shared_aliases: bool,
+    /// Their limits for bisection, a bit per [`SHARED_LIMITS`] option.
+    pub shared_limits: u16,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -472,6 +491,7 @@ impl Default for System {
             table_insert_throttled: false,
             page_relative: false,
             shared_aliases: false,
+            shared_limits: 0,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -951,6 +971,9 @@ impl fmt::Display for System {
         line.flag("--table-insert-throttled", self.table_insert_throttled)?;
         line.flag("--page-relative", self.page_relative)?;
         line.flag("--shared-aliases", self.shared_aliases)?;
+        for (bit, name) in SHARED_LIMITS.iter().enumerate() {
+            line.flag(name, self.shared_limits & 1 << bit != 0)?;
+        }
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;
