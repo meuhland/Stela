@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 18:03:26 +0000
+Subject: [PATCH] fix(nouveau): the GPU counts as off the bus only once BOOT_0
+ read all ones at every look for 1 s, and a silence that ends is said once
+ with how long it lasted, where one all ones read ended the session for a GPU
+ whose link only retrained
+
+---
+ .../drm/nouveau/include/nvkm/core/device.h    |  13 +-
+ .../gpu/drm/nouveau/nvkm/engine/device/base.c | 155 +++++++++++++++---
+ 2 files changed, 141 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+index df4f8b1cf64be67a4adf9a0a401a0d82c5dee279..db6961b4a9e1bc4e412afe7db62039df00655bf6 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+@@ -30,8 +30,19 @@ struct nvkm_device {
+ 	void __iomem *pri;
+ 
+ 	u32 debug;
+-	/* The device stopped answering MMIO (nvkm_device_gone()). */
++	/* The device stopped answering MMIO for good (nvkm_device_gone()). */
+ 	bool gone;
++	/*
++	 * All-ones answers in a row, which may yet end: whether one runs, when
++	 * it began and was last seen, what configuration space said at its
++	 * start, and how many ended (the first of them is reported).
++	 */
++	bool silent;
++	u32 silent_ended;
++	ktime_t silent_since;
++	ktime_t silent_seen;
++	u16 silent_vendor;
++	u16 silent_link;
+ 
+ 	const struct nvkm_device_chip *chip;
+ 	enum {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+index 4e5f865ccb55dbdf14e9b762e684a64a252eb99d..3315937085fcf8d7d61c3e2d5117adb67f930481 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+@@ -3083,42 +3083,145 @@ fail:
+ }
+ 
+ /*
+- * Whether the device stopped answering MMIO, as nvkm_device_ctor() takes it
+- * to be absent: a GPU that answers never reads NV_PMC_BOOT_0 as all ones.
+- * A device off the bus completes no work and answers no RPC, so callers end
+- * their waits at once instead of each waiting its whole bound. Once gone it
+- * stays gone; the first sight says so once, with what PCI configuration
+- * space still answers, which tells a lost link or power (all ones there
+- * too) from a function that only stopped decoding (memory space or D-state).
++ * How long NV_PMC_BOOT_0 must read all ones, looked at no further apart
++ * than NVKM_DEVICE_SILENT_LOOK_MS, before the device counts as gone. A link
++ * that retrains or recovers can read all ones for a moment and then answer
++ * again with its state kept; Linux gives a retrain PCIE_LINK_RETRAIN_TIMEOUT_MS
++ * (1000) before it takes the link for down, and a link that was down that
++ * long has reset the function.
+  */
+-bool
+-nvkm_device_gone(struct nvkm_device *device)
++#define NVKM_DEVICE_GONE_MS 1000
++#define NVKM_DEVICE_SILENT_LOOK_MS 250
++
++static DEFINE_SPINLOCK(nvkm_device_gone_lock);
++
++/* What PCI configuration space answers now; all ones where it does not. */
++struct nvkm_device_config {
++	u16 vendor, command, status, pmcsr, link;
++};
++
++static void
++nvkm_device_config(struct nvkm_device *device, struct nvkm_device_config *config)
+ {
+ 	struct nvkm_device_pci *pci = NULL;
+-	u16 vendor = 0xffff, command = 0xffff, status = 0xffff, pmcsr = 0xffff, link = 0xffff;
+ 	u8 pm;
+ 
++	memset(config, 0xff, sizeof(*config));
++	if (device->func->pci)
++		pci = device->func->pci(device);
++	if (!pci)
++		return;
++	pci_read_config_word(pci->pdev, PCI_VENDOR_ID, &config->vendor);
++	pci_read_config_word(pci->pdev, PCI_COMMAND, &config->command);
++	pci_read_config_word(pci->pdev, PCI_STATUS, &config->status);
++	pm = pci_find_capability(pci->pdev, PCI_CAP_ID_PM);
++	if (pm)
++		pci_read_config_word(pci->pdev, pm + PCI_PM_CTRL, &config->pmcsr);
++	pcie_capability_read_word(pci->pdev, PCI_EXP_LNKSTA, &config->link);
++}
++
++/*
++ * Whether the device stopped answering MMIO for good, as nvkm_device_ctor()
++ * takes it to be absent: a GPU that answers never reads NV_PMC_BOOT_0 as all
++ * ones. A device off the bus completes no work and answers no RPC, so callers
++ * end their waits at once instead of each waiting its whole bound.
++ *
++ * One such read does not say so: only all ones at every look for
++ * NVKM_DEVICE_GONE_MS do, and callers look again each tick or 10 ms of their
++ * waits. Until then the device counts as answering and the waits go on. A
++ * silence that ends is a transient: the first is said once, with how long it
++ * lasted (from its last all ones look to the look that was answered) and
++ * what configuration space answered when it began. Once gone the device
++ * stays gone; that is said once, with how long it had been silent, how many
++ * silences ended before, and what configuration space still answers, which
++ * tells a lost link or power (all ones there too) from a function that only
++ * stopped decoding (memory space or D-state).
++ */
++bool
++nvkm_device_gone(struct nvkm_device *device)
++{
++	enum { ANSWERS, BEGAN, ENDED, GONE } seen = ANSWERS;
++	struct nvkm_device_config config;
++	u16 vendor = 0xffff, link = 0xffff;
++	unsigned long flags;
++	s64 silent_ms = 0, ended_ms = 0;
++	u32 ended = 0;
++	bool all_ones;
++	ktime_t now;
++
+ 	if (READ_ONCE(device->gone))
+ 		return true;
+-	if (!device->pri || nvkm_rd32(device, 0x000000) != 0xffffffff)
++	if (!device->pri)
+ 		return false;
++	all_ones = nvkm_rd32(device, 0x000000) == 0xffffffff;
++	now = ktime_get();
+ 
+-	WRITE_ONCE(device->gone, true);
+-	if (device->func->pci)
+-		pci = device->func->pci(device);
+-	if (pci) {
+-		pci_read_config_word(pci->pdev, PCI_VENDOR_ID, &vendor);
+-		pci_read_config_word(pci->pdev, PCI_COMMAND, &command);
+-		pci_read_config_word(pci->pdev, PCI_STATUS, &status);
+-		pm = pci_find_capability(pci->pdev, PCI_CAP_ID_PM);
+-		if (pm)
+-			pci_read_config_word(pci->pdev, pm + PCI_PM_CTRL, &pmcsr);
+-		pcie_capability_read_word(pci->pdev, PCI_EXP_LNKSTA, &link);
++	spin_lock_irqsave(&nvkm_device_gone_lock, flags);
++	if (device->gone) {
++		spin_unlock_irqrestore(&nvkm_device_gone_lock, flags);
++		return true;
+ 	}
+-	nvdev_error(device,
+-		    "stopped answering: BOOT_0 reads ffffffff; config vendor %04x command %04x status %04x pmcsr %04x link status %04x; its waits end at once from here\n",
+-		    vendor, command, status, pmcsr, link);
+-	return true;
++	if (!all_ones) {
++		if (device->silent) {
++			device->silent = false;
++			if (!device->silent_ended++) {
++				seen = ENDED;
++				silent_ms = ktime_ms_delta(device->silent_seen,
++							   device->silent_since);
++				ended_ms = ktime_ms_delta(now, device->silent_since);
++				vendor = device->silent_vendor;
++				link = device->silent_link;
++			}
++		}
++	} else if (!device->silent ||
++		   ktime_ms_delta(now, device->silent_seen) > NVKM_DEVICE_SILENT_LOOK_MS) {
++		/*
++		 * The first all ones, or the first after too long without a
++		 * look to say the device was silent in between.
++		 */
++		device->silent = true;
++		device->silent_since = now;
++		device->silent_seen = now;
++		seen = BEGAN;
++	} else {
++		device->silent_seen = now;
++		silent_ms = ktime_ms_delta(now, device->silent_since);
++		if (silent_ms >= NVKM_DEVICE_GONE_MS) {
++			device->gone = true;
++			seen = GONE;
++			ended = device->silent_ended;
++			vendor = device->silent_vendor;
++			link = device->silent_link;
++		}
++	}
++	spin_unlock_irqrestore(&nvkm_device_gone_lock, flags);
++
++	switch (seen) {
++	case ANSWERS:
++		break;
++	case BEGAN:
++		nvkm_device_config(device, &config);
++		spin_lock_irqsave(&nvkm_device_gone_lock, flags);
++		device->silent_vendor = config.vendor;
++		device->silent_link = config.link;
++		spin_unlock_irqrestore(&nvkm_device_gone_lock, flags);
++		break;
++	case ENDED:
++		nvkm_device_config(device, &config);
++		nvdev_warn(device,
++			   "answers again: BOOT_0 read ffffffff for %lld to %lld ms (config vendor %04x link status %04x then; vendor %04x command %04x status %04x pmcsr %04x link status %04x now); taken for a transient, said once\n",
++			   silent_ms, ended_ms, vendor, link, config.vendor, config.command,
++			   config.status, config.pmcsr, config.link);
++		break;
++	case GONE:
++		nvkm_device_config(device, &config);
++		nvdev_error(device,
++			    "stopped answering: BOOT_0 read ffffffff for %lld ms; config vendor %04x command %04x status %04x pmcsr %04x link status %04x (vendor %04x link status %04x when it began, %u silences ended before); its waits end at once from here\n",
++			    silent_ms, config.vendor, config.command, config.status,
++			    config.pmcsr, config.link, vendor, link, ended);
++		break;
++	}
++	return seen == GONE;
+ }
+ 
+ void
