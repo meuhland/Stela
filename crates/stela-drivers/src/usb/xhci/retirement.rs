@@ -114,7 +114,37 @@ impl Controller {
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
     pub(super) fn disable_slot(&mut self, slot: u8, ownership: Ownership) -> Result<(), Failure> {
-        Quiesced::acquire(self, slot, ownership)?.disable()
+        Quiesced::acquire(self, slot, ownership, 0)?.disable()
+    }
+
+    /// [`Self::disable_slot`] for a retired device that left the bus, whose
+    /// endpoints in `departed` (bit `dci`) [`Self::departed_endpoint`] found
+    /// Halted with their Reset Endpoint refused: each stays Halted, which
+    /// runs no TD (xHCI 4.8.3), and Disable Slot retires it with the slot,
+    /// as Linux's `xhci_free_dev` disables a disconnected device's slot
+    /// without resetting its endpoints. Every other endpoint is retired as
+    /// [`Self::disable_slot`] retires it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    pub(super) fn disable_departed_slot(&mut self, slot: u8, departed: u32) -> Result<(), Failure> {
+        Quiesced::acquire(self, slot, Ownership::Retired, departed)?.disable()
+    }
+
+    /// Whether endpoint `dci` of `slot` failed its cancellation because its
+    /// device left the bus: the controller refused its Reset Endpoint with
+    /// a USB Transaction Error, in this cancellation or in a class owner's
+    /// recovery before it (`Transfer::departed`), and it still reads
+    /// Halted. QEMU's xHCI answers so for a passed-through device its host
+    /// took back (`xhci_reset_ep`), after ending the transfer under way the
+    /// same way.
+    pub(super) fn departed_endpoint(&mut self, slot: u8, dci: u8) -> bool {
+        self.slot(slot).is_ok_and(|state| {
+            state.endpoints[usize::from(dci)]
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.departed)
+        }) && self.endpoint_state(slot, dci) == Ok(ENDPOINT_HALTED)
     }
 }
 
@@ -194,11 +224,18 @@ impl<'a> Quiesced<'a> {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
+    /// `departed`: the endpoints, bit `dci`, of a retired device that left
+    /// the bus, left Halted ([`Controller::disable_departed_slot`]).
     fn acquire(
         controller: &'a mut Controller,
         slot: u8,
         ownership: Ownership,
+        departed: u32,
     ) -> Result<Self, Failure> {
+        let departed = match ownership {
+            Ownership::Retired => departed,
+            _ => 0,
+        };
         let index = usize::from(slot);
         if slot == 0
             || index >= controller.slots.len()
@@ -282,6 +319,10 @@ impl<'a> Quiesced<'a> {
             if unaddressed && dci == 1 && endpoint_state == ENDPOINT_DISABLED {
                 continue;
             }
+            // Its Reset Endpoint was refused once already; it stays Halted.
+            if departed & 1 << dci != 0 && endpoint_state == ENDPOINT_HALTED {
+                continue;
+            }
             // The complete software endpoint set is visited even after one
             // contributor fails. No Disable Slot is published on partial success.
             if let Err(error) = controller.cancel_inner(slot, dci as u8) {
@@ -305,6 +346,9 @@ impl<'a> Quiesced<'a> {
                         .coherent_u32(dci * context)
                         .map_err(|error| ("observe actual endpoint DMA context", error))?
                         & 7;
+                    if departed & 1 << dci != 0 && actual == ENDPOINT_HALTED {
+                        continue;
+                    }
                     if endpoint.poisoned
                         || ownership == Ownership::Vacant
                             && (endpoint.in_flight != 0 || !endpoint.ring.normal.idle())

@@ -340,7 +340,11 @@ impl Controller {
         }
     }
 
-    fn endpoint_state(&mut self, slot: u8, dci: u8) -> Result<u32, BlockError> {
+    pub(in super::super) fn endpoint_state(
+        &mut self,
+        slot: u8,
+        dci: u8,
+    ) -> Result<u32, BlockError> {
         let context = self.context();
         fence(Ordering::Acquire);
         Ok(self
@@ -409,6 +413,19 @@ impl Controller {
                 Cancelling::Reset => {
                     let reset = RESET_ENDPOINT << 10 | target;
                     if let Err(error) = self.step_command(&mut cancel.command, 0, 0, reset)? {
+                        // QEMU's xhci_reset_ep refuses a device that left
+                        // the bus so, the endpoint left Halted: it runs no
+                        // TD, and only Disable Slot retires it.
+                        if error
+                            == (BlockError::Device {
+                                status: super::USB_TRANSACTION_ERROR,
+                            })
+                            && self.endpoint_state(slot, dci) == Ok(ENDPOINT_HALTED)
+                            && let Ok(state) = self.slot(slot)
+                            && let Some(endpoint) = state.endpoints[usize::from(dci)].as_mut()
+                        {
+                            endpoint.departed = true;
+                        }
                         return Some(Err(error));
                     }
                     // Stopped is the only state in which dequeue is legal.

@@ -301,6 +301,7 @@ fn unpublished_data_or_retired_ring_owner_cannot_return_ep0_resources() {
                 iso: None,
                 is_in: false,
                 poisoned: false,
+                departed: false,
                 enabled: true,
                 in_flight: 0,
                 stopped: false,
