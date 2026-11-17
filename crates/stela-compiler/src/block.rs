@@ -327,6 +327,9 @@ pub fn analyze_and_plan(
 pub struct CompilationPlan {
     options: crate::Options,
     stage: Stage,
+    /// The first instruction's address, whose page a page-relative compile
+    /// is relative to.
+    base: GuestAddress,
 }
 
 enum Stage {
@@ -412,10 +415,17 @@ impl CompilationPlan {
         Ok(Self {
             options: *options,
             stage,
+            base,
         })
     }
 
     fn block(mut parsed: ParsedBlock, options: &crate::Options) -> Result<Self, CompileError> {
+        let base = parsed
+            .instructions
+            .first()
+            .map(|first| first.pc)
+            .or(parsed.terminal.as_ref().map(|(pc, _)| *pc))
+            .unwrap_or(parsed.next_pc);
         let profile = options.profile();
         let target = options.target();
         let checks = options.memory_checks();
@@ -471,6 +481,7 @@ impl CompilationPlan {
                 checked,
                 resident,
             },
+            base,
         })
     }
 
@@ -573,7 +584,24 @@ impl CompilationPlan {
         Ok((block, profile))
     }
 
+    /// [`Self::compile_body`], made page-relative where its options say so
+    /// ([`crate::x86_64::NativeSystem::page_relative`]); a block whose
+    /// code recorded no relocations stays as it is.
     fn compile_impl(
+        self,
+        recipes: Option<&mut profile::CompileProfile>,
+    ) -> Result<CompiledBlock, CompileError> {
+        const PAGE: u64 = 4096;
+        let page = self.base.0 & !(PAGE - 1);
+        let relative = self.options.native_system().page_relative;
+        let mut block = self.compile_body(recipes)?;
+        if relative {
+            block.native.make_page_relative(page);
+        }
+        Ok(block)
+    }
+
+    fn compile_body(
         self,
         recipes: Option<&mut profile::CompileProfile>,
     ) -> Result<CompiledBlock, CompileError> {

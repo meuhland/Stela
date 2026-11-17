@@ -85,6 +85,30 @@ pub struct NativeBlock {
     pub relocations: Option<Vec<u32>>,
 }
 
+impl NativeBlock {
+    /// Make the code of a page-relative compile
+    /// ([`x86_64::NativeSystem::page_relative`]) at `page` its own at every
+    /// page: each guest-address field becomes its offset from `page`, which
+    /// the code adds [`GuestState::page_base`] to (exits: the engine), and
+    /// no relocation is left. False, unchanged, for code that recorded no
+    /// relocations, which may hold an address no field names.
+    pub fn make_page_relative(&mut self, page: u64) -> bool {
+        let Some(fields) = self.relocations.as_mut() else {
+            return false;
+        };
+        for &at in fields.iter() {
+            let at = at as usize;
+            let field: [u8; 8] = self.x86_64_code[at..at + 8]
+                .try_into()
+                .expect("an 8-byte field");
+            let offset = u64::from_le_bytes(field).wrapping_sub(page);
+            self.x86_64_code[at..at + 8].copy_from_slice(&offset.to_le_bytes());
+        }
+        fields.clear();
+        true
+    }
+}
+
 /// What [`compile`] translates for: the guest services and memory checks of a
 /// [`block::BlockProfile`], the host's [`TargetCpu`], and the guest's scalable
 /// and numerical specialization for the context ABI.

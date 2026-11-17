@@ -212,6 +212,14 @@ pub struct NativeSystem {
     /// profiles.
     #[serde(default)]
     pub loop_counts: bool,
+    /// Guest addresses in a block's body are its page's offset added to
+    /// [`crate::GuestState::page_base`] where it runs, and its direct exits
+    /// leave the target's offset from the page in RAX, for the engine to
+    /// add the page its entry stored: one body serves every page that maps
+    /// the same code (each process's slide of a binary). The block records
+    /// no relocations, as nothing in it depends on its address.
+    #[serde(default)]
+    pub page_relative: bool,
 }
 
 impl NativeSystem {
@@ -225,6 +233,7 @@ impl NativeSystem {
         amx: false,
         self_loops: false,
         loop_counts: false,
+        page_relative: false,
     };
 }
 

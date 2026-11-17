@@ -229,6 +229,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some() && !self.loop_counts_off,
+            // Shared alias bodies need the engine to add the page on exit
+            // and set it on entry: not yet (design-alias-sharing.md, 2b).
+            page_relative: false,
         })
     }
 
