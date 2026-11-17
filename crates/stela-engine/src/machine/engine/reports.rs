@@ -459,6 +459,25 @@ impl StoreSource {
 
 const _: () = assert!(StoreSource::Rebased as usize + 1 == StoreSource::COUNT);
 
+/// What shared blocks (`--shared-aliases`) did, for [`Statistics::aliases`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alias {
+    /// Fetches the index answered with a shared block installed for
+    /// another guest page: installs avoided.
+    Hits,
+    /// Blocks installed shared, which serve every page of their frame.
+    Installs,
+    /// Installs dropped for a shared block another PE installed for
+    /// another page meanwhile.
+    Lost,
+}
+
+impl Alias {
+    pub const COUNT: usize = 3;
+}
+
+const _: () = assert!(Alias::Lost as usize + 1 == Alias::COUNT);
+
 /// Why the ITLB lacked a page it then took ([`Statistics::itlb_misses`]): a
 /// fill of another page took its entry's place, a TLBI by VA dropped it,
 /// its context was forgotten (an entry of the page in a forgotten context
@@ -651,6 +670,10 @@ pub struct Statistics {
     /// instruction, a device-site page, a host breakpoint, no store),
     /// taken from the pack, taken from another PE.
     pub store_sources: [[u64; StoreSource::COUNT]; 2],
+    /// Shared blocks' work (`--shared-aliases`), in [`Alias`]'s order:
+    /// fetches a block of another page served, shared installs, and
+    /// installs lost to a shared block.
+    pub aliases: [u64; Alias::COUNT],
     /// Counter ticks spent, for blocks not yet installed, reading, hashing
     /// and looking up their fetch pages; finding `shared` blocks; and
     /// installing every block.
@@ -882,6 +905,7 @@ impl core::ops::AddAssign for Statistics {
             sync_ticks,
             mail_waits,
             store_sources,
+            aliases,
         } = other;
         for (index, (total, count)) in self.mail_waits.iter_mut().zip(mail_waits).enumerate() {
             if index < MailWait::Longest as usize {
@@ -982,6 +1006,9 @@ impl core::ops::AddAssign for Statistics {
             .iter_mut()
             .zip(store_sources.as_flattened())
         {
+            *total += count;
+        }
+        for (total, count) in self.aliases.iter_mut().zip(aliases) {
             *total += count;
         }
         for (total, count) in [

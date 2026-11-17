@@ -241,6 +241,46 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.native_system = None;
     }
 
+    /// Let one page-relative block serve every guest page that maps its
+    /// frame ([`Block::shared`], `--shared-aliases`), from the next fetch
+    /// on: a fetch at another PC of the block's page offset runs it with
+    /// that PC's page instead of installing a copy. Only with
+    /// [`Self::set_page_relative`] on. A boot's option.
+    pub fn set_shared_aliases(&mut self, on: bool) {
+        self.shared_aliases = on;
+    }
+
+    /// Whether blocks are shared across the guest pages that map their
+    /// frame ([`Self::set_shared_aliases`]).
+    pub fn shared_aliases(&self) -> bool {
+        self.shared_aliases && self.page_relative
+    }
+
+    /// Whether a fetch at `pc` may run a shared block installed for another
+    /// PC, and a block installed for `pc` may be shared: sharing is on, and
+    /// no host breakpoint or trace point lies in the page of `pc`, which
+    /// end the blocks of that page alone.
+    pub(super) fn aliases_at(&self, pc: u64) -> bool {
+        if !self.shared_aliases() {
+            return false;
+        }
+        let page = pc & !(FETCH_PAGE - 1);
+        let in_page = |points: &[u64]| {
+            let first = points.partition_point(|&point| point < page);
+            points
+                .get(first)
+                .is_some_and(|&point| point < page + FETCH_PAGE)
+        };
+        !in_page(&self.breakpoints) && !in_page(&self.traces)
+    }
+
+    /// The PC block `index` ran at in the last native run, which ended in
+    /// it: its own, or for a shared block, its offset in the page the run
+    /// ended in ([`Machine::ran_page`]).
+    pub(super) fn running_pc(&self, index: usize) -> u64 {
+        self.code.blocks[index].start_at(self.ran_page)
+    }
+
     /// Run self-loops inside their blocks ([`NativeSystem::self_loops`]),
     /// the default, or through their links, from the next compilation on;
     /// the blocks compiled so far stay. For tests that compare the two.

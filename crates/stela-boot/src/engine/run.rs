@@ -2061,6 +2061,11 @@ impl Heartbeat {
                 "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
                 "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
             ));
+            // Per PE with `--shared-aliases`: fetches a shared block
+            // installed for another guest page served (installs avoided),
+            // its shared installs, and its installs lost to a shared block
+            // another PE installed meanwhile.
+            let mut aliases = String::from("PES ALIAS hits/shared_installs/lost");
             // Per PE: stamped tail hits and misses by cause, stamps written,
             // changed cells, table probe transfers (jump cache misses), stamped
             // tails made, then every probe transfer (jump cache and table).
@@ -2327,6 +2332,7 @@ impl Heartbeat {
                     now.store_sources.as_flattened(),
                     before.store_sources.as_flattened(),
                 );
+                deltas(&mut aliases, pe, &now.aliases, &before.aliases);
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
                     " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
@@ -2529,6 +2535,9 @@ impl Heartbeat {
             output::arguments(format_args!("{store}\n"));
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{}\n", pac_census_line(&pac_census)));
+            }
+            if machine.shared_aliases() {
+                output::arguments(format_args!("{aliases}\n"));
             }
             stamped.push_str(&format!(
                 " in_use={stamped_in_use} cell_probes={cell_probes} cells={}/{}/{} waiting={waiting} samples={samples} full={full}",

@@ -394,7 +394,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let variant = self.page_variant(variant, physical);
         let indexed = self
             .known_variant(variant)
-            .and_then(|id| self.code.find(pc, physical, id));
+            .and_then(|id| self.code.find(pc, physical, id, false));
         let index = match indexed {
             Some(index) => index,
             None => match self.compile(pc, physical, variant)? {
@@ -413,7 +413,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             },
         };
         let exceptions = self.statistics.exceptions;
-        self.execute(index, 0)?;
+        self.execute(index, pc, 0)?;
         if self.statistics.exceptions != exceptions {
             return Ok(());
         }

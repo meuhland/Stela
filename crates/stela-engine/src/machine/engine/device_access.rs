@@ -68,8 +68,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// unless the block is a single instruction's.
     pub(super) fn device_site_of(&self, index: usize, pc: u64) -> Option<u64> {
         let block = &self.code.blocks[index];
-        (!self.variants[block.variant.0 as usize].single)
-            .then(|| block.physical.wrapping_add(pc.wrapping_sub(block.pc)))
+        (!self.variants[block.variant.0 as usize].single).then(|| {
+            block
+                .physical
+                .wrapping_add(pc.wrapping_sub(block.start_at(pc)))
+        })
     }
 
     /// Learn that the instruction at `physical` reached a device register,
@@ -385,7 +388,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// single instruction does.
     fn run_one_natively(&mut self, pc: u64) -> Step {
         match self.fetch_block(pc, true)? {
-            Fetched::Block(index) => self.execute(index, 0),
+            Fetched::Block(index) => self.execute(index, pc, 0),
             Fetched::Exception(exception) => {
                 self.take(exception);
                 Ok(())
