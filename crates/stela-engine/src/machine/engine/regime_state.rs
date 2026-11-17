@@ -229,10 +229,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,
             loop_counts: self.step_timing.is_some() && !self.loop_counts_off,
-            // Shared alias bodies need the engine to add the page on exit
-            // and set it on entry: not yet (design-alias-sharing.md, 2b).
-            page_relative: false,
+            page_relative: self.page_relative,
         })
+    }
+
+    /// Compile blocks page-relative ([`NativeSystem::page_relative`]) from
+    /// the next compilation on: their code serves any page that maps the
+    /// same bytes; the blocks compiled so far stay. A boot's option.
+    pub fn set_page_relative(&mut self, on: bool) {
+        self.page_relative = on;
+        self.native_system = None;
     }
 
     /// Run self-loops inside their blocks ([`NativeSystem::self_loops`]),

@@ -342,6 +342,10 @@ pub struct System {
     /// (`--table-insert-throttled`), as before an entry's first insert on a
     /// PE went in regardless: for A/B runs.
     pub table_insert_throttled: bool,
+    /// Compile guest code page-relative (`--page-relative`): a block's code
+    /// serves every page that maps the same bytes, each entry setting the
+    /// page it runs at.
+    pub page_relative: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -464,6 +468,7 @@ impl Default for System {
             profile: false,
             profile_keep_pack: false,
             table_insert_throttled: false,
+            page_relative: false,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -937,6 +942,7 @@ impl fmt::Display for System {
         line.flag("--profile", self.profile && !self.profile_keep_pack)?;
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
         line.flag("--table-insert-throttled", self.table_insert_throttled)?;
+        line.flag("--page-relative", self.page_relative)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.flag(DISPLAY_FASTEST, self.display_fastest)?;

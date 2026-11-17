@@ -999,6 +999,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// entry's first insert on a PE went in regardless
     /// (`--table-insert-throttled`).
     table_insert_throttled: bool,
+    /// Whether blocks compile page-relative (`NativeSystem::page_relative`),
+    /// every entry setting the page they run at: off unless asked for.
+    page_relative: bool,
     /// The physical count up to which the event streams have set the event
     /// register; `None` before the first sample.
     event_sample: Option<u64>,
@@ -1455,6 +1458,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             loop_counts_off: false,
             remembered: vec![0; compilation::REMEMBERED].into_boxed_slice(),
             table_insert_throttled: false,
+            page_relative: false,
             event_sample: None,
             debug: None,
             device_lines: None,
@@ -1576,3 +1580,16 @@ impl<H: Host> mmu::TableMemory for RamTables<'_, H> {
 mod density;
 #[cfg(test)]
 mod tests;
+
+/// Whether `bytes` are a block's direct exit to `pc` of `kind`: its target
+/// whole, or, in a page-relative block (`NativeSystem::page_relative`), its
+/// offset from the page, which the exit's base slot adds the page to.
+pub(crate) fn exits_to(
+    bytes: &[u8],
+    pc: u64,
+    kind: impl Into<stela_compiler::x86_64::chain::ExitWord> + Copy,
+) -> bool {
+    use stela_compiler::{GuestAddress, x86_64::chain};
+    chain::is_direct_exit(bytes, GuestAddress(pc), kind)
+        || chain::is_direct_exit(bytes, GuestAddress(pc & (FETCH_PAGE - 1)), kind)
+}

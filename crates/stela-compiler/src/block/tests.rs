@@ -1101,6 +1101,7 @@ fn system_profile_has_one_source_bound_exit_and_rejects_memory_prefixes() {
         let at = compiled.native.source_map.last().unwrap().1;
         let mut expected = MOV_RAX_IMMEDIATE.to_vec();
         expected.extend(instruction.instruction_pc.0.to_le_bytes());
+        expected.extend(crate::x86_64::chain::BASE_NOP);
         expected.push(MOV_EDX_IMMEDIATE);
         expected.extend((ExitKind::System as u32).to_le_bytes());
         // The patch point's jump to the return after it, the return, the pad.
@@ -1152,6 +1153,7 @@ fn half_division_continues_its_block_on_every_target() {
     let exit = |pc: GuestAddress, kind: ExitKind| {
         let mut exit = vec![0x48, 0xb8]; // MOVABS RAX,PC
         exit.extend(pc.0.to_le_bytes());
+        exit.extend(crate::x86_64::chain::BASE_NOP); // the base slot
         exit.extend(crate::x86_64::chain::exit_word(kind as u32));
         exit
     };
@@ -2410,9 +2412,9 @@ fn page_relative_blocks_are_the_same_at_every_page() {
     }
 }
 
-/// In page-relative code a body address is its offset from the block's
-/// page followed by `add reg,[page_base]`; a direct exit's target is the
-/// offset alone, for the engine to add the page its entry stored.
+/// In page-relative code a guest address is its offset from the block's
+/// page followed by `add reg,[page_base]`: in the body, and in a direct
+/// exit's base slot (`chain::BASE_ADD`).
 #[test]
 fn page_relative_fields_hold_offsets_and_add_the_page_base() {
     use crate::block::{BlockProfile, Features};
@@ -2456,10 +2458,12 @@ fn page_relative_fields_hold_offsets_and_add_the_page_base() {
     // BL: X30 is the next instruction's address, and the exit's target.
     let link = find(base + 8 - page);
     assert!(adds_page_base(link), "BL's link value adds the page base");
+    // The exit's base slot adds the page, before its patch point: whatever
+    // the exit goes on to (a link, a cell, the engine) has the whole target.
     let exit = find(base + 4 + 0x100 - page);
     assert!(
-        !adds_page_base(exit),
-        "the exit leaves the target's offset alone"
+        adds_page_base(exit),
+        "the exit's base slot adds the page base"
     );
     assert!(
         code.windows(8)

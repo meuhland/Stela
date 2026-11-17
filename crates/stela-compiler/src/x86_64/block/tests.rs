@@ -1977,9 +1977,9 @@ fn conditional_exits_branch_over_the_fallthrough_exit() {
     assert_eq!(code[..6], [0x0f, 0x85, DIRECT_EXIT_BYTES as u8, 0, 0, 0]);
     assert_eq!(code[6..6 + DIRECT_EXIT_BYTES], fallthrough);
     assert_eq!(code[6 + DIRECT_EXIT_BYTES..], taken);
-    // The branch, then MOVABS, MOV, the patch point, the return (one
-    // emission) and four INT3s each.
-    assert_eq!(code.instructions(), 17);
+    // The branch, then MOVABS, the base slot, MOV, the patch point, the
+    // return (one emission) and four INT3s each.
+    assert_eq!(code.instructions(), 19);
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
@@ -3005,6 +3005,7 @@ fn clock_exit_requests_runtime_service_without_counter_or_guest_writes() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
+        expected.extend(super::super::chain::BASE_NOP);
         expected.extend(super::super::chain::exit_word(7));
         // No RDTSC, host helper address, guessed counter, destination write
         // or placeholder ISB: only the checked runtime service may complete.
@@ -3047,6 +3048,7 @@ fn pac_helper_exit_has_no_guest_writes_or_embedded_service_address() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
+        expected.extend(super::super::chain::BASE_NOP);
         expected.extend(super::super::chain::exit_word(6));
         // Only the SysV return registers RAX/RDX are touched, including for
         // RETAB: the runtime must keep signed LR while authenticating target.
@@ -3109,6 +3111,7 @@ fn trap_exit_uses_instruction_pc_and_only_native_return_scratch_registers() {
         );
         let mut expected = vec![0x48, 0xb8]; // movabs rax,instruction_pc
         expected.extend(pc.0.to_le_bytes());
+        expected.extend(super::super::chain::BASE_NOP);
         expected.extend(super::super::chain::exit_word(5)); // mov edx,Trap; ret
         assert_eq!(native.x86_64_code, expected);
         assert_eq!(native.source_map, [(pc, 0)]);
