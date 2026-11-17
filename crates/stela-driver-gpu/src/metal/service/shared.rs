@@ -1603,7 +1603,8 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
 
     /// Whether the call at `record` creates a pipeline or a texture or
     /// commits commands, whose compilations and new textures' kernel memory
-    /// may be made outside the lock: nothing it does before it defers stays.
+    /// may be made outside the lock, or creates a buffer or a heap: nothing
+    /// it does before it defers stays.
     /// A commit's replay compiles the variants its draws and dispatches
     /// need, and its command buffer is discarded when it defers one; once
     /// replay changes an indirect command buffer, it compiles in its turn
@@ -1625,6 +1626,10 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             Operation::NewComputePipeline,
             Operation::NewTilePipeline,
             Operation::NewTexture,
+            // Each allocates first and keeps nothing when that fails, so
+            // one whose kernel allocation was withdrawn is made again.
+            Operation::NewBuffer,
+            Operation::NewHeap,
             Operation::Commit,
         ]
         .iter()

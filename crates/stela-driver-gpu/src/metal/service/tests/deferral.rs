@@ -593,7 +593,7 @@ fn withdraw() -> bool {
 /// A host call no task took in time is withdrawn, and the driver fails the
 /// allocation behind it. A call that may be made again is answered
 /// `Pending` and completes when made again, instead of failing with out of
-/// memory for what was only a wait; one that cannot keeps the failure.
+/// memory for what was only a wait: a new texture and a new buffer alike.
 #[test]
 fn a_call_whose_host_call_no_task_took_runs_again_instead_of_failing() {
     use crate::metal::service::wire::{BufferResponse, NewBufferRequest, TextureResponse};
@@ -619,7 +619,8 @@ fn a_call_whose_host_call_no_task_took_runs_again_instead_of_failing() {
     assert_eq!(status(&mut memory, texture), Status::Ok);
     assert!(!shared.jobs_waiting());
 
-    // A new buffer is never made again: its failure stays the answer.
+    // A new buffer allocates first and keeps nothing when that fails: it
+    // is made again too, where its failure stayed the answer.
     shared
         .try_turn()
         .unwrap()
@@ -636,7 +637,10 @@ fn a_call_whose_host_call_no_task_took_runs_again_instead_of_failing() {
         size_of::<BufferResponse>(),
     );
     shared.serve(a, buffer, &mut memory).unwrap();
-    assert_eq!(status(&mut memory, buffer), Status::OutOfMemory);
+    assert_eq!(status(&mut memory, buffer), Status::Pending);
+    assert!(shared.run_job(0, 0).is_some());
+    shared.serve(a, buffer, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, buffer), Status::Ok);
     assert!(!shared.jobs_waiting());
     *WITHDRAWING.lock().unwrap() = None;
 }
