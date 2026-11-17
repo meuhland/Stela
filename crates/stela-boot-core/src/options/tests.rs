@@ -378,6 +378,39 @@ fn virtio_net_needs_virtio_and_round_trips() {
     );
 }
 
+/// The all-devices boot's line (`virtio-all`): the five virtio devices with
+/// virtio-snd on the HDMI route, in the order the options print it.
+#[test]
+fn every_virtio_device_with_the_hdmi_route_round_trips() {
+    let preboot = format!("--system --storage {DISK} --nor {DISK} --preboot {DISK}");
+    let line = format!(
+        "{preboot} --guest-network --guest-network-stelanet --guest-audio-hdmi-trust-quiesced \
+         --virtio --virtio-console-echo --virtio-snd --virtio-snd-capture 10 --virtio-net \
+         --virtio-blk-ram 64 --page-relative --shared-aliases"
+    );
+    let options = round_trip(&line);
+    assert_eq!(options.to_string(), line);
+    assert!(options.virtio && options.virtio_console_echo);
+    assert!(options.virtio_snd && options.virtio_net);
+    assert_eq!(options.virtio_snd_capture, Some(10));
+    assert_eq!(options.virtio_blk_ram, Some(64));
+    assert!(options.guest_audio_from_virtio() && !options.guest_audio_usb_speaker());
+    // Written in any order, the line prints back the same.
+    let shuffled = format!(
+        "{preboot} --virtio-blk-ram 64 --shared-aliases --virtio-net --virtio-snd-capture 10 \
+         --page-relative --virtio-snd --guest-network-stelanet --virtio-console-echo --virtio \
+         --guest-audio-hdmi-trust-quiesced --guest-network"
+    );
+    assert_eq!(round_trip(&shuffled).to_string(), line);
+    // Each device still needs --virtio.
+    for words in ["--virtio-snd", "--virtio-net", "--virtio-blk-ram 64"] {
+        assert!(
+            System::parse(&format!("{preboot} {words}")).is_err(),
+            "{words}"
+        );
+    }
+}
+
 #[test]
 fn chosen_disk_round_trips_and_the_mount_refuses_it_unreplaced() {
     let line = "--system --storage @disk --nor @disk --preboot @disk";
