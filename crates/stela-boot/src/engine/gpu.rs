@@ -1944,10 +1944,12 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
 /// Takes the display for the GPUs [`open`] bound, in the monitor's own mode
 /// or else the firmware's `screen` size, and opens their Metal services. `firmware` names the PCI
 /// function that showed the firmware's picture, `None` when there was a
-/// picture whose function is unknown.
+/// picture whose function is unknown. With `fastest` (`--display-fastest`)
+/// the monitor runs its fastest mode of the size, else its preferred one.
 pub(super) fn serve(
     #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: Option<(usize, usize)>,
     #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] firmware: Option<&str>,
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] fastest: bool,
 ) {
     #[cfg(feature = "nvk")]
     {
@@ -1956,7 +1958,7 @@ pub(super) fn serve(
             (Some(_), None) => display::Shown::Unknown,
             (Some(_), Some(function)) => display::Shown::By(function),
         };
-        display::take(screen.unwrap_or((0, 0)), shown);
+        display::take(screen.unwrap_or((0, 0)), shown, fastest);
         gate::open_service();
     }
 }

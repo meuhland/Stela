@@ -46,6 +46,7 @@ impl ParseState<'_> {
             SCANOUT_MIRROR => options.scanout_mirror = true,
             "--monitor-trace" => options.monitor_trace = true,
             "--display-trace" => options.display_trace = true,
+            DISPLAY_FASTEST => options.display_fastest = true,
             "--native-shared-check" => flag(
                 &mut options.native_shared_check,
                 Error::DuplicateNativeShared,

@@ -771,13 +771,25 @@ fn size_of_mode(mode: &ModeInfo) -> (u32, u32) {
     (u32::from(mode.hdisplay), u32::from(mode.vdisplay))
 }
 
-/// `modes`' fastest progressive mode of `size` that `fits`, the first of
-/// equals, else its first of that size. Linux sorts a preferred mode ahead
-/// of faster ones of its size (`drm_mode_compare`), and a monitor's
-/// preferred timing is often its 60 Hz one, with its 144 or 240 Hz modes
-/// in an extension, so the first listed is not the fastest. A monitor's
-/// fastest mode may not fit, as one past the guest's timing record's
-/// clock.
+/// Which of its modes of the display's size the output that gives the
+/// guest's timing runs when the display is taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rate {
+    /// The first DRM lists of the size that `fits`: the monitor's
+    /// preferred mode where it is of that size, as Linux sorts a preferred
+    /// mode ahead of faster ones of its size (`drm_mode_compare`), else the
+    /// fastest. A monitor's preferred timing is often its 60 Hz one, which
+    /// every input of it shows; a faster mode in an EDID extension may be
+    /// one only its DisplayPort input shows, as a Samsung Odyssey G40B's
+    /// 1920x1080 at 239.76 Hz over HDMI, which stayed blank.
+    #[default]
+    Preferred,
+    /// Its fastest progressive mode of the size that `fits`, the first of
+    /// equals (`--display-fastest`), for a monitor that shows it on the
+    /// input in use. macOS can still pick any of [`Display::refresh_rates`].
+    Fastest,
+}
+
 /// The progressive modes of `size` in `modes` that `fits`, fastest first,
 /// the first DRM lists of each refresh.
 fn rates_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Vec<ModeInfo> {
@@ -795,13 +807,21 @@ fn rates_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Vec<ModeInf
     rates
 }
 
-fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
+/// `modes`' mode of `size` that `fits` as `rate` picks it ([`Rate`]), else
+/// its first of that size. A monitor's fastest mode may not fit, as one
+/// past the guest's timing record's clock.
+fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>, rate: Rate) -> Option<ModeInfo> {
     let mut sized = modes.iter().filter(|mode| size_of_mode(mode) == size);
-    let fitting = sized
-        .clone()
-        .filter(|mode| mode.flags & INTERLACED == 0 && fits(size.0, size.1, refresh(mode)))
-        .rev()
-        .max_by_key(|mode| refresh(mode));
+    let fitting = match rate {
+        Rate::Preferred => sized
+            .clone()
+            .find(|mode| fits(size.0, size.1, refresh(mode))),
+        Rate::Fastest => sized
+            .clone()
+            .filter(|mode| mode.flags & INTERLACED == 0 && fits(size.0, size.1, refresh(mode)))
+            .rev()
+            .max_by_key(|mode| refresh(mode)),
+    };
     fitting.or_else(|| sized.next()).copied()
 }
 
@@ -901,11 +921,18 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
     Some((size, gives))
 }
 
-/// The mode one output with `modes` runs: [`plan`] for it alone.
+/// The mode one output with `modes` runs: [`plan`] for it alone, at its
+/// preferred rate ([`Rate::Preferred`]).
 #[cfg(test)]
 fn choose(modes: &[ModeInfo], wanted: Wanted, fits: Fits<'_>) -> Option<ModeInfo> {
+    choose_at(modes, wanted, fits, Rate::Preferred)
+}
+
+/// [`choose`] at `rate`.
+#[cfg(test)]
+fn choose_at(modes: &[ModeInfo], wanted: Wanted, fits: Fits<'_>, rate: Rate) -> Option<ModeInfo> {
     let (size, _) = plan(&[modes], wanted, fits)?;
-    mode_of(modes, size, fits)
+    mode_of(modes, size, fits, rate)
 }
 
 /// How an output after the first shows a picture of the display's size.
@@ -925,7 +952,9 @@ enum Fit {
 
 /// How an output with `modes` shows a picture of `size` ([`Fit`]).
 fn fit(modes: &[ModeInfo], size: (u32, u32)) -> Fit {
-    if let Some(mode) = mode_of(modes, size, &|_, _, _| true) {
+    // Its preferred mode where it is of the size: a following output paces
+    // no flips, and any input of the monitor shows that one.
+    if let Some(mode) = mode_of(modes, size, &|_, _, _| true, Rate::Preferred) {
         return Fit::Mode(mode);
     }
     let Some(native) = native(modes) else {
@@ -1193,8 +1222,20 @@ impl<D: Drm> Display<D> {
     /// a free encoder of its own ([`free_encoder`]) shows the picture: the
     /// output that gives the guest's mode is set first, and its refusal
     /// stops the take; each other in its mode of that size, else scaled
-    /// ([`follow`]). A refusal of another leaves it dark.
-    pub fn take_fitting(mut drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
+    /// ([`follow`]). A refusal of another leaves it dark. The first output
+    /// runs its preferred rate of the size ([`Rate::Preferred`]).
+    pub fn take_fitting(drm: D, wanted: Wanted, fits: Fits<'_>) -> Result<Self, Error> {
+        Self::take_fitting_at(drm, wanted, fits, Rate::Preferred)
+    }
+
+    /// [`Self::take_fitting`], the first output running the mode of the
+    /// size `rate` picks.
+    pub fn take_fitting_at(
+        mut drm: D,
+        wanted: Wanted,
+        fits: Fits<'_>,
+        rate: Rate,
+    ) -> Result<Self, Error> {
         let (crtcs, connectors) = resources(&mut drm)?;
         let mut usable = Vec::new();
         let mut others = Vec::new();
@@ -1233,7 +1274,7 @@ impl<D: Drm> Display<D> {
                 continue;
             };
             let run = match heads.first() {
-                None => mode_of(&found.modes, size, fits).map(|mode| (mode, None)),
+                None => mode_of(&found.modes, size, fits, rate).map(|mode| (mode, None)),
                 Some(shown) => match follow(&mut drm, id, &found.modes, size, shown.mode) {
                     Ok(Follow::Run(mode, scaling)) => Some((mode, scaling)),
                     Ok(Follow::Dark { smaller: dark }) => {
@@ -1574,7 +1615,7 @@ impl<D: Drm> Display<D> {
                     .find(|mode| size_of_mode(mode) == size && refresh(mode) == refresh(&ran))
             })
             .copied()
-            .or_else(|| mode_of(&found.modes, size, &|_, _, _| true));
+            .or_else(|| mode_of(&found.modes, size, &|_, _, _| true, Rate::Preferred));
         // Every head's mode is of the display's size, so the one it ran
         // serves as a scaled picture's timing.
         let (mode, scaling) = match own {

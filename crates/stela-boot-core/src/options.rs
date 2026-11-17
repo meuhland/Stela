@@ -39,6 +39,9 @@ pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
 pub const SINGLE_USER: &str = "--single-user";
 /// Keeps the newest presented frame at one logged address.
 pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
+/// Take a GPU's display in its monitor's fastest mode of the size
+/// ([`System::display_fastest`]).
+pub const DISPLAY_FASTEST: &str = "--display-fastest";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -401,6 +404,12 @@ pub struct System {
     pub monitor_trace: bool,
     /// Log every display swap's DCP calls, present and callback (`--display-trace`).
     pub display_trace: bool,
+    /// A GPU's display is taken in its monitor's fastest progressive mode of
+    /// the size that macOS can be told of (`--display-fastest`), where by
+    /// default it runs the monitor's preferred mode, which every input of
+    /// the monitor shows: a mode listed faster may show only over
+    /// DisplayPort.
+    pub display_fastest: bool,
     /// Log every device access in these physical ranges (`--watch BASE,BYTES`).
     pub watches: Vec<(u64, u64)>,
     /// Guest virtual ranges the stop's report shows (`--dump BASE,BYTES`).
@@ -477,6 +486,7 @@ impl Default for System {
             traces: Vec::new(),
             monitor_trace: false,
             display_trace: false,
+            display_fastest: false,
             watches: Vec::new(),
             dumps: Vec::new(),
         }
@@ -929,6 +939,7 @@ impl fmt::Display for System {
         line.flag("--table-insert-throttled", self.table_insert_throttled)?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
+        line.flag(DISPLAY_FASTEST, self.display_fastest)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
