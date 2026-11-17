@@ -239,8 +239,19 @@ impl AppleDevices {
 
     /// A frame from the host network for the guest's USB Ethernet adapter
     /// (or StelaNet adapter); dropped as the adapter's filter and queue
-    /// decide.
+    /// decide. With a virtio network device as well, the frames to its
+    /// address go to it alone, and broadcast and multicast frames to both
+    /// ([`super::virtio::route`]).
     pub fn network_deliver(&mut self, frame: &[u8]) -> Result<()> {
+        let route = self.virtio_net_route(frame);
+        if route != Route::First {
+            if let Some(net) = self.virtio_net() {
+                net.deliver_owned(frame.to_vec());
+            }
+            if route == Route::Second {
+                return Ok(());
+            }
+        }
         if let Some(net) = self.stela_net() {
             net.deliver_owned(frame.to_vec());
             return Ok(());
@@ -249,8 +260,24 @@ impl AppleDevices {
         Ok(())
     }
 
-    /// Hand the guest's network adapter an owned frame from the host link.
+    /// Hand the guest's network adapter an owned frame from the host link,
+    /// routed as [`Self::network_deliver`] routes it.
     pub fn network_deliver_owned(&mut self, frame: Vec<u8>) -> Result<()> {
+        let frame = match self.virtio_net_route(&frame) {
+            Route::First => frame,
+            Route::Both => {
+                if let Some(net) = self.virtio_net() {
+                    net.deliver_owned(frame.clone());
+                }
+                frame
+            }
+            Route::Second => {
+                if let Some(net) = self.virtio_net() {
+                    net.deliver_owned(frame);
+                }
+                return Ok(());
+            }
+        };
         if let Some(net) = self.stela_net() {
             net.deliver_owned(frame);
             return Ok(());
@@ -328,7 +355,9 @@ impl AppleDevices {
     }
 
     /// Whether the guest's USB Ethernet adapter has room for a frame from
-    /// the host network; false without an adapter.
+    /// the host network; false without an adapter. A virtio network device
+    /// beside it does not hold the host link back: what finds its queue
+    /// full is dropped and counted.
     pub fn network_room(&mut self) -> bool {
         if let Some(net) = self.stela_net() {
             return net.has_room();
@@ -336,12 +365,15 @@ impl AppleDevices {
         self.usb_network().is_ok_and(|network| network.has_room())
     }
 
-    /// The next frame the guest sent through its network adapter.
+    /// The next frame the guest sent through its network adapter, then
+    /// through its virtio network device.
     pub fn network_take(&mut self) -> Option<Vec<u8>> {
-        if let Some(net) = self.stela_net() {
-            return net.take();
-        }
-        self.usb_network().ok()?.take()
+        let first = if let Some(net) = self.stela_net() {
+            net.take()
+        } else {
+            self.usb_network().ok().and_then(|network| network.take())
+        };
+        first.or_else(|| self.virtio_net()?.take())
     }
 
     /// Return the host link's finished frame storage to the adapter.
@@ -352,6 +384,8 @@ impl AppleDevices {
         }
         if let Ok(network) = self.usb_network() {
             network.recycle_outbound(frame);
+        } else if let Some(net) = self.virtio_net() {
+            net.recycle(frame);
         }
     }
 

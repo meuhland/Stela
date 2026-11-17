@@ -45,6 +45,8 @@ pub const GUEST_AUDIO_FROM_VIRTIO: &str = "GUEST AUDIO source: virtio-snd (--vir
      left unattached, so macOS has one output (\"Stela virtio sound\"); without --virtio-snd the \
      USB speaker feeds HDMI as before, and with --guest-audio alone (no HDMI) both devices are \
      given, each to its own sink";
+/// Adds the virtio network device to `--virtio`'s devices.
+pub const VIRTIO_NET: &str = "--virtio-net";
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -457,6 +459,12 @@ pub struct System {
     /// fingerprint (`--virtio-snd-capture SECONDS`, 1 to
     /// [`VIRTIO_SND_CAPTURE_MAX`], implying `--virtio-snd`).
     pub virtio_snd_capture: Option<u32>,
+    /// Add the virtio network device to `--virtio`'s: the guest's second
+    /// network interface, beside StelaNet or the USB Ethernet adapter, with
+    /// a station address of its own on the same host adapter
+    /// (`--virtio-net`, which needs `--virtio`). Without `--guest-network`
+    /// it has no host adapter, and its link is down.
+    pub virtio_net: bool,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -564,6 +572,7 @@ impl Default for System {
             virtio_console_echo: false,
             virtio_snd: false,
             virtio_snd_capture: None,
+            virtio_net: false,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -1029,6 +1038,7 @@ impl fmt::Display for System {
         line.flag(VIRTIO_CONSOLE_ECHO, self.virtio_console_echo)?;
         line.flag(VIRTIO_SND, self.virtio_snd)?;
         line.value(VIRTIO_SND_CAPTURE, self.virtio_snd_capture)?;
+        line.flag(VIRTIO_NET, self.virtio_net)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

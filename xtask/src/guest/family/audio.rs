@@ -45,6 +45,16 @@ pub const FAMILY: Family = Family {
             trailing: "",
         },
     ],
+    declared: &[],
+    probe: "audio/tests/audio_probe.cpp",
+    probes: &[
+        ("StelaAudioProbeDevice", "IOAudioDevice"),
+        ("StelaAudioProbeEngine", "IOAudioEngine"),
+        ("StelaAudioProbeStream", "IOAudioStream"),
+        ("StelaAudioProbeControl", "IOAudioControl"),
+        ("StelaAudioProbeLevel", "IOAudioLevelControl"),
+        ("StelaAudioProbeToggle", "IOAudioToggleControl"),
+    ],
 };
 
 #[cfg(test)]
@@ -53,17 +63,6 @@ mod tests {
     use super::*;
     use std::{fs, path::Path, process::Command};
     use stela_loader::aux_kc::manifest::Manifest;
-
-    /// The probes of `audio/tests/audio_probe.cpp`, each with the family
-    /// class it derives from.
-    const PROBES: [(&str, &str); 6] = [
-        ("StelaAudioProbeDevice", "IOAudioDevice"),
-        ("StelaAudioProbeEngine", "IOAudioEngine"),
-        ("StelaAudioProbeStream", "IOAudioStream"),
-        ("StelaAudioProbeControl", "IOAudioControl"),
-        ("StelaAudioProbeLevel", "IOAudioLevelControl"),
-        ("StelaAudioProbeToggle", "IOAudioToggleControl"),
-    ];
 
     fn committed() -> Manifest {
         let text = fs::read_to_string(directory().join(FAMILY.manifest)).unwrap();
@@ -104,14 +103,14 @@ mod tests {
     }
 
     fn probe_object(headers: &Path) -> Vec<u8> {
-        compile(&directory().join("audio/tests/audio_probe.cpp"), headers)
+        compile(&directory().join(FAMILY.probe), headers)
     }
 
     #[test]
     fn the_audio_header_puts_every_method_in_the_kernels_slot() {
         let vtables = object_vtables(&probe_object(&directory())).unwrap();
         let manifest = committed();
-        for (probe, class) in PROBES {
+        for (probe, class) in FAMILY.probes {
             check_probe(&vtables, &manifest, probe, class).unwrap();
         }
         // The engine's pure slots are the probe's own methods.

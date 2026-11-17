@@ -150,6 +150,84 @@ pub mod ids {
     }
 }
 
+/// The network device (virtio 1.2, 5.1; `virtio_net.h`): its feature bits,
+/// configuration space and the `virtio_net_hdr_v1` every buffer starts with,
+/// as `stela_soc::virtio::net` models it and StelaVirtIONet drives it. The
+/// feature bits are StelaNet's (`crate::net::features`), which numbers them
+/// as virtio-net does.
+pub mod net {
+    /// Feature bits (5.1.3).
+    pub mod features {
+        layout! {
+            /// The device completes partial transmit checksums.
+            CSUM = 1 << 0;
+            /// The driver takes receive frames whose checksums the device
+            /// vouched for (`HDR_F_DATA_VALID`).
+            GUEST_CSUM = 1 << 1;
+            /// `CONFIG_MAC` holds the station address.
+            MAC = 1 << 5;
+            /// The driver takes coalesced TCPv4 and TCPv6 receive segments.
+            GUEST_TSO4 = 1 << 7;
+            GUEST_TSO6 = 1 << 8;
+            /// The device segments TCPv4 and TCPv6: never offered.
+            HOST_TSO4 = 1 << 11;
+            HOST_TSO6 = 1 << 12;
+            /// A receive frame may span buffers (`num_buffers`).
+            MRG_RXBUF = 1 << 15;
+            /// `CONFIG_STATUS` holds the link state.
+            STATUS = 1 << 16;
+            /// A control queue: never offered, so the device filters nothing
+            /// a driver could set (promiscuous and multicast lists).
+            CTRL_VQ = 1 << 17;
+
+            /// What the device always offers, on top of the transport's.
+            OFFERED = MAC | STATUS;
+        }
+    }
+
+    layout! {
+        /// The configuration space: the station address, 6 bytes.
+        CONFIG_MAC = 0;
+        /// The link state, 16 bits of `STATUS_` bits.
+        CONFIG_STATUS = 6;
+        /// The queue pairs, 16 bits: always 1.
+        CONFIG_MAX_VIRTQUEUE_PAIRS = 8;
+        /// The configuration space's bytes.
+        CONFIG_BYTES = 10;
+        /// `CONFIG_STATUS`: the link is up.
+        STATUS_LINK_UP = 1;
+
+        /// The receive queue's index, and the transmit queue's.
+        RX_QUEUE = 0;
+        TX_QUEUE = 1;
+
+        /// The `virtio_net_hdr_v1` every buffer starts with (5.1.6), its
+        /// `num_buffers` included whatever the features.
+        HEADER_BYTES = 12;
+        /// Its fields' offsets: flags, gso_type, hdr_len, gso_size,
+        /// csum_start, csum_offset and num_buffers.
+        HDR_FLAGS = 0;
+        HDR_GSO_TYPE = 1;
+        HDR_HDR_LEN = 2;
+        HDR_GSO_SIZE = 4;
+        HDR_CSUM_START = 6;
+        HDR_CSUM_OFFSET = 8;
+        HDR_NUM_BUFFERS = 10;
+        /// `flags`: the checksum from `csum_start` is partial, its field at
+        /// `csum_offset` past it.
+        HDR_F_NEEDS_CSUM = 1;
+        /// `flags`: the device verified the frame's checksums.
+        HDR_F_DATA_VALID = 2;
+        /// `gso_type`: no segmentation.
+        HDR_GSO_NONE = 0;
+
+        /// The longest Ethernet frame without FCS, the header excluded, and
+        /// the shortest: an Ethernet header.
+        FRAME_MAX = 1514;
+        FRAME_MIN = 14;
+    }
+}
+
 /// A split virtqueue's three areas (virtio 1.2, 2.7), each at the address
 /// the driver programs.
 pub mod ring {
@@ -225,5 +303,32 @@ mod tests {
         assert_eq!(ring::DESC_F_WRITE, crate::net::ring::DESC_F_WRITE);
         assert_eq!(features::TRANSPORT & features::REQUIRED, features::REQUIRED);
         assert_eq!(ids::RNG, 4);
+    }
+
+    #[test]
+    fn the_network_device_numbers_its_bits_and_header_as_stelanet_does() {
+        use crate::net::{features as stelanet, window};
+        use net::features::*;
+        for (virtio, stelanet) in [
+            (CSUM, stelanet::CSUM),
+            (GUEST_CSUM, stelanet::GUEST_CSUM),
+            (MAC, stelanet::MAC),
+            (GUEST_TSO4, stelanet::GUEST_TSO4),
+            (GUEST_TSO6, stelanet::GUEST_TSO6),
+            (HOST_TSO4, stelanet::HOST_TSO4),
+            (HOST_TSO6, stelanet::HOST_TSO6),
+            (MRG_RXBUF, stelanet::MRG_RXBUF),
+            (super::features::EVENT_IDX, stelanet::EVENT_IDX),
+            (super::features::VERSION_1, stelanet::VERSION_1),
+        ] {
+            assert_eq!(virtio, stelanet);
+        }
+        // virtio_net.h's numbering of what StelaNet has no bit for.
+        assert_eq!((STATUS, CTRL_VQ), (1 << 16, 1 << 17));
+        assert_eq!(net::HEADER_BYTES, window::HEADER_BYTES);
+        assert_eq!(net::FRAME_MAX, window::FRAME_MAX);
+        assert_eq!(net::HDR_NUM_BUFFERS + 2, net::HEADER_BYTES);
+        assert_eq!(net::CONFIG_MAX_VIRTQUEUE_PAIRS + 2, net::CONFIG_BYTES);
+        assert_eq!(OFFERED & super::features::TRANSPORT, 0);
     }
 }

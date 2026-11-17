@@ -238,6 +238,20 @@ impl Mmio {
         self.deadline().is_some_and(|deadline| deadline <= now)
     }
 
+    /// Whether the device has work for the host's service; asking clears it.
+    pub fn take_service_due(&mut self) -> bool {
+        self.device.take_service_due()
+    }
+
+    /// The device behind the transport.
+    pub fn device_mut(&mut self) -> &mut dyn VirtioDevice {
+        &mut *self.device
+    }
+
+    pub fn device(&self) -> &dyn VirtioDevice {
+        &*self.device
+    }
+
     fn event_idx(&self) -> bool {
         self.accepted & features::EVENT_IDX != 0
     }
@@ -268,6 +282,10 @@ impl Mmio {
             Ok(served) => {
                 self.stats.chains += served.chains;
                 self.stats.bytes += served.bytes;
+                if served.config {
+                    self.config_generation = self.config_generation.wrapping_add(1);
+                    self.raise(INT_CONFIG as u32, access);
+                }
                 if served.interrupt {
                     self.raise(INT_VRING as u32, access);
                 }

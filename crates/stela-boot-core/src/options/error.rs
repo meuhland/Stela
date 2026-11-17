@@ -136,6 +136,7 @@ pub enum Constraint {
     AudioHpetDependency,
     NativePciIoapicExclusive,
     VirtioSndDependency,
+    VirtioNetDependency,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -262,6 +263,7 @@ impl Constraint {
             Self::RecoverySafeMode => "a recoveryOS boot is not a safe-mode boot",
             Self::DramAlignment => "guest DRAM base must be 2 MiB aligned",
             Self::AudioHpetDependency => "--audio-own-hpet requires --audio-check",
+            Self::VirtioNetDependency => "--virtio-net requires --virtio",
             Self::NativePciIoapicExclusive => {
                 "--native-pci-own-ioapic requires the normal system platform path"
             }

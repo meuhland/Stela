@@ -372,3 +372,18 @@ StelaVirtIODevice::setHandler(OSObject *owner, StelaVirtIOHandler handler)
 {
 	transport->setHandler(owner, handler);
 }
+
+bool
+StelaVirtIODevice::readConfig(uint32_t offset, uint32_t *words, unsigned count)
+{
+	for (unsigned attempt = 0; attempt < kResetPolls; attempt++) {
+		uint32_t generation = transport->read(STELA_VIRTIO_MMIO_CONFIG_GENERATION);
+		for (unsigned word = 0; word < count; word++) {
+			words[word] = transport->read(STELA_VIRTIO_MMIO_CONFIG + offset + 4 * word);
+		}
+		if (transport->read(STELA_VIRTIO_MMIO_CONFIG_GENERATION) == generation) {
+			return true;
+		}
+	}
+	return false;
+}

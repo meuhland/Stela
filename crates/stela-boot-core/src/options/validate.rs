@@ -8,6 +8,9 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     install(options)?;
     boot_selection(options)?;
     dram(options)?;
+    if options.virtio_net && !options.virtio {
+        return Err(Error::Constraint(Constraint::VirtioNetDependency));
+    }
     if options.audio_own_hpet && options.audio_check.is_none() {
         return Err(Error::Constraint(Constraint::AudioHpetDependency));
     }

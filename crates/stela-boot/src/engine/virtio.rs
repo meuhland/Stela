@@ -7,7 +7,7 @@
 //! - `/arm-io/stela-virtio1`: the console. What the guest writes is logged
 //!   as `VIRTIO console tx: <line>`; its input is the host's test source
 //!   with `--virtio-console-echo` (a greeting, then each line echoed), else
-//!   nothing, as Stela has no host terminal channel yet.
+//!   nothing, as Stela has no host terminal channel yet;
 //! - `/arm-io/stela-virtio2`, with `--virtio-snd`: the sound device, one
 //!   48 kHz stereo output stream played to a counting sink at the host's
 //!   counter (`stela_soc::virtio::snd`), which paces the guest's engine;
@@ -19,10 +19,19 @@
 //!   HDMI route in place of the USB speaker, its clock following the HDMI
 //!   periods written ([`add`] hands the service the ring). The device's
 //!   clock is the host's device clock (`host::device_ticks`), which never
-//!   goes back whichever core steps it.
+//!   goes back whichever core steps it;
+//! - `/arm-io/stela-virtio3`, with `--virtio-net`: the network device, the
+//!   guest's second interface on the guest network's host adapter
+//!   (`--guest-network`), beside StelaNet or the USB Ethernet adapter, with
+//!   a station address of its own that derives from the board's ECID. The
+//!   board switches frames from the host between the two by destination
+//!   (`stela_soc::machine::route`); its link follows the host adapter's
+//!   carrier, and without a guest network it is down.
 //!
 //! The devices' node indices are [`DEVICES`]' order, kept in this one
-//! place: a device a boot leaves out keeps its index free.
+//! place: a device a boot leaves out keeps its index free. Windows and AIC
+//! inputs are not numbered: each placed device takes the next free ones,
+//! so the placed devices' inputs are consecutive whichever are left out.
 //!
 //! The kext is linked into the auxiliary collection beside StelaGPU. It is
 //! in the image only with the `virtio-kext` feature, as `include_bytes!`
@@ -45,6 +54,7 @@ use stela_soc::virtio::{
     VirtioDevice,
     console::{Console, Echo, Input, Silent},
     mmio::Event,
+    net::OFFLOADS,
     rng::Rng,
     snd::{
         Snd,
@@ -79,12 +89,13 @@ enum Kind {
     Rng,
     Console,
     Sound,
+    Net,
 }
 
 /// The devices by node index, in this one place: the entropy device stays
 /// `stela-virtio0`, and a device a boot leaves out keeps its index. A new
 /// device is the next entry.
-const DEVICES: [Kind; 3] = [Kind::Rng, Kind::Console, Kind::Sound];
+const DEVICES: [Kind; 4] = [Kind::Rng, Kind::Console, Kind::Sound, Kind::Net];
 
 impl Kind {
     /// Its name in the log, as its device names itself without `virtio-`.
@@ -93,6 +104,7 @@ impl Kind {
             Self::Rng => "rng",
             Self::Console => "console",
             Self::Sound => "snd",
+            Self::Net => "net",
         }
     }
 }
@@ -107,6 +119,8 @@ pub(super) struct Config {
     /// The sound device plays into the guest-audio ring of the HDMI route
     /// (`System::guest_audio_from_virtio`).
     hdmi_ring: bool,
+    /// The network device (`--virtio-net`).
+    net: bool,
 }
 
 impl Config {
@@ -115,6 +129,7 @@ impl Config {
             console_echo: options.virtio_console_echo,
             sound: options.virtio_snd.then_some(options.virtio_snd_capture),
             hdmi_ring: options.guest_audio_from_virtio(),
+            net: options.virtio_net,
         }
     }
 
@@ -123,8 +138,19 @@ impl Config {
         match kind {
             Kind::Rng | Kind::Console => true,
             Kind::Sound => self.sound.is_some(),
+            Kind::Net => self.net,
         }
     }
+}
+
+/// What the network device takes from the boot's guest network.
+pub(super) struct NetSetup {
+    /// The StelaNet offloads the boot offers (`--guest-network-stelanet-*`),
+    /// in virtio-net numbering; the device offers those it can.
+    pub offloads: u64,
+    /// The host adapter's station address, the guest's first interface's,
+    /// if the boot has a guest network.
+    pub host: Option<[u8; 6]>,
 }
 
 /// Set when a device has events or lines for the log.
@@ -179,14 +205,15 @@ pub(super) fn place(tree: &mut DeviceTree, config: &Config) -> Vec<Placed> {
 }
 
 /// Puts each placed device where its node says, its AIC input split into
-/// die and input by the board's `per_die`, as `config` asks. The
-/// guest-audio ring the sound device plays into, when it feeds the HDMI
-/// route, for the guest-audio service.
+/// die and input by the board's `per_die`, as `config` asks; `net` is the
+/// network device's guest network. The guest-audio ring the sound device
+/// plays into, when it feeds the HDMI route, for the guest-audio service.
 pub(super) fn add(
     devices: &mut AppleDevices,
     placed: Vec<Placed>,
     per_die: u32,
     config: &Config,
+    net: &NetSetup,
 ) -> Option<Arc<GuestRing>> {
     let mut audio = None;
     for Placed {
@@ -236,24 +263,60 @@ pub(super) fn add(
                     detail,
                 )
             }
+            Kind::Net => {
+                // The board keeps its one network device apart, for the
+                // host link's switch (`AppleDevices::add_virtio_net`).
+                let mac = devices
+                    .add_virtio_net(
+                        placement.physical,
+                        irq,
+                        net.offloads,
+                        net.host,
+                        Some(&EVENTS),
+                    )
+                    .unwrap_or_else(|error| output::fatal(&error));
+                if net.host.is_none() {
+                    devices.virtio_net_set_link(false);
+                }
+                log_placed(
+                    kind,
+                    index,
+                    &placement,
+                    &format!(
+                        " mac={} offloads={:#x} host adapter {}",
+                        colons(mac),
+                        net.offloads & OFFLOADS,
+                        net.host.map_or_else(
+                            || String::from("none: link down"),
+                            |host| format!("{} shared with the first interface", colons(host))
+                        )
+                    ),
+                );
+                continue;
+            }
         };
         devices
             .add_virtio_mmio(placement.physical, irq, device, Some(&EVENTS))
             .unwrap_or_else(|error| output::fatal(&error));
-        output::arguments(format_args!(
-            "VIRTIO {} /arm-io/{} at {:#x} aic input {:#x}{detail}{}\n",
-            kind.name(),
-            stela_loader::virtio::name(index),
-            placement.physical,
-            placement.irq,
-            if EMBEDDED {
-                ""
-            } else {
-                " (no StelaVirtIO kext in this image)"
-            }
-        ));
+        log_placed(kind, index, &placement, &detail);
     }
     audio
+}
+
+/// The placement line of device `kind` at node `index`, with `detail`.
+fn log_placed(kind: Kind, index: usize, placement: &Placement, detail: &str) {
+    output::arguments(format_args!(
+        "VIRTIO {} /arm-io/{} at {:#x} aic input {:#x}{detail}{}\n",
+        kind.name(),
+        stela_loader::virtio::name(index),
+        placement.physical,
+        placement.irq,
+        if EMBEDDED {
+            ""
+        } else {
+            " (no StelaVirtIO kext in this image)"
+        }
+    ));
 }
 
 /// Logs what the devices' drivers did since the last call, and the
@@ -354,6 +417,12 @@ fn log(report: &VirtioReport) {
                 .unwrap_or_default()
         ));
     }
+}
+
+/// A station address as `aa:bb:cc:dd:ee:ff`.
+fn colons(mac: [u8; 6]) -> String {
+    let [a, b, c, d, e, f] = mac;
+    alloc::format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
 }
 
 /// The status bits' names, `|`-joined.

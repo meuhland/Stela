@@ -1223,6 +1223,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             virtio_placed,
             u32::from(board.aic.layout.max_irq()),
             &virtio_config,
+            &virtio::NetSetup {
+                offloads: options.guest_network_stelanet_offloads.features(),
+                host: guest_network.as_ref().map(|network| network.mac().0),
+            },
         ),
         None => None,
     };

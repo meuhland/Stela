@@ -253,6 +253,7 @@ impl ParseState<'_> {
                 }
                 options.virtio_snd = true;
             }
+            VIRTIO_NET => options.virtio_net = true,
             "--audio-check" => {
                 if options.audio_check.is_some() {
                     return Err(Error::DuplicateAudioCheck);

@@ -287,7 +287,7 @@ fn net_header() -> String {
 /// device IDs and split-ring sizes, from `stela_contracts::virtio`. Plain C,
 /// so the kext's ring code compiles against it in the host's tests too.
 pub fn virtio_header() -> String {
-    use stela_contracts::virtio::{features, ids, mmio, ring, status};
+    use stela_contracts::virtio::{features, ids, mmio, net, ring, status};
     let mut header = String::from(
         "/* The virtio-mmio transport's layout, from stela_contracts::virtio. */\n\
          #pragma once\n",
@@ -297,6 +297,8 @@ pub fn virtio_header() -> String {
         ("STATUS", status::LAYOUT),
         ("F", features::LAYOUT),
         ("ID", ids::LAYOUT),
+        ("NET_F", net::features::LAYOUT),
+        ("NET", net::LAYOUT),
     ] {
         for (name, value) in layout {
             writeln!(header, "#define STELA_VIRTIO_{prefix}_{name} {value:#x}ULL").unwrap();
@@ -377,6 +379,12 @@ mod tests {
             "#define STELA_VIRTIO_F_VERSION_1 0x100000000ULL\n",
             "#define STELA_VIRTIO_F_EVENT_IDX 0x20000000ULL\n",
             "#define STELA_VIRTIO_ID_RNG 0x4ULL\n",
+            "#define STELA_VIRTIO_ID_NET 0x1ULL\n",
+            "#define STELA_VIRTIO_NET_F_MRG_RXBUF 0x8000ULL\n",
+            "#define STELA_VIRTIO_NET_F_STATUS 0x10000ULL\n",
+            "#define STELA_VIRTIO_NET_CONFIG_STATUS 0x6ULL\n",
+            "#define STELA_VIRTIO_NET_HEADER_BYTES 0xcULL\n",
+            "#define STELA_VIRTIO_NET_HDR_F_NEEDS_CSUM 0x1ULL\n",
             "#define STELA_VIRTIO_DESC_F_WRITE 0x2\n",
             "#define STELA_VIRTIO_USED_ALIGN 4ULL\n",
             "#define STELA_VIRTIO_USED_BYTES(size) (4 + 8 * (size) + 2)\n",
