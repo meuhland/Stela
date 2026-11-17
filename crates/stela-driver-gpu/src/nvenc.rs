@@ -1,29 +1,47 @@
-//! The NVENC "alive" probe (`--probe-nvenc`): does GSP-RM run the video
-//! encoder for nouveau on this GPU?
+//! NVENC, GA10x's video encoder (`NVC7B7_VIDEO_ENCODER`), driven through
+//! nouveau from Stela's host.
 //!
-//! On a render node of its own the probe opens a channel on the encoder's
-//! runlist (nouveau's abi16 `NOUVEAU_FIFO_ENGINE_NVENC`, Stela's patch
-//! 0202), creates the encoder class on it, and pushes the least the class
-//! takes: `SET_OBJECT`, `SET_APPLICATION_ID` (H.264) and a `SEMAPHORE_A..D`
-//! release of [`PAYLOAD`] to a small buffer of video memory. It then reads
-//! that buffer until the payload lands or [`Node::now_ns`] passes the bound.
-//! No picture is set up and nothing is encoded: the release alone proves the
-//! channel, the class and the encoder's falcon under GSP.
+//! Two users share this module's uAPI:
 //!
-//! The probe never stops: every refusal is a line and an [`Outcome`]. Its
-//! waits are bounded by the caller's clock; the ioctls themselves are bounded
-//! by nouveau (GSP RPCs by `R535_GSP_RPC_MS`). A channel whose pushes never
-//! finished is left open ([`Outcome::keeps_channel`]): freeing it would make
-//! nouveau idle it, a busy wait of up to 15 s on a fence that may never come.
+//! - **The "alive" probe** ([`probe`], `--probe-nvenc`): does GSP-RM run the
+//!   encoder for nouveau on this GPU? On a render node of its own it opens a
+//!   channel on the encoder's runlist (nouveau's abi16
+//!   `NOUVEAU_FIFO_ENGINE_NVENC`, Stela's Linux patch "allow allocating NVENC
+//!   channels via abi16"), creates the encoder class on it, and pushes the
+//!   least the class takes: `SET_OBJECT`, `SET_APPLICATION_ID` (H.264) and a
+//!   `SEMAPHORE_A..D` release of [`PAYLOAD`] to a small buffer of video
+//!   memory. It then reads that buffer until the payload lands or
+//!   [`Node::now_ns`] passes the bound. The legacy abi16 uAPI keeps it small:
+//!   a fresh file has no VM_BIND state, so `CHANNEL_ALLOC` turns it off,
+//!   buffers get their addresses from `GEM_NEW`, and `GEM_PUSHBUF` submits
+//!   with a fence of nouveau's own.
+//! - **The H.264/HEVC encoder** ([`session`]): nvenc-lab's `nvenc-test`
+//!   path, which encoded correct IDR and P frames on the RTX 3050 under
+//!   nouveau and GSP-RM 570.144 (2026-11-15/16): `VM_INIT` on a file of its
+//!   own, every buffer bound by `VM_BIND` at the GPU addresses NVIDIA's own
+//!   driver used, picture setups started from NVIDIA's captured ones
+//!   ([`setup`]), NVIDIA's method stream ([`push`]) submitted by `EXEC`, and
+//!   a bounded wait on the stream's own semaphore release.
 //!
-//! The legacy abi16 uAPI keeps it small: a fresh file has no VM_BIND state,
-//! so `CHANNEL_ALLOC` turns it off, buffers get their addresses from
-//! `GEM_NEW`, and `GEM_PUSHBUF` submits with a fence of nouveau's own.
+//! Neither ever stops the boot: every refusal is a line and a value. Waits
+//! are bounded by the caller's clock; the ioctls themselves are bounded by
+//! nouveau (GSP RPCs by `R535_GSP_RPC_MS`). A channel whose pushes never
+//! finished is left open: freeing it would make nouveau idle it, a busy wait
+//! of up to 15 s on a fence that may never come.
 use core::ffi::c_void;
 use core::fmt;
 use core::ptr::NonNull;
 
 use crate::nouveau_chip::{Architecture, Chip};
+
+pub mod bits;
+mod fields;
+pub mod layout;
+pub mod push;
+pub mod selftest;
+pub mod session;
+pub mod setup;
+pub mod surface;
 
 /// `NVC7B7_VIDEO_ENCODER`, GA10x's NVENC (7.3).
 pub const ENCODER_CLASS: u32 = 0xc7b7;
@@ -43,20 +61,43 @@ pub mod method {
     pub const SET_OBJECT: u32 = 0x0000;
     pub const NOP: u32 = 0x0100;
     pub const SET_APPLICATION_ID: u32 = 0x0200;
+    pub const SET_WATCHDOG_TIMER: u32 = 0x0204;
     pub const SEMAPHORE_A: u32 = 0x0240;
     pub const SEMAPHORE_B: u32 = 0x0244;
     pub const SEMAPHORE_C: u32 = 0x0248;
     pub const EXECUTE: u32 = 0x0300;
     pub const SEMAPHORE_D: u32 = 0x0304;
+    pub const SET_IN_REF_PIC0_LUMA: u32 = 0x0400;
+    pub const SET_IN_REF_PIC0_CHROMA: u32 = 0x0440;
+    pub const SET_CONTROL_PARAMS: u32 = 0x0700;
+    pub const SET_PICTURE_INDEX: u32 = 0x0704;
+    pub const SET_IN_RCDATA: u32 = 0x070c;
+    pub const SET_IN_DRV_PIC_SETUP: u32 = 0x0710;
+    pub const SET_OUT_ENC_STATUS: u32 = 0x0718;
+    pub const SET_OUT_BITSTREAM: u32 = 0x071c;
+    pub const SET_IOHISTORY: u32 = 0x0720;
+    pub const SET_IO_RC_PROCESS: u32 = 0x0724;
+    pub const SET_IN_COLOC_DATA: u32 = 0x0728;
+    pub const SET_OUT_COLOC_DATA: u32 = 0x072c;
+    pub const SET_OUT_REF_PIC_LUMA: u32 = 0x0730;
+    pub const SET_IN_CUR_PIC: u32 = 0x0734;
+    pub const SET_IN_MEPRED_DATA: u32 = 0x0738;
+    pub const SET_OUT_MEPRED_DATA: u32 = 0x073c;
+    pub const SET_IN_CUR_PIC_CHROMA_U: u32 = 0x0740;
+    pub const SET_IN_CUR_PIC_CHROMA_V: u32 = 0x0744;
+    pub const SET_OUT_REF_PIC_CHROMA: u32 = 0x074c;
 }
 
 /// `NVC7B7_SET_APPLICATION_ID_ID_NVENC_H264`.
 pub const APPLICATION_H264: u32 = 1;
+/// `NVC7B7_SET_APPLICATION_ID_ID_NVENC_H265`.
+pub const APPLICATION_H265: u32 = 3;
 
-/// The `NVC7B7_SEMAPHORE_D` the probe sends: `STRUCTURE_SIZE_ONE` (1:0, the
-/// payload alone, no timestamp), `AWAKEN_ENABLE_FALSE` (8:8, no interrupt),
-/// `OPERATION_RELEASE` (17:16), `FLUSH_DISABLE_FALSE` (21:21, flush before
-/// the write) and `PAYLOAD_SIZE_32BIT` (23:23): every field zero.
+/// The `NVC7B7_SEMAPHORE_D` the probe and the encoder send:
+/// `STRUCTURE_SIZE_ONE` (1:0, the payload alone, no timestamp),
+/// `AWAKEN_ENABLE_FALSE` (8:8, no interrupt), `OPERATION_RELEASE` (17:16),
+/// `FLUSH_DISABLE_FALSE` (21:21, flush before the write) and
+/// `PAYLOAD_SIZE_32BIT` (23:23): every field zero.
 pub const SEMAPHORE_D_RELEASE_32: u32 = 0;
 
 /// A Fermi-and-later incrementing method header (`NVC0_FIFO_PKHDR_SQ`):
@@ -86,15 +127,110 @@ pub const fn push(semaphore: u64, payload: u32) -> [u32; PUSH_WORDS] {
     ]
 }
 
-/// The encoder class of `chipset`, when the probe knows it: the GA10x parts
-/// with an encoder. GA100 has none; Turing's NVC4B7 and Ada's NVC9B7 are
-/// not probed.
+/// The encoder class of `chipset`, when this module knows it: the GA10x
+/// parts with an encoder. GA100 has none; Turing's NVC4B7 and Ada's NVC9B7
+/// are not driven.
 pub fn encoder_class(chipset: u16) -> Option<u32> {
     let chip = Chip::find(chipset)?;
     (chip.architecture == Architecture::Ampere && chip.display).then_some(ENCODER_CLASS)
 }
 
-// --- nouveau's abi16 uAPI (include/uapi/drm/nouveau_drm.h) ---
+/// The codecs [`session`] encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    Hevc,
+}
+
+impl Codec {
+    /// A word for the lines.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    /// `SET_APPLICATION_ID`.
+    pub fn application(self) -> u32 {
+        match self {
+            Self::H264 => APPLICATION_H264,
+            Self::Hevc => APPLICATION_H265,
+        }
+    }
+
+    /// The `SET_CONTROL_PARAMS` NVIDIA's driver sent at low-latency CBR
+    /// (`nvenc-capture.md`): H.264 `0x12001303` (codec 3, forced picture
+    /// and co-located output, GP timer, RC mode 0x12) and HEVC `0x12001104`
+    /// (codec 4, no co-located output). Bits 31:24 are the RC mode; zero is
+    /// `RCMODE_CONSTQP`.
+    pub fn control(self, rate: Rate) -> u32 {
+        let captured = match self {
+            Self::H264 => 0x1200_1303,
+            Self::Hevc => 0x1200_1104,
+        };
+        match rate {
+            Rate::ConstQp(_) => captured & !0xff00_0000,
+            Rate::Cbr { .. } => captured,
+        }
+    }
+
+    /// The bytes of one picture setup slot NVIDIA's driver used: 12 KiB for
+    /// H.264, 56 KiB for HEVC.
+    pub fn setup_bytes(self) -> usize {
+        match self {
+            Self::H264 => 0x3000,
+            Self::Hevc => 0xe000,
+        }
+    }
+}
+
+/// How a session spends bits. Either way the GOP is infinite (an IDR only
+/// first and when asked) and there are no B-frames, as Parsec encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rate {
+    /// Every picture at this QP (0..=51), RC mode 0.
+    ConstQp(u8),
+    /// Low-latency CBR at this many bits per second, NVIDIA's captured
+    /// rate control (`hrd_type 0x22`, a CPB of two seconds).
+    Cbr { bitrate: u32 },
+}
+
+impl Rate {
+    /// The bitrate NVIDIA's captured setups were made for.
+    pub const CAPTURED_BITRATE: u32 = 20_000_000;
+}
+
+/// What a [`session::Session`] encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub codec: Codec,
+    /// The displayed size; the coded size rounds it up to 16.
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second, for the rate control and the streams' timing.
+    pub fps: u32,
+    pub rate: Rate,
+    /// Map the reconstructed pictures for the CPU ([`session::Session::recon`]),
+    /// as the self-test does to compare them with the input.
+    pub map_recon: bool,
+}
+
+impl Config {
+    /// 1920x1080 at 60 fps: NVIDIA's captured session.
+    pub const fn hd(codec: Codec, rate: Rate) -> Self {
+        Self {
+            codec,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            rate,
+            map_recon: false,
+        }
+    }
+}
+
+// --- nouveau's uAPI (include/uapi/drm/nouveau_drm.h, drm.h) ---
 
 /// `DRM_COMMAND_BASE`.
 const COMMAND_BASE: u32 = 0x40;
@@ -109,11 +245,12 @@ const fn write<T>(number: u32) -> u32 {
     1 << 30 | (size_of::<T>() as u32) << 16 | 0x64 << 8 | number
 }
 
-/// `NOUVEAU_FIFO_ENGINE_NVENC`, Stela's abi16 engine (Linux patch 0214).
+/// `NOUVEAU_FIFO_ENGINE_NVENC`, Stela's abi16 engine (its Linux patch).
 pub const FIFO_ENGINE_NVENC: u32 = 0x400;
 pub const DOMAIN_VRAM: u32 = 1 << 1;
 pub const DOMAIN_GART: u32 = 1 << 2;
 pub const DOMAIN_MAPPABLE: u32 = 1 << 3;
+pub const DOMAIN_COHERENT: u32 = 1 << 4;
 /// `NOUVEAU_GEM_CPU_PREP_NOWAIT`.
 const CPU_PREP_NOWAIT: u32 = 1;
 
@@ -153,11 +290,12 @@ pub struct GemInfo {
     pub handle: u32,
     pub domain: u32,
     pub size: u64,
-    /// The buffer's GPU address in the file's VM.
+    /// The buffer's GPU address in the file's VM (legacy uAPI only).
     pub offset: u64,
     /// Its `mmap` offset.
     pub map_handle: u64,
     pub tile_mode: u32,
+    /// Bits 15:8 are the PTE kind.
     pub tile_flags: u32,
 }
 
@@ -227,18 +365,124 @@ pub struct GemClose {
     pub pad: u32,
 }
 
+/// `struct drm_nouveau_vm_init`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VmInit {
+    pub kernel_managed_addr: u64,
+    pub kernel_managed_size: u64,
+}
+
+/// `struct drm_nouveau_vm_bind_op`. The low 8 bits of `flags` are the PTE
+/// kind (`nouveau_uvmm.c` maps with `op->flags & 0xff`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VmBindOp {
+    pub op: u32,
+    pub flags: u32,
+    pub handle: u32,
+    pub pad: u32,
+    pub addr: u64,
+    pub bo_offset: u64,
+    pub range: u64,
+}
+
+/// `DRM_NOUVEAU_VM_BIND_OP_MAP`.
+pub const VM_BIND_OP_MAP: u32 = 0;
+
+/// `struct drm_nouveau_vm_bind`; `flags` zero runs it synchronously.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VmBind {
+    pub op_count: u32,
+    pub flags: u32,
+    pub wait_count: u32,
+    pub sig_count: u32,
+    pub wait_ptr: u64,
+    pub sig_ptr: u64,
+    pub op_ptr: u64,
+}
+
+/// `struct drm_nouveau_exec_push`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecPush {
+    pub va: u64,
+    pub va_len: u32,
+    pub flags: u32,
+}
+
+/// `struct drm_nouveau_sync`; `flags` zero is `DRM_NOUVEAU_SYNC_SYNCOBJ`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sync {
+    pub flags: u32,
+    pub handle: u32,
+    pub timeline_value: u64,
+}
+
+/// `struct drm_nouveau_exec`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Exec {
+    pub channel: u32,
+    pub push_count: u32,
+    pub wait_count: u32,
+    pub sig_count: u32,
+    pub wait_ptr: u64,
+    pub sig_ptr: u64,
+    pub push_ptr: u64,
+}
+
+/// `struct drm_syncobj_create`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncobjCreate {
+    pub handle: u32,
+    pub flags: u32,
+}
+
+/// `struct drm_syncobj_destroy`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncobjDestroy {
+    pub handle: u32,
+    pub pad: u32,
+}
+
+/// `struct drm_syncobj_wait`; `timeout_nsec` is absolute, so zero only
+/// looks.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncobjWait {
+    pub handles: u64,
+    pub timeout_nsec: i64,
+    pub count_handles: u32,
+    pub flags: u32,
+    pub first_signaled: u32,
+    pub pad: u32,
+    pub deadline_nsec: u64,
+}
+
 pub const CHANNEL_ALLOC: u32 = read_write::<ChannelAlloc>(COMMAND_BASE + 0x02);
 pub const CHANNEL_FREE: u32 = write::<ChannelFree>(COMMAND_BASE + 0x03);
 pub const GROBJ_ALLOC: u32 = write::<GrobjAlloc>(COMMAND_BASE + 0x04);
+pub const VM_INIT: u32 = read_write::<VmInit>(COMMAND_BASE + 0x10);
+pub const VM_BIND: u32 = read_write::<VmBind>(COMMAND_BASE + 0x11);
+pub const EXEC: u32 = read_write::<Exec>(COMMAND_BASE + 0x12);
 pub const GEM_NEW: u32 = read_write::<GemNew>(COMMAND_BASE + 0x40);
 pub const GEM_PUSHBUF: u32 = read_write::<Pushbuf>(COMMAND_BASE + 0x41);
 pub const GEM_CPU_PREP: u32 = write::<CpuPrep>(COMMAND_BASE + 0x42);
 /// `DRM_IOCTL_GEM_CLOSE`, DRM's own.
 pub const GEM_CLOSE: u32 = write::<GemClose>(0x09);
+/// `DRM_IOCTL_SYNCOBJ_CREATE`, `_DESTROY` and `_WAIT`, DRM's own.
+pub const SYNCOBJ_CREATE: u32 = read_write::<SyncobjCreate>(0xbf);
+pub const SYNCOBJ_DESTROY: u32 = read_write::<SyncobjDestroy>(0xc0);
+pub const SYNCOBJ_WAIT: u32 = read_write::<SyncobjWait>(0xc3);
 
 const EBUSY: i64 = -16;
 
-/// A bound GPU's render node, as the probe uses it.
+/// A bound GPU's render node, as the probe and the encoder use it.
 ///
 /// # Safety
 /// [`Node::control`] must honor nouveau's uAPI bounds for each request it is
@@ -253,7 +497,7 @@ pub unsafe trait Node {
     fn unmap(&mut self, address: NonNull<u8>, bytes: usize);
     /// A monotonic clock, in nanoseconds.
     fn now_ns(&mut self) -> u64;
-    /// Waits a little between two reads of the semaphore.
+    /// Waits a little between two reads of a semaphore.
     fn pause(&mut self);
 }
 
@@ -334,6 +578,7 @@ pub fn errno_name(errno: i64) -> &'static str {
         -22 => "EINVAL",
         -28 => "ENOSPC",
         -38 => "ENOSYS",
+        -62 => "ETIME",
         -95 => "EOPNOTSUPP",
         -110 => "ETIMEDOUT",
         _ => "errno",
@@ -348,7 +593,7 @@ struct Buffer {
 }
 
 /// The lines go to `log` without a newline.
-type Log<'a> = &'a mut dyn FnMut(fmt::Arguments<'_>);
+pub type Log<'a> = &'a mut dyn FnMut(fmt::Arguments<'_>);
 
 /// Probes the encoder of `chipset` through `node`, waiting at most
 /// `timeout_ns` for its semaphore, and says what it found to `log`.
@@ -370,14 +615,10 @@ pub fn probe<N: Node>(node: &mut N, chipset: u16, timeout_ns: u64, log: Log<'_>)
     };
     let result = node.control(CHANNEL_ALLOC, (&raw mut alloc).cast());
     if result != 0 {
-        let why = match result {
-            -38 => "this nouveau has no NVENC case in abi16 (Linux patch 0214)",
-            -22 => "nouveau found no NVENC runlist on this GPU",
-            _ => "nouveau or GSP-RM refused the channel",
-        };
         log(format_args!(
-            "NVENC PROBE channel refused: {} ({result}): {why}",
-            errno_name(result)
+            "NVENC PROBE channel refused: {} ({result}): {}",
+            errno_name(result),
+            channel_refusal(result)
         ));
         let outcome = Outcome::Failed {
             step: Step::Channel,
@@ -405,6 +646,15 @@ pub fn probe<N: Node>(node: &mut N, chipset: u16, timeout_ns: u64, log: Log<'_>)
     }
     done(log, &outcome);
     outcome
+}
+
+/// Why nouveau refused an NVENC channel, by its errno.
+pub fn channel_refusal(errno: i64) -> &'static str {
+    match errno {
+        -38 => "this nouveau has no NVENC case in abi16 (Stela's Linux patch)",
+        -22 => "nouveau found no NVENC runlist on this GPU",
+        _ => "nouveau or GSP-RM refused the channel",
+    }
 }
 
 /// The probe's last line.
@@ -648,5 +898,7 @@ fn close<N: Node>(node: &mut N, handle: u32) {
     node.control(GEM_CLOSE, (&raw mut close).cast());
 }
 
+#[cfg(test)]
+mod mock;
 #[cfg(test)]
 mod tests;
