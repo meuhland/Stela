@@ -124,6 +124,26 @@ pub struct HostInput {
     held: HeldInputs,
     /// The next device's identity.
     next_id: u64,
+    /// Host keyboard and pointer changes given to the guest since boot
+    /// (`INPUT reports`).
+    delivered: Delivered,
+}
+
+/// Host input changes given to the guest's peripheral since boot, by kind:
+/// a key, or any pointer change (motion, position, buttons, wheels).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Delivered {
+    keyboard: u64,
+    pointer: u64,
+}
+
+impl Delivered {
+    fn count(&mut self, input: &Input) {
+        match input {
+            Input::Key { .. } => self.keyboard += 1,
+            _ => self.pointer += 1,
+        }
+    }
 }
 
 impl HostInput {
@@ -151,6 +171,7 @@ impl HostInput {
             wanted_leds: None,
             reported_times: 0,
             held: HeldInputs::new(),
+            delivered: Delivered::default(),
         }
     }
 
@@ -168,6 +189,7 @@ impl HostInput {
     }
 
     fn deliver(&mut self, devices: &mut AppleDevices, input: Input) {
+        self.delivered.count(&input);
         match devices.input(input) {
             Ok(()) => super::session::input(),
             Err(error) => {
@@ -315,10 +337,29 @@ impl HostInput {
         pending
     }
 
-    /// `INPUT TIMES name:polls/waited_us/longest_wait_us/polled_us/
-    /// longest_poll_us/skipped …`: each device's polls since the last
-    /// report, the host-drivers lock waits before them, and their own time.
+    /// `INPUT reports keyboard=N pointer=N devices=N usb_errors=N
+    /// usb_retry_windows=N`: the host keyboard and pointer changes given to
+    /// the guest since boot, which grow as the host's keys and motion reach
+    /// it; the devices still read; and their USB HID transfer errors and the
+    /// times a second of failures slowed an interface's retries, each
+    /// retried. Then `INPUT TIMES name:polls/waited_us/longest_wait_us/
+    /// polled_us/longest_poll_us/skipped …`: each device's polls since the
+    /// last report, the host-drivers lock waits before them, and their own
+    /// time.
     fn report_times(&mut self) {
+        let (errors, windows) = self
+            .inputs
+            .devices
+            .iter()
+            .map(InputDevice::transfer_errors)
+            .fold((0, 0), |(e, w), (de, dw)| (e + de, w + dw));
+        output::arguments(format_args!(
+            "INPUT reports keyboard={} pointer={} devices={} usb_errors={errors} \
+             usb_retry_windows={windows}\n",
+            self.delivered.keyboard,
+            self.delivered.pointer,
+            self.inputs.devices.len(),
+        ));
         let micros = |ticks: u64| ticks / (super::host::COUNTER_HZ / 1_000_000);
         let mut line = alloc::string::String::from("INPUT TIMES");
         for (device, reported) in self.inputs.devices.iter().zip(&mut self.reported) {

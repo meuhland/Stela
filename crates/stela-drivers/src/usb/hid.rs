@@ -320,6 +320,11 @@ pub struct UsbInput {
     error_reported: bool,
     /// Why polling stopped for good.
     stop_cause: Option<String>,
+    /// Reports received, transfer errors met, and the times a second of
+    /// failures slowed the retries, since the interface started.
+    reports: u64,
+    transfer_errors: u64,
+    retry_windows: u64,
     pub name: String,
 }
 
@@ -508,6 +513,9 @@ impl UsbInput {
             failed: false,
             error_reported: false,
             stop_cause: None,
+            reports: 0,
+            transfer_errors: 0,
+            retry_windows: 0,
             name: format!(
                 "{} ({} interface {})",
                 device.name(),
@@ -590,6 +598,7 @@ impl UsbInput {
                 Ok(bytes) => {
                     self.queued = None;
                     self.retry = None;
+                    self.reports += 1;
                     let bytes = self.buffer.bytes()[..bytes].to_vec();
                     let events_at = self.pending.hid.events.len();
                     let translated = self.translator.translate(
@@ -630,6 +639,7 @@ impl UsbInput {
                 }
                 Err(error) => {
                     self.error.get_or_insert_with(|| error.clone());
+                    self.transfer_errors += 1;
                     self.invalidate_touch();
                     self.invalidate_receiver(receiver::Error::Transport);
                     let recovered =
@@ -646,10 +656,16 @@ impl UsbInput {
                     if recovered.is_ok() {
                         self.queued = None;
                     }
+                    let was_slow = self.retrying_slowly();
                     self.retry = Some(match self.retry {
                         None => Retry::first(now),
                         Some(retry) => retry.next(now),
                     });
+                    // A second of failures without a report (`INPUT reports
+                    // usb_retry_windows`).
+                    if !was_slow && self.retrying_slowly() {
+                        self.retry_windows += 1;
+                    }
                     // Only an endpoint that cannot be made ready again
                     // stops the interface: a transfer that keeps failing
                     // is tried again for as long as the device stays.
@@ -723,6 +739,21 @@ impl UsbInput {
     /// tried again once a second.
     pub fn retrying_slowly(&self) -> bool {
         self.retry.is_some_and(|retry| retry.slow)
+    }
+
+    /// Reports received since the interface started.
+    pub fn reports(&self) -> u64 {
+        self.reports
+    }
+
+    /// Transfer errors met since the interface started, each retried.
+    pub fn transfer_errors(&self) -> u64 {
+        self.transfer_errors
+    }
+
+    /// The times a second of failures without a report slowed the retries.
+    pub fn retry_windows(&self) -> u64 {
+        self.retry_windows
     }
 }
 

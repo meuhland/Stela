@@ -133,6 +133,16 @@ impl InputDevice {
         }
     }
 
+    /// A USB HID interface's transfer errors, and the times a second of
+    /// failures slowed its retries, since it started; zero for other
+    /// devices.
+    pub fn transfer_errors(&self) -> (u64, u64) {
+        match self {
+            Self::Usb(device) => (device.transfer_errors(), device.retry_windows()),
+            _ => (0, 0),
+        }
+    }
+
     /// Why the device stopped, when it holds the cause: the failure that
     /// ended its transfers, or that its device left.
     pub fn stop_cause(&self) -> Option<String> {
