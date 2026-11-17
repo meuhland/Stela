@@ -758,10 +758,17 @@ fn add_usbs(
         let hub = input || !usb.disks.is_empty() || usb.network.is_some();
         if hub && index + 1 == usbs && index != 0 {
             let disks = usb.disks.len();
-            let network = usb.network;
+            // Whether a network adapter is attached, never its station
+            // address: logs are shared, and an address printed as decimal
+            // bytes escapes the usual masking.
+            let network = if usb.network.is_some() {
+                "attached"
+            } else {
+                "none"
+            };
             devices.attach_input(controller.port, core::mem::take(&mut usb))?;
             log(format_args!(
-                "INPUT attached to USB-C port {} with {disks} USB disks, network={network:?}\n",
+                "INPUT attached to USB-C port {} with {disks} USB disks, network={network}\n",
                 controller.port
             ));
         }
