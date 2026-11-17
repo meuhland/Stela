@@ -527,3 +527,27 @@ fn probe_nvenc_is_off_by_default_and_round_trips() {
     let alone = round_trip(&format!("--system {PROBE_NVENC}"));
     assert_eq!(alone.to_string(), "--system --probe-nvenc");
 }
+
+/// `--nvenc-selftest` encodes a test pattern with NVENC before macOS; it is
+/// off unless asked for, round-trips alone, beside the probe and beside the
+/// boot's usual flags, and asks for nothing else.
+#[test]
+fn nvenc_selftest_is_off_by_default_and_round_trips() {
+    assert!(!System::default().nvenc_selftest);
+    assert!(!round_trip("--system").nvenc_selftest);
+    let alone = round_trip(&format!("--system {NVENC_SELFTEST}"));
+    assert!(alone.nvenc_selftest && !alone.probe_nvenc);
+    assert_eq!(alone.to_string(), "--system --nvenc-selftest");
+    assert_eq!(
+        System {
+            nvenc_selftest: false,
+            ..alone
+        },
+        System::default()
+    );
+    let both = round_trip(&format!("--system {NVENC_SELFTEST} {PROBE_NVENC}"));
+    assert!(both.nvenc_selftest && both.probe_nvenc);
+    assert_eq!(both.to_string(), "--system --probe-nvenc --nvenc-selftest");
+    let usual = round_trip(&format!("--system --input --parallel {NVENC_SELFTEST}"));
+    assert!(usual.nvenc_selftest && usual.input && usual.parallel);
+}

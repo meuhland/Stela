@@ -3,20 +3,34 @@ use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 
 #[test]
 fn requests_match_the_kernel_headers() {
-    // `DRM_IOCTL_NOUVEAU_*` as Linux's headers spell them, by size.
+    // `DRM_IOCTL_NOUVEAU_*` and DRM's own, as Linux's headers spell them, by
+    // size.
     assert_eq!(size_of::<ChannelAlloc>(), 88);
     assert_eq!(size_of::<GemInfo>(), 40);
     assert_eq!(size_of::<GemNew>(), 48);
     assert_eq!(size_of::<PushbufBo>(), 40);
     assert_eq!(size_of::<PushbufPush>(), 24);
     assert_eq!(size_of::<Pushbuf>(), 64);
+    assert_eq!(size_of::<VmInit>(), 16);
+    assert_eq!(size_of::<VmBindOp>(), 40);
+    assert_eq!(size_of::<VmBind>(), 40);
+    assert_eq!(size_of::<ExecPush>(), 16);
+    assert_eq!(size_of::<Exec>(), 40);
+    assert_eq!(size_of::<Sync>(), 16);
+    assert_eq!(size_of::<SyncobjWait>(), 40);
     assert_eq!(CHANNEL_ALLOC, 0xc058_6442);
     assert_eq!(CHANNEL_FREE, 0x4004_6443);
     assert_eq!(GROBJ_ALLOC, 0x400c_6444);
+    assert_eq!(VM_INIT, 0xc010_6450);
+    assert_eq!(VM_BIND, 0xc028_6451);
+    assert_eq!(EXEC, 0xc028_6452);
     assert_eq!(GEM_NEW, 0xc030_6480);
     assert_eq!(GEM_PUSHBUF, 0xc040_6481);
     assert_eq!(GEM_CPU_PREP, 0x4008_6482);
     assert_eq!(GEM_CLOSE, 0x4008_6409);
+    assert_eq!(SYNCOBJ_CREATE, 0xc008_64bf);
+    assert_eq!(SYNCOBJ_DESTROY, 0xc008_64c0);
+    assert_eq!(SYNCOBJ_WAIT, 0xc028_64c3);
 }
 
 #[test]
@@ -72,8 +86,24 @@ fn only_ga10x_with_an_encoder_is_probed() {
     }
 }
 
+#[test]
+fn the_codecs_send_nvidias_captured_controls() {
+    let cbr = Rate::Cbr {
+        bitrate: Rate::CAPTURED_BITRATE,
+    };
+    assert_eq!(Codec::H264.control(cbr), 0x1200_1303);
+    assert_eq!(Codec::Hevc.control(cbr), 0x1200_1104);
+    // RC mode 0, constant QP, as nvenc-test's --const-qp.
+    assert_eq!(Codec::H264.control(Rate::ConstQp(25)), 0x1303);
+    assert_eq!(Codec::Hevc.control(Rate::ConstQp(25)), 0x1104);
+    assert_eq!(
+        (Codec::H264.application(), Codec::Hevc.application()),
+        (1, 3)
+    );
+}
+
 /// The `(subchannel, method, data)` writes of incrementing method runs.
-fn decode(words: &[u32]) -> Vec<(u32, u32, u32)> {
+pub(super) fn decode(words: &[u32]) -> Vec<(u32, u32, u32)> {
     let mut methods = Vec::new();
     let mut index = 0;
     while index < words.len() {

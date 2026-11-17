@@ -62,6 +62,9 @@ pub const SINGLE_USER: &str = "--single-user";
 pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 /// Checks each started GPU's video encoder before macOS (`NVENC PROBE` lines).
 pub const PROBE_NVENC: &str = "--probe-nvenc";
+/// Encodes a test pattern with each started GPU's NVENC before macOS
+/// (`NVENC SELFTEST` lines).
+pub const NVENC_SELFTEST: &str = "--nvenc-selftest";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -440,6 +443,11 @@ pub struct System {
     /// encoder runs under GSP: a channel on its runlist, its class, and one
     /// semaphore release, logged as `NVENC PROBE` lines (`--probe-nvenc`).
     pub probe_nvenc: bool,
+    /// Once the GPUs start, before macOS, encode a moving test pattern with
+    /// each GA10x GPU's NVENC, H.264 then HEVC, at a fixed QP then CBR, and
+    /// check every frame, logged as `NVENC SELFTEST` lines
+    /// (`--nvenc-selftest`). Nothing it finds stops the boot.
+    pub nvenc_selftest: bool,
     /// Log every device access in these physical ranges (`--watch BASE,BYTES`).
     pub watches: Vec<(u64, u64)>,
     /// Guest virtual ranges the stop's report shows (`--dump BASE,BYTES`).
@@ -521,6 +529,7 @@ impl Default for System {
             monitor_trace: false,
             display_trace: false,
             probe_nvenc: false,
+            nvenc_selftest: false,
             watches: Vec::new(),
             dumps: Vec::new(),
         }
@@ -984,6 +993,7 @@ impl fmt::Display for System {
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
+        line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
