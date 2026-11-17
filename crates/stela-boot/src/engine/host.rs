@@ -423,7 +423,13 @@ static TSC_OFFSETS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// reads it moved by that offset. Cores take it only once their local
 /// record is active, which each AP's is before the first offset is kept.
 pub fn rdtsc() -> u64 {
-    let raw = crate::apic::rdtsc();
+    shared_tsc(crate::apic::rdtsc())
+}
+
+/// This processor's raw counter value `raw` as the BSP's counter read at
+/// the same instant ([`rdtsc`]), for a caller that takes the raw value
+/// itself, as the native clock does after its LFENCE.
+pub(crate) fn shared_tsc(raw: u64) -> u64 {
     if TSC_OFFSETS.load(core::sync::atomic::Ordering::Relaxed) {
         stela_boot_core::tsc::sync::shared_tsc(raw, local::tsc_offset())
     } else {

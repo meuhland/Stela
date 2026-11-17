@@ -22,13 +22,18 @@ pub(super) fn ordered() -> u64 {
     let _ = __cpuid_count(0, 0);
     result
 }
-/// The counter after every earlier instruction, without CPUID's VM exit:
-/// LFENCE dispatch-serializes on Intel and on AMD with its MSR control set,
-/// as Linux's rdtsc_ordered relies on.
+/// The BSP's counter after every earlier instruction, without CPUID's VM
+/// exit: LFENCE dispatch-serializes on Intel and on AMD with its MSR control
+/// set, as Linux's rdtsc_ordered relies on. A core whose counter agrees with
+/// the BSP's only through a software offset reads it moved by that offset
+/// (`host::shared_tsc`): the clock's samples and a device wait's start and
+/// end may be taken on different cores (the boot processor and the one
+/// running Linux in its place), whose raw counters can be seconds apart.
 pub(super) fn fenced() -> u64 {
     // SAFETY: LFENCE and RDTSC have no memory effects; x86-64 has both.
-    unsafe {
+    let raw = unsafe {
         core::arch::x86_64::_mm_lfence();
         core::arch::x86_64::_rdtsc()
-    }
+    };
+    crate::engine::host::shared_tsc(raw)
 }
