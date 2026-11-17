@@ -113,6 +113,8 @@ pub(crate) struct Settings {
     pub loop_counts_off: bool,
     /// `--page-relative`, as the home machine compiles.
     pub page_relative: bool,
+    /// `--shared-aliases`, as the home machine shares blocks.
+    pub shared_aliases: bool,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -147,6 +149,7 @@ pub(crate) fn spawn<H: Host>(
             table_insert_throttled: settings.table_insert_throttled,
             loop_counts_off: settings.loop_counts_off,
             page_relative: settings.page_relative,
+            shared_aliases: settings.shared_aliases,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -172,6 +175,7 @@ struct Pe {
     table_insert_throttled: bool,
     loop_counts_off: bool,
     page_relative: bool,
+    shared_aliases: bool,
 }
 
 impl Pe {
@@ -187,6 +191,7 @@ impl Pe {
             table_insert_throttled,
             loop_counts_off,
             page_relative,
+            shared_aliases,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -213,6 +218,7 @@ impl Pe {
         machine.set_loop_counts_off(loop_counts_off);
         machine.set_table_insert_throttled(table_insert_throttled);
         machine.set_page_relative(page_relative);
+        machine.set_shared_aliases(shared_aliases);
         if step_timing {
             host::pmu::start(pe);
         }

@@ -62,10 +62,13 @@ fn insert_target(
     target: chain::LookupEntry,
 ) -> bool {
     let block = &code.blocks[index];
-    if cache
-        .index
-        .get(&code.blocks, pc, block.physical, block.variant)
-        != Some(index)
+    if cache.index.get(
+        &code.blocks,
+        pc,
+        block.physical,
+        block.variant,
+        block.shared,
+    ) != Some(index)
     {
         cache.targets_raced += 1;
         return false;
@@ -76,7 +79,18 @@ fn insert_target(
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
+    /// The block a fetch at `pc` runs, or its exception or checked
+    /// instruction. A block's page is the one it runs at next
+    /// ([`Machine::ran_page`]).
     pub(super) fn fetch_block(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
+        let fetched = self.fetch_block_at(pc, single);
+        if let Ok(Fetched::Block(_)) = fetched {
+            self.ran_page = pc & !(FETCH_PAGE - 1);
+        }
+        fetched
+    }
+
+    fn fetch_block_at(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
         let context = self.current_variant(single, false);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         let contexts = self.contexts(el, context);
@@ -158,6 +172,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let variant = self.page_variant(current, physical);
         // The block another context, address space or fetch of the frame
         // recorded: what a TLBI ALL or a process switch leaves.
+        let aliases = !single && self.aliases_at(pc);
         if !single && let Some(id) = self.known_variant(variant) {
             let key = self.block_key(physical, id);
             self.translate_leaf(pc, key, physical, current);
@@ -169,7 +184,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .then(|| self.code.blocks.installed(target.block as usize))
                 .flatten()
                 .is_some_and(|block| {
-                    (block.pc, block.physical, block.variant) == (pc, physical, id)
+                    block.serves(pc, aliases) && (block.physical, block.variant) == (physical, id)
                 });
             if named {
                 self.statistics.fetches[1] += 1;
@@ -193,8 +208,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let indexed = self
             .known_variant(variant)
-            .and_then(|id| self.code.find(pc, physical, id));
+            .and_then(|id| self.code.find(pc, physical, id, aliases));
         self.statistics.fetches[if indexed.is_some() { 3 } else { 4 }] += 1;
+        // A shared block installed for another page: an install avoided.
+        if indexed.is_some_and(|index| self.code.blocks[index].pc != pc) {
+            self.statistics.aliases[Alias::Hits as usize] += 1;
+        }
         let index = match indexed {
             Some(index) => index,
             None => {
@@ -209,7 +228,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 // the code it compiled; the block stays for the next one.
                 if mail {
                     self.read_mail()?;
-                    return self.fetch_block(pc, single);
+                    return self.fetch_block_at(pc, single);
                 }
                 match compiled {
                     Fetched::Block(index) => index,
@@ -560,7 +579,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // indexed blocks of a target's page). The finder answers without
         // the lock; the lock checks again before the insert.
         let code = &self.code;
-        match code.finder.find(&code.blocks, pc, physical, variant_id) {
+        let shared = block.shared;
+        match code
+            .finder
+            .find(&code.blocks, pc, physical, variant_id, shared)
+        {
             Some(Some(found)) if found == index => {}
             Some(_) => {
                 board::Events::count(&code.events.targets_unindexed);
@@ -1300,6 +1323,28 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }))
         .then(|| (code.0 + code_bytes.len() - chain::DYNAMIC_EXIT_BYTES) as u64);
         let first = self.admit(u32::from_le_bytes(source[..4].try_into().expect("a word")));
+        // One body for every page that maps the frame (`--shared-aliases`):
+        // page-relative code with no guest address of its own, ending in no
+        // exit an install-time thunk completes for `pc` (PAC, transition and
+        // mirrored-read thunks are built for `GuestAddress(pc)`), outside a
+        // device-site page (which the store neither gives nor takes) and a
+        // page with a host breakpoint or trace point.
+        let serves_aliases = !single
+            && !self.installing_stub
+            && self.aliases_at(pc)
+            && variant.system.page_relative
+            && !variant.translated
+            && !variant.timing
+            && compiled.page_independent()
+            && !self.page_has_device_sites(physical)
+            && code_bytes
+                .len()
+                .checked_sub(chain::DIRECT_EXIT_BYTES)
+                .is_none_or(|site| {
+                    let exit = &code_bytes[site..];
+                    !super::exits_to(exit, terminal_pc, ExitKind::PointerAuthentication)
+                        && !super::exits_to(exit, terminal_pc, ExitKind::System)
+                });
         // A device site's stub completes only a plain device load natively.
         if !single && self.installing_stub {
             successors.extend(self.complete_device_read_natively(
@@ -1351,6 +1396,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             installer: self.current as u8,
             part: shared_part(&self.code, code),
             device_stub: self.installing_stub,
+            shared: serves_aliases,
         };
         let shared = Arc::clone(&self.code);
         shared.blocks.fill(slot, block);
@@ -1368,9 +1414,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
             installed_bytes,
             instructions,
         );
-        // Another PE installed the block meanwhile: the first install wins,
-        // and this one's code stays unreachable until its part goes.
-        if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id) {
+        // Another PE installed the block meanwhile, or a shared block of
+        // the frame offset at another page: the first install wins, and
+        // this one's code stays unreachable until its part goes.
+        let aliases = shared.blocks[slot].shared;
+        if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id, aliases) {
             shared.blocks.record(slot).mark_lost();
             // Its rows go: nothing faults in a block never reached.
             shared.blocks.recovery().remove(&slot);
@@ -1381,6 +1429,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .release(alloc::vec![slot as u32], grace.snapshot());
             drop(cache);
             self.statistics.lost_installs += 1;
+            if shared.blocks[held].pc != pc {
+                self.statistics.aliases[Alias::Lost as usize] += 1;
+            }
             board::Events::count(&shared.events.lost);
             return Ok(Some(Fetched::Block(held)));
         }
@@ -1413,6 +1464,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some(replaced) = cache.index.insert(&shared.blocks, slot) {
             // Only indexed blocks are reached, which eviction relies on.
             self.detach(&mut cache, &[replaced as u32]);
+        }
+        if shared.blocks[slot].shared {
+            self.statistics.aliases[Alias::Installs as usize] += 1;
         }
         // The fetch that compiled the block would take the lock again for
         // its block table entry right after; it takes it in this hold,
@@ -2034,7 +2088,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the block's last instruction, as it was compiled, or one it reads.
     pub(super) fn exit_word(&mut self, index: usize, pc: u64) -> Result<u32, Stop> {
         let block = &self.code.blocks[index];
-        if pc == block.terminal_pc() {
+        if pc == block.terminal_at(pc) {
             let terminal = block.terminal;
             let incarnation = self.code.blocks.record(index).incarnation();
             let pending = &mut self.exit_pending[index % PENDING_EXITS];
@@ -2130,10 +2184,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// block's last is kept as it was compiled; others are read again.
     pub(super) fn word(&mut self, index: usize, pc: u64) -> Result<u32, Stop> {
         let block = &self.code.blocks[index];
-        if pc == block.terminal_pc() {
+        if pc == block.terminal_at(pc) {
             return Ok(block.terminal);
         }
-        let physical = block.physical + (pc - block.pc);
+        let physical = block.physical + (pc - block.start_at(pc));
         let mut bytes = [0; 4];
         if !self.host.read_ram(physical, &mut bytes) {
             return Err(self.unsupported(RequirementKind::Fetch { physical }));
@@ -2170,8 +2224,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             record.live(),
             block.installer,
             block.device_stub,
-            self.device_site(block.physical.wrapping_add(pc.wrapping_sub(block.pc))),
-            block.pc,
+            self.device_site(
+                block
+                    .physical
+                    .wrapping_add(pc.wrapping_sub(block.start_at(pc)))
+            ),
+            block.start_at(pc),
             block.physical,
             block.instructions,
             block.terminal,
@@ -2186,7 +2244,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let kind = ExitKind::try_from(kind);
         // BTYPE belongs to the block's first instruction until it completes;
         // a branch ending the block gives the next one (Arm `BTypeNext`).
-        if next_pc != self.code.blocks[index].pc {
+        if next_pc != self.running_pc(index) {
             self.cpu.pstate.btype = 0;
         }
         match kind {
