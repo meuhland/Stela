@@ -41,6 +41,7 @@ impl ParseState<'_> {
                 options.profile_keep_pack = true;
             }
             "--table-insert-throttled" => options.table_insert_throttled = true,
+            "--page-relative" => options.page_relative = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,

@@ -388,11 +388,19 @@ impl<'a> Asm<'a> {
             self.alu_load(Alu::Add, Size::Qword, destination, super::frame(PAGE_BASE));
         }
     }
-    /// [`Self::guest_imm64`] for a direct exit's target in RAX, whose
-    /// patchable layout ([`super::chain`]) the field ends: page-relative,
-    /// the offset alone, which the engine adds the entry's page to.
+    /// [`Self::guest_imm64`] for a direct exit's target in RAX, and the
+    /// exit's base slot ([`super::chain::BASE_BYTES`]): page-relative, the
+    /// field's offset gets the page base added, else a NOP keeps the
+    /// exit's size.
     pub(crate) fn guest_exit_imm64(&mut self, destination: Gpr, address: crate::GuestAddress) {
+        debug_assert_eq!(destination, Gpr::Rax, "a direct exit's target is in RAX");
         self.guest_field(destination, address);
+        let relative = self.page_relative && self.relocations.is_some();
+        self.data(if relative {
+            &super::chain::BASE_ADD
+        } else {
+            &super::chain::BASE_NOP
+        });
     }
     fn guest_field(&mut self, destination: Gpr, address: crate::GuestAddress) {
         self.opcode_reg(Size::Qword, 0xb8, destination);
