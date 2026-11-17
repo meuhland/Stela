@@ -8287,29 +8287,34 @@ edge_to(LLVMBasicBlockRef from, LLVMBasicBlockRef to)
 static bool
 linked_references(struct translator *t, LLVMValueRef fn)
 {
-   LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-   unsigned count;
-   if (!stela_air_named_md(&t->metadata, "air.visible_function_references", nodes, &count))
+   struct stela_air_list nodes;
+   if (!stela_air_named_list(&t->metadata, "air.visible_function_references", &nodes))
       return false;
-   LLVMValueRef unlinked[AIR_MAX_METADATA_OPERANDS];
+   /* The unlinked functions take the places of the nodes already read. */
+   LLVMValueRef *unlinked = nodes.nodes;
    unsigned unlinked_count = 0;
-   for (unsigned i = 0; i < count; i++) {
+   for (unsigned i = 0; i < nodes.count; i++) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned field_count;
-      if (!stela_air_md_node(&t->metadata, nodes[i], fields, &field_count))
+      if (!stela_air_md_node(&t->metadata, nodes.nodes[i], fields, &field_count)) {
+         stela_air_list_release(&nodes);
          return false;
+      }
       if (field_count == 3 && fields[1] && LLVMIsAFunction(fields[1]) &&
           LLVMIsDeclaration(fields[1]))
          unlinked[unlinked_count++] = fields[1];
    }
-   if (!unlinked_count)
+   if (!unlinked_count) {
+      stela_air_list_release(&nodes);
       return true;
+   }
    unsigned blocks = LLVMCountBasicBlocks(fn);
    LLVMBasicBlockRef *stack = malloc(sizeof(*stack) * (blocks ? blocks : 1));
    struct set *seen = _mesa_pointer_set_create(NULL);
    if (!stack || !seen) {
       free(stack);
       _mesa_set_destroy(seen, NULL);
+      stela_air_list_release(&nodes);
       return fail(t, STELA_AIR_ALLOCATION, "visible function reference walk allocation failed");
    }
    unsigned depth = 0;
@@ -8345,6 +8350,7 @@ linked_references(struct translator *t, LLVMValueRef fn)
    }
    free(stack);
    _mesa_set_destroy(seen, NULL);
+   stela_air_list_release(&nodes);
    return linked;
 }
 

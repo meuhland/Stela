@@ -1365,6 +1365,56 @@ modules_list_their_functions(void)
    assert(count == 1);
 }
 
+/* A module of `kernels` kernels, each storing its index, as Metal's
+ * compiler builds a library compiled from source: one module listing them
+ * all. */
+static char *
+many_kernels(unsigned kernels)
+{
+   char *fixture = ralloc_strdup(NULL, "");
+   for (unsigned i = 0; i < kernels; i++)
+      ralloc_asprintf_append(&fixture,
+                             "define void @k%u(ptr addrspace(1) %%data) {\n"
+                             "store i32 %u, ptr addrspace(1) %%data, align 4\nret void\n}\n",
+                             i, i);
+   ralloc_strcat(&fixture, "!air.kernel = !{");
+   for (unsigned i = 0; i < kernels; i++)
+      ralloc_asprintf_append(&fixture, "%s!%u", i ? ", " : "", 1000 + i);
+   ralloc_strcat(&fixture, "}\n!900 = !{}\n!901 = !{!902}\n"
+                 "!902 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1,"
+                 " !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\","
+                 " i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\","
+                 " !\"air.arg_name\", !\"data\"}\n");
+   for (unsigned i = 0; i < kernels; i++)
+      ralloc_asprintf_append(&fixture, "!%u = !{ptr @k%u, !900, !901}\n", 1000 + i, i);
+   return fixture;
+}
+
+/* A module may list more entry points than a metadata node holds operands
+ * (256, AIR_MAX_METADATA_OPERANDS): a library compiled from source lists every
+ * function of it in one module. Each is listed, reflected and compiled. */
+static void
+modules_list_any_number_of_entries(void)
+{
+   const unsigned kernels = 300;
+   char *fixture = many_kernels(kernels);
+   assert(listed_functions(fixture) == kernels);
+   struct stela_metal_reflection reflection;
+   struct stela_air_error error;
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   static const char *const entries[] = {"k0", "k255", "k256", "k299"};
+   for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+      assert(reflect(fixture, entries[i], &reflection, &error) &&
+             reflection.stage == STELA_METAL_KERNEL);
+      nir_shader *shader = compile(fixture, entries[i], &specialization, &error);
+      if (!shader)
+         fprintf(stderr, "%s: %u %s\n", entries[i], error.kind, error.detail);
+      assert(shader);
+      stela_metal_release(shader);
+   }
+   ralloc_free(fixture);
+}
+
 static bool
 list_export(void *data, const char *name, size_t name_bytes, enum stela_metal_function_stage stage)
 {
@@ -5057,6 +5107,7 @@ main(void)
    glsl_type_singleton_init_or_ref();
    harness();
    modules_list_their_functions();
+   modules_list_any_number_of_entries();
    modules_list_their_exports();
    discovery_reports_malformed_metadata();
    reflection_requires_a_unique_listed_entry();
