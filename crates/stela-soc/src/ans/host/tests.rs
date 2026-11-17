@@ -393,6 +393,74 @@ fn a_waiting_flush_refills_each_discard_slot_as_it_completes() {
     assert!(!disk.discarding());
 }
 
+/// A disk that runs each command where it is asked: the discard commands
+/// it ran.
+struct Inline {
+    disk: RamDisk,
+    discards: Rc<RefCell<usize>>,
+}
+
+impl BlockDevice for Inline {
+    fn identity(&self) -> &Identity {
+        self.disk.identity()
+    }
+
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.disk.read(lba, buffer)
+    }
+
+    fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        self.disk.write(lba, data)
+    }
+
+    fn flush_cache(&mut self) -> Result<(), BlockError> {
+        self.disk.flush_cache()
+    }
+
+    fn execute(&mut self, command: Command) -> Finished {
+        if matches!(command, Command::Discard { .. }) {
+            *self.discards.borrow_mut() += 1;
+            return Ok(None);
+        }
+        self.disk.execute(command)
+    }
+}
+
+/// On a disk that runs each command on the calling PE, under the devices'
+/// lock, one poll of a waiting flush runs at most [`DISCARD_COMMANDS`]
+/// discards; the rest go at the next polls, and the flush after them.
+#[test]
+fn a_disk_that_runs_commands_where_asked_takes_a_bounded_number_of_discards_a_poll() {
+    let mut ram = RamDisk::new("", 256, 4096);
+    ram.identity.features.discard = Some(DiscardLimits {
+        blocks: 0,
+        ranges: 1,
+    });
+    ram.identity.features.write_zeroes = Some(WriteZeroes {
+        blocks: 64,
+        unmap: true,
+    });
+    ram.identity.features.write_cache = true;
+    let discards = Rc::new(RefCell::new(0));
+    let mut disk = HostDisk::new(Box::new(Inline {
+        disk: ram,
+        discards: discards.clone(),
+    }));
+    let runs = DISCARD_COMMANDS * 3 - 2;
+    for run in 0..runs as u64 {
+        disk.discard(run * 2, 1);
+    }
+    assert!(disk.submit(1, Request::Flush, 0).is_none());
+    assert!(disk.poll(0).is_empty());
+    assert_eq!(*discards.borrow(), DISCARD_COMMANDS);
+    assert!(disk.poll(1).is_empty());
+    assert_eq!(*discards.borrow(), DISCARD_COMMANDS * 2);
+    let done = disk.poll(2);
+    assert_eq!(*discards.borrow(), runs);
+    assert_eq!(done.len(), 1, "the flush goes once every discard ran");
+    assert!(!disk.discarding());
+}
+
 /// Urgent batches go beside guest transfers, and a write waits out
 /// whichever running batch it overlaps, not the others.
 #[test]

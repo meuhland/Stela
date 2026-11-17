@@ -304,10 +304,14 @@ impl HostDisk {
     /// none runs; while urgent, a new one in each free slot of
     /// [`DISCARD_COMMANDS`], so a batch waits for no other. Then resubmit
     /// the transfers that waited: a write beside the running batches goes,
-    /// a flush waits on until none remains.
+    /// a flush waits on until none remains. One call starts at most
+    /// [`DISCARD_COMMANDS`] batches: a disk that runs each command where it
+    /// is asked runs them on the calling PE, under the devices' lock, so the
+    /// rest wait for the next poll.
     fn advance_discards(&mut self, done: &mut Vec<(u32, Finished)>, now: u64) {
+        let mut started = 0;
         loop {
-            self.start_discards(now);
+            started += self.start_discards(now, DISCARD_COMMANDS - started);
             let before = self.discards.running.len();
             let mut index = 0;
             while index < self.discards.running.len() {
@@ -320,11 +324,14 @@ impl HostDisk {
                     self.refuse_discards(error);
                 }
             }
-            // A slot an urgent batch freed takes the next at once; with a
-            // disk that runs commands synchronously this ends once none
-            // waits.
+            // A slot an urgent batch freed takes the next at once, up to
+            // this call's bound.
             let freed = self.discards.running.len() < before;
-            if !(freed && self.discards.urgent() && !self.discards.waiting.is_empty()) {
+            if !(freed
+                && started < DISCARD_COMMANDS
+                && self.discards.urgent()
+                && !self.discards.waiting.is_empty())
+            {
                 break;
             }
         }
@@ -335,30 +342,36 @@ impl HostDisk {
         }
     }
 
-    /// Start the discard batches due at counter `now`: each one command of
-    /// as many ranges as the disk takes.
-    fn start_discards(&mut self, now: u64) {
+    /// Start up to `most` discard batches due at counter `now`, each one
+    /// command of as many ranges as the disk takes; how many started.
+    fn start_discards(&mut self, now: u64, most: usize) -> usize {
         let Some(limits) = self.identity().features.discard else {
-            return;
+            return 0;
         };
         if !self.discards.urgent() && (!self.running.is_empty() || now < self.discards.due(now)) {
-            return;
+            return 0;
         }
-        while self.discards.running.len() < self.discards.batches()
+        let mut started = 0;
+        while started < most
+            && self.discards.running.len() < self.discards.batches()
             && self.discards.failed.is_none()
         {
             let extents = self.discards.batch(limits.ranges.max(1));
             if extents.is_empty() {
-                return;
+                break;
             }
             let request = Request::Discard {
                 extents: extents.clone(),
             };
             match Submission::new(request, self.device.identity()) {
-                Ok(submission) => self.discards.running.push((submission, extents)),
+                Ok(submission) => {
+                    self.discards.running.push((submission, extents));
+                    started += 1;
+                }
                 Err(error) => self.refuse_discards(error),
             }
         }
+        started
     }
 
     /// The disk refused a discard: name why ([`Self::diagnostic`]) and
