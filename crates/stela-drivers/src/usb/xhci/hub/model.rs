@@ -426,6 +426,11 @@ pub(in super::super) struct Hardware {
     /// The root port reset under way and when it ends.
     root_reset_done: Option<(u32, u64)>,
     pub notification_override: Option<u32>,
+    /// The root port's device left the bus as QEMU's xHCI shows a USB
+    /// device the host takes back ([`Self::depart`]): its transfers end in
+    /// a USB Transaction Error that halts their endpoint, and a Reset
+    /// Endpoint is refused the same way.
+    pub departed: bool,
     pending_interrupts: BTreeMap<(u8, u8), (u64, u64, usize)>,
     /// Bulk TDs a wedged BOT peer never completes; a Stop Endpoint ends them.
     withheld: BTreeMap<(u8, u8), u64>,
@@ -471,6 +476,7 @@ impl Hardware {
             root_reset_us: None,
             root_reset_done: None,
             notification_override: None,
+            departed: false,
             pending_interrupts: BTreeMap::new(),
             withheld: BTreeMap::new(),
             mmio_reads: 0,
@@ -527,6 +533,38 @@ impl Hardware {
     pub fn notify_root(&mut self) {
         self.notify_root_code(SUCCESS);
     }
+    /// The root port's device leaves the bus as QEMU shows it when its host
+    /// takes the passed-through device back (`usb_host` detach): the port
+    /// loses its connection, and each interrupt transfer under way ends in
+    /// a USB Transaction Error (USB_RET_NODEV) that halts its endpoint.
+    pub fn depart(&mut self) {
+        self.departed = true;
+        self.root_status = Some(PP | CSC);
+        let pending: Vec<_> = self
+            .pending_interrupts
+            .iter()
+            .map(|(&(slot, dci), &(trb, _, _))| (slot, dci, trb))
+            .collect();
+        for (slot, dci, trb) in pending {
+            self.pending_interrupts.remove(&(slot, dci));
+            self.fail_departed(slot, dci, trb);
+        }
+        self.notify_root();
+    }
+    /// A transfer `trb` to a departed device: a USB Transaction Error that
+    /// halts the endpoint.
+    fn fail_departed(&mut self, slot: u8, dci: u8, trb: u64) {
+        let output = self.outputs[&slot] + u64::from(dci) * self.context_bytes as u64;
+        write32(output, read32(output) & !7 | ENDPOINT_HALTED);
+        self.event(
+            trb,
+            transfer::USB_TRANSACTION_ERROR,
+            TRANSFER_EVENT,
+            slot,
+            dci,
+            0,
+        );
+    }
     pub fn notify_root_code(&mut self, code: u32) {
         self.event(1 << 24, code, reset::PORT_STATUS_CHANGE, 0, 0, 0);
     }
@@ -571,6 +609,11 @@ impl Hardware {
             .then(|| read32(parameter + self.context_bytes as u64) & 0xfffff);
         let code = if self.fail == Some((kind, slot)) {
             11
+        } else if kind == RESET_ENDPOINT && self.departed {
+            // QEMU's xhci_reset_ep: a device no longer attached answers a
+            // Reset Endpoint with a USB Transaction Error, the endpoint
+            // left Halted.
+            transfer::USB_TRANSACTION_ERROR
         } else if route.is_some()
             && self
                 .answers
@@ -673,12 +716,14 @@ impl Hardware {
                     assert!(self.withheld.keys().all(|(s, _)| *s != slot));
                     for &(s, dci) in self.endpoints.keys() {
                         if s == slot {
-                            assert_eq!(
-                                read32(
-                                    self.outputs[&slot]
-                                        + u64::from(dci) * self.context_bytes as u64
-                                ) & 7,
-                                ENDPOINT_STOPPED,
+                            let state = read32(
+                                self.outputs[&slot] + u64::from(dci) * self.context_bytes as u64,
+                            ) & 7;
+                            // Halted only where its device left the bus and
+                            // its Reset Endpoint was refused.
+                            assert!(
+                                state == ENDPOINT_STOPPED
+                                    || self.departed && state == ENDPOINT_HALTED,
                                 "Disable Slot before acknowledged endpoint retirement"
                             );
                         }
@@ -1002,6 +1047,11 @@ impl Hardware {
         // A doorbell restarts an acknowledged stopped ring. A completed TD
         // leaves it Running, so recovery must Stop EP0 again before Disable.
         let output = self.outputs[&slot] + u64::from(dci) * self.context_bytes as u64;
+        // A Halted endpoint ignores its doorbell (xHCI 4.8.3), as one does
+        // whose Reset Endpoint a departed device's controller refused.
+        if self.departed && read32(output) & 7 == ENDPOINT_HALTED {
+            return;
+        }
         write32(output, read32(output) & !7 | ENDPOINT_RUNNING);
         if dci == 1 {
             let cursor = self.endpoints.get_mut(&(slot, dci)).unwrap();
@@ -1082,6 +1132,10 @@ impl Hardware {
             assert_eq!(control >> 10 & 0x3f, NORMAL);
             if self.nodes[&self.routes[&slot]].hid.is_some() {
                 assert_eq!(dci, 3);
+                if self.departed {
+                    self.fail_departed(slot, dci, trb);
+                    return;
+                }
                 assert!(
                     self.pending_interrupts
                         .insert((slot, dci), (trb, buffer, length as usize))

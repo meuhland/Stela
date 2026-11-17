@@ -223,6 +223,66 @@ fn a_hub_that_a_kvm_switch_unplugs_and_replugs_leaks_no_owner_or_key() {
     }
 }
 
+/// A keyboard on a root port that its host takes back and gives back on
+/// the same port, as Proxmox does with a passed-through USB receiver whose
+/// mapping changes (VM 117, 2026-11-17: `USB removed`, `USB added`, then
+/// `USB removed` again and `USB FAILED USB root port 16 lifecycle: USB
+/// transaction error`, with no keyboard after). QEMU ends the keyboard's
+/// interrupt transfer under way and refuses its Reset Endpoint, each with a
+/// USB Transaction Error, the endpoint left Halted. Its slot is still
+/// disabled, as Linux's xhci_free_dev disables a disconnected device's,
+/// so nothing is reported as failed, its held key is released, and each
+/// return on the same port enumerates it again and its keys arrive.
+#[test]
+fn a_root_keyboard_qemu_takes_back_and_returns_on_the_same_port_starts_again() {
+    let mut late = Late::boot(BTreeMap::from([(0, Node::hid(1))]));
+    for round in 0..3 {
+        {
+            let mut model = late.model.borrow_mut();
+            model.departed = false;
+            model.root_status = Some(PP | CCS | CSC | u32::from(FULL_SPEED) << 10);
+        }
+        let mut seen = late.settle();
+        assert!(seen.failures.is_empty(), "{round}: {:?}", seen.failures);
+        assert_eq!((seen.devices.len(), seen.inputs.len()), (1, 1), "{round}");
+        assert_eq!(late.enabled_slots(), 1, "{round}");
+        late.report(0, &[0, 0, 4, 0, 0, 0, 0, 0]);
+        let keyboard = &mut seen.inputs[0];
+        let pressed = poll_input(keyboard);
+        assert!(
+            pressed.contains(&Input::Key {
+                usage: 4,
+                pressed: true
+            }),
+            "{round}: {pressed:?}"
+        );
+        // Its next interrupt transfer is under way when the host takes it.
+        assert!(poll_input(keyboard).is_empty());
+        late.model.borrow_mut().depart();
+        // Odd rounds: the keyboard's own poll meets the failed transfer
+        // first; its soft retry's Reset Endpoint is refused too and the
+        // endpoint stays Halted, the transfer outstanding.
+        if round % 2 == 1 {
+            assert!(poll_input(keyboard).is_empty());
+            assert!(!keyboard.failed(), "{round}");
+        }
+        let gone = late.settle_within(RETIRE_US);
+        assert!(gone.failures.is_empty(), "{round}: {:?}", gone.failures);
+        assert_eq!(gone.removed.len(), 1, "{round}");
+        assert_eq!(late.enabled_slots(), 0, "{round}");
+        let keyboard = &mut seen.inputs[0];
+        let released = poll_input(keyboard);
+        assert!(
+            released.contains(&Input::Key {
+                usage: 4,
+                pressed: false
+            }),
+            "{round}: {released:?}"
+        );
+        assert!(keyboard.failed(), "{round}");
+    }
+}
+
 /// A hub port whose power never comes up is dropped after the hub's power
 /// on wait, reported once; the keyboard on the other port starts.
 #[test]
