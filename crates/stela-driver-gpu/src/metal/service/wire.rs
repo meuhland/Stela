@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 /// The protocol version a connection negotiates. A major version changes
 /// records; a minor version only adds operations.
 pub const MAJOR: u32 = 4;
-pub const MINOR: u32 = 0;
+pub const MINOR: u32 = 1;
 
 /// A fixed-width wire record.
 ///
@@ -964,6 +964,125 @@ const _: () = assert!(
 /// A binding, member or element without a `TypeInfo`: a datum.
 pub const NO_TYPE: u32 = u32::MAX;
 
+records! {
+    /// `EncoderCapabilities`: what the GPU's video encoder takes, which
+    /// answers `Unsupported` when the host serves none. `codecs` holds
+    /// `1 << EncoderCodec` for each codec; `inputs` holds `1 << EncoderInput`
+    /// for each input.
+    pub struct EncoderCapabilitiesResponse {
+        pub codecs: u32,
+        pub inputs: u32,
+        pub max_sessions: u32,
+        pub open_sessions: u32,
+        pub max_width: u32,
+        pub max_height: u32,
+    }
+
+    /// `EncoderOpen`: a session of `codec` for pictures of `width` by
+    /// `height` (even, 16 to 4096) at `fps_milli` / 1000 frames a second,
+    /// low-latency CBR at `bitrate` bits a second or a fixed `qp` by
+    /// `rate`, with `ENCODER_OPEN_*` flags. `token`, nonzero, names the
+    /// open across the calls answered `Pending` while the host makes it.
+    /// `parameter_sets` receives the stream's SPS and PPS (HEVC: VPS, SPS
+    /// and PPS) as Annex B, which every IDR's bytes repeat.
+    pub struct EncoderOpenRequest {
+        pub token: u64,
+        pub codec: u32,
+        pub width: u32,
+        pub height: u32,
+        pub fps_milli: u32,
+        pub rate: u32,
+        pub bitrate: u32,
+        pub qp: u32,
+        pub flags: u32,
+        pub parameter_sets: Span,
+    }
+
+    /// A new session: its handle, the length of its parameter sets
+    /// (written when they fit), the most bytes one frame's output takes,
+    /// and the size the engine codes.
+    pub struct EncoderOpenResponse {
+        pub encoder: u64,
+        pub parameter_sets_length: u64,
+        pub max_frame_bytes: u64,
+        pub coded_width: u32,
+        pub coded_height: u32,
+    }
+
+    /// `EncoderEncode`: frame `frame` of the session, a number each new
+    /// frame raises; a call made again for the same frame, after `Pending`
+    /// or `Unmapped` or with a longer `out`, goes on with it. The picture is
+    /// in the caller's memory: `EncoderInput` `input`'s planes at `luma`
+    /// and `chroma` (NV12; BGRA has one plane, at `luma`), each row
+    /// `luma_pitch` or `chroma_pitch` bytes after the last; each span holds
+    /// the plane's rows, the last one only as wide as the picture. `flags`
+    /// are `ENCODE_*`; a nonzero `bitrate` sets a CBR session's from this
+    /// frame on. `out` receives the frame's Annex B bytes.
+    pub struct EncoderEncodeRequest {
+        pub encoder: u64,
+        pub frame: u64,
+        pub luma: Span,
+        pub chroma: Span,
+        pub luma_pitch: u32,
+        pub chroma_pitch: u32,
+        pub input: u32,
+        pub flags: u32,
+        pub bitrate: u32,
+        pub reserved: u32,
+        pub out: Span,
+    }
+
+    /// An encoded frame: its Annex B length, written to `out` when it
+    /// fits (when not, the same call with a longer span gets it), whether
+    /// it is an IDR, which begins with the parameter sets, the engine's
+    /// picture index, `error_status` (2 is accepted) and average QP, and
+    /// microseconds of the host's input pass and of the engine's work.
+    pub struct EncoderEncodeResponse {
+        pub bytes: u64,
+        pub frame: u64,
+        pub idr: u32,
+        pub picture_index: u32,
+        pub error_status: u32,
+        pub average_qp: u32,
+        pub convert_us: u32,
+        pub gpu_us: u32,
+    }
+}
+
+raw_enum! {
+    /// The codecs an encoder session codes.
+    pub enum EncoderCodec: u32 {
+        H264 = 1,
+        Hevc = 2,
+    }
+}
+
+raw_enum! {
+    /// How an encoder session controls its rate.
+    pub enum EncoderRate: u32 {
+        /// Low-latency CBR at the request's bitrate.
+        Cbr = 0,
+        /// Every picture at the request's QP.
+        ConstQp = 1,
+    }
+}
+
+raw_enum! {
+    /// The pictures an encoder takes from the caller's memory.
+    pub enum EncoderInput: u32 {
+        /// `420v`: two planes, Y then interleaved CbCr, video range.
+        Nv12 = 0,
+        /// `BGRA`: one plane, converted to NV12 on the host's CPU.
+        Bgra = 1,
+    }
+}
+
+/// `EncoderOpenRequest::flags`: the pictures are full range (`420f`), which
+/// the parameter sets do not signal yet: refused.
+pub const ENCODER_OPEN_FULL_RANGE: u32 = 1;
+/// `EncoderEncodeRequest::flags`: make this frame an IDR.
+pub const ENCODE_FORCE_IDR: u32 = 1;
+
 raw_enum! {
     /// How an operation ended.
     pub enum Status: u32 {
@@ -995,6 +1114,13 @@ raw_enum! {
         /// moment, without holding its processor in the host, and calls
         /// again.
         Pending = 11,
+        /// A video encoder session stopped answering: its frame timed out,
+        /// and the session takes no more. The frontend closes it and
+        /// encodes another way.
+        Lost = 12,
+        /// The video encoder refused the frame's output: nothing was coded
+        /// for it, and the session's next frame is an IDR.
+        Dropped = 13,
     }
 }
 
@@ -1277,6 +1403,17 @@ operations! {
     EncodeIndirect = 0x0503 => EncodeIndirectRequest, Empty;
     /// `resetWithRange:`.
     ResetIndirect = 0x0504 => commands::IndirectRange, Empty;
+    /// The GPU's video encoder, which these calls reach outside the
+    /// device's turn (`encoders`): `Unsupported` when the host serves none.
+    EncoderCapabilities = 0x0a00 => Empty, EncoderCapabilitiesResponse;
+    /// Opens a session, answered `Pending` while the host makes it.
+    EncoderOpen = 0x0a01 => EncoderOpenRequest, EncoderOpenResponse;
+    /// Encodes a frame, answered `Pending` while the host stores it and
+    /// while the engine codes it; `Lost` once the session timed out,
+    /// `Dropped` for a frame the engine refused.
+    EncoderEncode = 0x0a02 => EncoderEncodeRequest, EncoderEncodeResponse;
+    /// Closes a session; closing the connection closes its sessions.
+    EncoderClose = 0x0a03 => Handle, Empty;
 }
 
 pub mod commands;

@@ -41,6 +41,8 @@ const PUSH_ROOM: u32 = (MOST_WORDS * 4) as u32 + 256;
 /// `-ETIME`, a syncobj wait that ran out.
 const ETIME: i64 = -62;
 const ETIMEDOUT: i64 = -110;
+/// How long [`Session::close`] lets a frame in flight complete.
+pub const CLOSE_WAIT_NS: u64 = 50_000_000;
 
 /// What went wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +138,10 @@ pub enum Frame<'a> {
     /// A block-linear NV12 surface of the session's geometry already at this
     /// GPU address of the session's VM ([`Session::bind_import`]).
     Gpu { address: u64 },
+    /// The next frame's own input surface, which the caller stored itself
+    /// through [`Session::input_surface`], in bands perhaps
+    /// ([`surface::store_rows`]).
+    Stored,
 }
 
 /// Per-frame choices.
@@ -187,6 +193,24 @@ enum State {
     Dead { keeps_channel: bool },
 }
 
+/// A frame submitted and not yet seen complete.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    n: u32,
+    idr: bool,
+    since_idr: u32,
+    slot: usize,
+    setup_index: usize,
+    payload: u32,
+    started: u64,
+    stored: u64,
+    submitted: u64,
+    /// When the bound runs out, from the first look after the submission.
+    deadline: u64,
+    /// nouveau's fence after the push signalled: the channel is idle.
+    job_done: bool,
+}
+
 pub struct Session<N: Node> {
     node: N,
     config: Config,
@@ -209,6 +233,20 @@ pub struct Session<N: Node> {
     idr_next: bool,
     timeout_ns: u64,
     state: State,
+    /// The channel, its object and syncobj are made: the buffers follow.
+    started: bool,
+    in_flight: Option<InFlight>,
+}
+
+/// Whether `rate` is one the encoder takes.
+fn rate_ok(rate: Rate) -> Result<(), Error> {
+    match rate {
+        Rate::ConstQp(qp) if qp > 51 => Err(Error::Config("QP is 0 to 51")),
+        Rate::Cbr { bitrate } if bitrate < 100_000 => {
+            Err(Error::Config("CBR needs at least 100 kb/s"))
+        }
+        _ => Ok(()),
+    }
 }
 
 impl<N: Node> Session<N> {
@@ -217,6 +255,29 @@ impl<N: Node> Session<N> {
     /// the node comes back with everything made so far given back: nothing
     /// was submitted, so nothing waits.
     pub fn open(
+        node: N,
+        chipset: u16,
+        config: Config,
+        timeout_ns: u64,
+    ) -> Result<Self, (Error, N)> {
+        let mut session = Self::begin(node, chipset, config, timeout_ns)?;
+        loop {
+            match session.bring_up_step() {
+                Ok(true) => return Ok(session),
+                Ok(false) => {}
+                Err(error) => {
+                    session.give_back();
+                    return Err((error, session.node));
+                }
+            }
+        }
+    }
+
+    /// A session for `config` on `node` as [`Session::open`] makes it, but
+    /// with nothing asked of nouveau yet: each [`Session::bring_up_step`]
+    /// makes a piece of it, so a caller with a short budget can spread the
+    /// bring-up over several calls. A refusal here gives the node back.
+    pub fn begin(
         node: N,
         chipset: u16,
         config: Config,
@@ -232,12 +293,8 @@ impl<N: Node> Session<N> {
         if !(1..=240).contains(&config.fps) {
             return Err((Error::Config("the frame rate must be 1 to 240"), node));
         }
-        match config.rate {
-            Rate::ConstQp(qp) if qp > 51 => return Err((Error::Config("QP is 0 to 51"), node)),
-            Rate::Cbr { bitrate } if bitrate < 100_000 => {
-                return Err((Error::Config("CBR needs at least 100 kb/s"), node));
-            }
-            _ => {}
+        if let Err(error) = rate_ok(config.rate) {
+            return Err((error, node));
         }
         let layout = Layout::new(config.codec, &geometry, config.map_recon);
         let templates = match Templates::new(&config, &geometry, &layout) {
@@ -258,7 +315,7 @@ impl<N: Node> Session<N> {
                 }
             }
         };
-        let mut session = Self {
+        Ok(Self {
             node,
             config,
             geometry,
@@ -277,14 +334,34 @@ impl<N: Node> Session<N> {
             idr_next: false,
             timeout_ns,
             state: State::Open,
-        };
-        match session.bring_up() {
-            Ok(()) => Ok(session),
-            Err(error) => {
-                session.give_back();
-                Err((error, session.node))
-            }
+            started: false,
+            in_flight: None,
+        })
+    }
+
+    /// Makes the next piece of a session [`Session::begin`] gave: first
+    /// `VM_INIT`, the channel, its object and the syncobj, then one buffer
+    /// each call. Whether the session is now whole. After a refusal the
+    /// session goes to [`Session::close`], which gives back what was made.
+    pub fn bring_up_step(&mut self) -> Result<bool, Error> {
+        if !self.started {
+            self.start_channel()?;
+            self.started = true;
+        } else if self.buffers.len() < self.layout.plans.len() {
+            let buffer = self.make(self.buffers.len())?;
+            self.buffers.push(buffer);
         }
+        Ok(self.ready())
+    }
+
+    /// Whether every piece is made, so frames may be encoded.
+    pub fn ready(&self) -> bool {
+        self.started && self.buffers.len() == self.layout.plans.len()
+    }
+
+    /// The buffers made so far and the layout's count.
+    pub fn made(&self) -> (usize, usize) {
+        (self.buffers.len(), self.layout.plans.len())
     }
 
     fn control<T>(
@@ -299,7 +376,7 @@ impl<N: Node> Session<N> {
         }
     }
 
-    fn bring_up(&mut self) -> Result<(), Error> {
+    fn start_channel(&mut self) -> Result<(), Error> {
         let mut init = VmInit {
             kernel_managed_addr: KERNEL_VA_START,
             kernel_managed_size: VA_TOP - KERNEL_VA_START,
@@ -321,10 +398,6 @@ impl<N: Node> Session<N> {
         let mut create = SyncobjCreate::default();
         self.control(SYNCOBJ_CREATE, &mut create, "syncobj")?;
         self.syncobj = create.handle;
-        for index in 0..self.layout.plans.len() {
-            let buffer = self.make(index)?;
-            self.buffers.push(buffer);
-        }
         Ok(())
     }
 
@@ -439,8 +512,30 @@ impl<N: Node> Session<N> {
         }
     }
 
-    /// Ends the session: its node, and whether the file must stay open.
+    /// Ends the session: its node, and whether the file must stay open. A
+    /// frame still in flight gets [`CLOSE_WAIT_NS`] to complete; one that
+    /// does not, with its job pending, keeps the channel and its file, as a
+    /// timeout does.
     pub fn close(mut self) -> Closed<N> {
+        if self.in_flight.is_some() {
+            let deadline = self.node.now_ns().saturating_add(CLOSE_WAIT_NS);
+            while let Some(flight) = self.in_flight {
+                let value = self.semaphore();
+                if value == flight.payload {
+                    self.in_flight = None;
+                    break;
+                }
+                let job_done = flight.job_done || self.ask_fence();
+                if self.node.now_ns() >= deadline {
+                    self.in_flight = None;
+                    self.state = State::Dead {
+                        keeps_channel: !job_done,
+                    };
+                    break;
+                }
+                self.node.pause();
+            }
+        }
         self.give_back();
         let keeps_file = matches!(
             self.state,
@@ -521,12 +616,70 @@ impl<N: Node> Session<N> {
         Some(unsafe { surface::load_nv12(cpu.as_ptr(), &self.geometry) })
     }
 
+    /// The input surface the next frame reads, for a caller that stores it
+    /// itself ([`surface::store_rows`]) and then submits [`Frame::Stored`].
+    /// It is the session's own until the frame after it is submitted: the
+    /// mapping is `geometry().surface_bytes()` long.
+    pub fn input_surface(&self) -> Result<NonNull<u8>, Error> {
+        if !self.ready() {
+            return Err(Error::Config("the session is still being made"));
+        }
+        if self.in_flight.is_some() {
+            return Err(Error::Input("a frame is in flight"));
+        }
+        let slot = (self.picture % SLOTS as u32) as usize;
+        Ok(self.cpu(self.layout.input[slot]))
+    }
+
+    /// Changes the rate control from the next frame on: the templates are
+    /// made again from NVIDIA's captured setups at the new rate. The
+    /// parameter sets carry no rate, so the stream goes on unchanged.
+    pub fn set_rate(&mut self, rate: Rate) -> Result<(), Error> {
+        rate_ok(rate)?;
+        if self.in_flight.is_some() {
+            return Err(Error::Input("a frame is in flight"));
+        }
+        let config = Config {
+            rate,
+            ..self.config
+        };
+        self.templates =
+            Templates::new(&config, &self.geometry, &self.layout).map_err(Error::Config)?;
+        self.config = config;
+        Ok(())
+    }
+
+    /// Whether a frame was submitted and not yet seen complete.
+    pub fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
     /// Encodes `frame`: an IDR when it is the session's first, when asked,
     /// or after an engine error; a P frame referencing the newest pictures
-    /// otherwise.
+    /// otherwise. It waits for the engine, reading the semaphore and asking
+    /// between reads whether nouveau's fence after the push signalled; each
+    /// ask lets the host's Linux run.
     pub fn encode(&mut self, frame: Frame<'_>, options: Options) -> Result<Encoded, Error> {
+        self.submit(frame, options)?;
+        loop {
+            if let Some(encoded) = self.poll(true)? {
+                return Ok(encoded);
+            }
+            self.node.pause();
+        }
+    }
+
+    /// Stores `frame`, writes its setup and method stream and submits it,
+    /// without waiting: [`Session::poll`] then looks for its completion.
+    pub fn submit(&mut self, frame: Frame<'_>, options: Options) -> Result<(), Error> {
         if self.state != State::Open {
             return Err(Error::Dead);
+        }
+        if !self.ready() {
+            return Err(Error::Config("the session is still being made"));
+        }
+        if self.in_flight.is_some() {
+            return Err(Error::Input("a frame is in flight"));
         }
         let started = self.node.now_ns();
         let n = self.picture;
@@ -535,6 +688,7 @@ impl<N: Node> Session<N> {
         let slot = (n % SLOTS as u32) as usize;
         let input = match frame {
             Frame::Gpu { address } => address,
+            Frame::Stored => self.layout.address(self.layout.input[slot]),
             Frame::Nv12(picture) => {
                 if !picture.fits(&self.geometry) {
                     return Err(Error::Input(
@@ -624,26 +778,114 @@ impl<N: Node> Session<N> {
         let submitted = self.node.now_ns();
         self.control(EXEC, &mut exec, "EXEC")?;
         self.push_at += (words.len() as u32 * 4).next_multiple_of(256);
-        self.wait(payload)?;
+        let deadline = self.node.now_ns().saturating_add(self.timeout_ns);
+        self.in_flight = Some(InFlight {
+            n,
+            idr,
+            since_idr,
+            slot,
+            setup_index,
+            payload,
+            started,
+            stored,
+            submitted,
+            deadline,
+            job_done: false,
+        });
+        Ok(())
+    }
+
+    /// The fence page's semaphore word.
+    fn semaphore(&self) -> u32 {
+        let fence_word = self.cpu(self.layout.fence).cast::<u32>();
+        // SAFETY: the fence page's mapping holds the word.
+        unsafe { fence_word.as_ptr().read_volatile() }
+    }
+
+    /// Asks nouveau whether the fence after the frame in flight signalled,
+    /// which lets the host's Linux run; whether it did, now or before.
+    pub fn ask_fence(&mut self) -> bool {
+        let Some(flight) = self.in_flight else {
+            return true;
+        };
+        if flight.job_done {
+            return true;
+        }
+        let mut handle = self.syncobj;
+        let mut wait = SyncobjWait {
+            handles: (&raw mut handle) as u64,
+            timeout_nsec: 0,
+            count_handles: 1,
+            ..SyncobjWait::default()
+        };
+        let done = match self.node.control(SYNCOBJ_WAIT, (&raw mut wait).cast()) {
+            0 => true,
+            ETIME | ETIMEDOUT => false,
+            // Not a reason to stop reading: the semaphore decides, and the
+            // channel is kept as if busy.
+            _ => false,
+        };
+        if let Some(flight) = self.in_flight.as_mut() {
+            flight.job_done |= done;
+        }
+        done
+    }
+
+    /// One look at the frame in flight: its output once the semaphore holds
+    /// its payload, `None` while it does not and the bound has not passed.
+    /// With `ask`, a look that finds it pending asks nouveau's fence too
+    /// ([`Session::ask_fence`]); without, only a look past the bound does,
+    /// to tell a busy channel from an idle one. Past the bound the frame
+    /// timed out and the session is dead.
+    pub fn poll(&mut self, ask: bool) -> Result<Option<Encoded>, Error> {
+        let Some(flight) = self.in_flight else {
+            return Err(Error::Input("no frame is in flight"));
+        };
+        let value = self.semaphore();
+        if value == flight.payload {
+            fence(Ordering::Acquire);
+            self.in_flight = None;
+            return self.complete(flight).map(Some);
+        }
+        if self.node.now_ns() >= flight.deadline {
+            let job_done = if ask {
+                flight.job_done
+            } else {
+                self.ask_fence()
+            };
+            self.in_flight = None;
+            self.state = State::Dead {
+                keeps_channel: !job_done,
+            };
+            return Err(Error::Timeout { value, job_done });
+        }
+        if ask {
+            self.ask_fence();
+        }
+        Ok(None)
+    }
+
+    /// The completed frame's output; the rotation and references move on.
+    fn complete(&mut self, flight: InFlight) -> Result<Encoded, Error> {
         let done = self.node.now_ns();
         // The frame is the engine's whichever way its output reads: the
         // rotation and references move on.
         self.picture += 1;
-        self.since_idr = since_idr + 1;
-        if idr {
+        self.since_idr = flight.since_idr + 1;
+        if flight.idr {
             self.idrs += 1;
             self.idr_next = false;
         }
         let timing = Timing {
-            store_ns: stored.saturating_sub(started),
-            wait_ns: done.saturating_sub(submitted),
-            total_ns: done.saturating_sub(started),
+            store_ns: flight.stored.saturating_sub(flight.started),
+            wait_ns: done.saturating_sub(flight.submitted),
+            total_ns: done.saturating_sub(flight.started),
         };
-        match self.output(n, idr, slot, setup_index) {
+        match self.output(flight.n, flight.idr, flight.slot, flight.setup_index) {
             Ok((bytes, status)) => Ok(Encoded {
                 bytes,
-                idr,
-                picture: n,
+                idr: flight.idr,
+                picture: flight.n,
                 status,
                 timing,
             }),
@@ -651,47 +893,6 @@ impl<N: Node> Session<N> {
                 self.idr_next = true;
                 Err(error)
             }
-        }
-    }
-
-    /// Reads the semaphore until it holds `payload` or the bound passes,
-    /// asking between reads whether nouveau's fence after the push
-    /// signalled; each ask lets the host's Linux run.
-    fn wait(&mut self, payload: u32) -> Result<(), Error> {
-        let fence_word = self.cpu(self.layout.fence).cast::<u32>();
-        let started = self.node.now_ns();
-        let deadline = started.saturating_add(self.timeout_ns);
-        let mut job_done = false;
-        loop {
-            // SAFETY: the fence page's mapping holds the word.
-            let value = unsafe { fence_word.as_ptr().read_volatile() };
-            if value == payload {
-                fence(Ordering::Acquire);
-                return Ok(());
-            }
-            if self.node.now_ns() >= deadline {
-                self.state = State::Dead {
-                    keeps_channel: !job_done,
-                };
-                return Err(Error::Timeout { value, job_done });
-            }
-            if !job_done {
-                let mut handle = self.syncobj;
-                let mut wait = SyncobjWait {
-                    handles: (&raw mut handle) as u64,
-                    timeout_nsec: 0,
-                    count_handles: 1,
-                    ..SyncobjWait::default()
-                };
-                match self.node.control(SYNCOBJ_WAIT, (&raw mut wait).cast()) {
-                    0 => job_done = true,
-                    ETIME | ETIMEDOUT => {}
-                    // Not a reason to stop reading: the semaphore decides,
-                    // and the channel is kept as if busy.
-                    _ => {}
-                }
-            }
-            self.node.pause();
         }
     }
 

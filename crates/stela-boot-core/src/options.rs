@@ -44,6 +44,9 @@ pub const PROBE_NVENC: &str = "--probe-nvenc";
 /// Encodes a test pattern with each started GPU's NVENC before macOS
 /// (`NVENC SELFTEST` lines).
 pub const NVENC_SELFTEST: &str = "--nvenc-selftest";
+/// Serves no video encoder sessions to the guest: StelaVT encodes H.264
+/// with x264, as before NVENC ([`System::nvenc`]).
+pub const NO_NVENC: &str = "--no-nvenc";
 /// Take a GPU's display in its monitor's fastest mode of the size
 /// ([`System::display_fastest`]).
 pub const DISPLAY_FASTEST: &str = "--display-fastest";
@@ -418,6 +421,11 @@ pub struct System {
     /// check every frame, logged as `NVENC SELFTEST` lines
     /// (`--nvenc-selftest`). Nothing it finds stops the boot.
     pub nvenc_selftest: bool,
+    /// Each NVIDIA GPU whose encoder Stela drives (GA102-GA107) serves
+    /// StelaVT's H.264 and HEVC sessions through its Metal gate; off with
+    /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
+    /// HEVC.
+    pub nvenc: bool,
     /// A GPU's display is taken in its monitor's fastest progressive mode of
     /// the size that macOS can be told of (`--display-fastest`), where by
     /// default it runs the monitor's preferred mode, which every input of
@@ -502,6 +510,7 @@ impl Default for System {
             display_trace: false,
             probe_nvenc: false,
             nvenc_selftest: false,
+            nvenc: true,
             display_fastest: false,
             watches: Vec::new(),
             dumps: Vec::new(),
@@ -957,6 +966,7 @@ impl fmt::Display for System {
         line.flag("--display-trace", self.display_trace)?;
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
+        line.flag(NO_NVENC, !self.nvenc)?;
         line.flag(DISPLAY_FASTEST, self.display_fastest)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;

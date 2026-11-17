@@ -549,3 +549,22 @@ fn nvenc_selftest_is_off_by_default_and_round_trips() {
     let usual = round_trip(&format!("--system --input --parallel {NVENC_SELFTEST}"));
     assert!(usual.nvenc_selftest && usual.input && usual.parallel);
 }
+
+/// The guest's NVENC sessions are on unless `--no-nvenc`, which
+/// round-trips alone and beside the boot's usual flags and the self-test,
+/// and changes nothing else.
+#[test]
+fn nvenc_sessions_are_on_unless_no_nvenc() {
+    assert!(System::default().nvenc);
+    assert!(round_trip("--system").nvenc);
+    assert!(!round_trip("--system").to_string().contains("nvenc"));
+    let off = round_trip(&format!("--system {NO_NVENC}"));
+    assert!(!off.nvenc);
+    assert_eq!(off.to_string(), "--system --no-nvenc");
+    assert_eq!(System { nvenc: true, ..off }, System::default());
+    let usual = round_trip(&format!(
+        "--system --input --parallel {NVENC_SELFTEST} {NO_NVENC}"
+    ));
+    assert!(!usual.nvenc && usual.nvenc_selftest && usual.input && usual.parallel);
+    assert!(usual.to_string().contains(" --nvenc-selftest --no-nvenc"));
+}

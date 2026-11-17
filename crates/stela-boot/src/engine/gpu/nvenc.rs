@@ -11,19 +11,28 @@
 //!   create a file on the stick: its FAT32 is read-only to Stela's drivers,
 //!   which write only the clusters the stela tool preallocated for the log.
 //!
+//! - **The guest's encoder sessions** ([`attach`]): each NVIDIA GPU whose
+//!   encoder this port drives serves the sessions StelaVT opens through its
+//!   Metal service's gate (`metal::service::encoders`), unless `--no-nvenc`
+//!   says not to, or the probe or the self-test found its encoder failing.
+//!   Each session is a render node file of its own, as the self-test's.
+//!
 //! Nothing either finds stops the boot. A push that never finished keeps
 //! its channel and file open, since freeing either makes nouveau idle the
 //! channel, a busy wait of up to 15 s; a GPU that timed out once is not
 //! asked again.
 use super::client::{self, RENDER_MINOR};
-use crate::output;
-use alloc::{string::String, vec::Vec};
+use super::stack::{self, Stack};
+use crate::{native_mmio::Window, output};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     ffi::{c_int, c_void},
-    hint,
+    fmt, hint,
     ptr::NonNull,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_drivers::gpu::Vendor;
+use stela_drivers::gpu::metal::service::encoders::{EncoderPlatform, Encoders, GateEncoders};
 use stela_drivers::gpu::nvenc::{self, Node, Rate, selftest};
 
 /// How long the probe's encoder gets to release its semaphore.
@@ -35,7 +44,32 @@ const PAUSE_NS: u64 = 50_000;
 /// whole frames: about 100 KiB each at QP 25.
 const DATA_CAP: usize = 256 * 1024;
 
-/// A render node file of the probe's or the self-test's own.
+/// Whether the Metal services serve the guest's encoder sessions: off with
+/// `--no-nvenc`.
+static SERVING: AtomicBool = AtomicBool::new(true);
+/// The bound GPUs, by index, whose encoder the probe or the self-test found
+/// failing: they serve no sessions.
+static FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// The pause between two looks at a guest frame's semaphore, within one
+/// gate call's budget.
+const GATE_PAUSE_NS: u64 = 10_000;
+/// The stack each GPU's encoder calls run on, one at a time under the
+/// encoders' lock: session code is shallow.
+const ENCODER_STACK_BYTES: usize = 1 << 20;
+
+/// `--no-nvenc`: the Metal services serve no encoder sessions, and StelaVT
+/// encodes H.264 with x264 as before.
+pub(in crate::engine) fn set_serving(serving: bool) {
+    SERVING.store(serving, Ordering::Relaxed);
+}
+
+/// Notes that GPU `index`'s encoder failed before macOS.
+fn failed(index: u32) {
+    FAILED.fetch_or(1 << index.min(63), Ordering::Relaxed);
+}
+
+/// A render node file of the probe's, the self-test's or a session's own.
 struct RenderFile(c_int);
 
 // SAFETY: Linux's DRM ioctls honor their UAPI bounds, and `client::map`
@@ -124,6 +158,12 @@ pub(in crate::engine) fn probe() {
         let outcome = nvenc::probe(&mut RenderFile(fd), chipset, BOUND_NS, &mut |text| {
             line(text);
         });
+        if matches!(
+            outcome,
+            nvenc::Outcome::Timeout { .. } | nvenc::Outcome::Failed { .. }
+        ) {
+            failed(index);
+        }
         if outcome.keeps_channel() {
             line(format_args!(
                 "NVENC PROBE GPU {index}: its file stays open with the unfinished channel"
@@ -191,6 +231,9 @@ pub(in crate::engine) fn selftest() {
             if matches!(rate, Rate::ConstQp(_)) {
                 data(&report);
             }
+            if !report.passed {
+                failed(index);
+            }
             summary.push(alloc::format!(
                 "{name} {}",
                 if report.passed { "PASS" } else { "FAIL" }
@@ -235,4 +278,115 @@ fn data(report: &selftest::Report) {
             number + 1
         ));
     }
+}
+
+/// The encoders of one bound GPU, on render node files of its own.
+struct GateGpu {
+    index: usize,
+    chipset: u16,
+    minor: u32,
+    stack: u64,
+}
+
+impl EncoderPlatform for GateGpu {
+    type Node = RenderFile;
+
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn chipset(&self) -> u16 {
+        self.chipset
+    }
+
+    fn open_node(&self) -> Result<RenderFile, &'static str> {
+        client::open_node(RENDER_MINOR + self.minor)
+            .map(RenderFile)
+            .ok_or("the GPU's render node did not open")
+    }
+
+    fn close_node(&self, node: RenderFile, keeps_file: bool) {
+        // A file whose channel is still busy stays open: closing it would
+        // make nouveau idle the channel.
+        if !keeps_file {
+            client::close_descriptor(node.0);
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        client::now_ns()
+    }
+
+    fn pause(&self) {
+        let until = client::now_ns().saturating_add(GATE_PAUSE_NS);
+        while client::now_ns() < until {
+            hint::spin_loop();
+        }
+    }
+
+    fn relax(&self) {
+        super::gate::relax();
+    }
+
+    fn run(&self, body: &mut dyn FnMut()) {
+        // SAFETY: the stack lives for the boot, and only the encoders'
+        // lock's holder runs on it.
+        unsafe { stack::on_stack(self.stack, body) };
+    }
+
+    fn log(&self, line: fmt::Arguments<'_>) {
+        output::arguments(format_args!("{line}\n"));
+    }
+}
+
+/// The encoders bound GPU `index` serves the guest's sessions with, or why
+/// it serves none, which is logged: it must be NVIDIA's, with an encoder
+/// this port drives (GA102 to GA107), and neither `--no-nvenc` nor a failed
+/// probe or self-test may say no.
+pub(super) fn attach(
+    window: &'static Window,
+    index: usize,
+    name: &str,
+    vendor: Vendor,
+    chipset: u16,
+) -> Option<Arc<dyn GateEncoders>> {
+    let refuse = |why: fmt::Arguments<'_>| {
+        line(format_args!("NVENC SESSION GPU {index} ({name}): {why}"));
+        None
+    };
+    if vendor != Vendor::Nvidia {
+        return None;
+    }
+    if !SERVING.load(Ordering::Relaxed) {
+        return refuse(format_args!("no sessions: --no-nvenc"));
+    }
+    if nvenc::encoder_class(chipset).is_none() {
+        return refuse(format_args!(
+            "no sessions: chipset {chipset:#x} has no encoder this port drives (GA102-GA107 only)"
+        ));
+    }
+    if FAILED.load(Ordering::Relaxed) & (1 << index.min(63)) != 0 {
+        return refuse(format_args!(
+            "no sessions: its encoder failed the probe or the self-test"
+        ));
+    }
+    let Some(minor) = client::minor(index) else {
+        return refuse(format_args!("no sessions: its render node is unknown"));
+    };
+    let Some(stack) = Stack::map(window, ENCODER_STACK_BYTES) else {
+        return refuse(format_args!("no sessions: no memory for their stack"));
+    };
+    let top = stack.top();
+    // It serves for the boot.
+    core::mem::forget(stack);
+    line(format_args!(
+        "NVENC SESSION GPU {index} ({name}): serves H.264 and HEVC sessions on chipset          {chipset:#x}, at most {} at once",
+        stela_drivers::gpu::metal::service::encoders::MAX_SESSIONS
+    ));
+    Some(Arc::new(Encoders::new(GateGpu {
+        index,
+        chipset,
+        minor,
+        stack: top,
+    })))
 }

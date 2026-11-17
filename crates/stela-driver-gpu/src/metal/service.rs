@@ -46,6 +46,7 @@ use stela_contracts::gate::MemoryRange;
 use wire::{Fault, Handle, NegotiateRequest, NegotiateResponse, Operation, Record, Span, Status};
 
 mod commands;
+pub mod encoders;
 mod gate;
 pub mod identity;
 mod indirect;
@@ -823,6 +824,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             Operation::IndirectResourceId => self.indirect_resource_id(&mut call),
             Operation::EncodeIndirect => self.encode_indirect(&mut call),
             Operation::ResetIndirect => self.reset_indirect(&mut call),
+            // The shared service hands these to its encoders before any
+            // turn; reaching the device, they found none.
+            Operation::EncoderCapabilities
+            | Operation::EncoderOpen
+            | Operation::EncoderEncode
+            | Operation::EncoderClose => Err(encoders::NONE),
         }
     }
 
