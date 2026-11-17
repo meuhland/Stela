@@ -98,6 +98,10 @@ struct KmsScanout {
     /// The counter at the display's last vertical blank as the last look
     /// read it, when it could ([`Display::last_vblank_ns`]).
     vblank_tsc: Option<u64>,
+    /// The refresh the last `display runs` line named: a refresh macOS
+    /// chooses is set at once or at a later flush, and each new one the
+    /// display runs gets its line ([`Self::report_rate`]).
+    reported_millihertz: u32,
 }
 
 impl Scanout for KmsScanout {
@@ -169,6 +173,7 @@ impl Scanout for KmsScanout {
         self.refresh_millihertz = millihertz;
         // The blank read before runs on the old period.
         self.vblank_tsc = None;
+        self.report_rate();
         Ok(())
     }
 
@@ -192,6 +197,11 @@ impl Scanout for KmsScanout {
     fn flush(&mut self) -> Result<()> {
         if let Some((_, display)) = &mut self.display {
             let flushed = display.flush();
+            // A refresh macOS chose may have been set by this flush.
+            self.report_rate();
+            let Some((_, display)) = &mut self.display else {
+                return Ok(());
+            };
             finish_present(display, flushed)?;
         }
         self.look();
@@ -239,6 +249,22 @@ impl KmsScanout {
             tsc_hz,
             reported: false,
             vblank_tsc: None,
+            reported_millihertz: refresh_millihertz,
+        }
+    }
+
+    /// `GPU name: display runs WxH at N mHz: macOS chose it` once the
+    /// display runs a refresh other than the one last named: the guest's
+    /// choice in Displays settings (`set_digital_out_mode`) reaches the
+    /// host's mode set here, at once or at a later flush.
+    fn report_rate(&mut self) {
+        let Some((name, display)) = &self.display else {
+            return;
+        };
+        let now = display.refresh_millihertz();
+        if now != self.reported_millihertz {
+            self.reported_millihertz = now;
+            report_runs(name, display, ": the rate macOS chose");
         }
     }
 
@@ -287,13 +313,16 @@ impl KmsScanout {
                 index += 1;
                 continue;
             }
-            match Display::take_fitting(
+            match Display::take_fitting_at(
                 Node(fd),
                 kms::Wanted::Size(wanted),
                 &stela_soc::dcp::modes::advertisable,
+                rate(),
             ) {
                 Ok(display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
+                    report_runs(name, &display, ": detected after start");
+                    self.reported_millihertz = display.refresh_millihertz();
                     report_ports(name, &display);
                     report_outputs(name, &display);
                     let screen = screen(&display);
@@ -478,6 +507,28 @@ unsafe impl Sync for Taken {}
 static TAKEN: Taken = Taken(UnsafeCell::new((None, Vec::new())));
 /// The bound GPU whose output [`take`] took, or `usize::MAX`.
 static TAKEN_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// `--display-fastest`: a display is taken in its monitor's fastest mode of
+/// the size, by [`take`] and by the scanout's later looks, else in its
+/// preferred mode ([`kms::Rate`]).
+static FASTEST: AtomicBool = AtomicBool::new(false);
+
+/// The rate a display is taken at ([`FASTEST`]).
+fn rate() -> kms::Rate {
+    match FASTEST.load(Ordering::Relaxed) {
+        true => kms::Rate::Fastest,
+        false => kms::Rate::Preferred,
+    }
+}
+
+/// `GPU name: display runs WxH at N mHz` and why, for each mode the first
+/// output is set to: at the take, and at each refresh macOS chooses.
+fn report_runs(name: &str, display: &Display<Node>, why: &str) {
+    let (width, height) = display.size();
+    output::arguments(format_args!(
+        "GPU {name}: display runs {width}x{height} at {} mHz{why}\n",
+        display.refresh_millihertz()
+    ));
+}
 
 /// The bound GPU, by its index, whose output took the connected display.
 pub(super) fn taken_index() -> Option<usize> {
@@ -514,7 +565,8 @@ const RETURN_STEP_MILLIS: u64 = 100;
 /// or likely to exist, so it is awaited within [`RETURN_SECONDS`], once.
 /// What stops one GPU is reported with what its connectors detected, and
 /// its node is kept for the scanout's looks.
-pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
+pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>, fastest: bool) {
+    FASTEST.store(fastest, Ordering::Relaxed);
     let Some(gpu) = super::installed() else {
         return;
     };
@@ -539,10 +591,11 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
             false => 0,
         };
         let result = loop {
-            match Display::take_fitting(
+            match Display::take_fitting_at(
                 Node(fd),
                 kms::Wanted::Native(wanted),
                 &stela_soc::dcp::modes::advertisable,
+                rate(),
             ) {
                 Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
                     let step = host::rdtsc();
@@ -562,11 +615,16 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
                         "GPU {name}: display detected after {waited_ms} ms\n"
                     ));
                 }
-                let (width, height) = display.size();
-                output::arguments(format_args!(
-                    "GPU {name}: display runs {width}x{height} at {} mHz\n",
-                    display.refresh_millihertz()
-                ));
+                report_runs(
+                    name,
+                    &display,
+                    match rate() {
+                        kms::Rate::Preferred => ": the monitor's preferred rate of the size",
+                        kms::Rate::Fastest => {
+                            ": the monitor's fastest rate of the size (--display-fastest)"
+                        }
+                    },
+                );
                 report_ports(name, &display);
                 // A GPU that serves no Metal device shows what another
                 // draws: the display is wired to it (a laptop's panel on its

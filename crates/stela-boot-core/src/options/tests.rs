@@ -137,6 +137,28 @@ fn scanout_mirror_round_trips() {
     assert!(round_trip(&format!("--system {SCANOUT_MIRROR}")).scanout_mirror);
 }
 
+/// A monitor's preferred mode by default; `--display-fastest` asks for its
+/// fastest of the size, and both read back the same.
+#[test]
+fn display_fastest_is_off_by_default_and_round_trips() {
+    assert!(!System::default().display_fastest);
+    assert!(!round_trip("--system").display_fastest);
+    let line = format!("--system --input {DISPLAY_FASTEST}");
+    let options = round_trip(&line);
+    assert!(options.display_fastest && options.input);
+    assert!(options.to_string().contains(DISPLAY_FASTEST));
+    assert!(
+        !round_trip("--system --input")
+            .to_string()
+            .contains(DISPLAY_FASTEST)
+    );
+    // Our usual line still parses as it did, the preferred mode.
+    let usual = "--system --storage @disk --nor @disk --preboot @disk --ecid 0x7217bd1d187e4e44 \
+                 --external-disks --guest-network-stelanet --guest-pes 8 --input";
+    assert!(!round_trip(usual).display_fastest);
+    assert!(round_trip(&format!("{usual} {DISPLAY_FASTEST}")).display_fastest);
+}
+
 #[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));

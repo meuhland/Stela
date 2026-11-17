@@ -428,27 +428,85 @@ fn the_firmwares_size_wins_then_the_preferred_mode() {
     assert_eq!(choose(&[], Wanted::Size((800, 600)), any), None);
 }
 
-/// Before the guest's mode is set the monitor's own mode wins: its fastest
-/// of the preferred size that fits, then the firmware's size.
-#[test]
-fn a_display_taken_at_start_runs_the_monitors_own_mode() {
-    let at = |width, height, kind, vrefresh| ModeInfo {
+/// The modes [`a_display_taken_at_start_runs_the_monitors_own_mode`] and
+/// its `--display-fastest` twin take from: a 3840x2160 monitor whose
+/// preferred timing is its 60 Hz one, listed first as Linux sorts it, with
+/// faster modes after it.
+fn monitor_modes() -> [ModeInfo; 4] {
+    [
+        mode_at(3840, 2160, PREFERRED, 60),
+        mode_at(3840, 2160, 0, 144),
+        mode_at(1920, 1080, 0, 240),
+        mode_at(1920, 1080, 0, 60),
+    ]
+}
+
+fn mode_at(width: u16, height: u16, kind: u32, vrefresh: u32) -> ModeInfo {
+    ModeInfo {
         vrefresh,
         ..mode(width, height, kind)
-    };
-    let modes = [
-        at(3840, 2160, PREFERRED, 60),
-        at(3840, 2160, 0, 144),
-        at(1920, 1080, 0, 240),
-        at(1920, 1080, 0, 60),
-    ];
+    }
+}
+
+/// Before the guest's mode is set the monitor's own mode wins: its
+/// preferred one where it fits, which every input of the monitor shows,
+/// then the firmware's size. A Samsung Odyssey G40B lists 1920x1080 at
+/// 239.76 Hz after its preferred 60 Hz and shows nothing at that rate over
+/// HDMI.
+#[test]
+fn a_display_taken_at_start_runs_the_monitors_own_mode() {
+    let modes = monitor_modes();
     let any: Fits<'_> = &|_, _, _| true;
     let firmware = Wanted::Native((1920, 1080));
-    // The preferred timing is the monitor's 60 Hz one, listed first as
-    // Linux sorts it; its 144 Hz mode of the same size runs.
-    assert_eq!(choose(&modes, firmware, any), Some(modes[1]));
+    assert_eq!(choose(&modes, firmware, any), Some(modes[0]));
+    assert_eq!(
+        choose_at(&modes, firmware, any, Rate::Preferred),
+        Some(modes[0])
+    );
+    // No preferred mode of the size: the first listed of it.
     assert_eq!(
         choose(&modes, Wanted::Size((1920, 1080)), any),
+        Some(modes[2])
+    );
+    let g40b = [
+        mode_at(1920, 1080, PREFERRED, 60),
+        mode_at(1920, 1080, 0, 240),
+        mode_at(1920, 1080, 0, 144),
+    ];
+    assert_eq!(choose(&g40b, firmware, any), Some(g40b[0]));
+    assert_eq!(
+        choose(&g40b, Wanted::Size((1920, 1080)), any),
+        Some(g40b[0])
+    );
+    // The native size cannot be described at all: the firmware's size.
+    let small: Fits<'_> = &|width, _, _| width < 3840;
+    assert_eq!(choose(&modes, firmware, small), Some(modes[2]));
+    // Its listed-first rate cannot: the next of the native size.
+    let fast = [modes[1], mode_at(3840, 2160, PREFERRED, 60), modes[2]];
+    let slow: Fits<'_> = &|_, _, refresh| refresh < 100_000;
+    assert_eq!(choose(&fast, firmware, slow), Some(fast[1]));
+    // No preferred mode: the firmware's size, then the first.
+    assert_eq!(choose(&modes[2..], firmware, any), Some(modes[2]));
+    assert_eq!(
+        choose(&modes[2..], Wanted::Native((800, 600)), any),
+        Some(modes[2])
+    );
+}
+
+/// `--display-fastest` ([`Rate::Fastest`]): the monitor's fastest
+/// progressive mode of the preferred size that fits, then the firmware's
+/// size, as upstream 90f2664f chose for every monitor.
+#[test]
+fn a_display_taken_at_start_runs_the_monitors_fastest_mode_with_display_fastest() {
+    let modes = monitor_modes();
+    let any: Fits<'_> = &|_, _, _| true;
+    let firmware = Wanted::Native((1920, 1080));
+    let fastest = |modes: &[ModeInfo], wanted, fits| choose_at(modes, wanted, fits, Rate::Fastest);
+    // The preferred timing is the monitor's 60 Hz one, listed first as
+    // Linux sorts it; its 144 Hz mode of the same size runs.
+    assert_eq!(fastest(&modes, firmware, any), Some(modes[1]));
+    assert_eq!(
+        fastest(&modes, Wanted::Size((1920, 1080)), any),
         Some(modes[2])
     );
     // An interlaced mode is passed over, however fast; equals keep the
@@ -457,22 +515,22 @@ fn a_display_taken_at_start_runs_the_monitors_own_mode() {
         modes[0],
         ModeInfo {
             flags: INTERLACED,
-            ..at(3840, 2160, 0, 120)
+            ..mode_at(3840, 2160, 0, 120)
         },
-        at(3840, 2160, 0, 60),
+        mode_at(3840, 2160, 0, 60),
     ];
-    assert_eq!(choose(&laced, firmware, any), Some(laced[0]));
+    assert_eq!(fastest(&laced, firmware, any), Some(laced[0]));
     // The native size cannot be described at all: the firmware's size.
     let small: Fits<'_> = &|width, _, _| width < 3840;
-    assert_eq!(choose(&modes, firmware, small), Some(modes[2]));
+    assert_eq!(fastest(&modes, firmware, small), Some(modes[2]));
     // Its listed-first rate cannot: the next of the native size.
-    let fast = [modes[1], at(3840, 2160, PREFERRED, 60), modes[2]];
+    let fast = [modes[1], mode_at(3840, 2160, PREFERRED, 60), modes[2]];
     let slow: Fits<'_> = &|_, _, refresh| refresh < 100_000;
-    assert_eq!(choose(&fast, firmware, slow), Some(fast[1]));
+    assert_eq!(fastest(&fast, firmware, slow), Some(fast[1]));
     // No preferred mode: the firmware's size, then the first.
-    assert_eq!(choose(&modes[2..], firmware, any), Some(modes[2]));
+    assert_eq!(fastest(&modes[2..], firmware, any), Some(modes[2]));
     assert_eq!(
-        choose(&modes[2..], Wanted::Native((800, 600)), any),
+        fastest(&modes[2..], Wanted::Native((800, 600)), any),
         Some(modes[2])
     );
 }

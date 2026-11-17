@@ -13,7 +13,7 @@ fn shown(outputs: &[&[ModeInfo]]) -> ((u32, u32), Vec<Fit>) {
         .iter()
         .enumerate()
         .map(|(index, modes)| match index == gives {
-            true => Fit::Mode(mode_of(modes, size, any).unwrap()),
+            true => Fit::Mode(mode_of(modes, size, any, Rate::Preferred).unwrap()),
             false => fit(modes, size),
         })
         .collect();

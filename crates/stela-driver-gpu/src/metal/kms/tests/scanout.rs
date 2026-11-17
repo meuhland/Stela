@@ -181,16 +181,29 @@ fn the_display_switches_between_the_rates_of_its_size_the_guest_can_be_told_of()
         flags: INTERLACED,
         ..at(2, 2, 0, 240)
     };
-    let mut card = Card::new(vec![
+    let modes = vec![
         at(2, 2, PREFERRED, 60),
         at(2, 2, 0, 144),
         at(2, 2, 0, 120),
         interlaced,
         at(2, 2, 0, 60),
         at(4, 2, 0, 75),
-    ]);
+    ];
     let no_200: Fits<'_> = &|_, _, refresh| refresh != 200_000;
-    let mut display = Display::take_fitting(&mut card, Wanted::Size((2, 2)), no_200).unwrap();
+    // By default the monitor's preferred mode runs, and macOS is told of
+    // every rate of the size, that one among them.
+    let mut first = Card::new(modes.clone());
+    let preferred = Display::take_fitting(&mut first, Wanted::Size((2, 2)), no_200).unwrap();
+    assert_eq!(preferred.refresh_millihertz(), 60_000);
+    assert_eq!(preferred.refresh_rates(), [144_000, 120_000, 60_000]);
+    assert_eq!(
+        preferred.drm.set.map(|(mode, _)| mode.kind),
+        Some(PREFERRED)
+    );
+    // With `--display-fastest` its fastest one of the size runs.
+    let mut card = Card::new(modes);
+    let mut display =
+        Display::take_fitting_at(&mut card, Wanted::Size((2, 2)), no_200, Rate::Fastest).unwrap();
     assert_eq!(display.refresh_millihertz(), 144_000);
     assert_eq!(display.refresh_rates(), [144_000, 120_000, 60_000]);
     let sets = display.drm.mode_sets;

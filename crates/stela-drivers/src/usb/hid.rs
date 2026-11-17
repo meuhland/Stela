@@ -59,7 +59,10 @@ const BOOT_REPORT_BYTES: usize = 8;
 /// An interrupt endpoint's wMaxPacketSize payload bits.
 const MAX_PACKET_SIZE: u16 = 0x7ff;
 /// Linux `hid_io_error`: retry after 13 ms, doubling to at least 100 ms,
-/// and give up after a second of failures.
+/// and after a second of failures reset the device and go on. Here the
+/// endpoint's own recovery stands for that reset and a new window begins:
+/// the interface is never dropped while its device is present and its
+/// endpoint recovers.
 const FIRST_RETRY_MS: u64 = 13;
 const LONGEST_RETRY_MS: u64 = 100;
 const RETRY_WINDOW_US: u64 = 1_000_000;
@@ -267,6 +270,11 @@ pub struct UsbInput {
     receiver: Option<receiver::Link>,
     /// The first transfer failure, reported once.
     failed: bool,
+    /// Reports received, transfer errors met, and retry windows that ran
+    /// out and began again, since the interface started.
+    reports: u64,
+    transfer_errors: u64,
+    retry_windows: u64,
     pub name: String,
 }
 
@@ -450,6 +458,9 @@ impl UsbInput {
             touch: None,
             receiver: None,
             failed: false,
+            reports: 0,
+            transfer_errors: 0,
+            retry_windows: 0,
             name: format!("{} ({})", device.name(), device.location),
         }))
     }
@@ -519,6 +530,7 @@ impl UsbInput {
                 Ok(bytes) => {
                     self.queued = None;
                     self.retry = None;
+                    self.reports += 1;
                     let bytes = self.buffer.bytes()[..bytes].to_vec();
                     let events_at = self.pending.hid.events.len();
                     let translated = self.translator.translate(
@@ -559,6 +571,7 @@ impl UsbInput {
                 }
                 Err(error) => {
                     self.error.get_or_insert_with(|| error.clone());
+                    self.transfer_errors += 1;
                     self.invalidate_touch();
                     self.invalidate_receiver(receiver::Error::Transport);
                     let recovered =
@@ -572,18 +585,25 @@ impl UsbInput {
                                     device.reset_endpoint(&self.endpoint)
                                 }
                             });
-                    if recovered.is_ok() {
-                        self.queued = None;
-                    }
-                    self.retry = match self.retry {
-                        None => Some(Retry::first(now)),
-                        Some(retry) => retry.next(now),
-                    };
                     if let Err(error) = recovered {
+                        // The endpoint could not be recovered: its TD and
+                        // DMA stay with this owner until a stop retires them.
                         self.fault(error);
-                    } else if self.retry.is_none() {
-                        self.fault(error);
+                        break;
                     }
+                    self.queued = None;
+                    // A second of failures without a report: Linux resets
+                    // the device and its retries begin again. The endpoint
+                    // was just recovered, so a new window begins here, and
+                    // the interface stays read; dropping it lost the device
+                    // for the rest of the boot.
+                    self.retry = Some(match self.retry {
+                        None => Retry::first(now),
+                        Some(retry) => retry.next(now).unwrap_or_else(|| {
+                            self.retry_windows += 1;
+                            Retry::first(now)
+                        }),
+                    });
                     break;
                 }
             }
@@ -620,6 +640,21 @@ impl UsbInput {
     /// Whether polling stopped on a transfer failure.
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// Reports received since the interface started.
+    pub fn reports(&self) -> u64 {
+        self.reports
+    }
+
+    /// Transfer errors met since the interface started, each retried.
+    pub fn transfer_errors(&self) -> u64 {
+        self.transfer_errors
+    }
+
+    /// Retry windows that ran a second without a report and began again.
+    pub fn retry_windows(&self) -> u64 {
+        self.retry_windows
     }
 }
 
