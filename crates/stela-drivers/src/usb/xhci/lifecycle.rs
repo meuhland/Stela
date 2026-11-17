@@ -949,18 +949,30 @@ impl Host {
         // Invalidate every alias before the first Stop command. An uncertain
         // contributor blocks all Disable Slot publication and new enumeration.
         let mut failure = None;
+        // Each slot's endpoints whose device left the bus, left Halted with
+        // their Reset Endpoint refused (`departed_endpoint`): Disable Slot
+        // retires them with the slot.
+        let mut departed: Vec<(u8, u32)> = Vec::new();
         for &slot in &slots {
             if c.slot_ownership[usize::from(slot)] != reset::Ownership::Enabled {
                 continue;
             }
+            let mut gone = 0u32;
             for dci in 1..32 {
                 if c.slots[usize::from(slot)]
                     .as_ref()
                     .is_some_and(|state| state.endpoints[dci].is_some())
                     && let Err(error) = c.cancel_inner(slot, dci as u8)
                 {
-                    failure.get_or_insert(error);
+                    if c.departed_endpoint(slot, dci as u8) {
+                        gone |= 1 << dci;
+                    } else {
+                        failure.get_or_insert(error);
+                    }
                 }
+            }
+            if gone != 0 {
+                departed.push((slot, gone));
             }
         }
         // From here no private child cancellation needs a live parent. Failed
@@ -975,7 +987,11 @@ impl Host {
             if Some(slot) != keep.map(SlotId::hardware_slot)
                 && c.slot_ownership[usize::from(slot)] == reset::Ownership::Enabled
             {
-                c.disable_slot(slot, reset::Ownership::Retired)
+                let gone = departed
+                    .iter()
+                    .find(|(departed, _)| *departed == slot)
+                    .map_or(0, |&(_, gone)| gone);
+                c.disable_departed_slot(slot, gone)
                     .map_err(|(_, error)| error)?;
             }
         }

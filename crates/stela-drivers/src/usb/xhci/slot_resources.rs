@@ -158,6 +158,7 @@ impl Cache {
             }),
             is_in: endpoint.is_in(),
             poisoned: false,
+            departed: false,
             enabled: false,
             in_flight: 0,
             stopped: false,
