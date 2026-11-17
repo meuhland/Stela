@@ -424,6 +424,8 @@ pub(in crate::engine) fn driver_line(line: &str) {
 /// new WindowServer is refused and dies, on a frozen screen. The stop is
 /// the one a boot without a GPU makes, with which GPU was lost and what
 /// its driver said of it. A reopen that gives a device changes nothing.
+/// Each look follows a reopen that failed, so a GPU whose driver said
+/// nothing is judged by reopens tried across its reset's time.
 pub(super) fn watch_losses() {
     if !LOSS_DUE.swap(false, Ordering::AcqRel) {
         return;
@@ -443,12 +445,14 @@ pub(super) fn watch_losses() {
             .map_or("(unnamed)", |bound| bound.name.as_str());
         losses.push((name, loss, SILENT.of(name)));
     }
+    let millis = (gpu.tsc_hz / 1000).max(1);
     let gpus: Vec<gpu_loss::Gpu<'_>> = losses
         .iter()
         .map(|(name, loss, silent)| gpu_loss::Gpu {
             name,
             lost: loss.lost,
             failed_reopens: loss.failed_reopens,
+            failing_ms: loss.failing_ticks / millis,
             error: loss.error.as_deref(),
             silent: silent.as_deref(),
         })

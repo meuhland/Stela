@@ -283,10 +283,14 @@ fn a_device_that_does_not_reopen_stays_lost() {
 }
 
 /// The platform ends a session no GPU serves by what the service counts:
-/// each reopen that failed since the loss, with the last error, and none
-/// once a reopen gave a device.
+/// each reopen that failed since the loss, over how long by the platform's
+/// clock, with the last error, and none once a reopen gave a device.
 #[test]
 fn failed_reopens_count_in_a_row_until_one_gives_a_device() {
+    fn clock() -> u64 {
+        static NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        NOW.fetch_add(1000, Ordering::Relaxed)
+    }
     let tries = alloc::sync::Arc::new(AtomicUsize::new(0));
     let reopen = {
         let tries = tries.clone();
@@ -296,6 +300,7 @@ fn failed_reopens_count_in_a_row_until_one_gives_a_device() {
         })
     };
     let mut service = service().with_reopen(reopen);
+    service.device().set_clock(clock);
     assert_eq!(service.loss(), Loss::default());
     let connection = connect(&mut service);
     service.device().mark_lost();
@@ -304,20 +309,25 @@ fn failed_reopens_count_in_a_row_until_one_gives_a_device() {
         service.loss(),
         Loss {
             lost: true,
-            failed_reopens: 0,
-            error: None
+            ..Loss::default()
         }
     );
     service.disconnect(connection).unwrap();
-    assert!(service.connect().is_err());
+    // One failed reopen spans no time yet.
     assert_eq!(
         service.loss(),
         Loss {
             lost: true,
-            failed_reopens: 2,
+            failed_reopens: 1,
+            failing_ticks: 0,
             error: Some("DeviceLost".into())
         }
     );
+    assert!(service.connect().is_err());
+    let loss = service.loss();
+    assert_eq!((loss.lost, loss.failed_reopens), (true, 2));
+    assert_eq!(loss.error.as_deref(), Some("DeviceLost"));
+    assert!(loss.failing_ticks >= 1000, "{loss:?}");
     assert!(
         service
             .refused

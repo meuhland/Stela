@@ -8,9 +8,19 @@ use alloc::{format, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// The failed reopens in a row after which a lost GPU is taken not to
-/// reopen, when its kernel driver did not say that it stopped answering:
-/// the close that found it lost and the next client's connection.
+/// reopen, when its kernel driver did not say that it stopped answering,
+/// and the least time from the first of them to the last
+/// ([`REOPEN_SPAN_MS`]): a close that found it lost and the clients that
+/// follow may try within milliseconds, while its driver may still be
+/// resetting it.
 pub const REOPEN_ATTEMPTS: u32 = 2;
+
+/// How long reopens of a lost GPU whose driver said nothing must keep
+/// failing before it is taken not to reopen. Linux gives a hung job 10 s
+/// (amdgpu's `lockup_timeout`, the xe and nouveau schedulers' job timeouts
+/// are shorter) before its driver resets the GPU, and the reset takes
+/// seconds more; a reopen tried after this has outlived both.
+pub const REOPEN_SPAN_MS: u64 = 30_000;
 
 /// What a kernel driver's line says, after its device's name, of a GPU that
 /// left the bus (nouveau's `nvkm_device_gone`): after it no reopen can work.
@@ -25,6 +35,8 @@ pub struct Gpu<'a> {
     pub lost: bool,
     /// The reopens that failed in a row since the loss.
     pub failed_reopens: u32,
+    /// The milliseconds from the first of them to the last.
+    pub failing_ms: u64,
     /// The last such reopen's error.
     pub error: Option<&'a str>,
     /// Its kernel driver's line that it stopped answering, if it gave one.
@@ -32,17 +44,17 @@ pub struct Gpu<'a> {
 }
 
 impl Gpu<'_> {
-    /// Whether the GPU is lost and will not reopen: a reopen failed after
-    /// its driver said it stopped answering, or [`REOPEN_ATTEMPTS`] failed
-    /// in a row. A lost GPU no reopen was tried on yet may still come back.
+    /// Whether the GPU is lost and will not reopen: a reopen failed and its
+    /// driver said it stopped answering (it then fails every later one), or
+    /// [`REOPEN_ATTEMPTS`] failed in a row over at least [`REOPEN_SPAN_MS`].
+    /// A lost GPU no reopen was tried on yet, or tried only within that
+    /// time, may still come back.
     fn gone(&self) -> bool {
         self.lost
-            && self.failed_reopens
-                >= if self.silent.is_some() {
-                    1
-                } else {
-                    REOPEN_ATTEMPTS
-                }
+            && match self.silent {
+                Some(_) => self.failed_reopens >= 1,
+                None => self.failed_reopens >= REOPEN_ATTEMPTS && self.failing_ms >= REOPEN_SPAN_MS,
+            }
     }
 }
 
@@ -58,7 +70,7 @@ pub fn verdict(gpus: &[Gpu<'_>]) -> Option<String> {
         .map(|gpu| {
             let tries = match gpu.failed_reopens {
                 1 => String::from("1 try"),
-                tries => format!("{tries} tries"),
+                tries => format!("{tries} tries over {} s", gpu.failing_ms / 1000),
             };
             let error = gpu.error.unwrap_or("no error named");
             let said = match gpu.silent {
@@ -175,6 +187,7 @@ mod tests {
             name: "0000:02:00.0",
             lost,
             failed_reopens,
+            failing_ms: u64::from(failed_reopens.saturating_sub(1)) * REOPEN_SPAN_MS,
             error: (failed_reopens != 0).then_some("DeviceLost"),
             silent,
         }
@@ -190,6 +203,13 @@ mod tests {
         // One failed reopen with no word from the driver may be a passing
         // refusal: the next client tries again.
         assert_eq!(verdict(&[gpu(true, 1, None)]), None);
+        // Nor do many within the time a driver's reset may take: the closes
+        // after a loss and the clients that follow try within moments.
+        let soon = Gpu {
+            failing_ms: REOPEN_SPAN_MS - 1,
+            ..gpu(true, 9, None)
+        };
+        assert_eq!(verdict(&[soon]), None);
         // A reopen that gave a device counts none, whatever came before.
         assert_eq!(verdict(&[gpu(false, 0, Some(GONE))]), None);
     }
@@ -205,9 +225,9 @@ mod tests {
     }
 
     #[test]
-    fn a_gpu_its_driver_said_nothing_of_ends_it_at_the_second_failed_reopen() {
+    fn a_gpu_its_driver_said_nothing_of_ends_it_once_reopens_failed_long_enough() {
         let reason = verdict(&[gpu(true, REOPEN_ATTEMPTS, None)]).expect("stops");
-        assert!(reason.contains("(2 tries, last: DeviceLost)"));
+        assert!(reason.contains("(2 tries over 30 s, last: DeviceLost)"));
         assert!(reason.ends_with("Its driver did not say that it left the bus"));
     }
 
@@ -221,13 +241,20 @@ mod tests {
         let other = Gpu {
             lost: true,
             failed_reopens: 2,
+            failing_ms: 1000,
             error: Some("OutOfMemory"),
+            ..other
+        };
+        // The other's reopens failed only for a moment yet.
+        assert_eq!(verdict(&[gpu(true, 3, Some(GONE)), other]), None);
+        let other = Gpu {
+            failing_ms: 41_500,
             ..other
         };
         let reason = verdict(&[gpu(true, 3, Some(GONE)), other]).expect("stops");
         assert!(reason.contains("the GPU 0000:02:00.0 was lost"));
         assert!(reason.contains("; the GPU 0000:03:00.0 was lost"));
-        assert!(reason.contains("(2 tries, last: OutOfMemory)"));
+        assert!(reason.contains("(2 tries over 41 s, last: OutOfMemory)"));
     }
 
     #[test]
