@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Louis-Philippe Gauthier <6123610+meuhland@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 02:00:34 +0000
+Subject: [PATCH] nouveau/headers: generate push helpers for the NVC7B7 video
+ encoder
+
+clc7b7.h (and nvenc_drv.h) are vendored already, but the class list
+generates P_* helpers only for the NVDEC classes. Add the GA10x encoder
+to it, on subchannel 4 as video decode is, and carry the kernel's
+NOUVEAU_FIFO_ENGINE_NVENC in the uapi copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/drm-uapi/nouveau_drm.h  | 2 ++
+ src/nouveau/headers/meson.build | 1 +
+ src/nouveau/headers/nv_push.h   | 2 ++
+ 3 files changed, 5 insertions(+)
+
+diff --git a/include/drm-uapi/nouveau_drm.h b/include/drm-uapi/nouveau_drm.h
+index 1fa82fa6af386a040ce7e36f74f4c5f992258aa5..74ea77f459198427b14d17b4c7019b4e335aeb7b 100644
+--- a/include/drm-uapi/nouveau_drm.h
++++ b/include/drm-uapi/nouveau_drm.h
+@@ -89,6 +89,8 @@ struct drm_nouveau_getparam {
+ #define NOUVEAU_FIFO_ENGINE_PPP 0x04
+ #define NOUVEAU_FIFO_ENGINE_BSP 0x08
+ #define NOUVEAU_FIFO_ENGINE_CE  0x30
++/* Stela: the video encoder's runlist (NVENC), as NVDEC's has its own. */
++#define NOUVEAU_FIFO_ENGINE_NVENC 0x400
+ 
+ struct drm_nouveau_channel_alloc {
+ 	__u32     fb_ctxdma_handle;
+diff --git a/src/nouveau/headers/meson.build b/src/nouveau/headers/meson.build
+index b7d3d539392bffddb2dda2a7dca0b433f8a5c386..db92ac39d31e6fea7c57e1a16c1fd6389fb8da99 100644
+--- a/src/nouveau/headers/meson.build
++++ b/src/nouveau/headers/meson.build
+@@ -48,6 +48,7 @@ nv_classes = [
+   'clc797',
+   'clc7b0',
+   'clc7b5',
++  'clc7b7',
+   'clc7c0',
+   'clc86f',
+   'clc8b5',
+diff --git a/src/nouveau/headers/nv_push.h b/src/nouveau/headers/nv_push.h
+index 1d0fd201c0f83d7267c6c02f6471b3390616b09a..eefa6c4410ec118ed9f4bef4c6c9c919a3ad66c5 100644
+--- a/src/nouveau/headers/nv_push.h
++++ b/src/nouveau/headers/nv_push.h
+@@ -96,6 +96,8 @@ void vk_push_print(FILE *fp, const struct nv_push *push,
+ 
+ /* video decode will get push on sub channel 4 */
+ #define SUBC_NVC5B0 4
++/* and so will video encode, on its own channel */
++#define SUBC_NVC7B7 4
+ 
+ static inline uint8_t
+ NVC0_FIFO_SUBC_FROM_PKHDR(uint32_t hdr)
