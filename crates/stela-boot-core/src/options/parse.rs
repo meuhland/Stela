@@ -54,6 +54,7 @@ impl ParseState<'_> {
             "--monitor-trace" => options.monitor_trace = true,
             "--display-trace" => options.display_trace = true,
             PROBE_NVENC => options.probe_nvenc = true,
+            NVENC_SELFTEST => options.nvenc_selftest = true,
             "--native-shared-check" => flag(
                 &mut options.native_shared_check,
                 Error::DuplicateNativeShared,
