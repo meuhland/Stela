@@ -234,10 +234,7 @@ pub(super) fn place(tree: &mut DeviceTree, config: &Config) -> Vec<Placed> {
             (Kind::Block, Some(mib)) => match block(mib) {
                 Ok(made) => Some(made),
                 Err(error) => {
-                    output::arguments(format_args!(
-                        "VIRTIO {} not placed: {error}\n",
-                        kind.name()
-                    ));
+                    output::arguments(format_args!("VIRTIO {} not placed: {error}\n", kind.name()));
                     continue;
                 }
             },
