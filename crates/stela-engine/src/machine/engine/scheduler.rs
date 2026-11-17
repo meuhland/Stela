@@ -761,6 +761,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
         if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0 {
+            if block.shared && self.shared_limits.no_cells {
+                return false;
+            }
             // A cell needs the entry this PE's translation of the target
             // names: without one it would hold none, and every transfer
             // through it would go on to the table probe until the table
@@ -802,6 +805,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
             return false;
         };
+        // `--shared-no-links`; and with `--shared-verify`, only into a
+        // shared block a fetch here checked.
+        if (block.shared || code.blocks[target].shared)
+            && (self.shared_limits.no_links || !self.alias_checked(target, next_pc))
+        {
+            return false;
+        }
         let exit = block.successors[position];
         let site = exit.site;
         let entry = code.blocks[target].code.0 as u64;

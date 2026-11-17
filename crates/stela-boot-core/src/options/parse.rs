@@ -28,6 +28,10 @@ impl ParseState<'_> {
     /// Consume exactly the value words required by this spelling. Duplicate
     /// checks stay on their original side of value parsing.
     fn apply(&mut self, name: &str) -> Result<(), Error> {
+        if let Some(bit) = SHARED_LIMITS.iter().position(|&limit| limit == name) {
+            self.options.shared_limits |= 1 << bit;
+            return Ok(());
+        }
         let options = &mut self.options;
         let mut value = || self.words.next();
         match name {

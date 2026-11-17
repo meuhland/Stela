@@ -151,7 +151,12 @@ fn page_relative_corpus() {
         system,
     );
     const PAGE: usize = 4096;
-    const AWAY: u64 = 1 << 32;
+    // `PR_AWAY` (hex): another distance, such as an ASLR slide, whose low
+    // 32 bits are not zero.
+    let away = std::env::var("PR_AWAY")
+        .ok()
+        .and_then(|away| u64::from_str_radix(&away, 16).ok())
+        .unwrap_or(1 << 32);
     let prepare = |offset: usize, pc: u64| {
         // As the engine's: to the page's end, a block's bytes at most.
         let end = ((offset / PAGE + 1) * PAGE).min(offset + super::MAX_BLOCK_BYTES as usize);
@@ -168,7 +173,7 @@ fn page_relative_corpus() {
                 break;
             }
             let pc = base + offset as u64;
-            let (here, there) = (prepare(offset, pc), prepare(offset, pc.wrapping_add(AWAY)));
+            let (here, there) = (prepare(offset, pc), prepare(offset, pc.wrapping_add(away)));
             let taken = match (here, there) {
                 (
                     Some(Ok(Prepared::Block { compiled: a, .. })),
