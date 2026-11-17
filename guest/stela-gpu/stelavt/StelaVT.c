@@ -1,8 +1,22 @@
 /*
- * StelaVT: a VideoToolbox H.264 encoder plugin backed by x264, for macOS
- * running under Stela, which has no Apple video encoder. It registers as a
- * hardware encoder so real-time clients (Parsec, screen sharing) that ask
- * for one get a fast software encoder instead of Apple's software HEVC.
+ * StelaVT: a VideoToolbox H.264 and HEVC encoder plugin for macOS running
+ * under Stela, which has no Apple video encoder. It registers as a hardware
+ * encoder so real-time clients (Parsec, screen sharing) that ask for one get
+ * a fast encoder instead of Apple's software HEVC.
+ *
+ * Each session encodes on the host's NVENC when the host serves it, through
+ * StelaGPU.bundle's gate (StelaEncoder.h), and otherwise with x264:
+ *
+ * - H.264: NVENC, or x264 when the host refuses the session; a session that
+ *   NVENC loses mid-stream goes on with x264, starting with an IDR.
+ * - HEVC: NVENC only. A session is refused at creation
+ *   (kVTCouldNotFindVideoEncoderErr) when the host has no HEVC encoder, so
+ *   VideoToolbox's client falls back to H.264.
+ *
+ * NVENC's output is Annex B, which becomes length-prefixed samples (AVCC,
+ * HVCC) under a format description made of the session's parameter sets.
+ * The host's parameter sets signal video range, so a session NVENC serves
+ * asks for '420v' only.
  *
  * VideoToolbox's plugin interface is private. Its layout here follows
  * Apple's own encoder plugins (JPEGVideoEncoder.bundle, macOS 27.2):
@@ -15,11 +29,15 @@
 #include <dlfcn.h>
 #include <os/log.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <x264.h>
+
+#include "StelaEncoder.h"
 
 /* ---- The private interface ---------------------------------------------- */
 
@@ -92,22 +110,101 @@ static os_log_t logger(void)
 	return log;
 }
 
+/* ---- The host's encoder ----------------------------------------------- */
+
+/* The bundle's table, which its constructor hands over. */
+static _Atomic(const StelaEncoderAPI *) handed;
+
+/* StelaGPU.bundle calls this before it registers StelaVT. */
+__attribute__((visibility("default"))) void StelaVT_UseEncoders(const StelaEncoderAPI *api)
+{
+	if (api && api->version >= STELA_ENCODER_API_VERSION) {
+		atomic_store(&handed, api);
+	}
+}
+
+/* The host's encoder calls: the handed table, or the bundle's by class when
+ * this image is not the one the bundle loaded; NULL without the bundle. */
+static const StelaEncoderAPI *host(void)
+{
+	const StelaEncoderAPI *api = atomic_load(&handed);
+	if (api) {
+		return api;
+	}
+	void *(*getClass)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+	void *(*registerName)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+	void *send = dlsym(RTLD_DEFAULT, "objc_msgSend");
+	void *class = getClass ? getClass(STELA_ENCODER_CLASS) : NULL;
+	if (!class || !registerName || !send) {
+		return NULL;
+	}
+	const StelaEncoderAPI *(*message)(void *, void *) = (const StelaEncoderAPI *(*)(void *, void *))send;
+	api = message(class, registerName("api"));
+	if (!api || api->version < STELA_ENCODER_API_VERSION) {
+		return NULL;
+	}
+	atomic_store(&handed, api);
+	return api;
+}
+
+/* Whether the host's encoder codes `codec` now; why not in `reason`. */
+static bool hostCodes(uint32_t codec, char *reason, size_t bytes)
+{
+	const StelaEncoderAPI *api = host();
+	if (!api) {
+		snprintf(reason, bytes, "StelaGPU.bundle gave no host encoder in this process");
+		return false;
+	}
+	StelaEncoderCapabilities capabilities;
+	StelaEncoderStatus status = api->capabilities(&capabilities, reason, bytes);
+	if (status != StelaEncoderOk) {
+		return false;
+	}
+	if (!(capabilities.codecs & (1u << codec))) {
+		snprintf(reason, bytes, "the host's encoder does not code this codec");
+		return false;
+	}
+	return true;
+}
+
 /* ---- The encoder ---------------------------------------------------------- */
 
 enum { kPending = 64 };
+/* Frames NVENC may refuse in a row before the session goes to x264. */
+enum { kMostDrops = 3 };
+/* The parameter sets' room: H.264 36 bytes and HEVC 95 at 1080p. */
+enum { kSetsBytes = 512 };
+
+typedef enum {
+	BackendNone,
+	BackendNVENC,
+	BackendX264,
+} Backend;
 
 typedef struct {
 	pthread_mutex_t lock;
 	VTEncoderSessionRef session;
+	CMVideoCodecType codec;
 	int32_t width, height;
+	Backend backend;
 	x264_t *x264;
 	CMFormatDescriptionRef format;
-	/* Settings, applied when x264 opens at the first frame. */
+	/* NVENC's session, its output buffer and the frame number it counts. */
+	StelaEncoderSession *nvenc;
+	uint8_t *out;
+	size_t outBytes;
+	uint64_t frame;
+	/* Frames since the last IDR, which the key frame interval counts. */
+	int sinceKey;
+	int drops;
+	/* A bitrate set since the last frame, which the next one carries. */
+	int newBitrate;
+	/* Settings, applied when the encoder opens at the first frame. */
 	int bitrate; /* bits per second, 0: default */
 	int keyInterval;
+	double keyDuration;
 	double frameRate;
-	bool fullRange;
-	/* Frames x264 holds, by its pts. */
+	/* x264's frames, by its pts. */
 	struct {
 		bool used;
 		int64_t pts;
@@ -115,32 +212,58 @@ typedef struct {
 		CMTime time, duration;
 	} pending[kPending];
 	int64_t nextPts;
-	uint64_t frames, bytes;
+	uint64_t frames, bytes, idrs;
+	uint64_t gpuMicros, convertMicros;
 } Encoder;
+
+static const char *codecName(CMVideoCodecType codec)
+{
+	return codec == kCMVideoCodecType_HEVC ? "HEVC" : "H.264";
+}
+
+static const char *backendName(Backend backend)
+{
+	return backend == BackendNVENC ? "NVENC" : backend == BackendX264 ? "x264" : "none";
+}
 
 static Encoder *storage(VTVideoEncoderRef encoder)
 {
 	return vt.derivedStorage(vt.encoderBase(encoder));
 }
 
+static void closeNVENC(Encoder *e)
+{
+	if (e->nvenc) {
+		host()->close(e->nvenc);
+		e->nvenc = NULL;
+	}
+	free(e->out);
+	e->out = NULL;
+	e->outBytes = 0;
+}
+
 static void finalize(CMBaseObjectRef object)
 {
 	Encoder *e = vt.derivedStorage(object);
+	closeNVENC(e);
 	if (e->x264) {
 		x264_encoder_close(e->x264);
 	}
 	if (e->format) {
 		CFRelease(e->format);
 	}
-	os_log(logger(), "StelaVT: closed after %llu frames, %llu bytes", e->frames, e->bytes);
+	uint64_t frames = e->frames ? e->frames : 1;
+	os_log(logger(), "StelaVT: %{public}s session closed after %llu frames, %llu bytes, %llu IDRs, on %{public}s"
+	    " (NVENC gpu %llu us, host convert %llu us a frame)", codecName(e->codec), e->frames, e->bytes, e->idrs,
+	    backendName(e->backend), e->gpuMicros / frames, e->convertMicros / frames);
 	pthread_mutex_destroy(&e->lock);
 }
 
 static CFStringRef copyDebugDescription(CMBaseObjectRef object)
 {
 	Encoder *e = vt.derivedStorage(object);
-	return CFStringCreateWithFormat(NULL, NULL, CFSTR("<StelaVT x264 H.264 %dx%d, %llu frames>"), e->width,
-	    e->height, e->frames);
+	return CFStringCreateWithFormat(NULL, NULL, CFSTR("<StelaVT %s %s %dx%d, %llu frames>"),
+	    backendName(e->backend), codecName(e->codec), e->width, e->height, e->frames);
 }
 
 static bool number(CFTypeRef value, double *out)
@@ -174,6 +297,8 @@ static OSStatus setProperty(CMBaseObjectRef object, CFStringRef key, CFTypeRef v
 				p.rc.i_vbv_max_bitrate = p.rc.i_bitrate;
 				x264_encoder_reconfig(e->x264, &p);
 			}
+			/* NVENC takes it with the next frame. */
+			e->newBitrate = e->bitrate;
 		}
 	} else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) {
 		if (number(value, &n) && n > 0) {
@@ -183,10 +308,13 @@ static OSStatus setProperty(CMBaseObjectRef object, CFStringRef key, CFTypeRef v
 		if (number(value, &n) && n > 0) {
 			e->keyInterval = (int)n;
 		}
+	} else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration)) {
+		if (number(value, &n) && n > 0) {
+			e->keyDuration = n;
+		}
 	} else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)
 	    || CFEqual(key, kVTCompressionPropertyKey_AllowFrameReordering)
 	    || CFEqual(key, kVTCompressionPropertyKey_ProfileLevel)
-	    || CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration)
 	    || CFEqual(key, kVTCompressionPropertyKey_DataRateLimits)
 	    || CFEqual(key, kVTCompressionPropertyKey_Quality)
 	    || CFEqual(key, kVTCompressionPropertyKey_H264EntropyMode)
@@ -194,7 +322,8 @@ static OSStatus setProperty(CMBaseObjectRef object, CFStringRef key, CFTypeRef v
 	    || CFEqual(key, kVTCompressionPropertyKey_TransferFunction)
 	    || CFEqual(key, kVTCompressionPropertyKey_YCbCrMatrix)
 	    || CFEqual(key, kVTVideoEncoderSpecification_EnableLowLatencyRateControl)) {
-		/* Accepted: x264's zerolatency tuning already never reorders. */
+		/* Accepted: NVENC codes one frame at a time with no B-frames, and
+		 * x264's zerolatency tuning never reorders either. */
 	} else {
 		status = kVTPropertyNotSupportedErr;
 	}
@@ -258,6 +387,7 @@ static OSStatus copySupportedPropertyDictionary(VTVideoEncoderRef encoder, CFDic
 	addProperty(d, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kVTPropertyType_Boolean);
 	os_log_debug(logger(), "StelaVT: copySupportedPropertyDictionary");
 	*out = d;
+	(void)encoder;
 	return noErr;
 }
 
@@ -269,13 +399,18 @@ static OSStatus startSession(VTVideoEncoderRef encoder, VTEncoderSessionRef sess
 	e->width = size.width;
 	e->height = size.height;
 	pthread_mutex_unlock(&e->lock);
-	/* NV12, video or full range: what x264 reads without conversion. */
+	/* NV12, which both encoders read without conversion: video range only
+	 * when NVENC may serve, whose parameter sets signal video range. */
+	char reason[160];
+	uint32_t codec = e->codec == kCMVideoCodecType_HEVC ? StelaEncoderHEVC : StelaEncoderH264;
+	bool nvenc = hostCodes(codec, reason, sizeof reason);
 	int formats[] = {kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
+	CFIndex count = nvenc ? 1 : 2;
 	CFNumberRef numbers[2];
-	for (int i = 0; i < 2; i++) {
+	for (CFIndex i = 0; i < count; i++) {
 		numbers[i] = CFNumberCreate(NULL, kCFNumberIntType, &formats[i]);
 	}
-	CFArrayRef list = CFArrayCreate(NULL, (const void **)numbers, 2, &kCFTypeArrayCallBacks);
+	CFArrayRef list = CFArrayCreate(NULL, (const void **)numbers, count, &kCFTypeArrayCallBacks);
 	CFDictionaryRef surface = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 	    &kCFTypeDictionaryValueCallBacks);
 	const void *keys[] = {kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferIOSurfacePropertiesKey};
@@ -286,14 +421,16 @@ static OSStatus startSession(VTVideoEncoderRef encoder, VTEncoderSessionRef sess
 	CFRelease(attributes);
 	CFRelease(surface);
 	CFRelease(list);
-	CFRelease(numbers[0]);
-	CFRelease(numbers[1]);
-	os_log(logger(), "StelaVT: session %dx%d, pixel buffer attributes %d", size.width, size.height, (int)status);
+	for (CFIndex i = 0; i < count; i++) {
+		CFRelease(numbers[i]);
+	}
+	os_log(logger(), "StelaVT: %{public}s session %dx%d, %{public}s, pixel buffer attributes %d",
+	    codecName(e->codec), size.width, size.height, nvenc ? "420v for NVENC" : "420v and 420f", (int)status);
 	return status;
 }
 
 /* x264 opened for the first frame's size and range, with the settings so far. */
-static OSStatus openEncoder(Encoder *e, int width, int height, bool fullRange)
+static OSStatus openX264(Encoder *e, int width, int height, bool fullRange)
 {
 	x264_param_t p;
 	if (x264_param_default_preset(&p, "ultrafast", "zerolatency") < 0) {
@@ -340,13 +477,222 @@ static OSStatus openEncoder(Encoder *e, int width, int height, bool fullRange)
 	if (!sets[0] || !sets[1]) {
 		return kVTVideoEncoderMalfunctionErr;
 	}
+	if (e->format) {
+		CFRelease(e->format);
+		e->format = NULL;
+	}
 	OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &e->format);
 	os_log(logger(), "StelaVT: x264 open %dx%d %.1f fps %d kbps keyint %d range %s: %d", width, height, fps, kbps,
 	    p.i_keyint_max, fullRange ? "full" : "video", (int)status);
 	return status;
 }
 
-static OSStatus emit(Encoder *e, x264_nal_t *nals, int count, x264_picture_t *out)
+/* ---- Annex B ---------------------------------------------------------------- */
+
+typedef struct {
+	const uint8_t *data;
+	size_t size;
+} Nal;
+
+enum { kMostNals = 256 };
+
+/* The NAL units of Annex B `bytes`, without their start codes. */
+static size_t splitAnnexB(const uint8_t *bytes, size_t length, Nal *nals, size_t most)
+{
+	size_t count = 0;
+	size_t start = SIZE_MAX;
+	size_t i = 0;
+	while (i + 3 <= length) {
+		if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1) {
+			if (start != SIZE_MAX && count < most) {
+				/* The zero_byte of a 4-byte start code is not the NAL's. */
+				size_t end = i;
+				while (end > start && bytes[end - 1] == 0) {
+					end--;
+				}
+				nals[count++] = (Nal){bytes + start, end - start};
+			}
+			start = i + 3;
+			i += 3;
+		} else {
+			i++;
+		}
+	}
+	if (start != SIZE_MAX && start < length && count < most) {
+		nals[count++] = (Nal){bytes + start, length - start};
+	}
+	return count;
+}
+
+static int nalType(CMVideoCodecType codec, Nal nal)
+{
+	if (nal.size == 0) {
+		return -1;
+	}
+	return codec == kCMVideoCodecType_HEVC ? (nal.data[0] >> 1) & 0x3f : nal.data[0] & 0x1f;
+}
+
+/* Parameter sets and access unit delimiters, which the format description
+ * or nothing carries in a length-prefixed stream. */
+static bool outOfBand(CMVideoCodecType codec, int type)
+{
+	return codec == kCMVideoCodecType_HEVC ? (type >= 32 && type <= 35) : (type == 7 || type == 8 || type == 9);
+}
+
+/* The format description of NVENC's parameter sets. */
+static OSStatus formatOfSets(Encoder *e, const uint8_t *sets, size_t length)
+{
+	Nal nals[8];
+	size_t count = splitAnnexB(sets, length, nals, 8);
+	bool hevc = e->codec == kCMVideoCodecType_HEVC;
+	/* H.264: SPS, PPS; HEVC: VPS, SPS, PPS. */
+	const int wanted[3] = {hevc ? 32 : 7, hevc ? 33 : 8, hevc ? 34 : -1};
+	size_t needed = hevc ? 3 : 2;
+	const uint8_t *pointers[3] = {NULL, NULL, NULL};
+	size_t sizes[3] = {0, 0, 0};
+	for (size_t i = 0; i < count; i++) {
+		int type = nalType(e->codec, nals[i]);
+		for (size_t slot = 0; slot < needed; slot++) {
+			if (type == wanted[slot] && !pointers[slot]) {
+				pointers[slot] = nals[i].data;
+				sizes[slot] = nals[i].size;
+			}
+		}
+	}
+	for (size_t slot = 0; slot < needed; slot++) {
+		if (!pointers[slot]) {
+			return kVTVideoEncoderMalfunctionErr;
+		}
+	}
+	if (e->format) {
+		CFRelease(e->format);
+		e->format = NULL;
+	}
+	if (hevc) {
+		return CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, needed, pointers, sizes, 4, NULL,
+		    &e->format);
+	}
+	return CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, needed, pointers, sizes, 4, &e->format);
+}
+
+/* Opens NVENC for the first frame's size with the settings so far; why not
+ * in `reason`. */
+static OSStatus openNVENC(Encoder *e, int width, int height, char *reason, size_t bytes)
+{
+	const StelaEncoderAPI *api = host();
+	if (!api) {
+		snprintf(reason, bytes, "StelaGPU.bundle gave no host encoder in this process");
+		return kVTCouldNotFindVideoEncoderErr;
+	}
+	double fps = e->frameRate > 0 ? e->frameRate : 60;
+	StelaEncoderConfig config = {
+		.codec = e->codec == kCMVideoCodecType_HEVC ? StelaEncoderHEVC : StelaEncoderH264,
+		.width = (uint32_t)width,
+		.height = (uint32_t)height,
+		.fps_milli = (uint32_t)(fps * 1000),
+		.rate = StelaEncoderCBR,
+		.bitrate = e->bitrate > 0 ? (uint32_t)e->bitrate : 0,
+		.qp = 0,
+	};
+	uint8_t sets[kSetsBytes];
+	size_t setsLength = 0;
+	uint64_t most = 0;
+	StelaEncoderStatus status = api->open(&config, sets, sizeof sets, &setsLength, &most, &e->nvenc, reason, bytes);
+	if (status != StelaEncoderOk) {
+		e->nvenc = NULL;
+		return kVTCouldNotFindVideoEncoderErr;
+	}
+	OSStatus made = setsLength <= sizeof sets ? formatOfSets(e, sets, setsLength) : kVTVideoEncoderMalfunctionErr;
+	e->outBytes = (size_t)most;
+	e->out = made == noErr ? malloc(e->outBytes) : NULL;
+	if (made != noErr || !e->out) {
+		snprintf(reason, bytes, "the host's parameter sets (%zu bytes) make no format description: %d", setsLength,
+		    (int)made);
+		closeNVENC(e);
+		return kVTVideoEncoderMalfunctionErr;
+	}
+	e->newBitrate = 0;
+	e->sinceKey = 0;
+	return noErr;
+}
+
+/* Picks the session's encoder at its first frame and says which, once. */
+static OSStatus openBackend(Encoder *e, int width, int height, bool fullRange)
+{
+	char reason[160] = "";
+	bool hevc = e->codec == kCMVideoCodecType_HEVC;
+	if (!fullRange || hevc) {
+		if (openNVENC(e, width, height, reason, sizeof reason) == noErr) {
+			e->backend = BackendNVENC;
+			os_log(logger(), "StelaVT: %{public}s session %dx%d %.0f fps %d kb/s encodes on NVENC (the host's)%{public}s",
+			    codecName(e->codec), width, height, e->frameRate > 0 ? e->frameRate : 60, e->bitrate / 1000,
+			    fullRange ? ", full-range input coded as video range" : "");
+			return noErr;
+		}
+	} else {
+		snprintf(reason, sizeof reason, "full-range input, which NVENC's parameter sets do not signal");
+	}
+	if (hevc) {
+		os_log_error(logger(), "StelaVT: HEVC session %dx%d has no encoder: NVENC refused: %{public}s", width, height,
+		    reason);
+		return kVTVideoEncoderNotAvailableNowErr;
+	}
+	OSStatus status = openX264(e, width, height, fullRange);
+	if (status == noErr) {
+		e->backend = BackendX264;
+		os_log(logger(), "StelaVT: H.264 session %dx%d encodes on x264: NVENC refused: %{public}s", width, height,
+		    reason);
+	}
+	return status;
+}
+
+/* ---- Emitting ------------------------------------------------------------ */
+
+static void markSync(CMSampleBufferRef sample, bool key)
+{
+	CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
+	CFMutableDictionaryRef first = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+	CFDictionarySetValue(first, kCMSampleAttachmentKey_NotSync, key ? kCFBooleanFalse : kCFBooleanTrue);
+	CFDictionarySetValue(first, kCMSampleAttachmentKey_DependsOnOthers, key ? kCFBooleanFalse : kCFBooleanTrue);
+}
+
+/* Emits `length` bytes of length-prefixed sample data at `data`, which the
+ * sample takes (malloc's); frees it on failure. */
+static OSStatus emitSample(Encoder *e, VTEncoderFrameToken token, uint8_t *data, size_t length, bool key, CMTime time,
+    CMTime duration)
+{
+	CMSampleTimingInfo timing = {
+		.duration = duration,
+		.presentationTimeStamp = time,
+		.decodeTimeStamp = time,
+	};
+	CMBlockBufferRef block = NULL;
+	CMSampleBufferRef sample = NULL;
+	OSStatus status = CMBlockBufferCreateWithMemoryBlock(NULL, data, length, kCFAllocatorMalloc, NULL, 0, length, 0,
+	    &block);
+	if (status != noErr) {
+		free(data);
+	}
+	if (status == noErr) {
+		status = CMSampleBufferCreateReady(NULL, block, e->format, 1, 1, &timing, 1, &length, &sample);
+	}
+	if (status == noErr) {
+		markSync(sample, key);
+	}
+	e->frames++;
+	e->bytes += length;
+	e->idrs += key;
+	OSStatus emitted = vt.emit(e->session, token, status, 0, status == noErr ? sample : NULL);
+	if (sample) {
+		CFRelease(sample);
+	}
+	if (block) {
+		CFRelease(block);
+	}
+	return status == noErr ? emitted : status;
+}
+
+static OSStatus emitX264(Encoder *e, x264_nal_t *nals, int count, x264_picture_t *out)
 {
 	size_t total = 0;
 	for (int i = 0; i < count; i++) {
@@ -362,42 +708,177 @@ static OSStatus emit(Encoder *e, x264_nal_t *nals, int count, x264_picture_t *ou
 	if (slot < 0) {
 		return kVTVideoEncoderMalfunctionErr;
 	}
-	VTEncoderFrameToken token = e->pending[slot].token;
-	CMSampleTimingInfo timing = {
-		.duration = e->pending[slot].duration,
-		.presentationTimeStamp = e->pending[slot].time,
-		.decodeTimeStamp = e->pending[slot].time,
-	};
 	e->pending[slot].used = false;
-	CMBlockBufferRef block = NULL;
-	CMSampleBufferRef sample = NULL;
-	OSStatus status = CMBlockBufferCreateWithMemoryBlock(NULL, NULL, total, NULL, NULL, 0, total,
-	    kCMBlockBufferAssureMemoryNowFlag, &block);
+	uint8_t *data = malloc(total ? total : 1);
+	if (!data) {
+		return kVTVideoEncoderMalfunctionErr;
+	}
 	size_t offset = 0;
-	for (int i = 0; status == noErr && i < count; i++) {
-		status = CMBlockBufferReplaceDataBytes(nals[i].p_payload, block, offset, (size_t)nals[i].i_payload);
+	for (int i = 0; i < count; i++) {
+		memcpy(data + offset, nals[i].p_payload, (size_t)nals[i].i_payload);
 		offset += (size_t)nals[i].i_payload;
 	}
-	if (status == noErr) {
-		status = CMSampleBufferCreateReady(NULL, block, e->format, 1, 1, &timing, 1, &total, &sample);
+	return emitSample(e, e->pending[slot].token, data, total, out->b_keyframe, e->pending[slot].time,
+	    e->pending[slot].duration);
+}
+
+/* NVENC's Annex B frame as one length-prefixed sample, its parameter sets
+ * left to the format description. */
+static OSStatus emitNVENC(Encoder *e, VTEncoderFrameToken token, const uint8_t *bytes, size_t length, bool key,
+    CMTime time, CMTime duration)
+{
+	Nal nals[kMostNals];
+	size_t count = splitAnnexB(bytes, length, nals, kMostNals);
+	size_t total = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (!outOfBand(e->codec, nalType(e->codec, nals[i]))) {
+			total += 4 + nals[i].size;
+		}
 	}
-	if (status == noErr) {
-		CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
-		CFMutableDictionaryRef first = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-		bool key = out->b_keyframe;
-		CFDictionarySetValue(first, kCMSampleAttachmentKey_NotSync, key ? kCFBooleanFalse : kCFBooleanTrue);
-		CFDictionarySetValue(first, kCMSampleAttachmentKey_DependsOnOthers, key ? kCFBooleanFalse : kCFBooleanTrue);
+	uint8_t *data = total ? malloc(total) : NULL;
+	if (!data) {
+		return kVTVideoEncoderMalfunctionErr;
 	}
-	e->frames++;
-	e->bytes += total;
-	OSStatus emitted = vt.emit(e->session, token, status, 0, status == noErr ? sample : NULL);
-	if (sample) {
-		CFRelease(sample);
+	size_t at = 0;
+	for (size_t i = 0; i < count; i++) {
+		if (outOfBand(e->codec, nalType(e->codec, nals[i]))) {
+			continue;
+		}
+		uint32_t size = (uint32_t)nals[i].size;
+		data[at] = (uint8_t)(size >> 24);
+		data[at + 1] = (uint8_t)(size >> 16);
+		data[at + 2] = (uint8_t)(size >> 8);
+		data[at + 3] = (uint8_t)size;
+		memcpy(data + at + 4, nals[i].data, nals[i].size);
+		at += 4 + nals[i].size;
 	}
-	if (block) {
-		CFRelease(block);
+	return emitSample(e, token, data, total, key, time, duration);
+}
+
+/* ---- Encoding ---------------------------------------------------------- */
+
+static OSStatus encodeX264(Encoder *e, VTEncoderFrameToken token, CVImageBufferRef image, CMTime time,
+    CMTime duration, bool forceKey)
+{
+	int slot = -1;
+	for (int i = 0; i < kPending; i++) {
+		if (!e->pending[i].used) {
+			slot = i;
+			break;
+		}
 	}
-	return status == noErr ? emitted : status;
+	if (slot < 0) {
+		return kVTVideoEncoderMalfunctionErr;
+	}
+	CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+	x264_picture_t in, out;
+	x264_picture_init(&in);
+	in.img.i_csp = X264_CSP_NV12;
+	in.img.i_plane = 2;
+	for (int plane = 0; plane < 2; plane++) {
+		in.img.plane[plane] = CVPixelBufferGetBaseAddressOfPlane(image, (size_t)plane);
+		in.img.i_stride[plane] = (int)CVPixelBufferGetBytesPerRowOfPlane(image, (size_t)plane);
+	}
+	in.i_pts = e->nextPts++;
+	if (forceKey) {
+		in.i_type = X264_TYPE_IDR;
+	}
+	e->pending[slot].used = true;
+	e->pending[slot].pts = in.i_pts;
+	e->pending[slot].token = token;
+	e->pending[slot].time = time;
+	e->pending[slot].duration = duration;
+	x264_nal_t *nals;
+	int count;
+	int size = x264_encoder_encode(e->x264, &nals, &count, &in, &out);
+	CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+	if (size < 0) {
+		e->pending[slot].used = false;
+		return kVTVideoEncoderMalfunctionErr;
+	}
+	return size > 0 ? emitX264(e, nals, count, &out) : noErr;
+}
+
+/* NVENC lost the session, or refused too many frames: H.264 goes on with
+ * x264 from an IDR, under x264's format description; HEVC has no other
+ * encoder. */
+static OSStatus leaveNVENC(Encoder *e, int width, int height, bool fullRange, const char *why)
+{
+	closeNVENC(e);
+	if (e->codec == kCMVideoCodecType_HEVC) {
+		e->backend = BackendNone;
+		os_log_error(logger(), "StelaVT: HEVC session %dx%d lost NVENC at frame %llu: %{public}s; no other encoder",
+		    width, height, e->frame, why);
+		return kVTVideoEncoderMalfunctionErr;
+	}
+	OSStatus status = openX264(e, width, height, fullRange);
+	e->backend = status == noErr ? BackendX264 : BackendNone;
+	os_log_error(logger(), "StelaVT: H.264 session %dx%d lost NVENC at frame %llu: %{public}s; x264 goes on from an IDR: %d",
+	    width, height, e->frame, why, (int)status);
+	return status;
+}
+
+/* One frame on NVENC: noErr with the frame emitted or dropped; an error when
+ * the session must leave NVENC. */
+static OSStatus encodeNVENC(Encoder *e, VTEncoderFrameToken token, CVImageBufferRef image, CMTime time,
+    CMTime duration, bool forceKey, char *reason, size_t bytes)
+{
+	double fps = e->frameRate > 0 ? e->frameRate : 60;
+	int keyFrames = e->keyInterval;
+	if (e->keyDuration > 0) {
+		int byDuration = (int)(e->keyDuration * fps);
+		keyFrames = keyFrames > 0 && keyFrames < byDuration ? keyFrames : byDuration;
+	}
+	bool key = forceKey || (keyFrames > 0 && e->sinceKey >= keyFrames);
+	CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+	size_t lumaPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
+	size_t chromaPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+	StelaEncoderFrame frame = {
+		.frame = ++e->frame,
+		.luma = CVPixelBufferGetBaseAddressOfPlane(image, 0),
+		.luma_bytes = lumaPitch * CVPixelBufferGetHeightOfPlane(image, 0),
+		.chroma = CVPixelBufferGetBaseAddressOfPlane(image, 1),
+		.chroma_bytes = chromaPitch * CVPixelBufferGetHeightOfPlane(image, 1),
+		.luma_pitch = (uint32_t)lumaPitch,
+		.chroma_pitch = (uint32_t)chromaPitch,
+		.input = StelaEncoderNV12,
+		.force_idr = key,
+		.bitrate = e->newBitrate > 0 ? (uint32_t)e->newBitrate : 0,
+		.out = e->out,
+		.out_bytes = e->outBytes,
+	};
+	StelaEncoderResult result = {0};
+	StelaEncoderStatus status = host()->encode(e->nvenc, &frame, &result, reason, bytes);
+	if (status == StelaEncoderOk && result.bytes > e->outBytes) {
+		/* Longer than the host said a frame takes: the same frame again. */
+		uint8_t *grown = realloc(e->out, (size_t)result.bytes);
+		if (grown) {
+			e->out = grown;
+			e->outBytes = (size_t)result.bytes;
+			frame.out = e->out;
+			frame.out_bytes = e->outBytes;
+			status = host()->encode(e->nvenc, &frame, &result, reason, bytes);
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+	if (status == StelaEncoderOk && result.bytes <= e->outBytes) {
+		e->newBitrate = 0;
+		e->drops = 0;
+		e->sinceKey = result.idr ? 1 : e->sinceKey + 1;
+		e->gpuMicros += result.gpu_us;
+		e->convertMicros += result.convert_us;
+		return emitNVENC(e, token, e->out, (size_t)result.bytes, result.idr, time, duration);
+	}
+	if (status == StelaEncoderDropped && ++e->drops < kMostDrops) {
+		/* Nothing was coded; the session's next frame is an IDR. */
+		os_log(logger(), "StelaVT: NVENC dropped frame %llu: %{public}s", e->frame, reason);
+		e->sinceKey = 0;
+		return vt.emit(e->session, token, noErr, kVTEncodeInfo_FrameDropped, NULL);
+	}
+	if (status == StelaEncoderOk) {
+		snprintf(reason, bytes, "a frame of %llu bytes past its %zu", result.bytes, e->outBytes);
+	}
+	return kVTVideoEncoderMalfunctionErr;
 }
 
 static OSStatus encodeFrame(VTVideoEncoderRef encoder, VTEncoderFrameToken token, CVImageBufferRef image, CMTime time,
@@ -409,51 +890,30 @@ static OSStatus encodeFrame(VTVideoEncoderRef encoder, VTEncoderFrameToken token
 	    && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
 		return kVTPixelTransferNotSupportedErr;
 	}
+	bool fullRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+	int width = (int)CVPixelBufferGetWidth(image), height = (int)CVPixelBufferGetHeight(image);
+	bool forceKey = options && truth(CFDictionaryGetValue(options, kVTEncodeFrameOptionKey_ForceKeyFrame));
 	pthread_mutex_lock(&e->lock);
 	OSStatus status = noErr;
-	if (!e->x264) {
-		status = openEncoder(e, (int)CVPixelBufferGetWidth(image), (int)CVPixelBufferGetHeight(image),
-		    format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+	if (e->backend == BackendNone) {
+		status = openBackend(e, width, height, fullRange);
 	}
-	int slot = -1;
-	for (int i = 0; status == noErr && i < kPending; i++) {
-		if (!e->pending[i].used) {
-			slot = i;
-			break;
+	if (status == noErr && e->backend == BackendNVENC) {
+		char reason[160] = "";
+		if (fullRange && e->codec == kCMVideoCodecType_H264) {
+			/* x264 signals full range; NVENC does not. */
+			status = leaveNVENC(e, width, height, fullRange, "full-range input");
+			forceKey = true;
+		} else {
+			status = encodeNVENC(e, token, image, time, duration, forceKey, reason, sizeof reason);
+			if (status != noErr) {
+				status = leaveNVENC(e, width, height, fullRange, reason);
+				forceKey = true;
+			}
 		}
 	}
-	if (status == noErr && slot < 0) {
-		status = kVTVideoEncoderMalfunctionErr;
-	}
-	if (status == noErr) {
-		CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-		x264_picture_t in, out;
-		x264_picture_init(&in);
-		in.img.i_csp = X264_CSP_NV12;
-		in.img.i_plane = 2;
-		for (int plane = 0; plane < 2; plane++) {
-			in.img.plane[plane] = CVPixelBufferGetBaseAddressOfPlane(image, (size_t)plane);
-			in.img.i_stride[plane] = (int)CVPixelBufferGetBytesPerRowOfPlane(image, (size_t)plane);
-		}
-		in.i_pts = e->nextPts++;
-		if (options && truth(CFDictionaryGetValue(options, kVTEncodeFrameOptionKey_ForceKeyFrame))) {
-			in.i_type = X264_TYPE_IDR;
-		}
-		e->pending[slot].used = true;
-		e->pending[slot].pts = in.i_pts;
-		e->pending[slot].token = token;
-		e->pending[slot].time = time;
-		e->pending[slot].duration = duration;
-		x264_nal_t *nals;
-		int count;
-		int size = x264_encoder_encode(e->x264, &nals, &count, &in, &out);
-		CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-		if (size < 0) {
-			e->pending[slot].used = false;
-			status = kVTVideoEncoderMalfunctionErr;
-		} else if (size > 0) {
-			status = emit(e, nals, count, &out);
-		}
+	if (status == noErr && e->backend == BackendX264) {
+		status = encodeX264(e, token, image, time, duration, forceKey);
 	}
 	pthread_mutex_unlock(&e->lock);
 	(void)flags;
@@ -465,6 +925,7 @@ static OSStatus completeFrames(VTVideoEncoderRef encoder, CMTime until)
 	Encoder *e = storage(encoder);
 	OSStatus status = noErr;
 	pthread_mutex_lock(&e->lock);
+	/* NVENC holds no frame: each was emitted as it was encoded. */
 	while (status == noErr && e->x264 && x264_encoder_delayed_frames(e->x264) > 0) {
 		x264_nal_t *nals;
 		int count;
@@ -473,7 +934,7 @@ static OSStatus completeFrames(VTVideoEncoderRef encoder, CMTime until)
 		if (size < 0) {
 			status = kVTVideoEncoderMalfunctionErr;
 		} else if (size > 0) {
-			status = emit(e, nals, count, &out);
+			status = emitX264(e, nals, count, &out);
 		}
 	}
 	pthread_mutex_unlock(&e->lock);
@@ -500,7 +961,8 @@ static const VTVideoEncoderClass kEncoderClass = {
 
 static const VTVideoEncoderVTable kVTable = {NULL, &kBaseClass, &kEncoderClass};
 
-/* The factory the bundle's Info.plist names. */
+/* The factory the bundle's Info.plist names, and the one StelaGPU.bundle
+ * registers for 'avc1' and, once its host codes HEVC, 'hvc1'. */
 __attribute__((visibility("default"))) OSStatus StelaVT_CreateInstance(FourCharCode codec, CFAllocatorRef allocator,
     VTVideoEncoderRef *out)
 {
@@ -509,8 +971,16 @@ __attribute__((visibility("default"))) OSStatus StelaVT_CreateInstance(FourCharC
 		os_log_error(logger(), "StelaVT: VideoToolbox lacks a plugin entry point");
 		return kVTVideoEncoderNotAvailableNowErr;
 	}
-	if (codec != kCMVideoCodecType_H264) {
+	if (codec != kCMVideoCodecType_H264 && codec != kCMVideoCodecType_HEVC) {
 		return kVTCouldNotFindVideoEncoderErr;
+	}
+	if (codec == kCMVideoCodecType_HEVC) {
+		/* x264 has no HEVC: without NVENC the client takes another codec. */
+		char reason[160] = "";
+		if (!hostCodes(StelaEncoderHEVC, reason, sizeof reason)) {
+			os_log(logger(), "StelaVT: HEVC refused: %{public}s", reason);
+			return kVTCouldNotFindVideoEncoderErr;
+		}
 	}
 	CMBaseObjectRef object = NULL;
 	OSStatus status = vt.derivedCreate(allocator, &kVTable, vt.encoderClassID(), &object);
@@ -520,7 +990,8 @@ __attribute__((visibility("default"))) OSStatus StelaVT_CreateInstance(FourCharC
 	Encoder *e = vt.derivedStorage(object);
 	memset(e, 0, sizeof *e);
 	pthread_mutex_init(&e->lock, NULL);
-	os_log_debug(logger(), "StelaVT: CreateInstance");
+	e->codec = codec;
+	os_log_debug(logger(), "StelaVT: CreateInstance %{public}s", codecName(codec));
 	*out = object;
 	return noErr;
 }
