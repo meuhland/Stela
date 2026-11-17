@@ -320,20 +320,46 @@ pub struct Step {
     pub dropped: usize,
     /// Frames played, after the dropped ones.
     pub take: usize,
-    /// Frames owed that the guest had not sent: silence.
+    /// Frames owed that the guest had not sent: silence (padding).
     pub silent: u64,
+    /// Silence of the stream's pre-roll, counted apart from padding.
+    pub pre_roll: u64,
 }
 
 /// The host's backlog of the guest's frames: whether it plays or fills.
 ///
-/// A stream fills first: the output plays silence until [`TARGET_FRAMES`]
-/// wait, so delivery jitter up to that much never shows as padding. It
-/// then plays what waits; a turn that finds fewer frames than it owes ran
-/// dry, plays what there is and fills again. A guest that stopped
-/// streaming has what it left played out.
+/// Every stream fills first (its pre-roll): the output plays silence until
+/// [`TARGET_FRAMES`] wait, so delivery jitter up to that much never shows
+/// as padding. The pre-roll's last period plays silence first and then
+/// only the frames past [`TARGET_FRAMES`] less a quarter of the period:
+/// what a take leaves then sits between that and a period more until the
+/// next, so the backlog averages near the target, whether the guest's
+/// periods come just before the output's takes (as a clock that follows
+/// the output's count brings them) or between them. It then plays what
+/// waits; a turn that finds fewer frames than it owes ran dry, plays what
+/// there is and fills again. A guest that stopped streaming has what it
+/// left played out, and its next stream fills again from the start,
+/// whatever the last one left. The pre-roll's silence is counted apart
+/// from padding (silence for frames a playing stream lacked, and the fill
+/// after it ran dry).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Backlog {
     playing: bool,
+    /// The guest streamed at the last period.
+    streaming: bool,
+    /// The stream has played none of its frames yet: it is in its
+    /// pre-roll.
+    fresh: bool,
+}
+
+/// What one period of the output plays: `lead` frames of silence, then
+/// `take` of the guest's, then silence for the rest. `pre_roll`: how much
+/// of `lead` is the stream's pre-roll (its first fill), not padding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Period {
+    pub lead: usize,
+    pub take: usize,
+    pub pre_roll: usize,
 }
 
 impl Backlog {
@@ -342,36 +368,80 @@ impl Backlog {
         !self.playing
     }
 
-    /// Frames to play of `due` owed, with `queued` waiting; `streaming`
+    /// Whether a guest that streams (`streaming`) is in its pre-roll: the
+    /// backlog fills, or the stream just started and its next period
+    /// starts the fill.
+    pub const fn pre_roll(&self, streaming: bool) -> bool {
+        streaming && (!self.playing || !self.streaming)
+    }
+
+    /// A period of `due` frames, with `queued` waiting; `streaming`
     /// whether the guest streams.
-    pub fn take(&mut self, due: usize, queued: usize, streaming: bool) -> usize {
-        if !self.playing && (queued >= TARGET_FRAMES || !streaming) {
-            self.playing = true;
+    pub fn period(&mut self, due: usize, queued: usize, streaming: bool) -> Period {
+        // A stream that starts fills first, even if the last one's frames
+        // were still playing out.
+        if streaming && !self.streaming {
+            self.playing = false;
+            self.fresh = true;
         }
+        self.streaming = streaming;
+        let (lead, take) = self.fill_or_play(due, queued, streaming);
+        let pre_roll = if streaming && self.fresh { lead } else { 0 };
+        if take > 0 {
+            self.fresh = false;
+        }
+        Period {
+            lead,
+            take,
+            pre_roll,
+        }
+    }
+
+    /// [`Self::period`]'s silence first and frames.
+    fn fill_or_play(&mut self, due: usize, queued: usize, streaming: bool) -> (usize, usize) {
         if !self.playing {
-            return 0;
+            if streaming && queued < TARGET_FRAMES {
+                return (due, 0);
+            }
+            self.playing = true;
+            if streaming {
+                // The fill's end: silence first, then the frames that leave
+                // the target less a quarter period waiting.
+                let take = queued
+                    .saturating_sub(TARGET_FRAMES.saturating_sub(due / 4))
+                    .min(due);
+                return (due - take, take);
+            }
         }
         let take = due.min(queued);
         if take < due && streaming {
             self.playing = false;
         }
-        take
+        (0, take)
+    }
+
+    /// Frames to play of `due` owed, with `queued` waiting; `streaming`
+    /// whether the guest streams ([`Self::period`]'s frames).
+    pub fn take(&mut self, due: usize, queued: usize, streaming: bool) -> usize {
+        self.period(due, queued, streaming).take
     }
 
     /// A turn that owes `due` frames with `queued` waiting: it plays what
-    /// [`Self::take`] gives, silence for the rest, and first drops the
-    /// oldest frames that would leave more than [`CAP_FRAMES`] waiting
-    /// after it.
+    /// [`Self::period`] gives, silence for the rest (the pre-roll's apart),
+    /// and first drops the oldest frames that would leave more than
+    /// [`CAP_FRAMES`] waiting after it.
     pub fn step(&mut self, due: u64, queued: usize, streaming: bool) -> Step {
-        let take = self.take(
+        let period = self.period(
             usize::try_from(due).unwrap_or(usize::MAX),
             queued,
             streaming,
         );
+        let pre_roll = period.pre_roll as u64;
         Step {
-            dropped: (queued - take).saturating_sub(CAP_FRAMES),
-            take,
-            silent: due - take as u64,
+            dropped: (queued - period.take).saturating_sub(CAP_FRAMES),
+            take: period.take,
+            silent: due - period.take as u64 - pre_roll,
+            pre_roll,
         }
     }
 }
@@ -684,9 +754,12 @@ impl fmt::Display for FifoCorrelation {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     pub consumed: u64,
+    /// Silence played for frames the guest had not sent (padding).
     pub silent: u64,
     /// Frames the host dropped past the backlog.
     pub trimmed: u64,
+    /// Silence played while each stream's backlog first filled.
+    pub pre_roll: u64,
 }
 
 impl Counters {
@@ -694,6 +767,7 @@ impl Counters {
         self.consumed += step.take as u64;
         self.silent += step.silent;
         self.trimmed += step.dropped as u64;
+        self.pre_roll += step.pre_roll;
     }
 }
 
@@ -731,8 +805,8 @@ pub struct Report {
     pub volume: i16,
     pub host: Counters,
     /// Since the last report period: silence played while the guest
-    /// streamed, and frames dropped (at the function's ring or past the
-    /// cap).
+    /// streamed (padding; the streams' pre-rolls apart), and frames dropped
+    /// (at the function's ring or past the cap).
     pub interval_silent: u64,
     pub interval_dropped: u64,
     /// The backlog's level over the period, `None` without a turn.
@@ -789,11 +863,12 @@ impl Report {
         let tenths = magnitude * 10 / 256;
         write!(
             f,
-            "GUEST AUDIO frames={} consumed={} silent={} dropped={} split={} queued={} \
-             bits={} muted={} volume={sign}{}.{}dB",
+            "GUEST AUDIO frames={} consumed={} silent={} pre_roll={} dropped={} split={} \
+             queued={} bits={} muted={} volume={sign}{}.{}dB",
             self.received,
             self.host.consumed,
             self.host.silent,
+            self.host.pre_roll,
             self.overflowed + self.host.trimmed,
             self.split,
             self.queued,
@@ -1115,18 +1190,17 @@ mod tests {
         assert_eq!(
             playing().step(480, 600, true),
             Step {
-                dropped: 0,
                 take: 480,
-                silent: 0
+                ..Step::default()
             }
         );
         // Too little: silence for the rest.
         assert_eq!(
             playing().step(480, 100, true),
             Step {
-                dropped: 0,
                 take: 100,
-                silent: 380
+                silent: 380,
+                ..Step::default()
             }
         );
         // More than the cap would remain: the oldest go first.
@@ -1135,7 +1209,7 @@ mod tests {
             Step {
                 dropped: 7,
                 take: 480,
-                silent: 0
+                ..Step::default()
             }
         );
         // Up to the cap waits: nothing dropped.
@@ -1149,7 +1223,8 @@ mod tests {
             Counters {
                 consumed: 580,
                 silent: 380,
-                trimmed: 7
+                trimmed: 7,
+                pre_roll: 0,
             }
         );
     }
@@ -1161,21 +1236,30 @@ mod tests {
     fn the_backlog_fills_to_its_target_then_rides_out_jitter() {
         let mut backlog = Backlog::default();
         assert!(backlog.filling());
-        // Filling: 10 ms periods of silence while the frames gather.
+        // Filling: 10 ms periods of silence while the frames gather, the
+        // stream's pre-roll (not padding).
         assert_eq!(
             backlog.step(480, 1000, true),
             Step {
-                dropped: 0,
-                take: 0,
-                silent: 480
+                pre_roll: 480,
+                ..Step::default()
             }
         );
         assert_eq!(backlog.step(480, TARGET_FRAMES - 1, true).take, 0);
-        // At the target it plays.
-        assert_eq!(backlog.step(480, TARGET_FRAMES, true).take, 480);
+        // At the target it plays: the pre-roll's last period is silence
+        // first, then the frames that leave the target less a quarter
+        // period.
+        assert_eq!(
+            backlog.period(480, TARGET_FRAMES, true),
+            Period {
+                lead: 360,
+                take: 120,
+                pre_roll: 360,
+            }
+        );
         // Bursty delivery: 0 to 30 ms a turn, 10 ms on average, against 10
         // ms periods. The 40 ms backlog absorbs it: no silence.
-        let mut queued = TARGET_FRAMES - 480;
+        let mut queued = TARGET_FRAMES - 120;
         let mut silent = 0;
         for turn in 0..1000 {
             queued += [0, 1440, 0, 480, 0, 960, 0, 960][turn % 8];
@@ -1185,14 +1269,83 @@ mod tests {
         }
         assert_eq!(silent, 0);
         assert!(!backlog.filling());
-        // Run dry: what waits plays, then it fills again.
+        // Run dry: what waits plays, then it fills again, all of it padding.
         assert_eq!(backlog.step(480, 100, true).take, 100);
         assert!(backlog.filling());
-        assert_eq!(backlog.step(480, 900, true).take, 0);
+        assert_eq!(
+            backlog.step(480, 900, true),
+            Step {
+                silent: 480,
+                ..Step::default()
+            }
+        );
         // The guest stopped: what it left plays out, without filling.
         assert_eq!(backlog.step(480, 900, false).take, 480);
         assert_eq!(backlog.step(480, 420, false).take, 420);
         assert!(!backlog.filling());
+        assert!(!backlog.pre_roll(false));
+    }
+
+    /// Each stream fills again from its start, whatever the last one left:
+    /// the first boot's streams started playing from an empty queue (the
+    /// last one's play-out had left the backlog playing), so the clock,
+    /// locked to the output, held them at 0 to 10 ms.
+    #[test]
+    fn every_stream_starts_with_its_pre_roll() {
+        let mut backlog = Backlog::default();
+        assert_eq!(backlog.period(480, 0, false), Period::default());
+        assert!(!backlog.filling());
+        // The next stream starts: its first period finds 480 frames, but it
+        // fills first.
+        assert!(backlog.pre_roll(true));
+        assert_eq!(
+            backlog.period(480, 480, true),
+            Period {
+                lead: 480,
+                take: 0,
+                pre_roll: 480,
+            }
+        );
+        assert!(backlog.filling() && backlog.pre_roll(true));
+        assert_eq!(backlog.period(480, 1440, true).take, 0);
+        // 2000 frames waiting: 280 frames of silence, then 200 of the
+        // guest's, which leave 1800 (the target less a quarter period).
+        assert_eq!(
+            backlog.period(480, 2000, true),
+            Period {
+                lead: 280,
+                take: 200,
+                pre_roll: 280,
+            }
+        );
+        assert!(!backlog.pre_roll(true));
+        // Far past the target: a whole period of frames.
+        let mut full = Backlog::default();
+        full.period(480, 0, true);
+        assert_eq!(
+            full.period(480, 3000, true),
+            Period {
+                lead: 0,
+                take: 480,
+                pre_roll: 0,
+            }
+        );
+        // A stream that starts while the last one's frames still play out
+        // keeps them, after its pre-roll.
+        let mut overlap = playing();
+        overlap.period(480, 1000, false);
+        assert_eq!(overlap.period(480, 1000, true).take, 0);
+        assert_eq!(overlap.period(480, 1920, true).take, 120);
+        // A sink's turn that owes more than the target never underflows.
+        let mut long = Backlog::default();
+        assert_eq!(
+            long.period(9600, 5000, true),
+            Period {
+                lead: 4600,
+                take: 5000,
+                pre_roll: 4600,
+            }
+        );
     }
 
     #[test]
@@ -1414,6 +1567,7 @@ mod tests {
                 consumed: 95_000,
                 silent: 10,
                 trimmed: 4,
+                pre_roll: 1800,
             },
             interval_silent: 10,
             interval_dropped: 3,
@@ -1430,8 +1584,8 @@ mod tests {
         };
         assert_eq!(
             report.to_string(),
-            "GUEST AUDIO frames=96000 consumed=95000 silent=10 dropped=7 split=0 queued=240 \
-             bits=16 muted=false volume=-12.5dB +silent=10 +dropped=3 backlog_ms=20.0/40.0/50.0 \
+            "GUEST AUDIO frames=96000 consumed=95000 silent=10 pre_roll=1800 dropped=7 split=0 \
+             queued=240 bits=16 muted=false volume=-12.5dB +silent=10 +dropped=3 backlog_ms=20.0/40.0/50.0 \
              feedback=0x00062000=49000.0Hz(+2.08%) measured=+1.56% packets=2000 \
              feedback_reads=1990"
         );

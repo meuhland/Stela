@@ -129,33 +129,46 @@ fn the_output_publication_reads_back_whole() {
     );
 }
 
-/// A backlog the output keeps over its target slows the clock a little
-/// until it comes back; one at the target changes nothing.
+/// A backlog the output keeps over its target (a pause left the newest
+/// 80 ms) slows the clock, at most by the trim's bound, until the backlog
+/// is back at the target; the link's rate learns nothing from it. One at
+/// the target changes nothing.
 #[test]
-fn a_backlog_away_from_its_target_trims_the_clock() {
+fn a_backlog_away_from_its_target_is_trimmed_back() {
     let ring = GuestRing::new();
     let mut clock = FollowClock::new(HZ);
     clock.start(48_000, 0, 0);
-    ring.publish(0, 0, BACKLOG_TARGET_FRAMES);
+    let over = BACKLOG_TARGET_FRAMES + 1920;
+    ring.publish(0, 0, over);
     assert!(clock.advance(0, ring.published()).is_some());
     // An output exactly at 48 kHz, published every 5 ms, 40 ms over its
-    // target (left at the cap after a pause).
-    let over = BACKLOG_TARGET_FRAMES + 1920;
-    for turn in 1..=2000u64 {
+    // target: the backlog is what the clock pushed less what the output
+    // took.
+    let mut backlog = over;
+    let mut slowest = 0;
+    let mut back = None;
+    for turn in 1..=4000u64 {
         let now = 5 * MS * turn;
-        ring.publish(240 * turn, now, over);
+        backlog = (over + clock.position(now)) - 240 * turn;
+        ring.publish(240 * turn, now, backlog);
         assert_eq!(clock.advance(now, ring.published()), None);
+        slowest = slowest.min(clock.ppm());
+        if back.is_none() && backlog <= BACKLOG_TARGET_FRAMES + 96 {
+            back = Some(turn * 5);
+        }
     }
-    // 2000 publications 1920 frames over moved the correspondence back by
-    // 2000 * 1920 / 2048 frames, which the clock follows: it ran slower.
-    let now = 10_000 * MS;
-    let moved = (2000 * 1920 / LEVEL_STEP_FRAMES) as u64;
+    assert_eq!(slowest, -MAX_TRIM_PPM, "the trim's bound, under the slew's");
+    // 1920 frames at 0.4%: 10 s, then the last 2 ms closing more slowly.
+    let back = back.unwrap();
     assert!(
-        clock.position(now) < 480_000 - moved / 2,
-        "{} after 10 s",
-        clock.position(now)
+        (9_000..=14_000).contains(&back),
+        "within 2 ms after {back} ms"
     );
-    assert!(clock.ppm() < 0 && clock.ppm() >= -MAX_SLEW_PPM);
+    assert!(
+        BACKLOG_TARGET_FRAMES.abs_diff(backlog) <= 24,
+        "within half a ms after 20 s: {backlog}"
+    );
+    assert!(clock.link_ppm().abs() <= 20, "{}", clock.link_ppm());
     // At the target: no trim.
     let mut clock = FollowClock::new(HZ);
     clock.start(48_000, 0, 0);
@@ -256,11 +269,13 @@ fn the_clock_follows_the_hdmi_frames_and_falls_back_to_the_device_clock() {
     let primed = periods_written(now, start, ppm) + 22 * 480;
     publish(&ring, primed, now);
     let at = clock.position(now);
+    let link = clock.link_ppm();
     assert_eq!(
         clock.advance(now, ring.published()),
         Some(ClockChange::Following {
             position: at,
-            frames: primed
+            frames: primed,
+            ppm: link,
         })
     );
     // A service that stops looking for over 100 ms: back to the device
@@ -287,6 +302,62 @@ fn the_clock_follows_the_hdmi_frames_and_falls_back_to_the_device_clock() {
     assert_eq!(clock.position(quiet + 500 * MS), held);
     assert_eq!(clock.when(held + 1), None);
     assert_eq!(clock.advance(quiet + 2 * MS, ring.published()), None);
+}
+
+/// Following a link 0.2% fast, the clock learns its rate; the next
+/// stream's handoff starts at it, so that stream runs at the link's rate
+/// from its first frame instead of slewing to it over seconds.
+#[test]
+fn the_link_rate_it_learned_starts_the_next_stream() {
+    let ring = GuestRing::new();
+    let mut clock = FollowClock::new(HZ);
+    let ppm = 2000;
+    let mut jitter = Jitter(5);
+    // Each turn 2 to 8 ms apart publishes the frames consumed (to the frame
+    // here, so the anchor of a handoff sits on the link's line, not on a
+    // period's step), the device's step a little after: the mean slew over
+    // `from..to`.
+    let mut follow = |clock: &mut FollowClock, now: &mut u64, to: u64, from: u64| {
+        let (mut sum, mut count) = (0, 0);
+        while *now < to {
+            *now += 2 * MS + jitter.next(6 * MS);
+            publish(&ring, hda_frames(*now, ppm), *now);
+            clock.advance(*now + jitter.next(MS), ring.published());
+            if *now >= from {
+                sum += clock.ppm();
+                count += 1;
+            }
+        }
+        sum / count
+    };
+    clock.start(48_000, 0, 0);
+    assert_eq!(clock.link_ppm(), 0);
+    let mut now = 0;
+    // The first stream: from nominal, the first 2 s slew toward the link.
+    let first = follow(&mut clock, &mut now, 2000 * MS, 0);
+    assert!(first < ppm - 500, "{first} ppm");
+    follow(&mut clock, &mut now, 60_000 * MS, 0);
+    let learned = clock.link_ppm();
+    assert!((ppm - 100..=ppm + 100).contains(&learned), "{learned} ppm");
+    clock.stop(now);
+    // The next stream, 3 s later: it starts at the learned rate.
+    now += 3000 * MS;
+    clock.start(48_000, now, clock.position(now));
+    publish(&ring, hda_frames(now, ppm), now);
+    let change = clock.advance(now, ring.published());
+    assert!(
+        matches!(change, Some(ClockChange::Following { ppm: from, .. }) if from == learned),
+        "{change:?}"
+    );
+    let start = now;
+    let next = follow(&mut clock, &mut now, start + 2000 * MS, start);
+    assert!((ppm - 100..=ppm + 100).contains(&next), "{next} ppm");
+    // The fallback runs at the device clock's own rate, and keeps what it
+    // learned for the next handoff.
+    ring.publish_stopped();
+    clock.advance(now, ring.published());
+    assert_eq!((clock.source(), clock.ppm()), (ClockSource::DeviceTicks, 0));
+    assert!((ppm - 100..=ppm + 100).contains(&clock.link_ppm()));
 }
 
 #[test]

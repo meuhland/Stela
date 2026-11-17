@@ -21,12 +21,16 @@
 //!   the handoff and from then advances as the output does: each new
 //!   publication compares where the output says the clock should be with
 //!   where it is, and slews the clock's rate (at most
-//!   [`MAX_SLEW_PPM`]) to close the gap over [`SLEW_HORIZON_FRAMES`]. So the
-//!   guest is paced by the HDA link's 48 kHz, and the frames it sends are
-//!   the frames the output takes: the backlog holds its level with no
-//!   drift to pad or drop. The publication also carries the backlog, and a
-//!   slow trim on it ([`LEVEL_STEP_FRAMES`]) brings a backlog that a pause
-//!   left at its cap back to [`BACKLOG_TARGET_FRAMES`].
+//!   [`MAX_SLEW_PPM`]) by a PI loop: the link's rate it learned (kept from
+//!   stream to stream, where each handoff starts) and the gap closed over
+//!   [`SLEW_HORIZON_FRAMES`]. So the guest is paced by the HDA link's
+//!   48 kHz, and the frames it sends are the frames the output takes: the
+//!   backlog holds its level with no drift to pad or drop. The level itself
+//!   is the output's: each stream fills to [`BACKLOG_TARGET_FRAMES`] before
+//!   it plays. The publication also carries the backlog, and a trim on it
+//!   (a slew of its own over [`TRIM_HORIZON_FRAMES`], at most
+//!   [`MAX_TRIM_PPM`]) brings it to the target when the 10 ms periods or
+//!   a pause (the newest 80 ms kept) left it away.
 //! - **Fallback.** An output that stops (`publish_stopped`: a route
 //!   paused, a sink asleep, a stream restarting, a route lost) or goes
 //!   quiet for [`STALE_MILLIS`] (a service turn that cannot reach the HDA)
@@ -58,14 +62,26 @@ pub const MAX_SLEW_PPM: i64 = 5_000;
 /// instead of slewing: 100 ms.
 pub const RESYNC_FRAMES: u64 = 48_000 / 10;
 /// The backlog the output keeps of the ring's frames: 40 ms, the boot's
-/// `guest_audio::TARGET_FRAMES`. While the clock follows, a backlog away
-/// from it moves the clock's correspondence with the output by a frame for
-/// each [`LEVEL_STEP_FRAMES`] of difference summed over the publications,
-/// so a backlog left at the cap (after a pause, the guest went on while the
-/// output did not) comes back to the target in some seconds instead of
-/// staying there.
+/// `guest_audio::TARGET_FRAMES`. The output fills each stream to it before
+/// it plays (its pre-roll); while the clock follows, a backlog away from it
+/// (the output's 10 ms periods against the guest's, or a pause that left
+/// the newest 80 ms) is trimmed back by a slew of its own,
+/// [`TRIM_HORIZON_FRAMES`].
 pub const BACKLOG_TARGET_FRAMES: u64 = 48_000 / 25;
-pub const LEVEL_STEP_FRAMES: i64 = 2048;
+/// The published backlog is smoothed over about this many publications
+/// (about 80 ms of 5 ms turns), so the 10 ms periods' sawtooth does not
+/// reach the clock's rate.
+pub const LEVEL_SMOOTHING_TURNS: i64 = 16;
+/// The trim closes the smoothed backlog's distance from its target in about
+/// this many frames: 1.5 s, so a short stream is trimmed within its first
+/// seconds; a pause's 40 ms over the target, at [`MAX_TRIM_PPM`], in about
+/// 10 s.
+pub const TRIM_HORIZON_FRAMES: i64 = 3 * 48_000 / 2;
+/// The most the trim moves the clock's rate: 0.4%, under [`MAX_SLEW_PPM`]
+/// so a link learned at up to 0.1% keeps room to follow.
+pub const MAX_TRIM_PPM: i64 = 4_000;
+/// The smoothed backlog's fixed point.
+const LEVEL_SCALE: i64 = 256;
 const MILLION: i64 = 1_000_000;
 
 /// One stereo frame, packed: the left sample's bits low, the right's high.
@@ -301,8 +317,13 @@ impl ClockSource {
 /// A change [`FollowClock::advance`] made, for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockChange {
-    /// It follows the output from `position`, the output at `frames`.
-    Following { position: u64, frames: u64 },
+    /// It follows the output from `position`, the output at `frames`,
+    /// starting at the link's rate as last learned (`ppm`).
+    Following {
+        position: u64,
+        frames: u64,
+        ppm: i64,
+    },
     /// It went back to the host's counter at `position`: the output
     /// stopped, or (`stale`) did not publish for [`STALE_MILLIS`].
     Fallback { position: u64, stale: bool },
@@ -330,9 +351,22 @@ pub struct FollowClock {
     anchor: (u64, i128),
     /// The publication last looked at.
     seen: u64,
-    /// The backlog's difference from its target, summed over the
-    /// publications, not yet a whole [`LEVEL_STEP_FRAMES`].
+    /// The backlog the output published, smoothed over
+    /// [`LEVEL_SMOOTHING_TURNS`], in 1/[`LEVEL_SCALE`] frames.
     level: i64,
+    /// The trim's slew while it follows, in parts per million, and its
+    /// frames (times a million) not yet a whole one.
+    trim_ppm: i64,
+    trim_carry: i128,
+    /// The output's link against the host's counter, in parts per billion,
+    /// as following it taught: the gap integrated over the host's time.
+    /// The link does not change with the stream, so this is kept across
+    /// stops, fallbacks and resyncs, and each handoff starts at its rate.
+    link_ppb: i64,
+    /// The host tick of the publication last looked at, and the gap it
+    /// showed.
+    last_tick: u64,
+    last_gap: i64,
     handoffs: u64,
     resyncs: u64,
 }
@@ -352,9 +386,20 @@ impl FollowClock {
             anchor: (0, 0),
             seen: 0,
             level: 0,
+            trim_ppm: 0,
+            trim_carry: 0,
+            link_ppb: 0,
+            last_tick: 0,
+            last_gap: 0,
             handoffs: 0,
             resyncs: 0,
         }
+    }
+
+    /// The output's link against the host's counter as last learned, in
+    /// parts per million.
+    pub fn link_ppm(&self) -> i64 {
+        self.link_ppb / 1000
     }
 
     pub fn source(&self) -> ClockSource {
@@ -438,6 +483,19 @@ impl FollowClock {
         )
     }
 
+    /// Follows the output from publication `p`: the clock's position at its
+    /// tick corresponds to its count, and the trim starts from its backlog.
+    fn follow(&mut self, p: Published) {
+        self.anchor = (p.frames, self.position_at(p.tick));
+        self.seen = p.generation;
+        self.last_tick = p.tick;
+        self.last_gap = 0;
+        self.level = p.backlog.min(1 << 32) as i64 * LEVEL_SCALE;
+        self.trim_ppm = 0;
+        self.trim_carry = 0;
+        self.source = ClockSource::HdmiFrames;
+    }
+
     /// From host tick `now` on, runs at `ppm` from the position reached.
     /// The new rate counts from the first tick that position was reached,
     /// so the part of a frame the old rate ran past it is kept rather than
@@ -462,40 +520,73 @@ impl FollowClock {
         let fresh = (p.live && !stale).then_some(p);
         match (self.source, fresh) {
             (ClockSource::DeviceTicks, Some(p)) => {
-                self.change(now, 0);
-                self.anchor = (p.frames, self.position_at(p.tick));
-                self.seen = p.generation;
-                self.level = 0;
-                self.source = ClockSource::HdmiFrames;
+                // At the link's rate as last learned: a stream that starts
+                // runs as the output does from its first frame.
+                self.change(now, self.link_ppm());
+                self.follow(p);
                 self.handoffs += 1;
                 Some(ClockChange::Following {
                     position: self.base,
                     frames: p.frames,
+                    ppm: self.ppm,
                 })
             }
             (ClockSource::HdmiFrames, Some(p)) if p.generation != self.seen => {
                 self.seen = p.generation;
-                // A backlog over its target moves the correspondence back
-                // (the clock slows), one under it forward.
-                self.level += BACKLOG_TARGET_FRAMES as i64 - p.backlog.min(1 << 40) as i64;
-                let steps = self.level / LEVEL_STEP_FRAMES;
-                self.level -= steps * LEVEL_STEP_FRAMES;
-                self.anchor.1 += i128::from(steps);
+                // The frames of the stream's rate since the last
+                // publication, by the host's counter.
+                let ticks = p.tick.saturating_sub(self.last_tick);
+                self.last_tick = p.tick;
+                let elapsed = (u128::from(ticks) * u128::from(self.rate) / u128::from(self.hz))
+                    .min(u128::from(u32::MAX)) as u64;
+                // The link's rate learns from the gap the clock ran on since
+                // the last publication, over the time it ran on it: weighed
+                // as the slew it set, not by the turn that ends the interval
+                // (a turn after a long one more often wrote a period, and
+                // reads the gap at its highest).
+                let horizon = i128::from(SLEW_HORIZON_FRAMES);
+                let learned = i128::from(self.last_gap) * i128::from(elapsed) * 1_000_000_000
+                    / (4 * horizon * horizon);
+                let bound = i128::from(MAX_SLEW_PPM) * 1000;
+                self.link_ppb = (i128::from(self.link_ppb) + learned).clamp(-bound, bound) as i64;
+                // The trim's slew since the last publication moved the
+                // clock from the output by its frames: the correspondence
+                // moves with it, so the loop on the gap keeps the trimmed
+                // relation and learns only the link.
+                self.trim_carry += i128::from(self.trim_ppm) * i128::from(elapsed);
+                let whole = self.trim_carry / i128::from(MILLION);
+                self.trim_carry -= whole * i128::from(MILLION);
+                self.anchor.1 += whole;
                 let (frames, position) = self.anchor;
                 let at = self.position_at(p.tick);
                 let wanted = position + (p.frames as i128 - frames as i128);
                 let gap = (wanted - at).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
                 if gap.unsigned_abs() > RESYNC_FRAMES {
-                    self.change(now, 0);
-                    self.anchor = (p.frames, self.position_at(p.tick));
-                    self.level = 0;
+                    self.change(now, self.link_ppm());
+                    self.follow(p);
                     self.resyncs += 1;
                     return Some(ClockChange::Resync {
                         position: self.base,
                         gap,
                     });
                 }
-                let ppm = (gap * MILLION / SLEW_HORIZON_FRAMES).clamp(-MAX_SLEW_PPM, MAX_SLEW_PPM);
+                // A PI loop on the gap: the link's rate it learned, and the
+                // gap closed over the horizon. Critically damped: the
+                // integral's gain is a quarter of the proportional's
+                // squared.
+                self.last_gap = gap;
+                let follow = self.link_ppm() + gap * MILLION / SLEW_HORIZON_FRAMES;
+                // The backlog's trim: its level, smoothed over the turns (as
+                // the report averages it), brought to the target over the
+                // trim's horizon by a slew of its own.
+                let backlog = p.backlog.min(1 << 32) as i64 * LEVEL_SCALE;
+                self.level += (backlog - self.level) / LEVEL_SMOOTHING_TURNS;
+                let error = BACKLOG_TARGET_FRAMES as i64 - self.level / LEVEL_SCALE;
+                let trim =
+                    (error * MILLION / TRIM_HORIZON_FRAMES).clamp(-MAX_TRIM_PPM, MAX_TRIM_PPM);
+                let ppm = (follow + trim).clamp(-MAX_SLEW_PPM, MAX_SLEW_PPM);
+                // What the bound left of the trim is what moves the clock.
+                self.trim_ppm = (ppm - follow).clamp(trim.min(0), trim.max(0));
                 self.change(now, ppm);
                 None
             }
@@ -646,9 +737,13 @@ impl Sink for GuestAudioRing {
             return;
         }
         let note = match change {
-            ClockChange::Following { position, frames } => format!(
+            ClockChange::Following {
+                position,
+                frames,
+                ppm,
+            } => format!(
                 "clock: hdmi-frames from frame {position}: follows the HDMI periods written (the \
-                 output at {frames} frames)"
+                 output at {frames} frames; from the link's rate as learned, {ppm:+} ppm)"
             ),
             ClockChange::Fallback { position, stale } => format!(
                 "clock: device-ticks from frame {position}: the HDMI output {}; the guest is paced \

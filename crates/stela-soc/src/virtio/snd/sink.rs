@@ -24,8 +24,8 @@ mod ring;
 
 pub use ring::{
     BACKLOG_TARGET_FRAMES, ClockChange, ClockSource, FollowClock, GuestAudioRing, GuestRing,
-    LEVEL_STEP_FRAMES, MAX_SLEW_PPM, Published, RESYNC_FRAMES, RING_FRAMES, RingStats,
-    SLEW_HORIZON_FRAMES, STALE_MILLIS, ring_frames,
+    LEVEL_SMOOTHING_TURNS, MAX_SLEW_PPM, MAX_TRIM_PPM, Published, RESYNC_FRAMES, RING_FRAMES,
+    RingStats, SLEW_HORIZON_FRAMES, STALE_MILLIS, TRIM_HORIZON_FRAMES, ring_frames,
 };
 
 use alloc::{boxed::Box, format, string::String, vec::Vec};

@@ -58,7 +58,7 @@ use alloc::{collections::VecDeque, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_boot_core::guest_audio::{
     self, Backlog, CAP_FRAMES, Counters, Dbfs, FEEDBACK_NOMINAL, Feedback, FifoCorrelation, Level,
-    MAX_STEP_FRAMES, Pacer, Report, RestartReason, Restarts, Sample, Step, Tone, Uploads,
+    MAX_STEP_FRAMES, Pacer, Period, Report, RestartReason, Restarts, Sample, Step, Tone, Uploads,
     VirtioReport, crossed, logged, s16_period, virtio_route,
 };
 use stela_drivers::{
@@ -208,7 +208,8 @@ pub(super) struct GuestAudio {
     /// The output's rate against the guest's time, and the backlog's PI
     /// loop: the speaker's feedback.
     feedback: Feedback,
-    /// The backlog after each streaming turn, since the last report.
+    /// The backlog after each streaming turn, since the last report (on
+    /// the monitor, once the stream's pre-roll filled it).
     level: Level,
     /// Frames the output consumed, silence included: what the sink's
     /// clock owed, or HDMI periods written.
@@ -453,19 +454,23 @@ impl GuestAudio {
                     &mut self.backlog,
                     &mut self.output_frames,
                 );
-                if streaming {
+                // The level while the stream plays, its pre-roll left out.
+                if streaming && !self.backlog.pre_roll(streaming) {
                     self.level.observe(hdmi.pending.len());
                 }
                 // The virtio stream's clock follows a route that ran through
                 // the turn, and goes back to the device clock when it did
-                // not; a turn that could not look tells it nothing.
+                // not; a turn that could not look tells it nothing. A
+                // backlog that fills (the stream's pre-roll) is published at
+                // its target: the silence it plays builds it, not the clock.
                 if let Source::Virtio(Some(ring)) = &self.source {
+                    let backlog = if self.backlog.pre_roll(streaming) {
+                        guest_audio::TARGET_FRAMES
+                    } else {
+                        hdmi.pending.len() + ring.queued()
+                    };
                     match turn {
-                        Some(true) => ring.publish(
-                            self.output_frames,
-                            now,
-                            (hdmi.pending.len() + ring.queued()) as u64,
-                        ),
+                        Some(true) => ring.publish(self.output_frames, now, backlog as u64),
                         Some(false) => ring.publish_stopped(),
                         None => {}
                     }
@@ -821,8 +826,7 @@ impl Hdmi {
             self.pending.drain(..excess);
             counters.add(Step {
                 dropped: excess,
-                take: 0,
-                silent: 0,
+                ..Step::default()
             });
         }
         turn
@@ -1015,16 +1019,24 @@ impl Hdmi {
         let _ = self.host.schedule_hdmi_readback(&self.playback);
         let mut written = 0;
         loop {
-            // What the backlog would play; taken only once written.
+            // What the backlog would play; taken only once written. The
+            // pre-roll's last period is silence first, so the stream's
+            // frames run on unbroken into the next.
             let mut next = *backlog;
-            let take = next.take(HDMI_PERIOD_FRAMES, self.pending.len(), streaming);
+            let Period {
+                lead,
+                take,
+                pre_roll,
+            } = next.period(HDMI_PERIOD_FRAMES, self.pending.len(), streaming);
             // The test tone instead of the guest's frames, which are still
             // taken (and discarded) as they would be played.
             let tone = self.tone;
             match self.tone.as_mut() {
                 Some(tone) => tone.fill(&mut self.period),
                 None => {
-                    s16_period(self.pending.iter().take(take).copied(), &mut self.period);
+                    let (silence, frames) = self.period.split_at_mut(lead * 4);
+                    silence.fill(0);
+                    s16_period(self.pending.iter().take(take).copied(), frames);
                 }
             }
             match self.host.refill_hdmi(&mut self.playback, &self.period) {
@@ -1054,16 +1066,18 @@ impl Hdmi {
                             ));
                         }
                     }
-                    // Silence counts only while the guest streams.
-                    let silent = if streaming {
-                        (HDMI_PERIOD_FRAMES - take) as u64
+                    // Silence counts only while the guest streams, the
+                    // stream's pre-roll apart from padding.
+                    let (silent, pre_roll) = if streaming {
+                        (HDMI_PERIOD_FRAMES - take - pre_roll, pre_roll)
                     } else {
-                        0
+                        (0, 0)
                     };
                     counters.add(Step {
                         dropped: 0,
                         take,
-                        silent,
+                        silent: silent as u64,
+                        pre_roll: pre_roll as u64,
                     });
                 }
                 // Not written: the tone's phase stays where the ring is.
