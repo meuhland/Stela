@@ -42,6 +42,8 @@ struct Reported {
     /// The device's identity while it is read ([`HeldInputs`]).
     id: u64,
     failed: bool,
+    /// Its first USB transfer error, retried, was reported.
+    transfer_error: bool,
     leds: bool,
     /// The keyboard LEDs last wanted have not reached the device yet.
     leds_due: bool,
@@ -121,6 +123,26 @@ pub struct HostInput {
     held: HeldInputs,
     /// The next device's identity.
     next_id: u64,
+    /// Host keyboard and pointer changes given to the guest since boot
+    /// (`INPUT reports`).
+    delivered: Delivered,
+}
+
+/// Host input changes given to the guest's peripheral since boot, by kind:
+/// a key, or any pointer change (motion, position, buttons, wheels).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Delivered {
+    keyboard: u64,
+    pointer: u64,
+}
+
+impl Delivered {
+    fn count(&mut self, input: &Input) {
+        match input {
+            Input::Key { .. } => self.keyboard += 1,
+            _ => self.pointer += 1,
+        }
+    }
 }
 
 impl HostInput {
@@ -148,6 +170,7 @@ impl HostInput {
             wanted_leds: None,
             reported_times: 0,
             held: HeldInputs::new(),
+            delivered: Delivered::default(),
         }
     }
 
@@ -165,6 +188,7 @@ impl HostInput {
     }
 
     fn deliver(&mut self, devices: &mut AppleDevices, input: Input) {
+        self.delivered.count(&input);
         if let Err(error) = devices.input(input)
             && !core::mem::replace(&mut self.refused, true)
         {
@@ -292,6 +316,18 @@ impl HostInput {
             {
                 output::arguments(format_args!("INPUT {}: {error}\n", device.name()));
             }
+            // A USB HID interface's first transfer error, which it retries:
+            // once, so a boot's log says what its endpoints met.
+            if !reported.transfer_error
+                && device.transfer_errors().0 != 0
+                && let Some(error) = device.first_error()
+            {
+                reported.transfer_error = true;
+                output::arguments(format_args!(
+                    "INPUT {} transfer error, retried: {error}\n",
+                    device.name()
+                ));
+            }
             stopped |= device.stopped();
             // A poll can take milliseconds in a hypervisor: a posted GPU call
             // does not wait for the remaining devices too.
@@ -307,10 +343,28 @@ impl HostInput {
         pending
     }
 
-    /// `INPUT TIMES name:polls/waited_us/longest_wait_us/polled_us/
-    /// longest_poll_us/skipped …`: each device's polls since the last
-    /// report, the host-drivers lock waits before them, and their own time.
+    /// `INPUT reports keyboard=N pointer=N devices=N usb_errors=N
+    /// usb_retry_windows=N`: the host keyboard and pointer changes given to
+    /// the guest since boot, which grow as the host's keys and motion reach
+    /// it; the devices still read; and their USB HID transfer errors and
+    /// spent retry windows, each recovered. Then `INPUT TIMES
+    /// name:polls/waited_us/longest_wait_us/polled_us/longest_poll_us/
+    /// skipped …`: each device's polls since the last report, the
+    /// host-drivers lock waits before them, and their own time.
     fn report_times(&mut self) {
+        let (errors, windows) = self
+            .inputs
+            .devices
+            .iter()
+            .map(InputDevice::transfer_errors)
+            .fold((0, 0), |(e, w), (de, dw)| (e + de, w + dw));
+        output::arguments(format_args!(
+            "INPUT reports keyboard={} pointer={} devices={} usb_errors={errors} \
+             usb_retry_windows={windows}\n",
+            self.delivered.keyboard,
+            self.delivered.pointer,
+            self.inputs.devices.len(),
+        ));
         let micros = |ticks: u64| ticks / (super::host::COUNTER_HZ / 1_000_000);
         let mut line = alloc::string::String::from("INPUT TIMES");
         for (device, reported) in self.inputs.devices.iter().zip(&mut self.reported) {
@@ -354,9 +408,14 @@ impl HostInput {
             let device = self.inputs.devices.remove(index);
             self.reported.remove(index);
             let name = device.name();
+            let why = device
+                .first_error()
+                .map_or_else(alloc::string::String::new, |error| {
+                    alloc::format!(": {error}")
+                });
             drop(device);
             drop(root);
-            output::arguments(format_args!("INPUT {name} stopped and removed\n"));
+            output::arguments(format_args!("INPUT {name} stopped and removed{why}\n"));
         }
     }
 }

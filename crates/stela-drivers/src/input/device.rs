@@ -129,6 +129,27 @@ impl InputDevice {
         }
     }
 
+    /// The first transfer error a USB HID interface met, for the line that
+    /// reports it stopped; `None` for one that met none, or for a device
+    /// that keeps no such error.
+    pub fn first_error(&self) -> Option<String> {
+        match self {
+            Self::Usb(device) => device
+                .first_error()
+                .map(|error| crate::usb::xhci::explain(&error)),
+            _ => None,
+        }
+    }
+
+    /// A USB HID interface's transfer errors and the retry windows that ran
+    /// out and began again since it started; zero for other devices.
+    pub fn transfer_errors(&self) -> (u64, u64) {
+        match self {
+            Self::Usb(device) => (device.transfer_errors(), device.retry_windows()),
+            _ => (0, 0),
+        }
+    }
+
     /// Whether the device stopped and is no longer read.
     pub fn stopped(&self) -> bool {
         match self {
