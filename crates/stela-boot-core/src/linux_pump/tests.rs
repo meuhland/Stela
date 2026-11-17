@@ -284,3 +284,49 @@ fn a_clock_sampled_on_two_processors_stays_monotonic() {
         assert_eq!(elapsed, expected);
     }
 }
+
+/// Issue 188 (Ryzen 5 5600H at 3,293,815,926 Hz): every AP agreed with the
+/// BSP only through a software offset of about -11,149,239,549 ticks, its
+/// raw counter 3.4 s ahead. The boot processor and the AP running Linux in
+/// its place sample one clock: from raw reads the AP's sample moves it 3.4 s
+/// on and the boot processor's next one is corrupt, which stopped the boot
+/// with CorruptContext; from reads moved by each core's offset the clock
+/// follows the BSP's counter on both.
+#[test]
+fn issue_188s_cores_apart_by_an_offset_sample_one_clock() {
+    use crate::tsc::sync::shared_tsc;
+    const OFFSET: i64 = -11_149_239_549;
+    const SKEW: u64 = 1 << 16;
+    // The BSP's counter at each sample, and which core takes it.
+    let samples = [
+        (100_000_000_000u64, false),
+        (100_000_100_000, true),
+        (100_000_200_000, false),
+        (100_000_300_000, true),
+        (100_000_300_050, false),
+    ];
+    let raw = |bsp: u64, ap: bool| {
+        if ap {
+            bsp.wrapping_sub(OFFSET as u64)
+        } else {
+            bsp
+        }
+    };
+    let run = |read: &dyn Fn(u64, bool) -> u64| {
+        let (mut previous, mut elapsed) = (read(samples[0].0, samples[0].1), 0u64);
+        for &(bsp, ap) in &samples[1..] {
+            match advance(previous, read(bsp, ap), SKEW) {
+                Sample::Moved { delta } => {
+                    previous = read(bsp, ap);
+                    elapsed += delta;
+                }
+                Sample::Behind | Sample::Same => elapsed += 1,
+                Sample::Corrupt => return Err(bsp),
+            }
+        }
+        Ok(elapsed)
+    };
+    assert_eq!(run(&raw), Err(100_000_200_000), "raw reads stop the clock");
+    let shared = |bsp: u64, ap: bool| shared_tsc(raw(bsp, ap), if ap { OFFSET } else { 0 });
+    assert_eq!(run(&shared), Ok(300_050));
+}
