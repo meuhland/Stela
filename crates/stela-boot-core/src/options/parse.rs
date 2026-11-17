@@ -254,6 +254,15 @@ impl ParseState<'_> {
                 options.virtio_snd = true;
             }
             VIRTIO_NET => options.virtio_net = true,
+            VIRTIO_BLK_RAM => {
+                let mib = value()
+                    .and_then(|mib| mib.parse::<u64>().ok())
+                    .filter(|mib| (1..=stela_soc::virtio::blk::RAM_MOST_MIB).contains(mib))
+                    .ok_or(Error::VirtioBlkRam)?;
+                if options.virtio_blk_ram.replace(mib).is_some() {
+                    return Err(Error::DuplicateVirtioBlkRam);
+                }
+            }
             "--audio-check" => {
                 if options.audio_check.is_some() {
                     return Err(Error::DuplicateAudioCheck);

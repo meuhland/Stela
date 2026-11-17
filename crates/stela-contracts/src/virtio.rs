@@ -267,6 +267,9 @@ pub mod ring {
     }
 }
 
+/// The block device's own layout.
+pub mod blk;
+
 #[cfg(test)]
 mod tests {
     use super::*;

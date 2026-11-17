@@ -58,6 +58,8 @@ pub enum Error {
     DuplicateWifiCountry,
     Usb4Approve,
     DuplicateUsb4Approve,
+    VirtioBlkRam,
+    DuplicateVirtioBlkRam,
     Ipv4,
     DuplicateIpv4,
     Ipv4Gateway,
@@ -137,6 +139,7 @@ pub enum Constraint {
     NativePciIoapicExclusive,
     VirtioSndDependency,
     VirtioNetDependency,
+    VirtioBlkDependency,
 }
 impl Error {
     /// The established stela.cfg diagnostic at presentation-only callers.
@@ -181,6 +184,8 @@ impl Error {
             Self::DuplicateWifiCountry => "duplicate --wifi-country",
             Self::Usb4Approve => "--usb4-approve needs a device UUID",
             Self::DuplicateUsb4Approve => "duplicate --usb4-approve",
+            Self::VirtioBlkRam => "--virtio-blk-ram takes the RAM disk's size, 1 to 256 MiB",
+            Self::DuplicateVirtioBlkRam => "duplicate --virtio-blk-ram",
             Self::Ipv4 => "--ipv4 needs a host ADDRESS/PREFIX, such as 192.168.1.20/24",
             Self::DuplicateIpv4 => "duplicate --ipv4",
             Self::Ipv4Gateway => "--ipv4-gateway needs an IPv4 address",
@@ -268,6 +273,7 @@ impl Constraint {
                 "--native-pci-own-ioapic requires the normal system platform path"
             }
             Self::VirtioSndDependency => "--virtio-snd and --virtio-snd-capture require --virtio",
+            Self::VirtioBlkDependency => "--virtio-blk-ram requires --virtio",
         }
     }
 }

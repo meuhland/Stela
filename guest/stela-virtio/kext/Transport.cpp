@@ -13,6 +13,8 @@ static const uint32_t kAvailOffset = 0x1000;
 static const uint32_t kUsedOffset = 0x2000;
 /* How long a reset may take to read back as done. */
 static const unsigned kResetPolls = 1000;
+/* How often a configuration read is tried while the configuration changes. */
+static const unsigned kConfigReads = 8;
 
 static_assert(STELA_VIRTIO_DESC_BYTES(STELA_VQ_MAX) <= kAvailOffset, "the descriptor table fits before the available ring");
 static_assert(STELA_VIRTIO_AVAIL_BYTES(STELA_VQ_MAX) <= kUsedOffset - kAvailOffset, "the available ring fits before the used ring");
@@ -338,6 +340,23 @@ StelaVirtIODevice::driverOK()
 {
 	transport->write(STELA_VIRTIO_MMIO_STATUS,
 	    transport->read(STELA_VIRTIO_MMIO_STATUS) | STELA_VIRTIO_STATUS_DRIVER_OK);
+}
+
+uint64_t
+StelaVirtIODevice::readConfig(uint32_t offset, unsigned bytes)
+{
+	uint64_t value = 0;
+	for (unsigned attempt = 0; attempt < kConfigReads; attempt++) {
+		uint32_t generation = transport->read(STELA_VIRTIO_MMIO_CONFIG_GENERATION);
+		value = transport->read(STELA_VIRTIO_MMIO_CONFIG + offset);
+		if (bytes == 8) {
+			value |= uint64_t(transport->read(STELA_VIRTIO_MMIO_CONFIG + offset + 4)) << 32;
+		}
+		if (transport->read(STELA_VIRTIO_MMIO_CONFIG_GENERATION) == generation) {
+			break;
+		}
+	}
+	return value;
 }
 
 void

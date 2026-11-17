@@ -102,6 +102,7 @@ pub fn generate(xnu: &Path, include: &Path) -> Result<()> {
     fs::write(stela.join("net.h"), net_header())?;
     fs::write(stela.join("virtio.h"), virtio_header())?;
     fs::write(stela.join("virtio_snd.h"), virtio_snd_header())?;
+    fs::write(stela.join("virtio_blk.h"), virtio_blk_header())?;
     Ok(())
 }
 
@@ -347,6 +348,31 @@ pub fn virtio_snd_header() -> String {
     header
 }
 
+/// `stela/virtio_blk.h`: the block device's feature bits, configuration
+/// offsets and requests, from `stela_contracts::virtio::blk`.
+pub fn virtio_blk_header() -> String {
+    use stela_contracts::virtio::blk::{config, features, request};
+    let mut header = String::from(
+        "/* The virtio block device's layout, from stela_contracts::virtio::blk. */\n\
+         #pragma once\n",
+    );
+    for (prefix, layout) in [
+        ("F", features::LAYOUT),
+        ("CONFIG", config::LAYOUT),
+        ("", request::LAYOUT),
+    ] {
+        for (name, value) in layout {
+            let separator = if prefix.is_empty() { "" } else { "_" };
+            writeln!(
+                header,
+                "#define STELA_VIRTIO_BLK_{prefix}{separator}{name} {value:#x}ULL"
+            )
+            .unwrap();
+        }
+    }
+    header
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +414,22 @@ mod tests {
             "#define STELA_VIRTIO_DESC_F_WRITE 0x2\n",
             "#define STELA_VIRTIO_USED_ALIGN 4ULL\n",
             "#define STELA_VIRTIO_USED_BYTES(size) (4 + 8 * (size) + 2)\n",
+        ] {
+            assert!(header.contains(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_virtio_blk_header_names_features_config_and_requests() {
+        let header = virtio_blk_header();
+        for line in [
+            "#define STELA_VIRTIO_BLK_F_FLUSH 0x200ULL\n",
+            "#define STELA_VIRTIO_BLK_F_RO 0x20ULL\n",
+            "#define STELA_VIRTIO_BLK_CONFIG_CAPACITY 0x0ULL\n",
+            "#define STELA_VIRTIO_BLK_CONFIG_BLK_SIZE 0x14ULL\n",
+            "#define STELA_VIRTIO_BLK_HEADER_BYTES 0x10ULL\n",
+            "#define STELA_VIRTIO_BLK_T_GET_ID 0x8ULL\n",
+            "#define STELA_VIRTIO_BLK_S_IOERR 0x1ULL\n",
         ] {
             assert!(header.contains(line), "{line}");
         }

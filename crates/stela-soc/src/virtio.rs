@@ -11,6 +11,7 @@
 //! [`VirtioDevice::deadline`] (the sound device's pacing), bring the step
 //! about. The
 //! queues are split virtqueues ([`queue`]), shared with StelaNet.
+pub mod blk;
 pub mod console;
 pub mod mmio;
 pub mod net;

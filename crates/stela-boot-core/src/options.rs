@@ -47,6 +47,7 @@ pub const GUEST_AUDIO_FROM_VIRTIO: &str = "GUEST AUDIO source: virtio-snd (--vir
      given, each to its own sink";
 /// Adds the virtio network device to `--virtio`'s devices.
 pub const VIRTIO_NET: &str = "--virtio-net";
+pub const VIRTIO_BLK_RAM: &str = "--virtio-blk-ram";
 pub const NATIVE_CORES: &str = "--native-cores";
 /// The limits on shared alias blocks (`--shared-aliases`), by bit of
 /// [`System::shared_limits`]: share at EL0 only, above EL0 only; no link
@@ -443,8 +444,11 @@ pub struct System {
     /// Give the guest Stela's virtio-mmio devices and link Stela's own
     /// virtio kext, StelaVirtIO, beside StelaGPU (`--virtio`): the entropy
     /// device at `/arm-io/stela-virtio0` and the console at
-    /// `/arm-io/stela-virtio1`. Without it neither the nodes nor the kext
-    /// are in the boot.
+    /// `/arm-io/stela-virtio1`; with `--virtio-snd` the sound device at
+    /// `/arm-io/stela-virtio2`, with `--virtio-net` the network device at
+    /// `/arm-io/stela-virtio3`, and with `--virtio-blk-ram` the block
+    /// device at `/arm-io/stela-virtio4`. Without it neither the nodes nor
+    /// the kext are in the boot.
     pub virtio: bool,
     /// Feed the virtio console's input from the host's test source
     /// (`--virtio-console-echo`, with `--virtio`): a greeting when the
@@ -465,6 +469,12 @@ pub struct System {
     /// (`--virtio-net`, which needs `--virtio`). Without `--guest-network`
     /// it has no host adapter, and its link is down.
     pub virtio_net: bool,
+    /// Give the guest a virtio block device backed by a zero-filled RAM disk
+    /// of this many MiB of the host's memory (`--virtio-blk-ram MIB`, with
+    /// `--virtio`, 1 to `stela_soc::virtio::blk::RAM_MOST_MIB`; 64 for the
+    /// first test). It never opens a host disk, and keeps nothing past
+    /// power-off.
+    pub virtio_blk_ram: Option<u64>,
     /// Join this Wi-Fi network for the mount's network (`--wifi SSID`). The
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
@@ -573,6 +583,7 @@ impl Default for System {
             virtio_snd: false,
             virtio_snd_capture: None,
             virtio_net: false,
+            virtio_blk_ram: None,
             ssid: None,
             wifi_key: None,
             wifi_country: None,
@@ -1039,6 +1050,7 @@ impl fmt::Display for System {
         line.flag(VIRTIO_SND, self.virtio_snd)?;
         line.value(VIRTIO_SND_CAPTURE, self.virtio_snd_capture)?;
         line.flag(VIRTIO_NET, self.virtio_net)?;
+        line.value(VIRTIO_BLK_RAM, self.virtio_blk_ram)?;
         line.value(WIFI, self.ssid.as_deref().map(Ssid))?;
         line.value(
             WIFI_KEY,

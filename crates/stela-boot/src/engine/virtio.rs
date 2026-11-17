@@ -26,7 +26,10 @@
 //!   a station address of its own that derives from the board's ECID. The
 //!   board switches frames from the host between the two by destination
 //!   (`stela_soc::machine::route`); its link follows the host adapter's
-//!   carrier, and without a guest network it is down.
+//!   carrier, and without a guest network it is down;
+//! - `/arm-io/stela-virtio4`, only with `--virtio-blk-ram MIB`: the block
+//!   device, in front of a zero-filled RAM disk of the host's memory. No
+//!   host disk is ever opened for it.
 //!
 //! The devices' node indices are [`DEVICES`]' order, kept in this one
 //! place: a device a boot leaves out keeps its index free. Windows and AIC
@@ -51,7 +54,7 @@ use stela_contracts::virtio::status;
 use stela_loader::{apple_device_tree::DeviceTree, aux_kc::Kext, stela_gpu::Placement};
 use stela_soc::machine::{AppleDevices, VirtioReport};
 use stela_soc::virtio::{
-    VirtioDevice,
+    VirtioDevice, blk,
     console::{Console, Echo, Input, Silent},
     mmio::Event,
     net::OFFLOADS,
@@ -90,12 +93,19 @@ enum Kind {
     Console,
     Sound,
     Net,
+    Block,
 }
 
 /// The devices by node index, in this one place: the entropy device stays
 /// `stela-virtio0`, and a device a boot leaves out keeps its index. A new
 /// device is the next entry.
-const DEVICES: [Kind; 4] = [Kind::Rng, Kind::Console, Kind::Sound, Kind::Net];
+const DEVICES: [Kind; 5] = [
+    Kind::Rng,
+    Kind::Console,
+    Kind::Sound,
+    Kind::Net,
+    Kind::Block,
+];
 
 impl Kind {
     /// Its name in the log, as its device names itself without `virtio-`.
@@ -105,6 +115,7 @@ impl Kind {
             Self::Console => "console",
             Self::Sound => "snd",
             Self::Net => "net",
+            Self::Block => "blk",
         }
     }
 }
@@ -121,6 +132,9 @@ pub(super) struct Config {
     hdmi_ring: bool,
     /// The network device (`--virtio-net`).
     net: bool,
+    /// The block device's RAM disk, in MiB (`--virtio-blk-ram`); no block
+    /// device without it.
+    blk_ram: Option<u64>,
 }
 
 impl Config {
@@ -130,6 +144,7 @@ impl Config {
             sound: options.virtio_snd.then_some(options.virtio_snd_capture),
             hdmi_ring: options.guest_audio_from_virtio(),
             net: options.virtio_net,
+            blk_ram: options.virtio_blk_ram,
         }
     }
 
@@ -139,6 +154,7 @@ impl Config {
             Kind::Rng | Kind::Console => true,
             Kind::Sound => self.sound.is_some(),
             Kind::Net => self.net,
+            Kind::Block => self.blk_ram.is_some(),
         }
     }
 }
@@ -151,6 +167,27 @@ pub(super) struct NetSetup {
     /// The host adapter's station address, the guest's first interface's,
     /// if the boot has a guest network.
     pub host: Option<[u8; 6]>,
+}
+
+/// A device made for its node, with the words its placement line adds.
+type Made = (Box<dyn VirtioDevice>, String);
+
+/// The block device of a boot that asked for a RAM disk of `mib` MiB, or
+/// why it could not be made: only ever engine memory, never a host disk.
+fn block(mib: u64) -> Result<Made, String> {
+    let disk = blk::ram(mib)?;
+    let detail = format!(
+        ", RAM disk {mib} MiB ({} bytes, {}-byte blocks), {}, serial {}, no host disk",
+        disk.bytes(),
+        disk.block_size(),
+        if disk.read_only() {
+            "read-only"
+        } else {
+            "writable"
+        },
+        blk::RAM_SERIAL
+    );
+    Ok((Box::new(disk), detail))
 }
 
 /// Set when a device has events or lines for the log.
@@ -173,28 +210,45 @@ pub(super) fn kexts(wanted: bool) -> Vec<Kext<'static>> {
     Vec::new()
 }
 
-/// A device's node, placed.
+/// A device's node, placed, and the device behind it when it was made
+/// before its node (the block device).
 pub(super) struct Placed {
     index: usize,
     kind: Kind,
     placement: Placement,
+    made: Option<Made>,
 }
 
 /// Places every device `config` asks for, in index order, after the GPU
-/// gates and StelaNet: each takes the next free window and AIC input. A
-/// device the tree has no room for is left out, and those after it still
-/// placed.
+/// gates and StelaNet: each takes the next free window and AIC input. The
+/// block device is made first, so one that cannot be made has no node for
+/// the guest to find. A device the tree has no room for is left out, and
+/// those after it still placed.
 pub(super) fn place(tree: &mut DeviceTree, config: &Config) -> Vec<Placed> {
     let mut placed = Vec::new();
     for (index, kind) in DEVICES.into_iter().enumerate() {
         if !config.places(kind) {
             continue;
         }
+        let made = match (kind, config.blk_ram) {
+            (Kind::Block, Some(mib)) => match block(mib) {
+                Ok(made) => Some(made),
+                Err(error) => {
+                    output::arguments(format_args!(
+                        "VIRTIO {} not placed: {error}\n",
+                        kind.name()
+                    ));
+                    continue;
+                }
+            },
+            _ => None,
+        };
         match stela_loader::virtio::place_virtio(tree, index) {
             Ok(placement) => placed.push(Placed {
                 index,
                 kind,
                 placement,
+                made,
             }),
             Err(error) => {
                 output::arguments(format_args!("VIRTIO {} not placed: {error}\n", kind.name()))
@@ -220,18 +274,20 @@ pub(super) fn add(
         index,
         kind,
         placement,
+        made,
     } in placed
     {
         let irq = AicInput::new(
             (placement.irq / per_die) as u8,
             (placement.irq % per_die) as u16,
         );
-        let (device, detail): (Box<dyn VirtioDevice>, String) = match kind {
-            Kind::Rng => {
+        let (device, detail): Made = match (kind, made) {
+            (_, Some(made)) => made,
+            (Kind::Rng, None) => {
                 let source = Box::new(|bytes: &mut [u8]| crate::random::fill(bytes).is_ok());
                 (Box::new(Rng::new(source)), String::new())
             }
-            Kind::Console => {
+            (Kind::Console, None) => {
                 let (input, detail): (Box<dyn Input>, &str) = if config.console_echo {
                     (Box::new(Echo::new()), ", input: the echo test source")
                 } else {
@@ -239,7 +295,7 @@ pub(super) fn add(
                 };
                 (Box::new(Console::new(input)), detail.into())
             }
-            Kind::Sound => {
+            (Kind::Sound, None) => {
                 let capture = config.sound.flatten();
                 let (sink, rates): (Box<dyn sink::Sink>, &str) = if config.hdmi_ring {
                     let ring = GuestRing::new();
@@ -263,7 +319,7 @@ pub(super) fn add(
                     detail,
                 )
             }
-            Kind::Net => {
+            (Kind::Net, None) => {
                 // The board keeps its one network device apart, for the
                 // host link's switch (`AppleDevices::add_virtio_net`).
                 let mac = devices
@@ -294,6 +350,8 @@ pub(super) fn add(
                 );
                 continue;
             }
+            // `place` makes the block device with its node.
+            (Kind::Block, None) => unreachable!("the block device is made with its node"),
         };
         devices
             .add_virtio_mmio(placement.physical, irq, device, Some(&EVENTS))

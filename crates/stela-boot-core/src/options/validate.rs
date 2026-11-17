@@ -24,6 +24,9 @@ pub(super) fn system(options: &System) -> Result<(), Error> {
     if options.virtio_snd && !options.virtio {
         return Err(Error::Constraint(Constraint::VirtioSndDependency));
     }
+    if options.virtio_blk_ram.is_some() && !options.virtio {
+        return Err(Error::Constraint(Constraint::VirtioBlkDependency));
+    }
     Ok(())
 }
 
