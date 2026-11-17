@@ -210,6 +210,54 @@ void stela_linux_pci_shutdown(struct pci_dev *dev)
 		dev->driver->shutdown(dev);
 }
 
+/* Bus mastering off after the driver's shutdown, as Linux's own shutdown
+ * clears it for a kexec (drivers/pci/pci-driver.c pci_device_shutdown) and
+ * whatever pci_disable_device's count says: nouveau enables its function
+ * twice (nvkm_device_pci_new and nouveau_drm_probe), and its shutdown drops
+ * one, so its pci_disable_device leaves BME on. The function then issues no
+ * new request, its interrupt messages included. *before and *after are
+ * Command as read before the write and after it; a PCIBIOS result. */
+int stela_linux_pci_clear_master(struct pci_dev *dev, u16 *before, u16 *after)
+{
+	int error;
+
+	*before = *after = (u16)~0;
+	error = pci_read_config_word(dev, PCI_COMMAND, before);
+	if (error)
+		return error;
+	if (*before & PCI_COMMAND_MASTER) {
+		error = pci_write_config_word(dev, PCI_COMMAND, *before & (u16)~PCI_COMMAND_MASTER);
+		if (error)
+			return error;
+	}
+	error = pci_read_config_word(dev, PCI_COMMAND, after);
+	if (error)
+		return error;
+	if (!(*after & PCI_COMMAND_MASTER))
+		dev->is_busmaster = 0;
+	return PCIBIOS_SUCCESSFUL;
+}
+
+/* Device Status's Transactions Pending (drivers/pci/pci.c
+ * pci_wait_for_pending_transaction reads it): *pending is false for a
+ * function without a PCI Express capability. A PCIBIOS result. */
+int stela_linux_pci_transactions_pending(struct pci_dev *dev, bool *pending)
+{
+	u16 status;
+	u8 express;
+	int error;
+
+	*pending = false;
+	error = stela_linux_pci_find_capability(dev, PCI_CAP_ID_EXP, &express);
+	if (error || !express)
+		return error;
+	error = pci_read_config_word(dev, express + PCI_EXP_DEVSTA, &status);
+	if (error)
+		return error;
+	*pending = status & PCI_EXP_DEVSTA_TRPND;
+	return PCIBIOS_SUCCESSFUL;
+}
+
 void stela_linux_pci_remove_device(struct pci_dev *dev)
 {
 	stela_linux_device_close(&dev->dev);
@@ -623,6 +671,35 @@ int main(void)
 	assert(config[PCI_COMMAND] & PCI_COMMAND_MASTER);
 	pci_disable_device(&dev);
 	assert(config[PCI_COMMAND] == PCI_COMMAND_MEMORY && !dev.is_busmaster);
+
+	/* After a shutdown that dropped one of two enables, as nouveau's does:
+	 * bus mastering goes off whatever the count, and Transactions Pending
+	 * reads from the Express capability. */
+	assert(!pci_enable_device(&dev) && !pci_enable_device(&dev));
+	pci_set_master(&dev);
+	pci_disable_device(&dev);
+	assert((config[PCI_COMMAND] & PCI_COMMAND_MASTER) && dev.is_busmaster);
+	u16 before, after;
+	assert(!stela_linux_pci_clear_master(&dev, &before, &after));
+	assert(before == (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER) && after == PCI_COMMAND_MEMORY);
+	assert(config[PCI_COMMAND] == PCI_COMMAND_MEMORY && !dev.is_busmaster);
+	assert(!stela_linux_pci_clear_master(&dev, &before, &after) &&
+	       before == PCI_COMMAND_MEMORY && after == PCI_COMMAND_MEMORY);
+	bool pending = true;
+	assert(!stela_linux_pci_transactions_pending(&dev, &pending) && !pending);
+	config[0x60 + PCI_EXP_DEVSTA] = PCI_EXP_DEVSTA_TRPND;
+	assert(!stela_linux_pci_transactions_pending(&dev, &pending) && pending);
+	/* Without a capability list there is no Express capability to read. */
+	config[PCI_STATUS] = 0;
+	assert(!stela_linux_pci_transactions_pending(&dev, &pending) && !pending);
+	config[PCI_STATUS] = PCI_STATUS_CAP_LIST;
+	config[0x60 + PCI_EXP_DEVSTA] = 0;
+	config_error = PCIBIOS_SET_FAILED;
+	assert(stela_linux_pci_clear_master(&dev, &before, &after) == PCIBIOS_SET_FAILED);
+	assert(stela_linux_pci_transactions_pending(&dev, &pending) == PCIBIOS_SET_FAILED && !pending);
+	config_error = 0;
+	pci_disable_device(&dev);
+	assert(!atomic_read(&dev.enable_cnt) && config[PCI_COMMAND] == PCI_COMMAND_MEMORY);
 
 	device_initialize(&dev.dev);
 	assert(!stela_linux_pci_publish_device(&dev));

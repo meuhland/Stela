@@ -432,15 +432,68 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                         "GPU completion waiter still open at the stop\n"
                     ));
                 }
-                gpu.start
-                    ._attached
-                    .iter()
-                    .for_each(|attached| attached.shutdown());
+                for (index, attached) in gpu.start._attached.iter().enumerate() {
+                    attached.shutdown();
+                    bus_master_off(index, attached, gpu.tsc_hz);
+                }
                 0
             }
         }
     }
 }
+
+/// The longest the stop waits for a GPU's outstanding requests to complete
+/// once its bus mastering is off ([`bus_master_off`]).
+const PENDING_US: u64 = 100_000;
+
+/// After GPU `index`'s driver stopped it ([`Operation::Shutdown`]): its bus
+/// mastering cleared and read back, then its PCI Express Transactions
+/// Pending waited for, [`PENDING_US`] at most, and one line says so. A card
+/// whose engines, GSP or display still had a request outstanding when the
+/// host turns it off and resets it can refuse its function-level reset
+/// until a power cycle; a set bit here names that before the host does.
+///
+/// # Safety
+/// In the entered Linux owner, on a task, after `attached`'s shutdown.
+unsafe fn bus_master_off<H: stela_linux::function::Host>(
+    index: usize,
+    attached: &stela_linux::function::Attached<H>,
+    tsc_hz: u64,
+) {
+    // SAFETY: the caller's contract; the driver's shutdown just ran.
+    let master = match unsafe { attached.clear_bus_master() } {
+        Ok((before, after)) if after & COMMAND_MASTER == 0 => {
+            alloc::format!("bus master off (command {before:#06x} -> {after:#06x})")
+        }
+        Ok((before, after)) => {
+            alloc::format!("bus master still on (command {before:#06x} -> {after:#06x})")
+        }
+        Err(error) => alloc::format!("bus master not cleared: PCIBIOS error {error:#x}"),
+    };
+    let started = host::rdtsc();
+    let limit = PENDING_US * (tsc_hz / 1_000_000).max(1);
+    let pending = loop {
+        let waited = host::rdtsc().wrapping_sub(started);
+        // SAFETY: the caller's contract.
+        match unsafe { attached.transactions_pending() } {
+            Ok(false) => {
+                let us = waited / (tsc_hz / 1_000_000).max(1);
+                break alloc::format!("no transactions pending ({us} us)");
+            }
+            Ok(true) if waited >= limit => {
+                break alloc::format!("transactions still pending after {PENDING_US} us");
+            }
+            Ok(true) => hint::spin_loop(),
+            Err(error) => {
+                break alloc::format!("transactions pending not read: PCIBIOS error {error:#x}");
+            }
+        }
+    };
+    output::arguments(format_args!("GPU {index} shutdown: {master}, {pending}\n"));
+}
+
+/// PCI Command's Bus Master Enable.
+const COMMAND_MASTER: u16 = 1 << 2;
 
 /// How long a worker waits for a call before it leaves, while another stays.
 const IDLE_SECONDS: u64 = 10;

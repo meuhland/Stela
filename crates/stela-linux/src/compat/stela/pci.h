@@ -12,6 +12,12 @@ bool stela_linux_pci_devices_present(void);
 int stela_linux_pci_find_capability(struct pci_dev *dev, int cap, u8 *found);
 bool stela_linux_pci_bound(const struct pci_dev *device);
 void stela_linux_pci_shutdown(struct pci_dev *dev);
+/* Bus mastering off after a shutdown, read back; Command before and after.
+ * A PCIBIOS result. */
+int stela_linux_pci_clear_master(struct pci_dev *dev, u16 *before, u16 *after);
+/* PCI Express Device Status's Transactions Pending; false without the
+ * capability. A PCIBIOS result. */
+int stela_linux_pci_transactions_pending(struct pci_dev *dev, bool *pending);
 void stela_linux_pci_remove_device(struct pci_dev *dev);
 
 /* A placed memory region of a function. */

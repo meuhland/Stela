@@ -196,6 +196,12 @@ unsafe extern "C" {
     fn stela_linux_owner() -> *const super::owner::RawOwner;
     fn stela_linux_pci_bound(device: *const c_void) -> bool;
     fn stela_linux_pci_shutdown(device: *mut c_void);
+    fn stela_linux_pci_clear_master(
+        device: *mut c_void,
+        before: *mut u16,
+        after: *mut u16,
+    ) -> c_int;
+    fn stela_linux_pci_transactions_pending(device: *mut c_void, pending: *mut bool) -> c_int;
     fn stela_linux_pci_remove_device(device: *mut c_void);
     fn stela_linux_pci_quarantined_functions() -> u64;
     fn stela_linux_fatal(message: *const c_char) -> !;
@@ -862,6 +868,39 @@ impl<H: Host> Attached<H> {
     pub unsafe fn shutdown(&self) {
         // SAFETY: the caller's contract, over this function's live device.
         unsafe { stela_linux_pci_shutdown(self.device.as_ptr()) };
+    }
+
+    /// Clears the function's bus mastering after [`Self::shutdown`], as
+    /// Linux's shutdown does for a kexec, and reads it back: Command before
+    /// and after, or the PCIBIOS error. The function then issues no new
+    /// request.
+    ///
+    /// # Safety
+    /// As for [`Self::shutdown`], after it: nothing of the function's driver
+    /// runs it again.
+    pub unsafe fn clear_bus_master(&self) -> Result<(u16, u16), c_int> {
+        let (mut before, mut after) = (0, 0);
+        // SAFETY: the caller's contract, over this function's live device.
+        match unsafe { stela_linux_pci_clear_master(self.device.as_ptr(), &mut before, &mut after) }
+        {
+            0 => Ok((before, after)),
+            error => Err(error),
+        }
+    }
+
+    /// Whether the function's PCI Express Transactions Pending is set:
+    /// requests it issued still await their completions. `false` without
+    /// the capability; the PCIBIOS error when the read failed.
+    ///
+    /// # Safety
+    /// In an entered Linux owner.
+    pub unsafe fn transactions_pending(&self) -> Result<bool, c_int> {
+        let mut pending = false;
+        // SAFETY: the caller's contract, over this function's live device.
+        match unsafe { stela_linux_pci_transactions_pending(self.device.as_ptr(), &mut pending) } {
+            0 => Ok(pending),
+            error => Err(error),
+        }
     }
 
     /// Whether a driver took the function.
