@@ -289,6 +289,46 @@ fn unsigned32_selector_keeps_canonical_report_protocol_and_complete_values() {
     input.stop_hid().unwrap();
 }
 
+/// An interface whose transfers keep failing past the one-second retry
+/// window, while each endpoint recovery succeeds, is retried from a new
+/// window, as Linux `hid_io_error` resets the device there and goes on: it
+/// is never dropped for good, and its next report still arrives.
+#[test]
+fn transfer_errors_past_the_retry_window_start_a_new_window_instead_of_dropping_the_interface() {
+    let _virtual = crate::test_clock::virtualize();
+    let mut dma = model::TestRegion::new(512 * 1024 * 8);
+    let (mut input, peer, _) = fixture(&mut dma, MIXED);
+    assert!(input.poll_hid().reports.is_empty());
+    let physical = input.buffer.physical();
+    let clock = input.controller.borrow().clock;
+    peer.borrow_mut().halt_transfer = Some(3);
+    assert_eq!(feed(&mut input, &peer, &[1, 1, 0]).inputs, [key(4, true)]);
+    assert!(input.retry.is_some());
+    assert_eq!((input.reports(), input.transfer_errors()), (1, 1));
+    // Three seconds of a STALL at every retry: windows run out and begin
+    // again, each failure recovered by its endpoint reset.
+    for _ in 0..30 {
+        crate::test_clock::advance(clock, LONGEST_RETRY_MS * MICROSECONDS_PER_MILLISECOND);
+        input.poll_hid();
+        assert!(!input.failed(), "{:?}", input.first_error());
+        assert_eq!(input.state(), State::Running);
+    }
+    assert!(input.transfer_errors() >= 15, "{}", input.transfer_errors());
+    assert!(input.retry_windows() >= 2, "{}", input.retry_windows());
+    assert_eq!(
+        input.first_error(),
+        Some(BlockError::Device { status: STALL })
+    );
+    // The endpoint works again: the next report arrives and ends the retry.
+    peer.borrow_mut().halt_transfer = None;
+    crate::test_clock::advance(clock, LONGEST_RETRY_MS * MICROSECONDS_PER_MILLISECOND);
+    assert_eq!(feed(&mut input, &peer, &[1, 0, 0]).inputs, [key(4, false)]);
+    assert!(input.retry.is_none());
+    assert_eq!(input.reports(), 2);
+    assert_eq!(input.buffer.physical(), physical);
+    input.stop_hid().unwrap();
+}
+
 #[test]
 fn stall_retirement_keeps_sparse_binding_and_original_dma_until_ack() {
     let mut dma = model::TestRegion::new(512 * 1024 * 8);
