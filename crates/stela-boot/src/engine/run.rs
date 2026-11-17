@@ -934,7 +934,7 @@ pub(super) fn run<H: Host>(
             output::report_log_stores();
             return stop;
         }
-        cursor.look(now);
+        cursor.look(now, tsc_hz);
         heartbeat.sample(machine, now, tsc_hz);
         // The heartbeat's reports wait for a quiet boot PE, as the service
         // does, for one more interval at most.
