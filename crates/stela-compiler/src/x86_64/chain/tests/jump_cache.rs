@@ -301,12 +301,21 @@ fn cached_tails_run_as_plain_tails() {
     for _ in 0..20_000 {
         let pc = pcs[(next() % pcs.len() as u64) as usize];
         match next() % 16 {
-            0 => world.map(
-                pc,
-                keys[(next() % 2) as usize],
-                (next() % BLOCKS as u64) as usize,
-                0b1111,
-            ),
+            0 => {
+                // A translation changes as a guest changes one, with a TLBI
+                // of its page. A rekey alone grows the epoch only while its
+                // old entry is in its set: one the page's entry of the other
+                // context put out of the set grows none, which a guest that
+                // skips the TLBI may see as a stale translation.
+                let page = pc & !0xfff;
+                world.itlb.forget_range(page..=page | 0xfff, u64::MAX);
+                world.map(
+                    pc,
+                    keys[(next() % 2) as usize],
+                    (next() % BLOCKS as u64) as usize,
+                    0b1111,
+                )
+            }
             1 => {
                 let page = pc & !0xfff;
                 world.itlb.forget_range(page..=page | 0xfff, u64::MAX);
