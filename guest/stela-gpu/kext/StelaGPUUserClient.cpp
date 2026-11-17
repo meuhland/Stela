@@ -54,7 +54,10 @@ StelaGPUUserClient::start(IOService *provider)
 	gpu->retain();
 	gate = gpu->openGate();
 	if (gate == 0) {
-		IOLog("StelaGPU: every gate connection is open\n");
+		// The gate answers no page when every connection is in use, when the
+		// host's GPU service refuses the open (a lost GPU, a stop), or while
+		// this kext stops; the host's log names which.
+		IOLog("StelaGPU: no gate connection opened: all are in use, or the host's GPU service refused it\n");
 		IOUserClient::stop(provider);
 		return false;
 	}
