@@ -497,6 +497,13 @@ fn dhcp_still_asks_after_a_spanning_tree_port_starts_forwarding() {
     assert!(clock.0.get() >= 60_000_000, "{}", clock.0.get());
     let requests = requests.borrow();
     assert!(requests.iter().any(|&at| at > 31_000_000), "{requests:?}");
+    // Unanswered, a DISCOVER is asked again after 4 s (RFC 2131 4.1), not
+    // smoltcp's 10 s.
+    let first = requests[0];
+    assert!(
+        requests.get(1).is_some_and(|&at| at - first <= 4_500_000),
+        "{requests:?}"
+    );
 }
 
 #[test]

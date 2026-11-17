@@ -31,13 +31,18 @@ pub struct Config {
     pub dns: Vec<Ipv4>,
 }
 
-/// smoltcp's DHCP client asks every 10 seconds within this. A switch port
+/// The DHCP client asks every [`DHCP_DISCOVER_SECONDS`] within this. A switch port
 /// that runs spanning tree forwards nothing for its first 30 seconds after
 /// the link comes up (IEEE 802.1D: 15 s listening, 15 s learning), and the
 /// adapter's start has just dropped and raised the link, so a wait of 30
 /// seconds lost every request there. Other systems' clients ask for a
 /// minute or longer.
 const DHCP_WAIT_US: u64 = 60_000_000;
+/// Seconds between DHCPDISCOVERs while no server answered: RFC 2131 4.1's
+/// first retransmission delay, where smoltcp's default waits 10 s. The
+/// first DISCOVER goes out as the link comes up, when a switch or the
+/// adapter itself often still drops it, so the lease came 10 s late.
+const DHCP_DISCOVER_SECONDS: u64 = 4;
 /// How long a lookup waits for an address family and a DNS server before
 /// it asks one.
 const DNS_WAIT_US: u64 = 15_000_000;
@@ -294,7 +299,11 @@ impl<L: Link, C: Clock> Stack<L, C> {
         let mut iface = Interface::new(config, &mut phy, now);
         iface.update_ip_addrs(|a| a.push(IpCidr::Ipv6(Ipv6Cidr::new(local_ipv6, 64))).unwrap());
         let mut sockets = SocketSet::new(Vec::new());
-        let dhcp = Some(sockets.add(dhcpv4::Socket::new()));
+        let mut client = dhcpv4::Socket::new();
+        let mut retry = dhcpv4::RetryConfig::default();
+        retry.discover_timeout = Duration::from_secs(DHCP_DISCOVER_SECONDS);
+        client.set_retry_config(retry);
+        let dhcp = Some(sockets.add(client));
         let dns = sockets.add(dns::Socket::new(&[], Vec::new()));
         Ok(Self {
             phy,
