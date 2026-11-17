@@ -669,7 +669,13 @@ impl SlotRefusal {
     }
 
     /// Refuse a function whose stop did not complete, reading COMMAND once
-    /// to judge whether it can still master DMA.
+    /// to judge whether it can still master DMA. Its writable map is then
+    /// withdrawn, as a parked function's is: the refusal keeps the
+    /// function's owner, so nothing else can drive it, but a map kept with
+    /// it conflicted with every later read-only view of its bus (the
+    /// topology and role inventory, the stopped rechecks), which refused the
+    /// whole fabric for one function. A map that cannot be withdrawn stays
+    /// with the refusal as before.
     fn unstopped(
         error: impl Into<ContainmentError>,
         config: UnpublishedConfig,
@@ -678,9 +684,15 @@ impl SlotRefusal {
         let master_stopped = config
             .try_read16(COMMAND)
             .is_ok_and(|command| plan.master_stopped(command));
+        // SAFETY: the stop's accesses were synchronous and have returned;
+        // no alias of this map escaped. Source keeps the original decode.
+        let original = match unsafe { config.park() } {
+            Ok(parked) => parked.into_parts(),
+            Err((_, original)) => original,
+        };
         Self {
             master_stopped,
-            ..Self::new(error, config.into_parts())
+            ..Self::new(error, original)
         }
     }
 }
