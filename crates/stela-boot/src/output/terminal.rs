@@ -200,6 +200,8 @@ impl core::fmt::Display for Failed {
 }
 
 pub(crate) fn panic(info: &PanicInfo<'_>) -> ! {
+    // A panic inside the heap holds its lock; its report allocates.
+    super::heap_stops();
     if PRINTING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()

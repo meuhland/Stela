@@ -1079,3 +1079,128 @@ fn a_large_request_no_extent_holds_frees_what_the_hook_keeps_and_is_served() {
     }
     assert_eq!(RECLAIMING.usage().live, 0);
 }
+
+/// A heap over `bytes` of page-aligned test backing, which the test leaks.
+fn stop_backed(heap: &Heap, bytes: usize) -> usize {
+    let layout = Layout::from_size_align(bytes, 4096).unwrap();
+    // SAFETY: a nonzero layout; the test leaks this backing.
+    let ram = unsafe { std::alloc::alloc(layout) };
+    // SAFETY: exclusive backing for the test's whole run.
+    unsafe { heap.initialize(ram, layout.size()) };
+    ram as usize
+}
+
+std::thread_local! {
+    /// The test thread's processor, for stop mode's identity.
+    static PROCESSOR: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+fn processor() -> u32 {
+    PROCESSOR.with(core::cell::Cell::get)
+}
+
+/// A processor that stops while its own interrupted context holds the
+/// lock allocates from the reserve, frees nothing it cannot, and reads its
+/// usage, all without waiting; once the lock is free it uses the heap.
+/// Processors that do not stop wait for the lock as before.
+#[test]
+fn a_stop_allocates_while_the_lock_is_held_and_never_waits() {
+    let heap = Heap::new();
+    stop_backed(&heap, 1 << 20);
+    assert!(heap.keep_stop_reserve(64 << 10));
+    let small = Layout::from_size_align(48, 16).unwrap();
+    let large = Layout::from_size_align(8 << 10, 64).unwrap();
+    // SAFETY: valid layouts; each block is freed once with its layout.
+    unsafe {
+        let before = heap.alloc(small);
+        let big_before = heap.alloc(large);
+        assert!(!before.is_null() && !big_before.is_null());
+        let live = heap.usage().live;
+        PROCESSOR.with(|id| id.set(7));
+        heap.stop_on(processor);
+        assert!(heap.stopping());
+        // The interrupted context holds the lock.
+        let held = heap.lock();
+        let a = heap.alloc(small);
+        let b = heap.alloc(large);
+        assert!(heap.in_reserve(a) && heap.in_reserve(b));
+        assert_eq!(b as usize % 64, 0);
+        a.write_bytes(0xa5, 48);
+        b.write_bytes(0x5a, 8 << 10);
+        // A resize moves within the reserve and keeps the bytes.
+        let grown = heap.realloc(a, small, 200);
+        assert!(heap.in_reserve(grown) && grown != a);
+        assert_eq!(*grown.add(47), 0xa5);
+        // Frees of reserve blocks do nothing; a heap block is dropped.
+        heap.dealloc(b, large);
+        heap.dealloc(before, small);
+        let counts = heap.stop_counts();
+        assert_eq!((counts.reserved, counts.dropped), (3, 1));
+        assert!(counts.reserve_used > (8 << 10) + 48 + 200);
+        assert_eq!(counts.reserve_bytes, 64 << 10);
+        // Usage answers from the counts the lock last left.
+        let usage = heap.usage();
+        assert_eq!((usage.live, usage.largest), (live, 0));
+        // More than the reserve holds: null, never a wait.
+        assert!(
+            heap.alloc(Layout::from_size_align(80 << 10, 16).unwrap())
+                .is_null()
+        );
+        drop(held);
+        // The lock is free again: the heap serves and takes back blocks.
+        let c = heap.alloc(small);
+        assert!(!c.is_null() && !heap.in_reserve(c));
+        heap.dealloc(c, small);
+        heap.dealloc(big_before, large);
+        let usage = heap.usage();
+        assert_eq!(usage.live, live - (8 << 10));
+        assert!(usage.largest > 0);
+        assert_eq!(heap.stop_counts().dropped, 1);
+    }
+    // Another processor is not stopping: it waits for the lock as ever.
+    let other = thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                PROCESSOR.with(|id| id.set(8));
+                assert!(!heap.stopping());
+                // SAFETY: a valid layout, freed once.
+                unsafe {
+                    let block = heap.alloc(small);
+                    let in_reserve = heap.in_reserve(block);
+                    heap.dealloc(block, small);
+                    in_reserve
+                }
+            })
+            .join()
+            .unwrap()
+    });
+    assert!(!other);
+}
+
+/// A stop with no reserve still never waits: an allocation the lock
+/// refuses is null, and counted as a failure.
+#[test]
+fn a_stop_without_a_reserve_fails_instead_of_waiting() {
+    let heap = Heap::new();
+    stop_backed(&heap, 512 << 10);
+    let layout = Layout::from_size_align(64, 16).unwrap();
+    // SAFETY: a valid layout, freed once.
+    unsafe {
+        let block = heap.alloc(layout);
+        heap.dealloc(block, layout);
+    }
+    assert!(!heap.stopping());
+    PROCESSOR.with(|id| id.set(3));
+    heap.stop_on(processor);
+    let held = heap.lock();
+    // SAFETY: a valid layout.
+    assert!(unsafe { heap.alloc(layout) }.is_null());
+    assert_eq!(heap.failures(), 1);
+    drop(held);
+    // SAFETY: a valid layout, freed once.
+    unsafe {
+        let block = heap.alloc(layout);
+        assert!(!block.is_null());
+        heap.dealloc(block, layout);
+    }
+}

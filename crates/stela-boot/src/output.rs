@@ -1057,6 +1057,8 @@ pub fn hypervisor_exit_port() -> bool {
 /// Report `code` on the hypervisor exit port, then halt. On a PC the screen
 /// keeps the output until the machine is powered off.
 pub fn terminate(code: u32) -> ! {
+    heap_stops();
+    stop_heap_report();
     arguments(format_args!(
         "STELA STOPPED code={code:#x}; power off to continue\n"
     ));
@@ -1075,6 +1077,7 @@ pub fn terminate(code: u32) -> ! {
 /// (`stop_record::carry`). Call only while firmware boot services and its
 /// system table remain live.
 pub(crate) fn early_fatal(message: &str) -> ! {
+    heap_stops();
     if let Claim::Later { first_here } = FIRST_STOP.claim(stopping_processor()) {
         later_stop(&message, first_here)
     }
@@ -1094,6 +1097,46 @@ pub(crate) fn early_fatal(message: &str) -> ! {
 /// The boot's first stop: the one whose reason is shown and recorded.
 pub static FIRST_STOP: FirstStop = FirstStop::new();
 
+/// The heap's reserve for a stop whose processor, or another that never
+/// runs again, holds the heap's lock (`stela_boot_core::heap::Heap::stop_on`):
+/// the stop's text, screen and the log's last stores, a pending megabyte
+/// of lines among them, with room to spare.
+const STOP_HEAP_RESERVE: usize = 4 << 20;
+
+/// Carve the heap's stop reserve, once each heap is set up: the loader's
+/// and the engine's. A heap without room for it is named in one line; a
+/// stop then fails its allocations while the lock is held, never waits.
+pub(crate) fn keep_stop_reserve() {
+    if !crate::ALLOCATOR.keep_stop_reserve(STOP_HEAP_RESERVE) {
+        arguments(format_args!(
+            "HEAP stop reserve of {} KiB not kept: the heap had no room; a stop while the \
+             heap's lock is held fails its allocations\n",
+            STOP_HEAP_RESERVE >> 10
+        ));
+    }
+}
+
+/// From here this processor stops, and its allocations never wait for the
+/// heap's lock without end: the stop may have interrupted the heap here,
+/// or its holder may never run again. First in every stop path; it
+/// allocates nothing and takes no lock.
+pub(crate) fn heap_stops() {
+    crate::ALLOCATOR.stop_on(stopping_processor);
+}
+
+/// One line when a stop found the heap's lock held and used its reserve
+/// or dropped frees; none otherwise.
+fn stop_heap_report() {
+    let counts = crate::ALLOCATOR.stop_counts();
+    if counts.reserved != 0 || counts.dropped != 0 {
+        arguments(format_args!(
+            "HEAP the stop found the heap's lock held: {} allocations took {} of the {} bytes \
+             of its reserve, {} frees were dropped\n",
+            counts.reserved, counts.reserve_used, counts.reserve_bytes, counts.dropped
+        ));
+    }
+}
+
 /// This processor's APIC ID, without the engine's per-processor state, which
 /// a stop before it exists has none of.
 fn stopping_processor() -> u32 {
@@ -1110,6 +1153,7 @@ fn stopping_processor() -> u32 {
 /// screen and in the kept record. The processor that made the first stop
 /// goes back to its wait for the power button; any other halts.
 fn later_stop(message: &dyn core::fmt::Display, first_here: bool) -> ! {
+    heap_stops();
     // Whatever guest lines the first stop has not written, as its
     // processor may be the one that stopped making progress.
     crate::engine::write_guest_output_at_stop();
@@ -1225,6 +1269,7 @@ fn stop_advice(reason: Option<&str>) -> &'static str {
 }
 
 pub fn fatal(message: impl core::fmt::Display) -> ! {
+    heap_stops();
     // A remote PE's processor halts at the end, and may wait on the way: its
     // clock slot must not hold the other PEs' time meanwhile, whether this
     // stop is the first or a later one.

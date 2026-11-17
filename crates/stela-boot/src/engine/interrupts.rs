@@ -773,6 +773,9 @@ pub(crate) unsafe fn observe_descriptors() -> Descriptors {
 
 /// Report an x86 exception that is a Stela failure, never a guest event.
 pub fn fatal(frame: &Frame) -> ! {
+    // The exception may have interrupted the heap here, holding its lock or
+    // halfway through this processor's cache: the report below allocates.
+    output::heap_stops();
     // A watcher's NMI after the boot stopped names no new failure: the
     // stop's reason stays the one shown.
     if frame.vector == 2 {
