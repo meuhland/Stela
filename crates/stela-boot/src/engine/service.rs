@@ -188,6 +188,13 @@ impl Service {
     /// Store what the guest committed since the last service, the caller
     /// waiting: at the stop, before the PC restarts or turns off.
     pub(super) fn stop(&mut self) {
+        // First, and before the GPU's driver unloads: the GPU's HD Audio
+        // functions the guest's sound plays on stop their DMA, reset their
+        // link and lose bus mastering, so nothing of them still reads the
+        // guest's memory when the PC turns off or restarts.
+        if let Some(audio) = self.audio.as_mut() {
+            audio.shutdown();
+        }
         // The virtio devices' last events and counters.
         super::virtio::report(&self.devices, true);
         if let Some(nor) = self.nor.as_mut() {

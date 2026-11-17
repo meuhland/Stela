@@ -229,7 +229,18 @@ pub(super) struct GuestAudio {
     hdmi: Option<Hdmi>,
     /// The GPU's audio functions, claimed and kept for the boot.
     _display: Option<DisplayAudio>,
+    /// The loader's root, which maps the claimed functions' registers.
+    root: u64,
+    /// The stop brought the claimed functions to rest ([`Self::shutdown`]):
+    /// no turn reaches them again.
+    quiesced: bool,
 }
+
+/// The longest each step of a claimed function's power-off quiesce waits
+/// for its readback ([`GuestAudio::shutdown`]).
+const SHUTDOWN_STEP_US: u64 = 100_000;
+/// The longest the stop waits for the host drivers' lock to reach them.
+const SHUTDOWN_LOCK_US: u64 = 500_000;
 
 impl GuestAudio {
     /// `tone`: the HDMI route plays the built-in test tone instead of the
@@ -375,6 +386,33 @@ impl GuestAudio {
             reported: None,
             hdmi,
             _display: display,
+            root,
+            quiesced: false,
+        }
+    }
+
+    /// At the stop, before the PC turns off or restarts and before the GPU's
+    /// driver unloads: every claimed HD Audio function of the GPUs, the
+    /// HDMI route's first, is brought to rest (`Host::quiesce_for_power_off`):
+    /// its streams stopped and read back stopped, CORB/RIRB and position DMA
+    /// stopped, its link put in reset (GCTL.CRST), bus mastering cleared,
+    /// and its outstanding PCI Express requests waited for, each wait
+    /// [`SHUTDOWN_STEP_US`] at most. One line per function says what each
+    /// step took. A stream the stop left running would go on reading the
+    /// guest's memory while the host tears the machine down and resets the
+    /// card. Once; no turn reaches the functions afterwards.
+    pub(super) fn shutdown(&mut self) {
+        if core::mem::replace(&mut self.quiesced, true) {
+            return;
+        }
+        let root = self.root;
+        let playing = self.hdmi.iter_mut().map(|hdmi| (&mut hdmi.host, true));
+        let others = self
+            ._display
+            .iter_mut()
+            .flat_map(|display| display.hosts.iter_mut().map(|host| (host, false)));
+        for (host, route) in playing.chain(others) {
+            quiesce_display_audio(host, root, route);
         }
     }
 
@@ -384,6 +422,9 @@ impl GuestAudio {
     /// guest does not stream, what it left waiting is discarded and the
     /// sink's clock stops.
     pub(super) fn serve(&mut self, devices: &mut AppleDevices, now: u64) {
+        if self.quiesced {
+            return;
+        }
         let (status, queued) = match &self.source {
             Source::Usb => {
                 let Some((status, queued)) = devices.guest_audio_status() else {
@@ -441,7 +482,7 @@ impl GuestAudio {
     /// period the DMA completed, and trims the queue to the cap. Then, on
     /// the monitor or the sink, the feedback looks at the turn.
     pub(super) fn play(&mut self, now: u64) {
-        let Some((status, _)) = self.status else {
+        let Some((status, _)) = self.status.filter(|_| !self.quiesced) else {
             return;
         };
         let streaming = status.bits != 0;
@@ -1420,6 +1461,75 @@ pub(super) fn claim_display_audio(
             None
         }
     }
+}
+
+/// Brings one claimed function to rest at the stop, in the loader's root
+/// `root`, and prints what each step took (`GuestAudio::shutdown`). `route`:
+/// the HDMI route plays on it.
+fn quiesce_display_audio(host: &mut Host, root: u64, route: bool) {
+    use core::fmt::Write;
+    use stela_drivers::probe::native::hda::Pending;
+    let what = if route { " (the HDMI route's)" } else { "" };
+    // SAFETY: the loader root `storage::open` captured, which maps the
+    // claimed function's registers for the whole run, as for a turn
+    // (`Hdmi::play`); the stop runs with its processor's pinned record
+    // active.
+    let Some(_root) = (unsafe { RestoreRoot::enter_within(root, SHUTDOWN_LOCK_US) }) else {
+        output::arguments(format_args!(
+            "GUEST AUDIO HDMI shutdown on {}{what}: not reached: the host drivers' lock stayed \
+             held for {} ms; its DMA is left as it runs\n",
+            host.location,
+            SHUTDOWN_LOCK_US / 1000
+        ));
+        return;
+    };
+    let report = match host.quiesce_for_power_off(SHUTDOWN_STEP_US) {
+        Ok(report) => report,
+        Err(error) => {
+            output::arguments(format_args!(
+                "GUEST AUDIO HDMI shutdown on {}{what}: not reached: {error:?}\n",
+                host.location
+            ));
+            return;
+        }
+    };
+    let controller = report.controller;
+    let limit = SHUTDOWN_STEP_US;
+    let mut line = String::new();
+    if controller.unanswered {
+        line.push_str("the controller did not answer (GCAP all ones), nothing written");
+    } else {
+        let streams = controller.running_streams;
+        let _ = match (streams, controller.streams_us) {
+            (0, Some(_)) => write!(line, "no stream running"),
+            (_, Some(us)) => write!(line, "stream stopped in {us} us (streams {streams:#x})"),
+            (_, None) => write!(
+                line,
+                "stream still running after {limit} us (streams {streams:#x})"
+            ),
+        };
+        let _ = match controller.commands_us {
+            Some(us) => write!(line, ", CORB/RIRB stopped in {us} us"),
+            None => write!(line, ", CORB/RIRB still running after {limit} us"),
+        };
+        let _ = match controller.reset_us {
+            Some(us) => write!(line, ", CRST in {us} us"),
+            None => write!(line, ", CRST not read back after {limit} us"),
+        };
+    }
+    let _ = match report.bus_master {
+        Ok(()) => write!(line, ", bus master off"),
+        Err(error) => write!(line, ", bus master not cleared: {error:?}"),
+    };
+    let _ = match report.pending {
+        Pending::Clear { us } => write!(line, ", no transactions pending ({us} us)"),
+        Pending::Set => write!(line, ", transactions still pending after {limit} us"),
+        Pending::Unread => write!(line, ", transactions pending not read"),
+    };
+    output::arguments(format_args!(
+        "GUEST AUDIO HDMI shutdown on {}{what}: {line}\n",
+        host.location
+    ));
 }
 
 /// The longest the claim and the codecs' discovery may take, the survey's
