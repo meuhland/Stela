@@ -120,6 +120,12 @@ pub struct GuestState {
     /// native code left on the host stack between blocks are discarded. Set
     /// by each entry.
     pub exit_rsp: ExitStack,
+    /// The guest page a page-relative block runs at
+    /// ([`crate::x86_64::NativeSystem::page_relative`]): its guest addresses
+    /// are this plus their offset from the page it was compiled at. Set by
+    /// whatever enters such a block, and by a paired call's continuation
+    /// (`chain::paired_call`); other code never reads it.
+    pub page_base: PageBase,
 }
 
 /// [`GuestState::exit_rsp`]: a host stack address of the native run in
@@ -142,6 +148,20 @@ impl core::fmt::Debug for ExitStack {
         formatter.write_str("ExitStack")
     }
 }
+
+/// [`GuestState::page_base`]: the host's, no part of the guest's state, so
+/// any two compare equal.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageBase(pub u64);
+
+impl PartialEq for PageBase {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PageBase {}
 
 /// [`GuestState::lower_limit`]: the host's, no part of the guest's state, so
 /// any two compare equal.
@@ -183,6 +203,7 @@ impl Default for GuestState {
             lower_limit: Limit(0),
             loop_retired: 0,
             exit_rsp: ExitStack(0),
+            page_base: PageBase(0),
         }
     }
 }
@@ -198,7 +219,7 @@ mod tests {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
             assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v14-"));
         }
-        assert_eq!(size_of::<GuestState>(), 912);
+        assert_eq!(size_of::<GuestState>(), 920);
         assert_eq!(align_of::<GuestState>(), 8);
         assert_eq!(offset_of!(GuestState, x), 0);
         assert_eq!(offset_of!(GuestState, sp), 248);
@@ -213,6 +234,7 @@ mod tests {
         assert_eq!(offset_of!(GuestState, lower_limit), 888);
         assert_eq!(offset_of!(GuestState, loop_retired), 896);
         assert_eq!(offset_of!(GuestState, exit_rsp), 904);
+        assert_eq!(offset_of!(GuestState, page_base), 912);
     }
 
     #[test]

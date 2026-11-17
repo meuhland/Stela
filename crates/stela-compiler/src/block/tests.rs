@@ -2343,3 +2343,126 @@ fn self_loops_take_dc_zva_unconditional_back_branches_and_joins() {
         assert_eq!(linked.source_bytes, first);
     }
 }
+
+/// Page-relative system-mode code (`NativeSystem::page_relative`): a block
+/// compiled at two addresses of one page offset is the same bytes, with no
+/// relocation left, while ordinary code differs there.
+#[test]
+fn page_relative_blocks_are_the_same_at_every_page() {
+    use crate::block::{BlockProfile, Features};
+    use crate::{GuestAddress, Options, TargetCpu, compile, x86_64::NativeSystem};
+    let options = |page_relative| {
+        Options::new(
+            BlockProfile::new(Features::SYSTEM_MODE),
+            TargetCpu::Baseline,
+        )
+        .with_native_system(NativeSystem {
+            page_relative,
+            ..NativeSystem::NONE
+        })
+    };
+    // Same offset in its page, far apart: a low user slide and a high one.
+    let bases = [0x1_0000_0230_u64, 0x7f12_3456_7230];
+    let blocks: [&[u32]; 7] = [
+        // ADR X0,#0x40; ADRP X1,#0x5000; ADD X1,X1,#0x10; BL #0x100
+        &[0x1000_0200, 0xb000_0021, 0x9100_4021, 0x9400_0040],
+        // ADR X0,#0x40; B.EQ #0x20
+        &[0x1000_0200, 0x5400_0100],
+        // CBZ X3,#0x40
+        &[0xb400_0203],
+        // LDR X2,literal #0x80; RET
+        &[0x5800_0402, 0xd65f_03c0],
+        // ADRP X4,#-0x3000; B #0x200
+        &[0xf0ff_ffe4, 0x1400_0080],
+        // MOVZ X8,#1; SVC #0x80
+        &[0xd280_0028, 0xd400_1001],
+        // BL #0x1000 (another page)
+        &[0x9400_0400],
+    ];
+    for words in blocks {
+        let source: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let at = |base: u64, relative| {
+            compile(&source, GuestAddress(base), &options(relative))
+                .unwrap_or_else(|error| panic!("{words:x?} at {base:#x}: {error:?}"))
+        };
+        let first = at(bases[0], true);
+        let second = at(bases[1], true);
+        assert_eq!(
+            first.native.x86_64_code, second.native.x86_64_code,
+            "{words:x?}: page-relative code differs between pages"
+        );
+        assert_eq!(
+            first.native.relocations.as_deref(),
+            Some(&[][..]),
+            "{words:x?}"
+        );
+        let plain = [at(bases[0], false), at(bases[1], false)];
+        let fields = plain[0]
+            .native
+            .relocations
+            .as_ref()
+            .expect("recorded fields");
+        assert_eq!(
+            !fields.is_empty(),
+            plain[0].native.x86_64_code != plain[1].native.x86_64_code,
+            "{words:x?}: ordinary code differs exactly where it holds addresses"
+        );
+    }
+}
+
+/// In page-relative code a body address is its offset from the block's
+/// page followed by `add reg,[page_base]`; a direct exit's target is the
+/// offset alone, for the engine to add the page its entry stored.
+#[test]
+fn page_relative_fields_hold_offsets_and_add_the_page_base() {
+    use crate::block::{BlockProfile, Features};
+    use crate::{GuestAddress, Options, TargetCpu, compile, x86_64::NativeSystem};
+    const PAGE_BASE: u32 = core::mem::offset_of!(crate::GuestState, page_base) as u32;
+    let options = Options::new(
+        BlockProfile::new(Features::SYSTEM_MODE),
+        TargetCpu::Baseline,
+    )
+    .with_native_system(NativeSystem {
+        page_relative: true,
+        ..NativeSystem::NONE
+    });
+    let base = 0x5_4321_0230_u64;
+    let page = base & !0xfff;
+    // ADR X0,#0x40; BL #0x100: a body address and an exit.
+    let source: Vec<u8> = [0x1000_0200_u32, 0x9400_0040]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let code = compile(&source, GuestAddress(base), &options)
+        .unwrap()
+        .native
+        .x86_64_code;
+    let find = |value: u64| {
+        code.windows(8)
+            .position(|bytes| bytes == value.to_le_bytes())
+            .unwrap_or_else(|| panic!("no field {value:#x}"))
+    };
+    // `add r64,[rdi+disp32]`: REX.W(.R) 03 /r, mod 10, rm RDI.
+    let adds_page_base = |at: usize| {
+        let after = &code[at + 8..];
+        after.len() >= 7
+            && after[0] & 0xfb == 0x48
+            && after[1] == 0x03
+            && after[2] & 0xc7 == 0x87
+            && after[3..7] == PAGE_BASE.to_le_bytes()
+    };
+    let adr = find(base + 0x40 - page);
+    assert!(adds_page_base(adr), "ADR's address adds the page base");
+    // BL: X30 is the next instruction's address, and the exit's target.
+    let link = find(base + 8 - page);
+    assert!(adds_page_base(link), "BL's link value adds the page base");
+    let exit = find(base + 4 + 0x100 - page);
+    assert!(
+        !adds_page_base(exit),
+        "the exit leaves the target's offset alone"
+    );
+    assert!(
+        code.windows(8)
+            .all(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()) != base + 0x40)
+    );
+}

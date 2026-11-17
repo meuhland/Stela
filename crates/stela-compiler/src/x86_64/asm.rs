@@ -35,6 +35,8 @@ pub(crate) struct Asm<'a> {
     /// The [`Code`]'s guest-address fields ([`Self::guest_imm64`]); none for
     /// code built outside a block (thunks and tails the engine places).
     relocations: Option<&'a mut Vec<u32>>,
+    /// The [`Code`]'s page-relative mode (`Code::set_page_relative`).
+    page_relative: bool,
     pinned: bool,
     locals: Option<super::pinned::LocalRegisters>,
     /// The locals a fault recovers from their hosts ([`super::pinned::Span`]).
@@ -72,6 +74,7 @@ impl<'a> Asm<'a> {
             shared: None,
             sites: None,
             relocations: None,
+            page_relative: false,
             pinned: false,
             locals: None,
             dirty: Default::default(),
@@ -370,7 +373,28 @@ impl<'a> Asm<'a> {
     /// code records among its relocations so that the block, stored, moves
     /// with its page. Every guest address a block's code holds is emitted
     /// here; [`Self::mov_imm64`] takes no [`crate::GuestAddress`].
+    ///
+    /// Page-relative (`Code::set_page_relative`), `add destination,
+    /// [page_base]` follows, and the block's compile leaves the field its
+    /// address's offset from the block's page
+    /// ([`crate::NativeBlock::make_page_relative`]). It sets the flags, which
+    /// no lowering keeps across a guest address: a condition is live in
+    /// them only right after the NZCV store it ends with
+    /// (`x86_64::block::branch_condition_with`).
     pub(crate) fn guest_imm64(&mut self, destination: Gpr, address: crate::GuestAddress) {
+        self.guest_field(destination, address);
+        if self.page_relative && self.relocations.is_some() {
+            const PAGE_BASE: u32 = core::mem::offset_of!(crate::GuestState, page_base) as u32;
+            self.alu_load(Alu::Add, Size::Qword, destination, super::frame(PAGE_BASE));
+        }
+    }
+    /// [`Self::guest_imm64`] for a direct exit's target in RAX, whose
+    /// patchable layout ([`super::chain`]) the field ends: page-relative,
+    /// the offset alone, which the engine adds the entry's page to.
+    pub(crate) fn guest_exit_imm64(&mut self, destination: Gpr, address: crate::GuestAddress) {
+        self.guest_field(destination, address);
+    }
+    fn guest_field(&mut self, destination: Gpr, address: crate::GuestAddress) {
         self.opcode_reg(Size::Qword, 0xb8, destination);
         let at = self.code.len();
         self.data(&address.0.to_le_bytes());
