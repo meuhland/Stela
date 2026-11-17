@@ -236,6 +236,33 @@ enum Phase {
     Closing,
     Failed,
     Retired,
+    /// Brought to rest for the machine's power-off or restart
+    /// ([`Native::quiesce_for_power_off`]); nothing reenters it.
+    PoweredOff,
+}
+
+/// The function's PCI Express Transactions Pending after bus mastering was
+/// cleared ([`Native::quiesce_for_power_off`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pending {
+    /// Read clear after this many microseconds (0 at the first read, or
+    /// for a function without a PCI Express capability).
+    Clear { us: u64 },
+    /// Still set at the limit.
+    Set,
+    /// Not read: the configuration access failed, or bus mastering could
+    /// not be cleared.
+    Unread,
+}
+
+/// What [`Native::quiesce_for_power_off`] did: the controller's steps, bus
+/// mastering, and the requests still outstanding after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerOff {
+    pub controller: hda::cold::PowerOffQuiesce,
+    /// PCI Command.BME cleared and read back clear, or why not.
+    pub bus_master: Result<(), Error>,
+    pub pending: Pending,
 }
 pub(super) struct Native<R, T> {
     owner: Owner<R, T>,
@@ -503,6 +530,59 @@ impl<R: NativeRegisters, T: audio::Timer + Clone> Native<R, T> {
                 Err(error)
             }
         }
+    }
+    /// Bring the function to rest before the machine turns off or restarts:
+    /// the controller's streams, CORB/RIRB and position DMA stopped and its
+    /// link put in reset (`hda::cold::quiesce_for_power_off`, each readback
+    /// bounded by `limit_us`), then bus mastering cleared and read back, then
+    /// PCI Express Transactions Pending waited for, `limit_us` at most. Every
+    /// step runs whatever an earlier one reported, and from any phase but a
+    /// retirement that already took the function's registers: a failed or
+    /// closing owner is the one most likely to have left DMA running. The
+    /// owner then admits nothing more; nothing is unmapped, detached or
+    /// freed, as the machine does not run on. `Err` when no registers remain
+    /// to reach the function through.
+    pub fn quiesce_for_power_off(&mut self, limit_us: u64) -> Result<PowerOff, Error> {
+        if matches!(self.phase, Phase::Retired | Phase::PoweredOff) {
+            return Err(self.error.unwrap_or(Error::Terminal));
+        }
+        let Some(r) = self.owner.0.as_deref_mut() else {
+            return Err(Error::Terminal);
+        };
+        let Some(pci) = r.pci.as_ref() else {
+            return Err(Error::Terminal);
+        };
+        let Ok(mut pci) = pci.try_borrow_mut() else {
+            return Err(Error::SharedRegisters);
+        };
+        // Admission ends before the first register effect: a later service
+        // turn finds the owner terminal, whatever this returns.
+        self.phase = Phase::PoweredOff;
+        let controller = hda::cold::quiesce_for_power_off(&mut *pci, &r.clock, limit_us);
+        // SAFETY: the controller's engines were just stopped as far as they
+        // read back, and the machine is about to turn off: nothing of this
+        // owner is restarted, and its original owners, Attachment and DMA
+        // memory stay held. Clearing BME never enables a requester.
+        let bus_master = unsafe { pci.set_bus_master(false) }.map_err(Error::Pci);
+        let pending = if bus_master.is_ok() {
+            let clock = &r.clock;
+            let start = clock.now_us();
+            let expired = || clock.now_us().wrapping_sub(start) >= limit_us;
+            match pci.wait_for_pending_transactions(expired) {
+                Ok(()) => Pending::Clear {
+                    us: clock.now_us().wrapping_sub(start),
+                },
+                Err(crate::bus::pci::requester::ClaimError::Active { .. }) => Pending::Set,
+                Err(_) => Pending::Unread,
+            }
+        } else {
+            Pending::Unread
+        };
+        Ok(PowerOff {
+            controller,
+            bus_master,
+            pending,
+        })
     }
     fn close_inner(r: &mut Resources<R, T>) -> Result<(), Error> {
         r.controller.as_mut().unwrap().shutdown()?;

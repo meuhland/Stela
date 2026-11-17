@@ -232,6 +232,142 @@ fn cold_stop_supports_the_last_physical_bidirectional_descriptor_without_allocat
     );
 }
 
+fn written(state: &Rc<RefCell<State>>, offset: usize) -> Vec<usize> {
+    state
+        .borrow()
+        .effects
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, Effect::Write(o, _, _) if *o == offset))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[test]
+fn power_off_quiesce_stops_streams_then_command_dma_then_resets_the_link() {
+    let (mut model, clock, state) = fixture();
+    let report = quiesce_for_power_off(&mut model, &clock, 100);
+    assert_eq!(
+        report,
+        PowerOffQuiesce {
+            unanswered: false,
+            running_streams: 0xff,
+            streams_us: Some(0),
+            commands_us: Some(0),
+            reset_us: Some(0),
+        }
+    );
+    assert!(report.complete());
+    let s = state.borrow();
+    for i in 0..8 {
+        assert_eq!(s.values[&(stream_base(i) + SD_CTL)] & u32::from(SD_RUN), 0);
+        assert!(
+            s.effects
+                .contains(&Effect::Write(stream_base(i) + SD_CTL, 1, 0))
+        );
+    }
+    for o in [INTCTL, CORBCTL, RIRBCTL, DPLBASE, DPUBASE] {
+        assert_eq!(s.values[&o], 0, "offset {o:#x}");
+    }
+    assert_eq!(s.values[&GCTL] & GCTL_RESET, 0);
+    // Nothing of the rings' memory is touched: stopped, not rebased.
+    assert!(!s.effects.iter().any(|e| matches!(e,Effect::Write(o,_,_) if
+        [CORBLBASE,CORBUBASE,RIRBLBASE,RIRBUBASE].contains(o))));
+    drop(s);
+    // Interrupts, then every stream, then CORB/RIRB, then position DMA,
+    // then CRST.
+    let interrupts = written(&state, INTCTL)[0];
+    let last_stream = (0..8)
+        .map(|i| written(&state, stream_base(i) + SD_CTL)[0])
+        .max()
+        .unwrap();
+    let first_stream = (0..8)
+        .map(|i| written(&state, stream_base(i) + SD_CTL)[0])
+        .min()
+        .unwrap();
+    let corb = written(&state, CORBCTL)[0];
+    let rirb = written(&state, RIRBCTL)[0];
+    let position = written(&state, DPLBASE)[0];
+    let reset = written(&state, GCTL);
+    assert_eq!(reset.len(), 1);
+    assert!(interrupts < first_stream && last_stream < corb && corb < rirb);
+    assert!(rirb < position && position < reset[0]);
+    assert_eq!(state.borrow().inherited.len(), 8192);
+}
+
+#[test]
+fn power_off_quiesce_bounds_a_stream_that_keeps_running_and_still_resets_the_link() {
+    let (mut model, clock, state) = fixture();
+    state.borrow_mut().blocked = Some(stream_base(3) + SD_CTL);
+    let report = quiesce_for_power_off(&mut model, &clock, 50);
+    assert_eq!(report.running_streams, 0xff);
+    assert_eq!(report.streams_us, None);
+    assert_eq!(report.commands_us, Some(0));
+    assert_eq!(report.reset_us, Some(0));
+    assert!(!report.complete());
+    // The wait ended at its limit, not later.
+    assert_eq!(clock.0.get(), 50);
+    assert_eq!(state.borrow().values[&GCTL] & GCTL_RESET, 0);
+}
+
+#[test]
+fn power_off_quiesce_bounds_command_dma_and_reset_waits() {
+    for (blocked, limit) in [(CORBCTL, 30), (GCTL, 40)] {
+        let (mut model, clock, state) = fixture();
+        state.borrow_mut().blocked = Some(blocked);
+        let report = quiesce_for_power_off(&mut model, &clock, limit);
+        assert_eq!(report.streams_us, Some(0));
+        if blocked == CORBCTL {
+            assert_eq!(report.commands_us, None);
+            assert_eq!(report.reset_us, Some(0));
+            // CRST still followed the stuck command DMA.
+            assert_eq!(state.borrow().values[&GCTL] & GCTL_RESET, 0);
+        } else {
+            assert_eq!(report.commands_us, Some(0));
+            assert_eq!(report.reset_us, None);
+        }
+        assert_eq!(clock.0.get(), limit);
+        assert!(!report.complete());
+    }
+}
+
+#[test]
+fn power_off_quiesce_writes_nothing_to_a_controller_that_does_not_answer() {
+    let (mut model, clock, state) = fixture();
+    state.borrow_mut().fail_read = Some(GCAP);
+    let report = quiesce_for_power_off(&mut model, &clock, 100);
+    assert!(report.unanswered && !report.complete());
+    assert_eq!(report.streams_us, None);
+    assert!(
+        !state
+            .borrow()
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Write(..)))
+    );
+}
+
+#[test]
+fn power_off_quiesce_of_a_quiet_controller_touches_no_stream_and_no_reset() {
+    let (mut model, clock, state) = fixture();
+    {
+        let mut s = state.borrow_mut();
+        for i in 0..8 {
+            s.values.insert(stream_base(i) + SD_CTL, 0);
+        }
+        s.values.insert(CORBCTL, 0);
+        s.values.insert(RIRBCTL, 0);
+        s.values.insert(GCTL, 0);
+    }
+    let report = quiesce_for_power_off(&mut model, &clock, 100);
+    assert_eq!(report.running_streams, 0);
+    assert!(report.complete());
+    for i in 0..8 {
+        assert!(written(&state, stream_base(i) + SD_CTL).is_empty());
+    }
+    assert!(written(&state, GCTL).is_empty());
+}
+
 // SAFETY: private synchronous peripheral peer consumes model microseconds.
 unsafe impl crate::bus::pci::power::Timer for Clock {
     fn check(&self) -> Result<(), crate::bus::pci::power::Error> {

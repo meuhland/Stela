@@ -223,6 +223,20 @@ impl<R, C: ConfigSpace, F: DerefMut<Target = Function<C>>> PciRegisters<R, F> {
     }
 }
 
+impl<R, C: ConfigSpace, F: DerefMut<Target = Function<C>>> PciRegisters<R, F> {
+    /// Waits until the function's PCI Express Transactions Pending reads
+    /// clear, or `expired` says the caller's deadline passed
+    /// (`requester::wait_for_pending_transactions`): after bus mastering was
+    /// cleared, the requests the function still had outstanding. A function
+    /// without a PCI Express capability has none to wait for. Reads only.
+    pub fn wait_for_pending_transactions(
+        &mut self,
+        expired: impl FnMut() -> bool,
+    ) -> Result<(), crate::bus::pci::requester::ClaimError> {
+        crate::bus::pci::requester::wait_for_pending_transactions(&*self.function.config(), expired)
+    }
+}
+
 impl<R, F> PciRegisters<R, F> {
     /// Mandatory identity-selected configuration for this function.
     pub fn config(&self) -> Config {

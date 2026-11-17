@@ -14,8 +14,10 @@ use crate::{
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
 mod lifetime;
+pub use crate::audio::hda::cold::PowerOffQuiesce;
 pub use lifetime::Error as RetirementError;
 use lifetime::{Inputs, Native, OriginalUsers};
+pub use lifetime::{Pending, PowerOff};
 
 /// HD Audio BAR0 through its actual owned uncached mapping/native widths.
 pub struct Bar0 {
@@ -157,6 +159,17 @@ impl Host {
     /// Failure and unwind keep the complete graph and permanently close entry.
     pub fn shutdown(&mut self) -> Result<(), RetirementError> {
         self.owner.close()
+    }
+
+    /// Bring the function to rest before the machine turns off or restarts,
+    /// without retiring it: streams, CORB/RIRB and position DMA stopped, the
+    /// link put in reset (GCTL.CRST), bus mastering cleared, and PCI Express
+    /// Transactions Pending waited for, each wait `limit_us` at most. Unlike
+    /// [`Self::shutdown`], no codec verb is sent and every step runs whatever
+    /// an earlier one found, from a failed owner too. The host admits
+    /// nothing afterwards.
+    pub fn quiesce_for_power_off(&mut self, limit_us: u64) -> Result<PowerOff, RetirementError> {
+        self.owner.quiesce_for_power_off(limit_us)
     }
 
     /// The controller's capabilities and the codecs its link found.

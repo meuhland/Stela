@@ -221,5 +221,123 @@ pub fn stop_inherited(
     })
 }
 
+/// What [`quiesce_for_power_off`] found and did, step by step. Each time is
+/// from the step's first write to the readback that showed it done, `None`
+/// when the readback still disagreed at the step's limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowerOffQuiesce {
+    /// GCAP read all ones: the controller did not answer, so nothing was
+    /// written and every step is `None`.
+    pub unanswered: bool,
+    /// The stream descriptors whose RUN bit was set, by index.
+    pub running_streams: u32,
+    /// Every stream read back stopped (SDnCTL.RUN = 0).
+    pub streams_us: Option<u64>,
+    /// CORB and RIRB DMA read back stopped (CORBRUN = 0, RIRBDMAEN = 0).
+    pub commands_us: Option<u64>,
+    /// The controller read back in reset (GCTL.CRST = 0).
+    pub reset_us: Option<u64>,
+}
+
+impl PowerOffQuiesce {
+    /// Whether every step read back done.
+    pub fn complete(&self) -> bool {
+        !self.unanswered
+            && self.streams_us.is_some()
+            && self.commands_us.is_some()
+            && self.reset_us.is_some()
+    }
+}
+
+/// Polls `done` until it holds or `limit_us` passed since `start`: the time
+/// it took, or `None`. An all-ones read never counts as done.
+fn settle<R: Registers>(
+    registers: &mut R,
+    timer: &impl Timer,
+    start: u64,
+    limit_us: u64,
+    mut done: impl FnMut(&mut R) -> bool,
+) -> Option<u64> {
+    loop {
+        let elapsed = timer.now_us().wrapping_sub(start);
+        if done(registers) {
+            return Some(elapsed);
+        }
+        if elapsed >= limit_us {
+            return None;
+        }
+        timer.relax();
+    }
+}
+
+/// Bring a controller to rest before the machine turns off or restarts, as
+/// Linux's `azx_stop_chip` then `azx_enter_link_reset`: interrupts off,
+/// every running stream's RUN cleared and read back stopped, CORB and RIRB
+/// DMA stopped, position DMA off, then the link put in reset (GCTL.CRST =
+/// 0) and read back in reset. Each readback waits `limit_us` at most, and a
+/// step that did not finish does not stop the next: whatever ran is stopped
+/// as far as the controller lets it. Bus mastering is the caller's, after
+/// this. Nothing is allocated, unmapped or retired.
+pub fn quiesce_for_power_off(
+    registers: &mut impl Registers,
+    timer: &impl Timer,
+    limit_us: u64,
+) -> PowerOffQuiesce {
+    let mut report = PowerOffQuiesce::default();
+    let gcap = registers.read16(GCAP);
+    if gcap == u16::MAX {
+        report.unanswered = true;
+        return report;
+    }
+    let streams = ((gcap >> 8) & 15) + ((gcap >> 12) & 15) + ((gcap >> 3) & 31);
+    let streams = (0..streams.min(30) as u8)
+        .filter(|&index| registers.region_bytes() >= stream_base(index) + 0x20)
+        .count() as u8;
+    registers.write32(INTCTL, 0);
+    let start = timer.now_us();
+    for index in 0..streams {
+        let base = stream_base(index);
+        let control = registers.read8(base + SD_CTL);
+        if control == u8::MAX || control & (SD_RUN | SD_STATUS) == 0 {
+            continue;
+        }
+        if control & SD_RUN != 0 {
+            report.running_streams |= 1 << index;
+        }
+        registers.write8(base + SD_CTL, control & !(SD_RUN | SD_STATUS));
+    }
+    report.streams_us = settle(registers, timer, start, limit_us, |registers| {
+        (0..streams).all(|index| {
+            let control = registers.read8(stream_base(index) + SD_CTL);
+            control != u8::MAX && control & SD_RUN == 0
+        })
+    });
+    for index in 0..streams {
+        if report.running_streams & 1 << index != 0 {
+            registers.write8(stream_base(index) + SD_STS, SD_STATUS);
+        }
+    }
+    let start = timer.now_us();
+    registers.write8(CORBCTL, 0);
+    registers.write8(RIRBCTL, 0);
+    report.commands_us = settle(registers, timer, start, limit_us, |registers| {
+        let (corb, rirb) = (registers.read8(CORBCTL), registers.read8(RIRBCTL));
+        corb != u8::MAX && rirb != u8::MAX && (corb | rirb) & COMMAND_RUN == 0
+    });
+    // DPLBASE bit 0 enables position DMA; cleared before its high half.
+    registers.write32(DPLBASE, 0);
+    registers.write32(DPUBASE, 0);
+    let start = timer.now_us();
+    let gctl = registers.read32(GCTL);
+    if gctl != u32::MAX && gctl & GCTL_RESET != 0 {
+        registers.write32(GCTL, gctl & !GCTL_RESET);
+    }
+    report.reset_us = settle(registers, timer, start, limit_us, |registers| {
+        let gctl = registers.read32(GCTL);
+        gctl != u32::MAX && gctl & GCTL_RESET == 0
+    });
+    report
+}
+
 #[cfg(test)]
 mod tests;

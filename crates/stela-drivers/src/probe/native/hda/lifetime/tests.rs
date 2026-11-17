@@ -390,3 +390,110 @@ fn a_bus_reset_vouches_for_original_users_and_binds_like_a_proved_capability() {
     ));
     native.close().unwrap();
 }
+
+/// The position of the first write to `offset` at or after `from` whose
+/// value `matching` takes.
+fn write_at(
+    events: &[Event],
+    from: usize,
+    offset: usize,
+    matching: impl Fn(u32) -> bool,
+) -> Option<usize> {
+    events[from..]
+        .iter()
+        .position(|e| matches!(e, Event::Write(o, _, v) if *o == offset && matching(*v)))
+        .map(|i| from + i)
+}
+
+/// At the power-off, a running stream and the command rings stop before the
+/// link is reset, bus mastering is cleared after that, and nothing is
+/// retired: no drain, unmap, detach or BAR retirement. The owner then admits
+/// nothing, and dropping it does nothing more.
+#[test]
+fn power_off_quiesce_stops_dma_then_resets_the_link_then_clears_bus_master() {
+    let mut f = fixture(true);
+    let mut native = match Native::new(f.inputs.take().unwrap()) {
+        Ok(n) => n,
+        Err(e) => panic!("{:?}", e.error),
+    };
+    let mark = {
+        let mut s = lock(&f.state);
+        // A playback stream and both command rings running, the link up.
+        s.values.insert(0xa0, 0x1e);
+        s.values.insert(0x4c, 2);
+        s.values.insert(0x5c, 3);
+        s.values.insert(0x08, 0x101);
+        s.events.len()
+    };
+    let report = native.quiesce_for_power_off(100_000).unwrap();
+    assert_eq!(report.controller.running_streams, 1 << 1);
+    assert!(report.controller.complete(), "{report:?}");
+    assert_eq!(report.bus_master, Ok(()));
+    assert_eq!(report.pending, Pending::Clear { us: 0 });
+    let events = lock(&f.state).events.clone();
+    let stream = write_at(&events, mark, 0xa0, |v| v & 2 == 0).unwrap();
+    let corb = write_at(&events, mark, 0x4c, |v| v == 0).unwrap();
+    let rirb = write_at(&events, mark, 0x5c, |v| v == 0).unwrap();
+    let reset = write_at(&events, mark, 0x08, |v| v & 1 == 0).unwrap();
+    assert!(stream < corb && corb < rirb && rirb < reset);
+    assert_eq!(lock(&f.state).values[&0x08] & 1, 0);
+    assert!(!events[mark..].iter().any(|e| matches!(
+        e,
+        Event::PayloadDrain | Event::DmaUnmap(_) | Event::Detach | Event::BarRetire
+    )));
+    // Admission ended: no controller, close or second quiesce.
+    assert!(matches!(
+        native.controller(),
+        Err(RetirementError::Terminal)
+    ));
+    assert_eq!(native.close(), Err(RetirementError::Terminal));
+    assert!(native.quiesce_for_power_off(100_000).is_err());
+    let before = snapshot(&f.state);
+    drop(native);
+    assert_eq!(snapshot(&f.state), before);
+    assert_eq!(f.config.unmaps.load(Ordering::Relaxed), 0);
+}
+
+/// A stream whose RUN stays set is waited for until the limit only; the
+/// link reset and bus mastering still follow.
+#[test]
+fn power_off_quiesce_bounds_a_stuck_stream_and_still_clears_bus_master() {
+    let mut f = fixture(true);
+    let mut native = match Native::new(f.inputs.take().unwrap()) {
+        Ok(n) => n,
+        Err(e) => panic!("{:?}", e.error),
+    };
+    let start = {
+        let mut s = lock(&f.state);
+        // The model's stream 0 reads RUN set whatever is written.
+        s.fault = Fault::Stop;
+        s.now
+    };
+    let report = native.quiesce_for_power_off(1_000).unwrap();
+    assert_eq!(report.controller.running_streams & 1, 1);
+    assert_eq!(report.controller.streams_us, None);
+    assert!(report.controller.commands_us.is_some());
+    assert!(report.controller.reset_us.is_some());
+    assert_eq!(report.bus_master, Ok(()));
+    // The relax step is 100 us: the stream's wait ended at its limit.
+    assert_eq!(lock(&f.state).now - start, 1_000);
+    assert_eq!(lock(&f.state).values[&0x08] & 1, 0);
+    core::mem::forget(native);
+}
+
+/// An owner whose retirement failed part way is still brought to rest.
+#[test]
+fn power_off_quiesce_reaches_an_owner_whose_close_failed() {
+    let mut f = fixture(true);
+    let mut native = match Native::new(f.inputs.take().unwrap()) {
+        Ok(n) => n,
+        Err(e) => panic!("{:?}", e.error),
+    };
+    lock(&f.state).fault = Fault::Payload;
+    assert!(native.close().is_err());
+    let report = native.quiesce_for_power_off(100_000).unwrap();
+    assert!(report.controller.complete(), "{report:?}");
+    assert_eq!(report.bus_master, Ok(()));
+    assert_eq!(lock(&f.state).values[&0x08] & 1, 0);
+    core::mem::forget(native);
+}
