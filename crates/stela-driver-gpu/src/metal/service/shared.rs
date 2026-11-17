@@ -1744,7 +1744,14 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
 
 impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedService<B, C> {
     fn connect(&self) -> Result<NonZeroU64, &'static str> {
-        self.call(|service| service.connect()).map_err(|fault| {
+        let (connected, refused) =
+            self.call(|service| (service.connect(), core::mem::take(&mut service.refused)));
+        // What opening met, such as why a lost device did not reopen: a
+        // refused connection serves no call that would report it later.
+        for reason in &refused {
+            (self.host.report)(reason);
+        }
+        connected.map_err(|fault| {
             (self.host.report)(&alloc::format!("{fault} in a connection"));
             fault.reason
         })
@@ -1766,14 +1773,22 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             .with(|staging| staging.retain(|staged| staged.connection != connection.get()));
         self.forget_read_backs(connection);
         // The gate closes only connections it opened and holds.
-        let closed = self.call(|service| {
+        let (closed, refused) = self.call(|service| {
             self.free_read_backs(service);
             for slot in &self.polling {
                 let _ =
                     slot.compare_exchange(connection.get(), 0, Ordering::AcqRel, Ordering::Acquire);
             }
-            service.disconnect(connection)
+            (
+                service.disconnect(connection),
+                core::mem::take(&mut service.refused),
+            )
         });
+        // What the close met, such as a reopen it tried, whether or not any
+        // connection serves another call.
+        for reason in &refused {
+            (self.host.report)(reason);
+        }
         debug_assert!(closed.is_ok());
     }
 

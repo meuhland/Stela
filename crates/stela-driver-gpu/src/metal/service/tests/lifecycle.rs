@@ -205,6 +205,43 @@ fn a_lost_device_reopens_once_its_last_connection_closes() {
     assert_eq!(service.device().current_allocated_size(), 4096);
 }
 
+/// Why a lost device did not come back is reported by the connections
+/// that tried to reopen it: a refused connection serves no call, so the
+/// reason waited, unreported, for a call that never came.
+#[test]
+fn connections_report_why_the_lost_device_did_not_reopen() {
+    static REPORTED: AtomicUsize = AtomicUsize::new(0);
+    let service = service().with_reopen(Box::new(|| Err(Error::DeviceLost)));
+    let shared = SharedService::new(
+        service,
+        ServiceHost {
+            relax: || panic!("nothing waits"),
+            relax_within: || panic!("nothing waits"),
+            stack: 0x4000,
+            run: |_, call| call(),
+            report: |reason| {
+                if reason.contains("did not reopen") {
+                    REPORTED.fetch_add(1, Ordering::Relaxed);
+                }
+            },
+            note: |_| {},
+            ticks: || 0,
+            served: |_| {},
+            wake: || {},
+            bundle: |_| {},
+        },
+    );
+    let held = shared.connect().unwrap();
+    shared.try_turn().unwrap().device().mark_lost();
+    // The close of the last connection tries the reopen.
+    shared.disconnect(held);
+    assert_eq!(REPORTED.load(Ordering::Relaxed), 1);
+    // Each later client tries again and is refused; it says why too.
+    assert!(shared.connect().is_err());
+    assert_eq!(REPORTED.load(Ordering::Relaxed), 2);
+    assert!(shared.try_turn().unwrap().refused.is_empty());
+}
+
 /// A process that keeps an empty connection open no longer keeps every
 /// later client from the GPU: the device reopens for new clients, and the
 /// old connection stays lost.
