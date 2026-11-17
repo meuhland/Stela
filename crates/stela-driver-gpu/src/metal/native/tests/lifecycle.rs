@@ -224,13 +224,15 @@ fn backend(device: ash::Device, drops: &Arc<AtomicUsize>) -> NativeBackend {
 
 #[test]
 fn failed_device_idle_keeps_the_export_owner() {
-    let calls = Calls::new(vk::Result::ERROR_DEVICE_LOST);
-    let drops = Arc::new(AtomicUsize::new(0));
-    let backend = backend(device(&calls), &drops);
-    drop(backend);
-    assert_eq!(calls.waits.load(Ordering::Relaxed), 1);
-    assert_eq!(calls.frees.load(Ordering::Relaxed), 0);
-    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    for result in [vk::Result::ERROR_DEVICE_LOST, vk::Result::TIMEOUT] {
+        let calls = Calls::new(result);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let backend = backend(device(&calls), &drops);
+        drop(backend);
+        assert_eq!(calls.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.frees.load(Ordering::Relaxed), 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
 }
 
 #[test]
@@ -238,6 +240,8 @@ fn idle_acknowledgement_requires_native_success_and_keeps_roots_owned() {
     for (result, expected) in [
         (vk::Result::SUCCESS, Ok(())),
         (vk::Result::ERROR_DEVICE_LOST, Err(Error::DeviceLost)),
+        // The host's bound on a fence wait ended Mesa's queue idle wait.
+        (vk::Result::TIMEOUT, Err(Error::DeviceLost)),
         (
             vk::Result::ERROR_OUT_OF_HOST_MEMORY,
             Err(Error::OutOfMemory),

@@ -15,6 +15,46 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const WITHDRAW_MS: u64 = 300;
 /// How long a posted call a task performs may run before the boot stops.
 pub const STOP_MS: u64 = 10_000;
+/// The longest a posted DRM fence wait may wait: the bound of the GPU
+/// backend's own idle waits. A wait asking for longer, as Mesa's
+/// `vkQueueWaitIdle` does with no timeout, ends at this bound with
+/// `ETIME`, its caller's answer for a wait that timed out. Linux sleeps in
+/// such a wait until the fence signals, which on a channel that hangs
+/// without a channel error is when the scheduler's 10 s job timeout kills
+/// the channel; that is [`STOP_MS`] after the post at the earliest, so a
+/// guest processor spinning on it would always reach the stop first.
+pub const WAIT_MS: u64 = 1_000;
+
+/// `DRM_IOCTL_SYNCOBJ_WAIT`: `struct drm_syncobj_wait`, 40 bytes.
+pub const SYNCOBJ_WAIT: u32 = 0xc028_64c3;
+/// `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`: `struct drm_syncobj_timeline_wait`,
+/// 48 bytes.
+pub const SYNCOBJ_TIMELINE_WAIT: u32 = 0xc030_64ca;
+
+/// The byte offset of the absolute `timeout_nsec` (CLOCK_MONOTONIC, signed)
+/// in the argument of the fence wait `request`, None for other requests.
+pub const fn wait_timeout_offset(request: u32) -> Option<usize> {
+    match request {
+        // handles, then timeout_nsec.
+        SYNCOBJ_WAIT => Some(8),
+        // handles, points, then timeout_nsec.
+        SYNCOBJ_TIMELINE_WAIT => Some(16),
+        _ => None,
+    }
+}
+
+/// The deadline a posted fence wait asking for `timeout` (absolute, in the
+/// monotonic clock that reads `now` nanoseconds) runs to instead: None when
+/// it ends within [`WAIT_MS`] already, polls, or has passed.
+pub const fn bounded_wait_deadline(timeout: i64, now: u64) -> Option<i64> {
+    let bound = now.saturating_add(WAIT_MS * 1_000_000);
+    let bound = if bound > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        bound as i64
+    };
+    if timeout > bound { Some(bound) } else { None }
+}
 
 const POSTED: u32 = 0;
 const TAKEN: u32 = 1;
@@ -89,5 +129,34 @@ mod tests {
     #[test]
     fn the_bounds_stay_inside_xnus_half_second_and_stop_after_it() {
         const _: () = assert!(WITHDRAW_MS < 500 && STOP_MS > 500);
+    }
+
+    #[test]
+    fn a_fence_wait_ends_before_the_stop() {
+        const _: () = assert!(WITHDRAW_MS + WAIT_MS < STOP_MS);
+    }
+
+    #[test]
+    fn a_fence_wait_without_a_timeout_ends_at_the_bound() {
+        let now = 5_000_000_000;
+        let bound = (now + WAIT_MS * 1_000_000) as i64;
+        // Mesa's vkQueueWaitIdle: UINT64_MAX, i64::MAX once converted.
+        assert_eq!(bounded_wait_deadline(i64::MAX, now), Some(bound));
+        assert_eq!(bounded_wait_deadline(bound + 1, now), Some(bound));
+        assert_eq!(bounded_wait_deadline(bound, now), None);
+        assert_eq!(bounded_wait_deadline(now as i64 + 1, now), None);
+        // A poll or a passed deadline stays as it is.
+        assert_eq!(bounded_wait_deadline(0, now), None);
+        assert_eq!(bounded_wait_deadline(-1, now), None);
+        assert_eq!(bounded_wait_deadline(i64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn only_fence_waits_have_a_timeout() {
+        assert_eq!(wait_timeout_offset(SYNCOBJ_WAIT), Some(8));
+        assert_eq!(wait_timeout_offset(SYNCOBJ_TIMELINE_WAIT), Some(16));
+        // DRM_IOCTL_SYNCOBJ_DESTROY and NOUVEAU_GEM_NEW.
+        assert_eq!(wait_timeout_offset(0xc008_64c0), None);
+        assert_eq!(wait_timeout_offset(0xc030_6480), None);
     }
 }

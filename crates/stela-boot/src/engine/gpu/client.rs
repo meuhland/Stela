@@ -9,7 +9,9 @@
 //! Each wait is bounded ([`posted_call`]): a call no task took in time is
 //! withdrawn and answered `ETIMEDOUT`, and one a task performs too long stops
 //! the boot, naming it, as a processor held out of its guest for long makes
-//! XNU panic.
+//! XNU panic. A fence wait asking for longer than
+//! [`posted_call::WAIT_MS`] runs to that bound and answers `ETIME`, so a
+//! wait on a channel that hangs ends before the stop.
 //!
 //! A thread Mesa starts is a Linux task too, as Linux's own kthreads are, so it
 //! makes its calls in place and sleeps in Linux. It runs Mesa on a stack of its
@@ -89,6 +91,7 @@ const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
 const EAGAIN: i64 = -11;
 const ETIMEDOUT: i64 = -110;
+const ETIME: i64 = -62;
 
 /// `struct stela_libc_drm_device`.
 #[repr(C)]
@@ -945,6 +948,61 @@ fn submit(operation: Operation) -> i64 {
         return result;
     }
     let code = request_code(&operation);
+    let bounded = match operation {
+        Operation::Control {
+            request, argument, ..
+        } => {
+            // SAFETY: the caller's argument of its request.
+            unsafe { bound_wait(request, argument) }
+        }
+        _ => None,
+    };
+    let result = perform_posted(gpu, operation, code);
+    if let Some((field, asked)) = bounded {
+        // SAFETY: as in `bound_wait`; Linux's wait does not write it.
+        unsafe { field.write_unaligned(asked) };
+        if result == ETIME {
+            let count = BOUNDED.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                output::arguments(format_args!(
+                    "GPU fence wait {code:#x} on PE {} asked for more than {} ms and ended \
+                     at that bound with ETIME ({count} bounded)\n",
+                    host::processor(),
+                    posted_call::WAIT_MS
+                ));
+            }
+        }
+    }
+    result
+}
+
+/// Fence waits [`bound_wait`] bounded that ended at the bound, for the
+/// report of the first and of each power of two after it.
+static BOUNDED: AtomicU64 = AtomicU64::new(0);
+
+/// Bounds a posted fence wait that asks for longer than
+/// [`posted_call::WAIT_MS`] to that, as its poster spins until it ends: its
+/// timeout field and the timeout it asked for, which the caller's argument
+/// gets back after the call. None for any other call.
+///
+/// # Safety
+/// `argument` is the caller's argument of `request`, valid for its size.
+unsafe fn bound_wait(request: u32, argument: *mut c_void) -> Option<(*mut i64, i64)> {
+    let offset = posted_call::wait_timeout_offset(request)?;
+    if argument.is_null() {
+        return None;
+    }
+    let field = argument.cast::<u8>().wrapping_add(offset).cast::<i64>();
+    // SAFETY: the request's argument holds its timeout at `offset`.
+    let asked = unsafe { field.read_unaligned() };
+    let deadline = posted_call::bounded_wait_deadline(asked, now_ns())?;
+    // SAFETY: as above.
+    unsafe { field.write_unaligned(deadline) };
+    Some((field, asked))
+}
+
+/// [`submit`]'s posted call: `operation` for a Linux task, waited for.
+fn perform_posted(gpu: &Installed, operation: Operation, code: u32) -> i64 {
     // Boxed, so that a withdrawn call outlives this frame with the task
     // that meets it.
     let request = NonNull::from(Box::leak(Box::new(Request::new(operation))));

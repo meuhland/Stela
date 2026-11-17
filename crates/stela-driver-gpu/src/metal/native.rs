@@ -2375,7 +2375,12 @@ impl Backend for NativeBackend {
         // SAFETY: this backend exclusively owns the device. The Metal owner
         // closes admission and drains its submission timeline before asking;
         // only a successful Vulkan acknowledgement establishes idleness.
-        unsafe { self.device.device_wait_idle() }.map_err(failure)?;
+        unsafe { self.device.device_wait_idle() }.map_err(|error| match error {
+            // The host ends a fence wait at its bound: the queue did not
+            // drain in time, so nothing is proven stopped.
+            vk::Result::TIMEOUT => Error::DeviceLost,
+            error => failure(error),
+        })?;
         self.store.idle(&self.device);
         Ok(())
     }
