@@ -21,6 +21,7 @@ int sprintf(char *buffer, const char *format, ...)
 }
 
 #ifdef STELA_LINUX_PRINTF_TEST
+#include <linux/kstrtox.h>
 #include <linux/string.h>
 #include <stela/linux.h>
 #include <stela/test.h>
@@ -47,6 +48,22 @@ int main(void)
 	       (int)sizeof("-17:0x000001:18446744073709551615") - 1);
 	assert(!strcmp(output, "-17:0x000001:18446744073709551615"));
 	assert(render(output, "%s", "") == 0 && !output[0]);
+	/* Linux's own input parsing (lib/vsscanf.c): a number after a literal,
+	 * as hwmon reads its device's name, then widths, bases and a set. */
+	int (*volatile scan)(const char *, const char *, ...) = sscanf;
+	int id = -1;
+	unsigned int word = 0;
+	unsigned long long wide = 0;
+	char name[8];
+	assert(scan("hwmon12", "hwmon%d", &id) == 1 && id == 12);
+	assert(scan("temp1", "hwmon%d", &id) == 0 && id == 12);
+	assert(scan("0x1f -7 fffffffffffffffe", "%x %d %llx", &word, &id, &wide) == 3);
+	assert(word == 0x1f && id == -7 && wide == 0xfffffffffffffffeULL);
+	assert(scan("12345", "%2d%3u", &id, &word) == 2 && id == 12 && word == 345);
+	/* A set lists its characters; Linux reads no ranges in it. */
+	assert(scan("abc123", "%7[abc]%d", name, &id) == 2 && !strcmp(name, "abc") && id == 123);
+	assert(scan("abc123", "%7[a-c]%d", name, &id) == 1 && !strcmp(name, "a"));
+	assert(simple_strtoul("077x", NULL, 0) == 63 && simple_strtol("-12", NULL, 10) == -12);
 	stela_linux_exit();
 	printf("Linux sprintf: direct and va_list text, length and termination passed\n");
 	return 0;

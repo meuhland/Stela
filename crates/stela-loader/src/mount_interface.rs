@@ -89,15 +89,24 @@ pub enum Opening {
 
 /// How the menu opens with the file's `timeout_seconds`, `first_mac` telling
 /// whether its first entry starts the Mac (`Some`) and whether that Mac can
-/// start now (`true`), and `ready_macs` Mac entries that can start now. Only
-/// a real choice keeps the countdown: one ready Mac, the first entry, starts
-/// at once, and Install macOS and recovery stay a key away. A timeout of 0
-/// reaches the menu only when a key was already pressed, which asked for it.
-pub fn opening(timeout_seconds: u32, first_mac: Option<bool>, ready_macs: usize) -> Opening {
+/// start now (`true`), `ready_macs` Mac entries that can start now and
+/// `other_systems` of the PC firmware's entries that start a system on the
+/// PC's disks (`firmware_boot::LoadOption::on_disk`). Only a real choice
+/// keeps the countdown: one ready Mac, the first entry, on a PC with no
+/// other system starts at once, and Install macOS and recovery stay a key
+/// away. Another system on the PC is a choice, so the countdown shows it
+/// beside the Mac. A timeout of 0 reaches the menu only when a key was
+/// already pressed, which asked for it.
+pub fn opening(
+    timeout_seconds: u32,
+    first_mac: Option<bool>,
+    ready_macs: usize,
+    other_systems: usize,
+) -> Opening {
     match first_mac {
         None => Opening::Wait,
         Some(_) if timeout_seconds == 0 => Opening::Wait,
-        Some(true) if ready_macs == 1 => Opening::Glance,
+        Some(true) if ready_macs == 1 && other_systems == 0 => Opening::Glance,
         Some(_) => Opening::Countdown(timeout_seconds),
     }
 }
@@ -398,19 +407,30 @@ mod tests {
 
     #[test]
     fn only_a_real_choice_counts_down() {
-        // One installed Mac starts at once; the menu is a key away.
-        assert_eq!(opening(5, Some(true), 1), Opening::Glance);
+        // One installed Mac on a PC with no other system starts at once;
+        // the menu is a key away.
+        assert_eq!(opening(5, Some(true), 1, 0), Opening::Glance);
         // None ready, or several, is a choice to make.
-        assert_eq!(opening(5, Some(false), 0), Opening::Countdown(5));
-        assert_eq!(opening(5, Some(true), 2), Opening::Countdown(5));
-        assert_eq!(opening(5, Some(false), 1), Opening::Countdown(5));
+        assert_eq!(opening(5, Some(false), 0, 0), Opening::Countdown(5));
+        assert_eq!(opening(5, Some(true), 2, 0), Opening::Countdown(5));
+        assert_eq!(opening(5, Some(false), 1, 0), Opening::Countdown(5));
         // A first entry that is not the Mac, such as Install macOS while no
         // macOS is installed, waits for a choice.
-        assert_eq!(opening(5, None, 0), Opening::Wait);
-        assert_eq!(opening(5, None, 1), Opening::Wait);
+        assert_eq!(opening(5, None, 0, 0), Opening::Wait);
+        assert_eq!(opening(5, None, 1, 2), Opening::Wait);
         // A timeout of 0 opened the menu because a key asked for it.
-        assert_eq!(opening(0, Some(true), 1), Opening::Wait);
-        assert_eq!(opening(0, Some(true), 2), Opening::Wait);
+        assert_eq!(opening(0, Some(true), 1, 0), Opening::Wait);
+        assert_eq!(opening(0, Some(true), 2, 1), Opening::Wait);
+    }
+
+    #[test]
+    fn another_system_on_the_pc_keeps_the_countdown_after_an_install() {
+        // Before the install the first entry is Install macOS, which waits
+        // with the PC's Windows and Linux listed; once macOS is installed
+        // it is the only ready Mac, and the countdown still lists them.
+        assert_eq!(opening(5, None, 0, 2), Opening::Wait);
+        assert_eq!(opening(5, Some(true), 1, 2), Opening::Countdown(5));
+        assert_eq!(opening(5, Some(true), 1, 1), Opening::Countdown(5));
     }
 
     #[test]

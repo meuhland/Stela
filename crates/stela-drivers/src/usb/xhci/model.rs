@@ -293,6 +293,7 @@ fn address_controller_with_capabilities(
         slots: vec![None, None],
         retry_resources: slot_resources::Cache::new(2),
         queued_resets: Vec::new(),
+        after_boot: false,
         slot_ownership: vec![reset::Ownership::Vacant; 2],
         test_retired_numbers: vec![false; 2],
         power: power::Ledger::new(2),
@@ -349,6 +350,16 @@ pub(crate) struct CancelModel {
     pub(crate) fail: Option<(u32, u32)>,
     pub(crate) silence: Option<u32>,
     pub(crate) race_halt: bool,
+    /// Stop Endpoint commands a Running endpoint fails with a Context State
+    /// Error, staying Running, as when the controller handles the command
+    /// before the endpoint ran (Linux `xhci_handle_cmd_stop_ep`).
+    pub(crate) stop_races: usize,
+    /// After a doorbell on a Stopped endpoint, Stop Endpoint commands that
+    /// fail with a Context State Error while its output context still says
+    /// Stopped although it runs; then the context says Running.
+    pub(crate) context_lag: usize,
+    /// Endpoints running behind a context that still says Stopped.
+    pub(crate) lagging: [bool; 32],
     pub(crate) stale: Option<u64>,
     pub(crate) seen: Vec<u32>,
     pub(crate) dequeues: Vec<u64>,
@@ -381,12 +392,20 @@ pub(crate) struct CancelModel {
     pub(crate) control_replies: alloc::collections::VecDeque<([u8; 8], Vec<u8>)>,
     pub(crate) stall_control: Option<u8>,
     pub(crate) silence_control: Option<u8>,
+    /// The device stops answering EP0 from the control transfer at this
+    /// index of [`Self::setup`] on, though it still takes each request.
+    pub(crate) silence_control_from: Option<usize>,
     pub(crate) short_bulk_out: bool,
     pub(crate) ethernet: Option<ethernet::rtl815x::tests::Model>,
     pub(crate) ethernet_upload: Option<ethernet::rtl815x::FirmwareModel>,
     pub(crate) asix: Option<ethernet::AsixModel>,
     pub(crate) asix_legacy: Option<ethernet::LegacyModel>,
     pub(crate) asix_ticks: u64,
+    /// Command completions and EP0 transfer events wait in [`Self::held`]
+    /// until [`Self::release`]: the device answers late, after the call that
+    /// asked has returned.
+    pub(crate) late: bool,
+    pub(crate) held: Vec<(u64, u32, u32, u8, usize)>,
     /// Runs the controller's one-tick-per-microsecond deadlines on virtual time.
     _clock: crate::test_clock::Guard,
 }
@@ -410,6 +429,10 @@ impl CancelModel {
         }
     }
     pub(crate) fn event(&mut self, parameter: u64, code: u32, kind: u32, dci: u8, residual: usize) {
+        if self.late && (kind == COMMAND_COMPLETION || (kind == TRANSFER_EVENT && dci == 1)) {
+            self.held.push((parameter, code, kind, dci, residual));
+            return;
+        }
         let cycle = u32::from((self.event_index / RING_TRBS).is_multiple_of(2));
         let address = self.events + ((self.event_index % RING_TRBS) * TRB) as u64;
         // SAFETY: all three fields are in the still-live test event ring.
@@ -420,6 +443,18 @@ impl CancelModel {
                 .write_volatile(1 << 24 | u32::from(dci) << 16 | kind << 10 | cycle);
         }
         self.event_index += 1;
+    }
+    /// The controller reports a Host System Error from here on.
+    pub(crate) fn host_system_error(&mut self) {
+        self.fatal_status = HSE;
+    }
+    /// Post the events held while [`Self::late`].
+    pub(crate) fn release(&mut self) {
+        let late = core::mem::replace(&mut self.late, false);
+        for (parameter, code, kind, dci, residual) in core::mem::take(&mut self.held) {
+            self.event(parameter, code, kind, dci, residual);
+        }
+        self.late = late;
     }
     /// The device sends interrupt-IN (DCI 3) data, bulk-IN (DCI 5) data or
     /// an independent peripheral's bulk-IN data, as soon as a TD waits.
@@ -535,6 +570,19 @@ impl CancelModel {
                         }
                     }
                 }
+                STOP_ENDPOINT if self.lagging[dci] => {
+                    code = 19;
+                    self.context_lag = self.context_lag.saturating_sub(1);
+                    if self.context_lag == 0 {
+                        self.lagging[dci] = false;
+                        self.set_state(dci, 1);
+                    }
+                }
+                STOP_ENDPOINT if self.stop_races > 0 && self.state(dci) == 1 => {
+                    self.stop_races -= 1;
+                    code = 19;
+                }
+                SET_DEQUEUE if self.lagging[dci] => code = 19,
                 STOP_ENDPOINT => {
                     if self.race_halt {
                         self.race_halt = false;
@@ -643,7 +691,11 @@ impl CancelModel {
                 ((at + 8) as *const u32).read_volatile() as usize & 0x1ffff,
             )
         };
-        self.set_state(dci, 1);
+        if self.context_lag > 0 && self.state(dci) == 3 {
+            self.lagging[dci] = true;
+        } else {
+            self.set_state(dci, 1);
+        }
         if self.transaction_errors[dci] > 0 {
             // The TD stays at the dequeue pointer of the halted endpoint.
             self.transaction_errors[dci] -= 1;
@@ -763,7 +815,13 @@ impl CancelModel {
                 self.event(at, STALL, TRANSFER_EVENT, dci as u8, 0);
                 return;
             }
-            if self.silence_transfer == Some(dci) || self.silence_control == Some(request[1]) {
+            let silent_from = self
+                .silence_control_from
+                .is_some_and(|from| self.setup.len() > from);
+            if self.silence_transfer == Some(dci)
+                || self.silence_control == Some(request[1])
+                || silent_from
+            {
                 self.active[dci] = Some((at, 0, length));
             } else {
                 if received < length {
@@ -971,6 +1029,9 @@ fn cancellation_controller_with_context(
         fail: None,
         silence: None,
         race_halt: false,
+        stop_races: 0,
+        context_lag: 0,
+        lagging: [false; 32],
         stale: None,
         seen: Vec::new(),
         dequeues: Vec::new(),
@@ -998,12 +1059,15 @@ fn cancellation_controller_with_context(
         control_replies: Default::default(),
         stall_control: None,
         silence_control: None,
+        silence_control_from: None,
         short_bulk_out: false,
         ethernet: None,
         ethernet_upload: None,
         asix: None,
         asix_legacy: None,
         asix_ticks: 0,
+        late: false,
+        held: Vec::new(),
         _clock: crate::test_clock::virtualize(),
     }));
     model.borrow_mut().set_state(1, 1);
@@ -1017,6 +1081,28 @@ fn cancellation_controller_with_context(
         controller.current_descriptions(1, configurations).unwrap();
     }
     (controller, model)
+}
+
+/// Mark the boot as handed over, as [`super::Host::poll_after_boot`] does.
+pub(crate) fn boot_ended(controller: &mut Controller) {
+    controller.after_boot = true;
+}
+
+/// Choose a freshly identified device's configuration, as enumeration does.
+pub(crate) fn choose(
+    controller: &mut Controller,
+    device: &mut Device,
+    failures: &mut Vec<(String, BlockError)>,
+) -> bool {
+    let location = device.location.clone();
+    controller.choose(device, &location, failures)
+}
+
+/// Put the controller's minimum provider on the controller clock's own
+/// calibration, so minimum intervals pass on the virtual time its deadlines
+/// and a link's runtime calls count.
+pub(crate) fn minimum_on_controller_clock(controller: &mut Controller) {
+    controller.minimum = super::minimum::fixture(controller.clock);
 }
 
 pub(crate) fn cancellation_controller(

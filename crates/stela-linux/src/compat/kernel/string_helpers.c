@@ -5,7 +5,10 @@
  * compiled unchanged. */
 #include <linux/ctype.h>
 #include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/sprintf.h>
 #include <linux/string.h>
+#include <linux/string_helpers.h>
 
 /* skip_spaces is an exact bounded projection from the pinned original
  * lib/string_helpers.c, Copyright 31 August 2008 James Bottomley;
@@ -83,6 +86,58 @@ void memcpy_and_pad(void *dest, size_t dest_len, const void *src, size_t count, 
 	}
 }
 
+/* A size of size blocks of blk_size bytes, as a number below its unit's
+ * divisor with three significant digits and the unit, following Linux's
+ * string_get_size(): the product is reduced by Napier's algorithm so that
+ * neither factor is truncated before they multiply. */
+int string_get_size(u64 size, u64 blk_size, const enum string_size_units units, char *buf,
+		    int len)
+{
+	static const char *const decimal[] = {"", "k", "M", "G", "T", "P", "E", "Z", "Y"};
+	static const char *const binary[] = {"", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi", "Yi"};
+	static const u32 rounding[] = {500, 50, 5};
+	bool base_2 = (units & STRING_UNITS_MASK) == STRING_UNITS_2;
+	u32 divisor = base_2 ? 1024 : 1000;
+	u32 remainder = 0;
+	unsigned int power = 0;
+	char fraction[12] = "";
+
+	if (!blk_size)
+		size = 0;
+	if (size) {
+		for (; blk_size >> 32; power++)
+			blk_size /= divisor;
+		for (; size >> 32; power++)
+			size /= divisor;
+		size *= blk_size;
+		for (; size >= divisor; power++) {
+			remainder = (u32)(size % divisor);
+			size /= divisor;
+		}
+
+		/* The digits the remainder supplies below three significant ones. */
+		unsigned int digits = 0;
+
+		for (u32 shown = (u32)size; shown * 10 < 1000; shown *= 10)
+			digits++;
+		if (base_2)
+			remainder = remainder * 1000 >> 10;
+		remainder += rounding[digits];
+		if (remainder >= 1000) {
+			remainder -= 1000;
+			size++;
+		}
+		if (digits) {
+			snprintf(fraction, sizeof(fraction), ".%03u", remainder);
+			fraction[digits + 1] = 0;
+		}
+	}
+	return snprintf(buf, (size_t)len, "%u%s%s%s%s", (u32)size, fraction,
+			units & STRING_UNITS_NO_SPACE ? "" : " ",
+			power >= ARRAY_SIZE(binary) ? "UNK" : (base_2 ? binary : decimal)[power],
+			units & STRING_UNITS_NO_BYTES ? "" : "B");
+}
+
 #ifdef STELA_LINUX_STRING_HELPERS_TEST
 #include <linux/string_helpers.h>
 #include <stela/test.h>
@@ -139,10 +194,45 @@ static void unescape_strings(void)
 	assert(!strcmp(malformed, "\\xQ\\8"));
 }
 
+static void sizes(void)
+{
+	static const struct {
+		u64 size, block;
+		unsigned int units;
+		const char *text;
+	} cases[] = {
+		{0, 512, STRING_UNITS_2, "0 B"},
+		{1, 0, STRING_UNITS_10, "0 B"},
+		{1, 512, STRING_UNITS_2, "512 B"},
+		{2, 512, STRING_UNITS_2, "1.00 KiB"},
+		{2, 512, STRING_UNITS_10, "1.02 kB"},
+		{8192, 4096, STRING_UNITS_2, "32.0 MiB"},
+		{1, 256ull << 20, STRING_UNITS_2, "256 MiB"},
+		{1, 1500, STRING_UNITS_10, "1.50 kB"},
+		/* A carry out of the rounding is not reduced again, as in Linux. */
+		{1, 999999, STRING_UNITS_10, "1000 kB"},
+		{3, 1ull << 40, STRING_UNITS_2, "3.00 TiB"},
+		{U64_MAX, U64_MAX, STRING_UNITS_2, "256 UNKB"},
+		{U64_MAX, U64_MAX, STRING_UNITS_10, "340 UNKB"},
+		{2, 512, STRING_UNITS_2 | STRING_UNITS_NO_SPACE, "1.00KiB"},
+		{2, 512, STRING_UNITS_2 | STRING_UNITS_NO_BYTES, "1.00 Ki"},
+	};
+	char text[16];
+
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		int length = string_get_size(cases[i].size, cases[i].block, cases[i].units, text,
+					     sizeof(text));
+		assert(length == (int)strlen(cases[i].text) && !strcmp(text, cases[i].text));
+	}
+	/* A short buffer is terminated and the full length still reported. */
+	assert(string_get_size(2, 512, STRING_UNITS_2, text, 5) == 8 && !strcmp(text, "1.00"));
+}
+
 int main(void)
 {
 	leading_whitespace();
 	unescape_strings();
+	sizes();
 	const char *const choices[] = {"first", "second", NULL, "hidden"};
 	assert(__sysfs_match_string(choices, ARRAY_SIZE(choices), "second\n") == 1);
 	assert(__sysfs_match_string(choices, 1, "second") == -EINVAL);

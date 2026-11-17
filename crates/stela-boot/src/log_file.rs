@@ -52,7 +52,19 @@ pub fn open() -> Option<Guid> {
             .map_err(|error| refuse!("firmware boot log output: {error}", %error))?;
         Ok(partition)
     });
-    finish(opened).flatten()
+    match opened {
+        // Stela's drivers find the file's volume by its GPT partition, so
+        // a path that names none leaves the log at the firmware's exit.
+        Ok(None) => {
+            output::arguments(format_args!(
+                "BOOT LOG FILE kept only until the firmware exits: the firmware's path to \
+                 Stela's volume names no GPT partition, which Stela's drivers find it by\n"
+            ));
+            status::done(&format!("{BOOT_LOG_FILE}, until the firmware exits"));
+            None
+        }
+        opened => finish(opened).flatten(),
+    }
 }
 
 /// The PCI functions an earlier boot did not finish starting, or skipped

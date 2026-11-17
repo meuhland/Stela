@@ -7,9 +7,18 @@
 //! which runs NIR to machine code. The job owns its inputs, so it runs on
 //! any processor while other calls take turns. Its [`Done`] goes back to its
 //! owner in a later turn, and the call, run again, finds what it made.
+//!
+//! A platform whose processors must return to their guests within a bound
+//! runs a job in slices ([`Sliced`]): the job gives its processor back at
+//! points the platform chooses and any processor resumes it later. It
+//! computes the same; it holds the compile lock from its first slice to its
+//! end.
 use super::compiler::CompileLock;
 use alloc::{boxed::Box, sync::Arc};
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 pub(crate) mod kept;
 
@@ -42,6 +51,13 @@ impl Job {
     /// Runs the job. Jobs run one at a time, on the one compile stack,
     /// under the compile lock the caller holds.
     pub fn run(self, _held: &super::compiler::CompileGuard<'_>) -> Done {
+        self.run_sliced()
+    }
+
+    /// [`Self::run`], for a job run in slices, whose runner holds the
+    /// compile lock with a [`SharedHold`](super::compiler::SharedHold)
+    /// from its first slice until it took what the job made.
+    pub fn run_sliced(self) -> Done {
         Done {
             key: self.key,
             owner: self.owner,
@@ -66,12 +82,73 @@ pub struct Done {
     pub made: Made,
 }
 
+/// A job a platform runs in slices: started on the compile stack by its
+/// [`Slicer`], it gives its processor back where the platform decides.
+pub trait Sliced: Send {
+    /// Runs the job on until it gives its processor back or ends: whether
+    /// it ended.
+    fn resume(&mut self) -> bool;
+}
+
+/// Starts a job's body on the compile stack whose top is the first
+/// argument, to run in slices; nothing of it runs before its first
+/// [`Sliced::resume`].
+pub type Slicer = fn(u64, Box<dyn FnOnce() + Send>) -> Box<dyn Sliced>;
+
 /// The lock jobs run under, and what a waiter for it runs: a backend holds
 /// it while it destroys what its jobs use.
 #[derive(Clone)]
 pub struct JobLock {
     pub lock: Arc<CompileLock>,
     pub relax: fn(),
+}
+
+/// The platform's count of the spin locks the running code holds
+/// ([`set_lock_hooks`]): enter, then leave.
+static LOCK_HOOKS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// Gives a platform that runs jobs in slices ([`Sliced`]) the count of the
+/// spin locks its processors hold ([`hold_lock`]): `enter` as one is taken,
+/// `leave` once it is let go. A slice never ends while its job holds one,
+/// as the lock's other users spin without resuming the job, and the
+/// platform resumes no job on a processor that holds one, as the job may
+/// take that very lock. Set once, before any job runs.
+pub fn set_lock_hooks(enter: fn(), leave: fn()) {
+    LOCK_HOOKS[1].store(leave as usize, Ordering::Release);
+    LOCK_HOOKS[0].store(enter as usize, Ordering::Release);
+}
+
+/// A spin lock held ([`hold_lock`]) until this drops.
+#[must_use]
+pub struct LockHeld(Option<fn()>);
+
+impl Drop for LockHeld {
+    fn drop(&mut self) {
+        if let Some(leave) = self.0 {
+            leave();
+        }
+    }
+}
+
+/// Counts a spin lock the caller is about to take, for as long as the
+/// returned value lives: take it before the lock and drop it after the
+/// lock's release. Without hooks it counts nothing.
+pub fn hold_lock() -> LockHeld {
+    let enter = LOCK_HOOKS[0].load(Ordering::Acquire);
+    if enter == 0 {
+        return LockHeld(None);
+    }
+    let leave = LOCK_HOOKS[1].load(Ordering::Acquire);
+    // SAFETY: only `set_lock_hooks` stores nonzero values, `fn()`s, the
+    // leave before the enter.
+    let (enter, leave) = unsafe {
+        (
+            core::mem::transmute::<usize, fn()>(enter),
+            core::mem::transmute::<usize, fn()>(leave),
+        )
+    };
+    enter();
+    LockHeld(Some(leave))
 }
 
 /// Which processor offers to run a deferred job, between two slices of its
@@ -103,6 +180,25 @@ impl Taker {
             Self::Busy => 20,
         }
     }
+
+    /// How long a job that ran a slice waits before this taker resumes it,
+    /// in milliseconds: at once, but for the boot processor, whose Linux
+    /// work a slice holds up. Busy processors are spaced by
+    /// [`busy_pause_after_slice`].
+    pub const fn resume_after_millis(self) -> u64 {
+        match self {
+            Self::Waiting | Self::Busy => 0,
+            Self::Boot => 100,
+        }
+    }
+}
+
+/// How long busy processors leave the queue after one of them ran a slice
+/// of `slice` ticks, with `millis` ticks to a millisecond: as long as the
+/// slice and at least a millisecond, so that a job in slices costs busy
+/// guests about half of one processor at most.
+pub const fn busy_pause_after_slice(slice: u64, millis: u64) -> u64 {
+    if slice > millis { slice } else { millis }
 }
 
 /// How long busy processors leave the queue after one of them looked, in
@@ -123,7 +219,7 @@ pub const fn busy_wait_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Taker, busy_pause_millis, busy_wait_millis};
+    use super::{Taker, busy_pause_after_slice, busy_pause_millis, busy_wait_millis};
 
     #[test]
     fn a_job_waits_about_a_frame_with_every_processor_busy() {
@@ -133,5 +229,17 @@ mod tests {
         // now a frame and a look.
         assert_eq!(busy_wait_millis(), 21);
         assert!(busy_pause_millis(false) < busy_pause_millis(true));
+    }
+
+    #[test]
+    fn a_job_in_slices_takes_half_a_busy_processor_and_the_boot_one_last() {
+        assert_eq!(Taker::Waiting.resume_after_millis(), 0);
+        assert_eq!(Taker::Busy.resume_after_millis(), 0);
+        assert_eq!(
+            Taker::Boot.resume_after_millis(),
+            Taker::Boot.after_millis()
+        );
+        assert_eq!(busy_pause_after_slice(2_000, 1_000), 2_000);
+        assert_eq!(busy_pause_after_slice(10, 1_000), 1_000);
     }
 }

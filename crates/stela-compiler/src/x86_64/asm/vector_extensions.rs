@@ -1359,11 +1359,12 @@ pub(crate) mod execution {
             // SAFETY: callers supply a complete generated function using the
             // state/context ABI, with every requested host feature available.
             unsafe {
-                let entry: unsafe extern "sysv64" fn(
-                    *mut GuestState,
-                    *mut ExecutionContext,
-                ) -> u64 = core::mem::transmute(self.page);
-                entry(state, context)
+                crate::x86_64::native::call::<u64>(
+                    self.page as *const u8,
+                    state,
+                    context as *mut ExecutionContext as u64,
+                    0,
+                )
             }
         }
     }

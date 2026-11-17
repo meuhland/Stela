@@ -127,6 +127,13 @@ pub struct Config {
     /// followed by a GETID. An ordinary ID0 mouse stays three-byte.
     /// The separate Explorer4.0 horizontal-mode sequence is not enabled.
     pub wheel: bool,
+    /// Reset the controller and keyboard before negotiation. Native x86
+    /// firmware handoff leaves this off, as Linux's i8042/atkbd defaults do;
+    /// some embedded laptop keyboards do not complete these reset commands.
+    pub reset_on_start: bool,
+    /// Query F0 00 after acknowledged Set 2 selection. Some laptop embedded
+    /// keyboards ignore this optional query; native startup leaves it off.
+    pub query_scan_set: bool,
     pub io_timeout_us: u64,
     pub command_timeout_us: u64,
     pub reset_timeout_us: u64,
@@ -140,6 +147,8 @@ impl Default for Config {
             keyboard: true,
             mouse: true,
             wheel: true,
+            reset_on_start: true,
+            query_scan_set: true,
             io_timeout_us: 500_000,
             command_timeout_us: 200_000,
             reset_timeout_us: 1_000_000,
@@ -202,10 +211,17 @@ pub enum Recovery {
     NotAttempted,
     PortsDisabled,
     Failed,
+    /// Only this port's device failed: its port is disabled and the other
+    /// port goes on, as Linux's atkbd and psmouse are separate devices.
+    PortDisabled(Port),
+    /// The controller and both devices go on without the failed command.
+    Continued,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error {
     pub kind: ErrorKind,
+    /// Last wire command before failure, preserved across containment.
+    pub command: Option<Command>,
     pub recovery: Recovery,
     /// Reply or framed-error byte consumed before failure, including a
     /// late ACK. This is an observation, not proof of accepted acknowledgement.
@@ -217,19 +233,81 @@ pub struct Error {
     pub recovery_response: Option<ObservedResponse>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    Controller(u8),
+    Device { port: Port, byte: u8 },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedResponse {
     pub port: Port,
     pub data: u8,
 }
+impl ErrorKind {
+    /// A device's own answer to one command, or its silence: the controller
+    /// still works, and Linux's atkbd goes on without that command.
+    fn device_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout(Phase::Response)
+                | Self::ResendLimit { .. }
+                | Self::DeviceReply { .. }
+                | Self::DeviceReset(Port::Keyboard)
+        )
+    }
+    /// A byte that broke a keyboard sequence or a mouse packet, or a packet
+    /// that never finished: Linux's atkbd and psmouse drop it, resynchronize
+    /// on the next byte and keep the device.
+    fn framing(self) -> bool {
+        matches!(
+            self,
+            Self::KeyboardSequence
+                | Self::PacketTimeout(_)
+                | Self::MouseSync(_)
+                | Self::MousePacketMode(_)
+                | Self::DeviceReset(Port::Keyboard)
+                | Self::Synaptics(synaptics::Error::Packet { .. })
+                | Self::Elantech(elantech::Error::Packet)
+        )
+    }
+    /// The port whose device alone failed, when the other port can go on.
+    fn port(self, command: Option<Command>) -> Option<Port> {
+        match self {
+            Self::Timeout(Phase::Response) => match command? {
+                Command::Device { port, .. } => Some(port),
+                Command::Controller(SEND_MOUSE) => Some(Port::Mouse),
+                Command::Controller(_) => None,
+            },
+            Self::DeviceReply { port, .. }
+            | Self::ResendLimit { port, .. }
+            | Self::DeviceReset(port)
+            | Self::PacketTimeout(port) => Some(port),
+            Self::Frame {
+                port: Port::Mouse, ..
+            }
+            | Self::UnsupportedMouseId(_)
+            | Self::MousePacketMode(_)
+            | Self::MouseSync(_)
+            | Self::Synaptics(_)
+            | Self::Elantech(_) => Some(Port::Mouse),
+            Self::UnsupportedScanSet(_) | Self::KeyboardSequence => Some(Port::Keyboard),
+            _ => None,
+        }
+    }
+}
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "PS/2 {:?} (recovery {:?})", self.kind, self.recovery)
+        write!(
+            f,
+            "PS/2 {:?} at {:?} (recovery {:?})",
+            self.kind, self.command, self.recovery
+        )
     }
 }
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self {
             kind,
+            command: None,
             recovery: Recovery::NotAttempted,
             response: None,
             recovery_error: None,
@@ -304,6 +382,13 @@ pub struct Controller<R = PortIo, T = Clock> {
     /// dropped, as `psmouse_smbus_process_byte` drops them.
     companion: bool,
     observed_response: Option<ObservedResponse>,
+    last_command: Option<Command>,
+    /// Commands a keyboard did not acknowledge that its start went on
+    /// without, as Linux's atkbd goes on without them.
+    refused: Vec<Command>,
+    /// Mouse bytes dropped for their parity or timeout bit, and bytes that
+    /// broke a keyboard sequence or mouse packet and were dropped.
+    framing_errors: u64,
 }
 
 /// The psmouse protocol probe the first initialization runs on the mouse port.
@@ -353,6 +438,9 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             probe: None,
             companion: false,
             observed_response: None,
+            last_command: None,
+            refused: Vec::new(),
+            framing_errors: 0,
         })
     }
     /// Select the mouse port's protocol as Linux `psmouse_extensions` does
@@ -446,6 +534,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
     }
     fn command(&mut self, command: u8) -> Result<(), ErrorKind> {
+        self.last_command = Some(Command::Controller(command));
         self.write_ready()?;
         self.registers.write_command(command);
         Ok(())
@@ -458,34 +547,47 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     fn read_byte(&mut self) -> Result<Option<Byte>, ErrorKind> {
         self.read_byte_for(None)
     }
+    /// The next byte either port sent. A keyboard byte whose status has the
+    /// parity or timeout bit is taken as it is, as Linux's atkbd takes it on
+    /// x86; a mouse byte with either bit is dropped, as psmouse drops it.
+    /// A mouse port that sends nothing but such bytes fails after a queue's
+    /// worth of them.
     fn read_byte_for(&mut self, expected: Option<Port>) -> Result<Option<Byte>, ErrorKind> {
-        let status = self.status()?;
-        if status & OUTPUT_FULL == 0 {
-            return Ok(None);
+        let mut framed = 0;
+        for _ in 0..QUEUE_LIMIT {
+            let status = self.status()?;
+            if status & OUTPUT_FULL == 0 {
+                return Ok(None);
+            }
+            let port = if status & AUX_DATA == 0 {
+                Port::Keyboard
+            } else {
+                Port::Mouse
+            };
+            let dropped = port == Port::Mouse && status & FRAME_ERRORS != 0;
+            // A sibling byte needs queue space. Do not consume it to learn
+            // the queue is full, including during subsequent fault
+            // containment. Expected replies have their own observation slot.
+            if self.pending.len() >= QUEUE_LIMIT && expected != Some(port) && !dropped {
+                return Err(ErrorKind::QueueFull);
+            }
+            let data = self.registers.read_data();
+            if dropped {
+                framed = status;
+                self.observed_response = Some(ObservedResponse { port, data });
+                self.framing_errors = self.framing_errors.saturating_add(1);
+                continue;
+            }
+            return Ok(Some(Byte {
+                port,
+                data,
+                received_us: self.timestamp_us(),
+            }));
         }
-        let port = if status & AUX_DATA == 0 {
-            Port::Keyboard
-        } else {
-            Port::Mouse
-        };
-        // A sibling byte needs queue space. Do not consume it to learn
-        // the queue is full, including during subsequent fault containment.
-        // Expected replies have their own observation slot; framed errors also
-        // keep their consumed byte with the first failure below.
-        if self.pending.len() >= QUEUE_LIMIT && expected != Some(port) && status & FRAME_ERRORS == 0
-        {
-            return Err(ErrorKind::QueueFull);
-        }
-        let data = self.registers.read_data();
-        if status & FRAME_ERRORS != 0 {
-            self.observed_response = Some(ObservedResponse { port, data });
-            return Err(ErrorKind::Frame { port, status });
-        }
-        Ok(Some(Byte {
-            port,
-            data,
-            received_us: self.timestamp_us(),
-        }))
+        Err(ErrorKind::Frame {
+            port: Port::Mouse,
+            status: framed,
+        })
     }
     fn queue(&mut self, byte: Byte) -> Result<(), ErrorKind> {
         if !self.input_known {
@@ -572,6 +674,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             if port == Port::Mouse {
                 self.command(SEND_MOUSE)?;
             }
+            self.last_command = Some(Command::Device { port, byte: value });
             self.write_data(value)?;
             loop {
                 let received = self.response(port, start, timeout)?;
@@ -677,17 +780,34 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         self.reset_mouse()
     }
-    /// Reset the mouse, check it is an ordinary ID 0 mouse, and leave it at
-    /// its defaults with reporting disabled.
+    /// Reset the mouse and leave it at its defaults with reporting disabled.
+    /// As Linux `psmouse_reset`, the reset fails only when neither the
+    /// self-test result nor the ID that follows it is an ordinary mouse's,
+    /// and a mouse that sends its self-test result without the ID passes.
     fn reset_mouse(&mut self) -> Result<(), ErrorKind> {
-        self.reset_device(Port::Mouse)?;
-        let id = self.response(
+        self.send_byte(Port::Mouse, RESET, self.config.reset_timeout_us, false)?;
+        let bat = self.response(
+            Port::Mouse,
+            self.timer.start(),
+            self.config.reset_timeout_us,
+        )?;
+        let id = match self.response(
             Port::Mouse,
             self.timer.start(),
             self.config.command_timeout_us,
-        )?;
-        if id != 0 {
-            return Err(ErrorKind::UnsupportedMouseId(id));
+        ) {
+            Ok(id) => Some(id),
+            Err(ErrorKind::Timeout(Phase::Response)) => None,
+            Err(kind) => return Err(kind),
+        };
+        if bat != BAT_OK && id != Some(0) {
+            return Err(match id {
+                Some(id) => ErrorKind::UnsupportedMouseId(id),
+                None => ErrorKind::DeviceReply {
+                    port: Port::Mouse,
+                    received: bat,
+                },
+            });
         }
         self.device_command(Port::Mouse, DEFAULTS, &[])?;
         self.device_command(Port::Mouse, DISABLE_REPORTING, &[])
@@ -728,14 +848,26 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         let config = self.controller_response(READ_CONFIG)?;
         self.controller_config = Some(config);
         self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
-        self.expect_controller(SELF_TEST, 0x55)?;
-        // Self-test can reset CTR on real controllers; reapply/read it back.
-        self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
-        if self.config.keyboard {
+        if self.config.reset_on_start {
+            self.expect_controller(SELF_TEST, 0x55)?;
+            // Self-test can reset CTR on real controllers; reapply/read it back.
+            self.set_config(
+                (config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED,
+            )?;
+        }
+        // Linux tests neither port at a native start; its auxiliary port
+        // check accepts 0, FA and FF from the controller's port test.
+        if self.config.keyboard && self.config.reset_on_start {
             self.expect_controller(TEST_KEYBOARD, 0)?;
         }
         if self.config.mouse {
-            self.expect_controller(TEST_MOUSE, 0)?;
+            let received = self.controller_response(TEST_MOUSE)?;
+            if !matches!(received, 0 | ACK | 0xff) {
+                return Err(ErrorKind::ControllerReply {
+                    command: TEST_MOUSE,
+                    received,
+                });
+            }
         }
         let enabled = (config & !(IRQ_BITS | TRANSLATION | KEYBOARD_DISABLED | MOUSE_DISABLED))
             | if self.config.keyboard {
@@ -745,23 +877,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             | if self.config.mouse { 0 } else { MOUSE_DISABLED };
         if self.config.keyboard {
-            self.command(ENABLE_KEYBOARD)?;
-            // Firmware may have left this keyboard reporting an unknown scan
-            // set. Quiesce it before RESET, and never interpret those bytes.
-            self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
-            self.reset_device(Port::Keyboard)?;
-            self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
-            self.device_command(Port::Keyboard, SET_SCAN, &[2])?;
-            self.device_command(Port::Keyboard, SET_SCAN, &[0])?;
-            let scan = self.response(
-                Port::Keyboard,
-                self.timer.start(),
-                self.config.command_timeout_us,
-            )?;
-            if scan != 2 {
-                return Err(ErrorKind::UnsupportedScanSet(scan));
-            }
-            self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
+            self.start_keyboard()?;
         }
         if self.config.mouse {
             self.command(ENABLE_MOUSE)?;
@@ -781,9 +897,102 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.device_command(Port::Mouse, ENABLE_REPORTING, &[])?;
         }
         if self.config.keyboard {
-            self.device_command(Port::Keyboard, ENABLE_REPORTING, &[])?;
+            // atkbd_activate's failure is reported, and the keyboard kept.
+            self.optional_keyboard(ENABLE_REPORTING, &[])?;
         }
         Ok(())
+    }
+    /// Bring up the keyboard as Linux `atkbd_connect` does on x86: no reset
+    /// unless asked, GETID or else Set LEDs to prove a keyboard is there,
+    /// and the rest (reporting disable, Set 2 selection, LEDs) tried and
+    /// gone on without when the keyboard does not acknowledge them. Linux
+    /// sends no scan-set command at all for Set 2; the selection here is
+    /// tried because translation is off, and a keyboard that refuses it is
+    /// taken to report Set 2, the set firmware and Linux both leave it in.
+    fn start_keyboard(&mut self) -> Result<(), ErrorKind> {
+        self.command(ENABLE_KEYBOARD)?;
+        // Firmware may have left this keyboard reporting an unknown scan
+        // set. Quiesce it first, and never interpret those bytes.
+        self.optional_keyboard(DISABLE_REPORTING, &[])?;
+        if self.config.reset_on_start {
+            self.reset_device(Port::Keyboard)?;
+            self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
+        }
+        let leds_set = if self.keyboard_id()? {
+            false
+        } else {
+            self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
+            true
+        };
+        self.optional_keyboard(SET_SCAN, &[2])?;
+        if self.config.query_scan_set {
+            self.device_command(Port::Keyboard, SET_SCAN, &[0])?;
+            let scan = self.response(
+                Port::Keyboard,
+                self.timer.start(),
+                self.config.command_timeout_us,
+            )?;
+            if scan != 2 {
+                return Err(ErrorKind::UnsupportedScanSet(scan));
+            }
+        }
+        if !leds_set {
+            self.optional_keyboard(SET_LEDS, &[0])?;
+        }
+        Ok(())
+    }
+    /// A keyboard command whose refusal Linux's atkbd goes on after: the
+    /// refused command is kept for [`Self::refused_commands`], and the start
+    /// goes on. A controller failure still fails.
+    fn optional_keyboard(&mut self, value: u8, arguments: &[u8]) -> Result<bool, ErrorKind> {
+        match self.device_command(Port::Keyboard, value, arguments) {
+            Ok(()) => Ok(true),
+            Err(kind) if kind.device_refusal() => {
+                let command = Command::Device {
+                    port: Port::Keyboard,
+                    byte: value,
+                };
+                if !self.refused.contains(&command) {
+                    self.refused.push(command);
+                }
+                Ok(false)
+            }
+            Err(kind) => Err(kind),
+        }
+    }
+    /// Linux `atkbd_probe`'s GETID: whether the keyboard acknowledged it and
+    /// sent an ID. A keyboard ID's first byte is one `ps2_is_keyboard_id`
+    /// lists and a second byte follows it, which a keyboard may leave out.
+    fn keyboard_id(&mut self) -> Result<bool, ErrorKind> {
+        match self.device_command(Port::Keyboard, GET_ID, &[]) {
+            Ok(()) => {}
+            Err(kind) if kind.device_refusal() => return Ok(false),
+            Err(kind) => return Err(kind),
+        }
+        let timeout = self.config.command_timeout_us;
+        let first = match self.response(Port::Keyboard, self.timer.start(), timeout) {
+            Ok(first) => first,
+            Err(ErrorKind::Timeout(Phase::Response)) => return Ok(false),
+            Err(kind) => return Err(kind),
+        };
+        if matches!(first, 0xab | 0xac | 0x2b | 0x5d | 0x60 | 0x47) {
+            match self.response(Port::Keyboard, self.timer.start(), timeout) {
+                Ok(_) | Err(ErrorKind::Timeout(Phase::Response)) => {}
+                Err(kind) => return Err(kind),
+            }
+        }
+        Ok(true)
+    }
+    /// Keyboard commands the keyboard did not acknowledge at its start, which
+    /// the start went on without, as Linux's atkbd goes on without them.
+    pub fn refused_commands(&self) -> &[Command] {
+        &self.refused
+    }
+    /// Mouse bytes dropped for their parity or timeout bit, and bytes that
+    /// broke a keyboard sequence or mouse packet and were dropped to
+    /// resynchronize.
+    pub fn framing_errors(&self) -> u64 {
+        self.framing_errors
     }
     /// Set up the mouse's selected protocol, its reporting still disabled.
     fn set_up_mouse(&mut self) -> Result<(), ErrorKind> {
@@ -850,7 +1059,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.companion = true;
             self.reset_mouse()
         })();
-        result.map_err(|kind| self.fail(kind))?;
+        result.map_err(|kind| self.recover(kind))?;
         self.mouse.release(&mut self.events);
         if let Some(engine) = &mut self.synaptics {
             engine.release(&mut self.events);
@@ -875,7 +1084,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.set_up_mouse()?;
             self.device_command(Port::Mouse, ENABLE_REPORTING, &[])
         })();
-        result.map_err(|kind| self.fail(kind))
+        result.map_err(|kind| self.recover(kind))
     }
     /// Reset, test, initialize and enable only the configured attached ports.
     /// Ownership remains in this object on failure; a faulted object cannot
@@ -890,6 +1099,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         self.state = State::Initializing;
         self.observed_response = None;
         self.input_known = false;
+        self.refused.clear();
         match self.initialize_inner() {
             Ok(()) => {
                 self.state = State::Ready;
@@ -939,11 +1149,113 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         };
         self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)
     }
+    /// Contain a failure while running: a failure of one port's device
+    /// disables that port alone while the other is configured; anything
+    /// else stops both.
+    fn recover(&mut self, kind: ErrorKind) -> Error {
+        let command = self.last_command;
+        let response = self.observed_response.take();
+        if let Some(port) = kind.port(command) {
+            let other = match port {
+                Port::Keyboard => self.config.mouse,
+                Port::Mouse => self.config.keyboard,
+            };
+            if other {
+                return match self.disable_port(port) {
+                    Ok(()) => Error {
+                        command,
+                        recovery: Recovery::PortDisabled(port),
+                        response,
+                        ..kind.into()
+                    },
+                    Err(containment) => {
+                        let mut error = self.fail(containment);
+                        error.kind = kind;
+                        error.command = command;
+                        error.response = response;
+                        error.recovery_error = Some(containment);
+                        error.recovery = Recovery::Failed;
+                        error
+                    }
+                };
+            }
+        }
+        self.observed_response = response;
+        self.fail(kind)
+    }
+    /// Whether `kind` from a byte of `port` broke only a keyboard sequence
+    /// or a mouse packet: the byte or packet is then dropped and the port
+    /// reads on from its next byte, as Linux's atkbd and psmouse
+    /// resynchronize. Nothing is reported for it but the count.
+    fn resynchronized(&mut self, kind: ErrorKind, port: Port) -> bool {
+        if !kind.framing() {
+            return false;
+        }
+        let port = match kind {
+            ErrorKind::PacketTimeout(port) | ErrorKind::DeviceReset(port) => port,
+            ErrorKind::KeyboardSequence => Port::Keyboard,
+            _ => port,
+        };
+        self.resync(port);
+        self.framing_errors = self.framing_errors.saturating_add(1);
+        true
+    }
+    /// Drop `port`'s packet or sequence in progress.
+    fn resync(&mut self, port: Port) {
+        match port {
+            Port::Keyboard => self.keyboard.reset_prefix(),
+            Port::Mouse => {
+                if let Some(engine) = &mut self.synaptics {
+                    engine.resync();
+                } else if let Some(engine) = &mut self.elantech {
+                    engine.resync();
+                } else {
+                    self.mouse.resync();
+                }
+            }
+        }
+    }
+    /// Stop `port`'s clock, release what its device held and read on with
+    /// the other port alone. The controller command sets the port's disable
+    /// bit itself, so no configuration readback shares the keyboard's lane
+    /// with keys.
+    fn disable_port(&mut self, port: Port) -> Result<(), ErrorKind> {
+        let (command, bit) = match port {
+            Port::Keyboard => (DISABLE_KEYBOARD, KEYBOARD_DISABLED),
+            Port::Mouse => (DISABLE_MOUSE, MOUSE_DISABLED),
+        };
+        self.command(command)?;
+        self.write_ready()?;
+        if let Some(config) = &mut self.controller_config {
+            *config |= bit;
+        }
+        self.pending.retain(|byte| byte.port != port);
+        match port {
+            Port::Keyboard => {
+                self.capture_keyboard_observation();
+                self.stop_keyboard_observation(StopCause::TransportFailed);
+                self.keyboard.release(&mut self.events);
+                self.config.keyboard = false;
+            }
+            Port::Mouse => {
+                self.mouse.release(&mut self.events);
+                if let Some(engine) = &mut self.synaptics {
+                    engine.release(&mut self.events);
+                }
+                if let Some(engine) = &mut self.elantech {
+                    engine.release(&mut self.events);
+                }
+                self.config.mouse = false;
+            }
+        }
+        Ok(())
+    }
     fn fail(&mut self, kind: ErrorKind) -> Error {
         self.state = State::Faulted;
         self.capture_keyboard_observation();
         self.stop_keyboard_observation(StopCause::TransportFailed);
         let response = self.observed_response;
+        let command = self.last_command;
         self.observed_response = None;
         let containment = self.disable_ports();
         let recovery = if containment.is_ok() {
@@ -953,6 +1265,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         };
         Error {
             kind,
+            command,
             recovery,
             response,
             recovery_error: containment.err(),
@@ -979,8 +1292,19 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         if !self.config.keyboard {
             return Err(ErrorKind::NotInitialized.into());
         }
+        // Linux's atkbd goes on after a Set LEDs the keyboard refused.
         self.device_command(Port::Keyboard, SET_LEDS, &[leds])
-            .map_err(|kind| self.fail(kind))
+            .map_err(|kind| {
+                if kind.device_refusal() {
+                    Error {
+                        command: self.last_command,
+                        recovery: Recovery::Continued,
+                        ..kind.into()
+                    }
+                } else {
+                    self.fail(kind)
+                }
+            })
     }
     fn decode(&mut self, byte: Byte) -> Result<(), ErrorKind> {
         match byte.port {
@@ -1016,10 +1340,12 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 self.config.packet_timeout_us,
                 &mut self.events,
             ),
-            _ => Err(ErrorKind::DeviceReply {
-                port: byte.port,
-                received: byte.data,
-            }),
+            // A byte from a port this owner disabled, sent before the
+            // controller stopped its clock.
+            _ => {
+                self.framing_errors = self.framing_errors.saturating_add(1);
+                Ok(())
+            }
         }
     }
     /// Decode at most 64 hardware bytes per poll. Prefixes/partial packets stay
@@ -1128,7 +1454,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             let byte = match self.pending.pop_front() {
                 Some(byte) => Some(byte),
-                None => self.read_byte().map_err(|kind| self.fail(kind))?,
+                None => self.read_byte().map_err(|kind| self.recover(kind))?,
             };
             let Some(byte) = byte else {
                 // The port already reported no output. Only an incomplete
@@ -1144,7 +1470,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 if matches!(kind, ErrorKind::UnsupportedScanCode(_)) {
                     return Err(kind.into());
                 }
-                return Err(self.fail(kind));
+                if self.resynchronized(kind, byte.port) {
+                    continue;
+                }
+                return Err(self.recover(kind));
             }
         }
         // A silent device must not keep an incomplete prefix indefinitely.
@@ -1165,8 +1494,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                         self.mouse.expire(now, self.config.packet_timeout_us)
                     }
                 });
-            if let Err(kind) = result {
-                return Err(self.fail(kind));
+            if let Err(kind) = result
+                && !self.resynchronized(kind, Port::Mouse)
+            {
+                return Err(self.recover(kind));
             }
         }
         Ok(self.drain_events())

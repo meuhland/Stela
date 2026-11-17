@@ -104,6 +104,30 @@ fn compute(plan: &mut Plan, library: &str, rng: &mut Random) {
                 .output(Output::exact("again", Dtype::U32, u32s(&again))),
         );
     }
+    // Two buffers in turn, each dispatch reading a neighbour's word of what
+    // the one before wrote: a processor that read a word two dispatches ago
+    // must not see it again once it has changed.
+    let (mut a, mut b) = (v.clone(), vec![0u32; N as usize]);
+    let mut steps = vec![];
+    for k in 0..6 {
+        let (src, dst) = if k % 2 == 0 { ("a", "b") } else { ("b", "a") };
+        let step =
+            Step::compute("neighbours", grid(N), [64, 1, 1]).bind(&[(src, 0), (dst, 1), ("n", 2)]);
+        steps.push(if k == 0 { step } else { step.continues() });
+        if k % 2 == 0 {
+            b = neighbours(&a);
+        } else {
+            a = neighbours(&b);
+        }
+    }
+    plan.add(
+        Case::sequence("sequence.compute.ping_pong", library, steps)
+            .buffer(Buffer::data("a", 0, u32s(&v)).unbound())
+            .buffer(Buffer::zeroed("b", 0, N as usize * 4).unbound())
+            .buffer(Buffer::data("n", 0, u32s(&[N])).unbound())
+            .output(Output::exact("a", Dtype::U32, u32s(&a)))
+            .output(Output::exact("b", Dtype::U32, u32s(&b))),
+    );
     // Blits before and after compute: a fill the dispatch reads, and a copy
     // of what it wrote.
     let filled = vec![0x0707_0707u32; N as usize];
@@ -1199,12 +1223,78 @@ fn event_chain(plan: &mut Plan, library: &str) {
     plan.add(case);
 }
 
+/// Shared depth targets, which Apple GPUs keep in unified memory: the CPU
+/// writes stored depths (a combined depth-stencil target is cleared), a
+/// pass tests and writes them, then compute samples them in the next
+/// command buffer and the CPU reads a single-aspect target back.
+fn shared_depth(plan: &mut Plan, library: &str) {
+    let (w, h) = (8u32, 8u32);
+    let (z, color) = (0.5, [0.25, 0.5, 0.75, 1.0]);
+    // The left half nearer than z, the right half farther.
+    let stored: Vec<f64> = (0..h)
+        .flat_map(|_| (0..w).map(|x| if x < w / 2 { 0.25 } else { 0.75 }))
+        .collect();
+    for (format, cleared) in [("depth32float", false), ("depth32float_stencil8", true)] {
+        let before = if cleared {
+            vec![1.0; stored.len()]
+        } else {
+            stored.clone()
+        };
+        let after: Vec<f64> = before.iter().map(|&d| if z < d { z } else { d }).collect();
+        let image: Vec<f64> = before
+            .iter()
+            .flat_map(|&d| if z < d { color } else { [0.0; 4] })
+            .collect();
+        let mut depth = json!({"texture": "d", "compare": "less", "write": true});
+        let mut target = Texture::d2("d", format, w, h)
+            .usage(&["render", "read"])
+            .set("storage", "shared");
+        if cleared {
+            depth["clear"] = 1.0.into();
+        } else {
+            target = target.data(f32s(&stored));
+        }
+        let mut case = Case::sequence(
+            &format!("sequence.shared_depth.{format}"),
+            library,
+            vec![
+                Step::render(
+                    "vert_rect_z",
+                    "frag_constant",
+                    json!({"colors": [{"texture": "a", "clear": [0, 0, 0, 0]}], "depth": depth,
+                           "primitive": "triangle_strip", "vertex_count": 4}),
+                )
+                .bind_stage("vertex", &[("full", 0), ("z", 1)])
+                .bind_stage("fragment", &[("color", 0)]),
+                Step::compute("read_depth_target", [w, h, 1], [8, 8, 1])
+                    .bind_textures(&[("d", 0)])
+                    .bind(&[("out", 0)])
+                    .new_command_buffer(),
+            ],
+        )
+        .buffer(Buffer::data("full", 0, f32s(&[-1.0, -1.0, 1.0, 1.0])).unbound())
+        .buffer(Buffer::data("z", 0, f32s(&[z])).unbound())
+        .buffer(Buffer::data("color", 0, f32s(&color)).unbound())
+        .buffer(Buffer::zeroed("out", 0, (w * h * 4) as usize).unbound())
+        .texture(Texture::d2("a", "rgba32float", w, h).usage(&["render"]))
+        .texture(target)
+        .output(Output::exact("a", Dtype::F32, f32s(&image)))
+        .output(Output::exact("out", Dtype::F32, f32s(&after)));
+        // The CPU reads no combined depth-stencil texels.
+        if !cleared {
+            case = case.output(Output::exact("d", Dtype::F32, f32s(&after)));
+        }
+        plan.add(case);
+    }
+}
+
 pub fn build(plan: &mut Plan) {
     let library = plan.library("sequences", SOURCE, &[], super::plan::LATEST);
     let mut rng = Random::new(5150);
     compute(plan, &library, &mut rng);
     indirect(plan, &library);
     passes(plan, &library);
+    shared_depth(plan, &library);
     indirect_commands(plan, &library, &mut rng);
     indirect_commands_more(plan, &library, &mut rng);
     api_ordering(plan, &library, &mut rng);

@@ -94,6 +94,35 @@ stela_air_named_md(struct stela_air_metadata *t, const char *name, LLVMValueRef 
 }
 
 bool
+stela_air_named_list(struct stela_air_metadata *t, const char *name, struct stela_air_list *list)
+{
+   unsigned count = LLVMGetNamedMetadataNumOperands(t->module, name);
+   list->nodes = list->small;
+   list->count = 0;
+   if (count > AIR_MAX_LISTED)
+      return fail(t, STELA_AIR_LIMIT, "%s list budget exceeded", name);
+   if (count > ARRAY_SIZE(list->small)) {
+      list->nodes = malloc(count * sizeof(*list->nodes));
+      if (!list->nodes) {
+         list->nodes = list->small;
+         return fail(t, STELA_AIR_ALLOCATION, "%s list allocation failed", name);
+      }
+   }
+   LLVMGetNamedMetadataOperands(t->module, name, list->nodes);
+   list->count = count;
+   return true;
+}
+
+void
+stela_air_list_release(struct stela_air_list *list)
+{
+   if (list->nodes != list->small)
+      free(list->nodes);
+   list->nodes = list->small;
+   list->count = 0;
+}
+
+bool
 stela_air_metadata_shared_profile(struct stela_air_metadata *t)
 {
    if (LLVMPointerSizeForAS(t->layout, 3) != 8)
@@ -2513,24 +2542,30 @@ stela_air_metadata_kernel(struct stela_air_metadata *t, LLVMValueRef fn,
        LLVMGetTypeKind(LLVMGetReturnType(LLVMGlobalGetValueType(fn))) != LLVMVoidTypeKind ||
        LLVMIsFunctionVarArg(LLVMGlobalGetValueType(fn)))
       return fail(t, STELA_AIR_ARGUMENT, "entry must be a defined nonvariadic void C-convention kernel");
-   LLVMValueRef kernels[AIR_MAX_METADATA_OPERANDS], args_node = NULL, selected = NULL;
-   unsigned kernel_count;
-   if (!stela_air_named_md(t, "air.kernel", kernels, &kernel_count))
+   LLVMValueRef args_node = NULL, selected = NULL;
+   struct stela_air_list kernels;
+   if (!stela_air_named_list(t, "air.kernel", &kernels))
       return false;
-   for (unsigned i = 0; i < kernel_count; i++) {
+   bool valid = true;
+   for (unsigned i = 0; valid && i < kernels.count; i++) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned count;
-      if (!stela_air_md_node(t, kernels[i], fields, &count) || count < 3)
-         return fail(t, STELA_AIR_METADATA, "invalid air.kernel descriptor");
-      if (fields[0] == fn) {
+      if (!stela_air_md_node(t, kernels.nodes[i], fields, &count) || count < 3) {
+         valid = fail(t, STELA_AIR_METADATA, "invalid air.kernel descriptor");
+      } else if (fields[0] == fn) {
          LLVMValueRef outputs[AIR_MAX_METADATA_OPERANDS];
          unsigned output_count;
-         if (args_node || !stela_air_md_node(t, fields[1], outputs, &output_count) || output_count)
-            return fail(t, STELA_AIR_METADATA, "duplicate kernel or nonempty compute outputs");
-         args_node = fields[2];
-         selected = kernels[i];
+         if (args_node || !stela_air_md_node(t, fields[1], outputs, &output_count) || output_count) {
+            valid = fail(t, STELA_AIR_METADATA, "duplicate kernel or nonempty compute outputs");
+         } else {
+            args_node = fields[2];
+            selected = kernels.nodes[i];
+         }
       }
    }
+   stela_air_list_release(&kernels);
+   if (!valid)
+      return false;
    if (!args_node)
       return fail(t, STELA_AIR_METADATA, "entry is not an AIR compute kernel");
    return metadata_arguments(t, fn, args_node, kernel, NULL) &&
@@ -2565,22 +2600,28 @@ stela_air_metadata_stage(struct stela_air_metadata *m, LLVMValueRef fn,
    LLVMValueRef args = NULL, outputs = NULL, selected = NULL;
    /* In enum stela_air_stage order. */
    const char *lists[] = {"air.vertex", "air.fragment", "air.object", "air.mesh", "air.kernel"};
-   for (unsigned list = 0; list < ARRAY_SIZE(lists); list++) {
-      LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-      unsigned count;
-      if (!stela_air_named_md(m, lists[list], nodes, &count)) return false;
-      for (unsigned i = 0; i < count; i++) {
+   bool valid = true;
+   for (unsigned list = 0; valid && list < ARRAY_SIZE(lists); list++) {
+      struct stela_air_list nodes;
+      if (!stela_air_named_list(m, lists[list], &nodes)) return false;
+      for (unsigned i = 0; valid && i < nodes.count; i++) {
          LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
          unsigned fields_count;
-         if (!stela_air_md_node(m, nodes[i], fields, &fields_count) || fields_count < 3 ||
+         if (!stela_air_md_node(m, nodes.nodes[i], fields, &fields_count) || fields_count < 3 ||
              !fields[0] || !LLVMIsAFunction(fields[0]))
-            return fail(m, STELA_AIR_METADATA, "invalid stage manifest descriptor");
-         if (fields[0] != fn) continue;
-         if (args || list + 1 != (unsigned)stage)
-            return fail(m, STELA_AIR_METADATA, "duplicate or mismatched selected render stage");
-         outputs = fields[1]; args = fields[2]; selected = nodes[i];
+            valid = fail(m, STELA_AIR_METADATA, "invalid stage manifest descriptor");
+         else if (fields[0] != fn)
+            continue;
+         else if (args || list + 1 != (unsigned)stage)
+            valid = fail(m, STELA_AIR_METADATA, "duplicate or mismatched selected render stage");
+         else {
+            outputs = fields[1]; args = fields[2]; selected = nodes.nodes[i];
+         }
       }
+      stela_air_list_release(&nodes);
    }
+   if (!valid)
+      return false;
    if (!args ||
        !(stage == STELA_AIR_VERTEX ? entry_patch(m, selected, &r->entry) :
          stage == STELA_AIR_FRAGMENT ? entry_fragment(m, selected, &r->entry) :
@@ -2880,24 +2921,29 @@ entry_stage(struct stela_air_metadata *m, const char *entry, unsigned *stage)
 {
    bool found = false;
    LLVMValueRef fn = LLVMGetNamedFunction(m->module, entry);
-   for (unsigned list = 0; fn && list < ARRAY_SIZE(entry_lists); list++) {
-      LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-      unsigned count;
-      if (!stela_air_named_md(m, entry_lists[list], nodes, &count))
+   bool valid = true;
+   for (unsigned list = 0; valid && fn && list < ARRAY_SIZE(entry_lists); list++) {
+      struct stela_air_list nodes;
+      if (!stela_air_named_list(m, entry_lists[list], &nodes))
          return false;
-      for (unsigned i = 0; i < count; i++) {
+      for (unsigned i = 0; valid && i < nodes.count; i++) {
          LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
          unsigned fields_count;
-         if (!stela_air_md_node(m, nodes[i], fields, &fields_count) || !fields_count)
-            return false;
-         if (fields[0] != fn)
+         if (!stela_air_md_node(m, nodes.nodes[i], fields, &fields_count) || !fields_count)
+            valid = false;
+         else if (fields[0] != fn)
             continue;
-         if (found)
-            return fail(m, STELA_AIR_METADATA, "entry listed more than once");
-         found = true;
-         *stage = list;
+         else if (found)
+            valid = fail(m, STELA_AIR_METADATA, "entry listed more than once");
+         else {
+            found = true;
+            *stage = list;
+         }
       }
+      stela_air_list_release(&nodes);
    }
+   if (!valid)
+      return false;
    return found || fail(m, STELA_AIR_ARGUMENT, "entry is not a listed AIR function");
 }
 
@@ -3037,6 +3083,7 @@ inspect(const void *bitcode, size_t size, const struct stela_air_constants *cons
       size_t name_bytes;
       struct stela_air_kernel kernel;
    } *entries = NULL;
+   struct stela_air_list kernels = {0};
    if (!parsed || error->kind != STELA_AIR_OK) {
       fail(&m, STELA_AIR_BITCODE, "LLVM refused AIR bitcode");
       goto done;
@@ -3094,10 +3141,28 @@ inspect(const void *bitcode, size_t size, const struct stela_air_constants *cons
       if (!success) fail(&m, STELA_AIR_LIMIT, "AIR stage receiver refused entry");
       goto done;
    }
-   LLVMValueRef kernels[AIR_MAX_METADATA_OPERANDS];
-   unsigned count;
-   if (!stela_air_named_md(&m, "air.kernel", kernels, &count))
+   if (!stela_air_named_list(&m, "air.kernel", &kernels))
       goto done;
+   if (entry_name) {
+      /* One entry, which entry_stage found listed once: its descriptor
+       * alone, whatever else the module lists. */
+      LLVMValueRef fn = LLVMGetNamedFunction(m.module, entry_name);
+      unsigned selected = kernels.count;
+      for (unsigned i = 0; fn && selected == kernels.count && i < kernels.count; i++) {
+         LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
+         unsigned fields_count;
+         if (stela_air_md_node(&m, kernels.nodes[i], fields, &fields_count) && fields_count &&
+             fields[0] == fn)
+            selected = i;
+      }
+      if (selected == kernels.count) {
+         fail(&m, STELA_AIR_ARGUMENT, "entry is not an AIR compute kernel");
+         goto done;
+      }
+      kernels.nodes[0] = kernels.nodes[selected];
+      kernels.count = 1;
+   }
+   unsigned count = kernels.count;
    if (!count || count > max_entries) {
       fail(&m, STELA_AIR_LIMIT, "no executable compute entries or entry budget exceeded");
       goto done;
@@ -3112,7 +3177,7 @@ inspect(const void *bitcode, size_t size, const struct stela_air_constants *cons
    for (unsigned i = 0; i < count; i++) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned fields_count;
-      if (!stela_air_md_node(&m, kernels[i], fields, &fields_count) || fields_count < 3 ||
+      if (!stela_air_md_node(&m, kernels.nodes[i], fields, &fields_count) || fields_count < 3 ||
           !fields[0] || !LLVMIsAFunction(fields[0])) {
          fail(&m, STELA_AIR_METADATA, "invalid AIR kernel manifest entry");
          goto done;
@@ -3171,6 +3236,7 @@ inspect(const void *bitcode, size_t size, const struct stela_air_constants *cons
    }
    success = true;
 done:
+   stela_air_list_release(&kernels);
    stela_air_release_constructed_constants(&prepared);
    free(entries);
    if (m.module)
@@ -3261,13 +3327,12 @@ stela_air_functions(const void *bitcode, size_t size, stela_air_visit_function v
    LLVMContextRef context;
    bool visited = parse_metadata(&m, bitcode, size, &context);
    for (unsigned list = 0; visited && list < ARRAY_SIZE(entry_lists); list++) {
-      LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-      unsigned count;
-      visited = stela_air_named_md(&m, entry_lists[list], nodes, &count);
-      for (unsigned i = 0; visited && i < count; i++) {
+      struct stela_air_list nodes;
+      visited = stela_air_named_list(&m, entry_lists[list], &nodes);
+      for (unsigned i = 0; visited && i < nodes.count; i++) {
          LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
          unsigned fields_count;
-         visited = stela_air_md_node(&m, nodes[i], fields, &fields_count) && fields_count &&
+         visited = stela_air_md_node(&m, nodes.nodes[i], fields, &fields_count) && fields_count &&
                    fields[0] && LLVMIsAFunction(fields[0]);
          if (visited) {
             size_t name_bytes;
@@ -3275,6 +3340,7 @@ stela_air_functions(const void *bitcode, size_t size, stela_air_visit_function v
             visited = visit(data, name, name_bytes, list);
          }
       }
+      stela_air_list_release(&nodes);
    }
    if (!visited && m.error->kind == STELA_AIR_OK)
       fail(&m, STELA_AIR_METADATA, "a function the module lists");
@@ -3286,20 +3352,20 @@ stela_air_functions(const void *bitcode, size_t size, stela_air_visit_function v
 static bool
 listed_entry(struct stela_air_metadata *m, LLVMValueRef fn)
 {
-   for (unsigned list = 0; list < ARRAY_SIZE(entry_lists); list++) {
-      LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-      unsigned count;
-      if (!stela_air_named_md(m, entry_lists[list], nodes, &count))
+   bool listed = false;
+   for (unsigned list = 0; !listed && list < ARRAY_SIZE(entry_lists); list++) {
+      struct stela_air_list nodes;
+      if (!stela_air_named_list(m, entry_lists[list], &nodes))
          return false;
-      for (unsigned i = 0; i < count; i++) {
+      for (unsigned i = 0; !listed && i < nodes.count; i++) {
          LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
          unsigned fields_count;
-         if (stela_air_md_node(m, nodes[i], fields, &fields_count) && fields_count &&
-             fields[0] == fn)
-            return true;
+         listed = stela_air_md_node(m, nodes.nodes[i], fields, &fields_count) && fields_count &&
+                  fields[0] == fn;
       }
+      stela_air_list_release(&nodes);
    }
-   return false;
+   return listed;
 }
 
 bool

@@ -683,6 +683,7 @@ pub(super) fn vector_use(operand: &Operand, target: crate::TargetCpu) -> super::
         Operand::Memory { .. } | Operand::MemoryPair { .. } | Operand::MemoryRegisterOffset(_) => {
             Access
         }
+        Operand::Sha256(operand) => sha256::vector_use(operand, target),
         _ => Settle,
     }
 }

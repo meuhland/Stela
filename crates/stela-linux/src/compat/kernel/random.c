@@ -52,6 +52,14 @@ void add_device_randomness(const void *bytes, size_t size)
 		stela_linux_unsupported("kernel random device input unavailable");
 }
 
+/* An interrupt's arrival, as Linux's drivers/char/random.c takes it from a
+ * flow handler: the line goes to the owner's pool like any device input,
+ * and the owner samples its counter as it mixes. */
+void add_interrupt_randomness(int irq)
+{
+	add_device_randomness(&irq, sizeof(irq));
+}
+
 /* RFC 7693 keyed BLAKE2s over the domain, counter sample and device bytes.
  * The key is private output taken from the existing owner stream. */
 void stela_linux_random_mix_key(const u8 *key, u64 ticks, const void *bytes,

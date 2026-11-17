@@ -789,6 +789,14 @@ pub struct CommandBuffer {
     /// What its passes change of the extended-range textures' planes,
     /// applied once it is committed.
     pub(crate) planes: super::device::resources::PlaneChanges,
+    /// The textures with aligned copies it writes, which its end copies
+    /// back into their rows.
+    pub(crate) aligned_writes: Vec<super::device::TextureId>,
+    /// Every texture it writes: an attachment, a blit destination, one
+    /// shaders may write.
+    pub(crate) written: Vec<super::device::TextureId>,
+    /// The IOSurface objects it uses, as the guest reported them.
+    pub(crate) surfaces: Vec<super::device::SurfaceNote>,
 }
 
 impl CommandBuffer {
@@ -801,6 +809,24 @@ impl CommandBuffer {
             pipelines: Vec::new(),
             workload: Workload::default(),
             planes: Default::default(),
+            aligned_writes: Vec::new(),
+            written: Vec::new(),
+            surfaces: Vec::new(),
+        }
+    }
+
+    /// Brackets the finished commands: `lead` runs first, after the
+    /// opening barrier, and `tail` last, before the completion signal.
+    pub(crate) fn surround(&mut self, lead: Vec<Command>, tail: Vec<Command>) {
+        if !lead.is_empty() {
+            let first = &mut self.recorder.segments[0].commands;
+            first.splice(1..1, lead);
+        }
+        if !tail.is_empty() {
+            self.recorder.push(Command::Barrier(FULL));
+            for command in tail {
+                self.recorder.push(command);
+            }
         }
     }
 

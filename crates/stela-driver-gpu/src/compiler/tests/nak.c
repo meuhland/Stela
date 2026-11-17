@@ -123,6 +123,103 @@ check_global_load_access(unsigned sm, bool store, enum gl_access_qualifier load_
    return result;
 }
 
+/* Lines of NAK's listing that start (after indentation) with `op` and
+ * contain `order`. */
+static unsigned
+count_order(const char *listing, const char *op, const char *order)
+{
+   unsigned count = 0;
+   for (const char *line = listing; line && *line;) {
+      const char *end = strchr(line, '\n');
+      size_t length = end ? (size_t)(end - line) : strlen(line);
+      char text[256];
+      snprintf(text, sizeof(text), "%.*s", (int)length, line);
+      const char *at = strstr(text, op);
+      if (at && (!order || strstr(at, order)))
+         count++;
+      line = end ? end + 1 : NULL;
+   }
+   return count;
+}
+
+/* The order NAK gives global memory accesses and barriers in a shader whose
+ * accesses have no derefs, as the Metal translation's have: a plain store
+ * is weak and a coherent, volatile or atomic one stays strong at GPU scope,
+ * as every load does; a workgroup barrier on global memory is bar.sync and
+ * a CTA membar; a device-scope fence on global memory keeps its modes, so
+ * it stays a GPU membar that writes L1 back before it and invalidates L1
+ * after it. */
+static int
+check_global_order(unsigned sm)
+{
+   const struct nv_device_info dev = {.sm = sm, .max_warps_per_mp = 32};
+   struct nak_compiler *nak = nak_compiler_create(&dev);
+   if (!nak)
+      return 1;
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, nak_nir_options(nak),
+                                                  "stela_order_probe");
+   b.shader->info.workgroup_size[0] = 128;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+   nir_def *index = nir_load_local_invocation_index(&b);
+   nir_def *offset = nir_u2u64(&b, nir_imul_imm(&b, index, 4));
+   nir_def *address = nir_iadd(&b, nir_imm_int64(&b, 0x100000), offset);
+   nir_def *plain = nir_load_global(&b, 1, 32, address, .align_mul = 4);
+   nir_def *coherent = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, address, 0x10000),
+                                       .align_mul = 4, .access = ACCESS_COHERENT);
+   nir_store_global(&b, plain, nir_iadd_imm(&b, address, 0x20000), .align_mul = 4);
+   nir_store_global(&b, coherent, nir_iadd_imm(&b, address, 0x30000), .align_mul = 4,
+                    .access = ACCESS_COHERENT);
+   nir_store_global(&b, plain, nir_iadd_imm(&b, address, 0x40000), .align_mul = 4,
+                    .access = ACCESS_VOLATILE);
+   nir_store_global(&b, coherent, nir_iadd_imm(&b, address, 0x50000), .align_mul = 4,
+                    .access = ACCESS_ATOMIC | ACCESS_COHERENT);
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_global | nir_var_mem_shared);
+   nir_def *loaded = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, address, 0x60000), .align_mul = 4);
+   nir_store_global(&b, loaded, nir_iadd_imm(&b, address, 0x70000), .align_mul = 4);
+   nir_barrier(&b, .memory_scope = SCOPE_DEVICE, .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_global);
+   nir_store_global(&b, nir_load_global(&b, 1, 32, nir_iadd_imm(&b, address, 0x80000), .align_mul = 4),
+                    nir_iadd_imm(&b, address, 0x90000), .align_mul = 4);
+   const nir_lower_compute_system_values_options system_values = {
+      .lower_local_invocation_index = true,
+   };
+   nir_lower_compute_system_values(b.shader, &system_values);
+   nak_preprocess_nir(b.shader, nak);
+   struct nak_shader_bin *bin = nak_compile_shader(b.shader, true, nak, 0, NULL, false);
+   const char *listing = bin ? bin->asm_str : NULL;
+   unsigned weak_stores = count_order(listing, "st.global", ".weak");
+   unsigned strong_stores = count_order(listing, "st.global", ".strong.gpu");
+   unsigned weak_loads = count_order(listing, "ld.global", ".weak");
+   unsigned strong_loads = count_order(listing, "ld.global", ".strong.gpu");
+   unsigned syncs = count_order(listing, "bar.sync", NULL);
+   unsigned cta = count_order(listing, "membar", "cta");
+   unsigned gpu = count_order(listing, "membar", "gpu");
+   unsigned controls = count_order(listing, "cctl", NULL);
+   /* CCTL.WBALL exists from Volta on; CCTL.IVALL on every target. */
+   unsigned expected_controls = sm >= 70 ? 2 : 1;
+   int result = 0;
+   if (!listing || weak_stores != 3 || strong_stores != 3 || weak_loads != 0 || strong_loads != 4 ||
+       syncs != 1 || cta != 1 || gpu != 1 || controls != expected_controls) {
+      fprintf(stderr,
+              "SM%u: stores weak %u strong %u (expected 3, 3), loads weak %u strong %u "
+              "(expected 0, 4), bar.sync %u membar.cta %u membar.gpu %u (expected 1 each), "
+              "cache controls %u (expected %u)\n",
+              sm, weak_stores, strong_stores, weak_loads, strong_loads, syncs, cta, gpu, controls,
+              expected_controls);
+      if (listing)
+         fputs(listing, stderr);
+      result = 1;
+   }
+   if (bin)
+      nak_shader_bin_destroy(bin);
+   ralloc_free(b.shader);
+   nak_compiler_destroy(nak);
+   return result;
+}
+
 int
 main(void)
 {
@@ -136,6 +233,7 @@ main(void)
    for (unsigned i = 0; i < ARRAY_SIZE(stela_nvidia_sms); i++) {
       unsigned sm = stela_nvidia_sms[i];
       result |= compile_store(sm);
+      result |= check_global_order(sm);
       result |= check_global_load_access(sm, false, 0, ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
       result |= check_global_load_access(sm, true, 0, 0);
       result |= check_global_load_access(sm, false, ACCESS_COHERENT, ACCESS_COHERENT);

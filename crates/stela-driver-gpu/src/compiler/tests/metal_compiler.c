@@ -1031,7 +1031,8 @@ static const char *mesh =
    " !\"air.arg_name\", !\"tid\"}\n";
 
 static const struct stela_metal_target target = {
-   .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+   .nir = STELA_METAL_NIR_ALL(&nir_options),
+   .max_instructions = 10000, .max_threadgroup_bytes = 32768,
    .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
    .max_payload_bytes = 16384, .max_mesh_vertices = 256, .max_mesh_primitives = 256,
 };
@@ -1270,6 +1271,56 @@ modules_list_their_functions(void)
    assert(count == 1);
 }
 
+/* A module of `kernels` kernels, each storing its index, as Metal's
+ * compiler builds a library compiled from source: one module listing them
+ * all. */
+static char *
+many_kernels(unsigned kernels)
+{
+   char *fixture = ralloc_strdup(NULL, "");
+   for (unsigned i = 0; i < kernels; i++)
+      ralloc_asprintf_append(&fixture,
+                             "define void @k%u(ptr addrspace(1) %%data) {\n"
+                             "store i32 %u, ptr addrspace(1) %%data, align 4\nret void\n}\n",
+                             i, i);
+   ralloc_strcat(&fixture, "!air.kernel = !{");
+   for (unsigned i = 0; i < kernels; i++)
+      ralloc_asprintf_append(&fixture, "%s!%u", i ? ", " : "", 1000 + i);
+   ralloc_strcat(&fixture, "}\n!900 = !{}\n!901 = !{!902}\n"
+                 "!902 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1,"
+                 " !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\","
+                 " i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\","
+                 " !\"air.arg_name\", !\"data\"}\n");
+   for (unsigned i = 0; i < kernels; i++)
+      ralloc_asprintf_append(&fixture, "!%u = !{ptr @k%u, !900, !901}\n", 1000 + i, i);
+   return fixture;
+}
+
+/* A module may list more entry points than a metadata node holds operands
+ * (256, AIR_MAX_METADATA_OPERANDS): a library compiled from source lists every
+ * function of it in one module. Each is listed, reflected and compiled. */
+static void
+modules_list_any_number_of_entries(void)
+{
+   const unsigned kernels = 300;
+   char *fixture = many_kernels(kernels);
+   assert(listed_functions(fixture) == kernels);
+   struct stela_metal_reflection reflection;
+   struct stela_air_error error;
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   static const char *const entries[] = {"k0", "k255", "k256", "k299"};
+   for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+      assert(reflect(fixture, entries[i], &reflection, &error) &&
+             reflection.stage == STELA_METAL_KERNEL);
+      nir_shader *shader = compile(fixture, entries[i], &specialization, &error);
+      if (!shader)
+         fprintf(stderr, "%s: %u %s\n", entries[i], error.kind, error.detail);
+      assert(shader);
+      stela_metal_release(shader);
+   }
+   ralloc_free(fixture);
+}
+
 static bool
 list_export(void *data, const char *name, size_t name_bytes, enum stela_metal_function_stage stage)
 {
@@ -1446,7 +1497,8 @@ framebuffer_reads_access_storage_attachments(void)
 {
    struct stela_air_error error;
    const struct stela_metal_target interlocked = {
-      .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+      .nir = STELA_METAL_NIR_ALL(&nir_options),
+      .max_instructions = 10000, .max_threadgroup_bytes = 32768,
       .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
       .raster_order_groups = 1,
    };
@@ -1551,7 +1603,8 @@ framebuffer_reads_run_their_own_fragment_tests(void)
 {
    struct stela_air_error error;
    const struct stela_metal_target interlocked = {
-      .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+      .nir = STELA_METAL_NIR_ALL(&nir_options),
+      .max_instructions = 10000, .max_threadgroup_bytes = 32768,
       .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
       .raster_order_groups = 1, .fragment_tests = 1,
    };
@@ -1568,7 +1621,8 @@ framebuffer_reads_run_their_own_fragment_tests(void)
    storage.fragment_tests = STELA_METAL_SELF_TESTS;
    /* A device without fragment tests of its own cannot run them. */
    const struct stela_metal_target untested = {
-      .nir = &nir_options, .max_instructions = 10000, .max_threadgroup_bytes = 32768,
+      .nir = STELA_METAL_NIR_ALL(&nir_options),
+      .max_instructions = 10000, .max_threadgroup_bytes = 32768,
       .max_private_bytes = 4096, .max_constant_bytes = 65536, .max_varying_slots = 16,
       .raster_order_groups = 1,
    };
@@ -1671,6 +1725,61 @@ patch_functions_compile_behind_their_tessellation_stages(void)
    stela_metal_tessellation_stages(&target, &tessellation, stages);
    assert(stages[0]->info.stage == MESA_SHADER_VERTEX);
    assert(stages[1]->info.stage == MESA_SHADER_TESS_CTRL);
+   for (unsigned i = 0; i < 2; i++)
+      stela_metal_release(stages[i]);
+}
+
+/* Each shader is built with its own stage's options, as a driver with a set
+ * per stage (BRW) builds it; a target missing a stage's is refused. */
+static void
+shaders_take_their_stages_options(void)
+{
+   static nir_shader_compiler_options staged[STELA_METAL_NIR_STAGES];
+   struct stela_metal_target own = target;
+   for (unsigned stage = 0; stage < STELA_METAL_NIR_STAGES; stage++) {
+      staged[stage] = nir_options;
+      own.nir[stage] = &staged[stage];
+   }
+   struct stela_air_error error;
+   /* As kernels_compile and the vertex and fragment test specialize them. */
+   const struct stela_metal_threadgroup_length lengths[] = {{0, 256}};
+   const struct stela_metal_specialization dispatched = {
+      .workgroup_size = {64, 1, 1}, .threadgroup_length_count = 1, .threadgroup_lengths = lengths,
+   };
+   const struct stela_metal_linked_varying linked[] = {
+      {"user(color)", 11, 0}, {"user(uv)", 8, 0},
+   };
+   const struct stela_metal_specialization rendered = {.varyings = linked, .varying_count = 2};
+   const struct {
+      const char *fixture, *entry;
+      const struct stela_metal_specialization *specialization;
+      mesa_shader_stage stage;
+   } shaders[] = {
+      {kernel, "kernel", &dispatched, MESA_SHADER_COMPUTE},
+      {vertex, "vertex", &rendered, MESA_SHADER_VERTEX},
+      {fragment, "fragment", &rendered, MESA_SHADER_FRAGMENT},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(shaders); i++) {
+      LLVMMemoryBufferRef input = bitcode(shaders[i].fixture);
+      nir_shader *shader =
+         stela_metal_compile(LLVMGetBufferStart(input), LLVMGetBufferSize(input), shaders[i].entry,
+                             &own, shaders[i].specialization, &error);
+      assert(shader && shader->info.stage == shaders[i].stage);
+      assert(shader->options == &staged[shaders[i].stage]);
+      stela_metal_release(shader);
+      own.nir[shaders[i].stage] = NULL;
+      assert(!stela_metal_compile(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                  shaders[i].entry, &own, shaders[i].specialization, &error) &&
+             error.kind == STELA_AIR_INPUT);
+      own.nir[shaders[i].stage] = &staged[shaders[i].stage];
+      LLVMDisposeMemoryBuffer(input);
+   }
+   struct stela_metal_tessellation tessellation = {
+      .partition = STELA_METAL_PARTITION_INTEGER, .max_factor = 16};
+   nir_shader *stages[2];
+   stela_metal_tessellation_stages(&own, &tessellation, stages);
+   assert(stages[0]->options == &staged[MESA_SHADER_VERTEX]);
+   assert(stages[1]->options == &staged[MESA_SHADER_TESS_CTRL]);
    for (unsigned i = 0; i < 2; i++)
       stela_metal_release(stages[i]);
 }
@@ -4015,6 +4124,112 @@ run_summed(nir_shader *shader)
    return store.values[0].u32;
 }
 
+/* A thread array of N words: a fixed loop stores 3i + tid to word i, then
+ * the word the buffer's first value names, masked into the array, replaces
+ * that value. */
+#define THREAD_ARRAY_KERNEL(N, MASK)                                                          \
+   "define void @thread_array(ptr addrspace(1) %data, i32 %tid) {\n"                          \
+   "entry:\n"                                                                                  \
+   "%arr = alloca [" #N " x i32], align 4\n"                                                   \
+   "br label %fill\n"                                                                          \
+   "fill:\n"                                                                                   \
+   "%i = phi i32 [0, %entry], [%next, %fill]\n"                                                \
+   "%wide = zext i32 %i to i64\n"                                                              \
+   "%slot = getelementptr inbounds [" #N " x i32], ptr %arr, i64 0, i64 %wide\n"               \
+   "%triple = mul i32 %i, 3\n"                                                                 \
+   "%value = add i32 %triple, %tid\n"                                                          \
+   "store i32 %value, ptr %slot, align 4\n"                                                    \
+   "%next = add i32 %i, 1\n"                                                                   \
+   "%more = icmp ult i32 %next, " #N "\n"                                                      \
+   "br i1 %more, label %fill, label %read\n"                                                   \
+   "read:\n"                                                                                   \
+   "%k = load i32, ptr addrspace(1) %data, align 4\n"                                          \
+   "%m = and i32 %k, " #MASK "\n"                                                              \
+   "%mw = zext i32 %m to i64\n"                                                                \
+   "%at = getelementptr inbounds [" #N " x i32], ptr %arr, i64 0, i64 %mw\n"                   \
+   "%x = load i32, ptr %at, align 4\n"                                                         \
+   "store i32 %x, ptr addrspace(1) %data, align 4\n"                                           \
+   "ret void\n}\n"                                                                             \
+   "!air.kernel = !{!2}\n"                                                                     \
+   "!2 = !{ptr @thread_array, !3, !4}\n!3 = !{}\n!4 = !{!40, !41}\n"                           \
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\"," \
+   " !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4,"                      \
+   " !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"data\"}\n"                       \
+   "!41 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\","        \
+   " !\"air.arg_name\", !\"tid\"}\n"
+
+/* The value thread_array stores, run as one invocation whose buffer at OUT
+ * starts with first. */
+static uint32_t
+run_thread_array(nir_shader *shader, uint32_t first)
+{
+   static uint8_t memory[0x900];
+   static uint8_t scratch[512];
+   uint8_t push[STELA_METAL_PUSH_BYTES] = {0};
+   memset(memory, 0, sizeof(memory));
+   memset(scratch, 0, sizeof(scratch));
+   put64(push + STELA_METAL_PUSH_TABLES, BASE + TABLE);
+   put64(memory + TABLE + STELA_METAL_TABLE_BUFFER_ADDRESSES, BASE + OUT);
+   put32(memory + OUT, first);
+   const struct air_effect_environment environment = {
+      .base = BASE, .bytes = memory, .size = sizeof(memory), .push = push,
+      .push_size = sizeof(push), .scratch = scratch, .scratch_size = sizeof(scratch),
+   };
+   struct air_effect_store store;
+   struct air_effect_run run = air_effect_execute_in(shader, 100000, &store, 1, &environment);
+   if (run.status != AIR_EFFECT_COMPLETE)
+      fprintf(stderr, "thread array: %s\n", run.detail);
+   assert(run.status == AIR_EFFECT_COMPLETE && run.stores == 1 && store.address == BASE + OUT);
+   return store.values[0].u32;
+}
+
+/* Loops in a control-flow list, nested ones included. */
+static unsigned
+count_loops(struct exec_list *list)
+{
+   unsigned loops = 0;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop) {
+         loops += 1 + count_loops(&nir_cf_node_as_loop(node)->body);
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *branch = nir_cf_node_as_if(node);
+         loops += count_loops(&branch->then_list) + count_loops(&branch->else_list);
+      }
+   }
+   return loops;
+}
+
+/* A thread array of up to 16 words lives in registers: the loop that fills
+ * it by its induction variable unrolls, so its stores take constant words,
+ * and the dynamic index that reads it becomes a select over its words; a
+ * larger array stays in scratch. Both read the same values. */
+static void
+small_thread_arrays_live_in_registers(void)
+{
+   const struct stela_metal_specialization specialization = {.workgroup_size = {64, 1, 1}};
+   struct stela_air_error error;
+   nir_shader *shader = compile(THREAD_ARRAY_KERNEL(16, 15), "thread_array", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "thread array: %u %s\n", error.kind, error.detail);
+   assert(shader && !shader->scratch_size);
+   assert(!count_intrinsic(shader, nir_intrinsic_load_scratch) &&
+          !count_intrinsic(shader, nir_intrinsic_store_scratch));
+   assert(!count_intrinsic(shader, nir_intrinsic_load_deref) &&
+          !count_intrinsic(shader, nir_intrinsic_store_deref));
+   assert(!count_loops(&nir_shader_get_entrypoint(shader)->body));
+   for (uint32_t k = 0; k < 16; k++)
+      assert(run_thread_array(shader, k) == 3 * k);
+   stela_metal_release(shader);
+
+   shader = compile(THREAD_ARRAY_KERNEL(17, 15), "thread_array", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "thread array: %u %s\n", error.kind, error.detail);
+   assert(shader && shader->scratch_size > 16 * 4);
+   assert(count_intrinsic(shader, nir_intrinsic_load_scratch));
+   assert(run_thread_array(shader, 13) == 39);
+   stela_metal_release(shader);
+}
+
 /* MPS's shapes: setup() returns a struct its callers take coerced to its
  * fields, constant() returns its function constant k in a struct through
  * sret, and added() and extracted() take such structs through pointers to
@@ -4855,6 +5070,91 @@ harness(void)
    exit(0);
 }
 
+/* A blit of one byte a pixel from a buffer, as Core Animation's buffer image
+ * blit reads it: at floor(uv.x) + floor(uv.y) * 64, an index a helper left
+ * of or above the rectangle takes below zero. USE is what the color takes of
+ * the byte %f. */
+#define BYTE_BLIT(USE)                                                                              \
+   "declare float @air.floor.f32(float)\n"                                                         \
+   "declare float @air.dfdx.f32(float)\n"                                                          \
+   "define <4 x float> @blit(<2 x float> %uv, ptr addrspace(1) %image) {\n"                        \
+   "%x = extractelement <2 x float> %uv, i64 0\n"                                                  \
+   "%y = extractelement <2 x float> %uv, i64 1\n"                                                  \
+   "%fx = call float @air.floor.f32(float %x)\n"                                                   \
+   "%fy = call float @air.floor.f32(float %y)\n"                                                   \
+   "%row = fmul float %fy, 64.0\n"                                                                 \
+   "%at = fadd float %fx, %row\n"                                                                  \
+   "%i = fptosi float %at to i32\n"                                                                \
+   "%o = sext i32 %i to i64\n"                                                                     \
+   "%p = getelementptr inbounds i8, ptr addrspace(1) %image, i64 %o\n"                             \
+   "%v = load i8, ptr addrspace(1) %p, align 1\n"                                                  \
+   "%f = uitofp i8 %v to float\n" USE                                                              \
+   "%c = insertelement <4 x float> zeroinitializer, float %g, i64 0\n"                             \
+   "ret <4 x float> %c\n}\n"                                                                       \
+   "!air.fragment = !{!2}\n"                                                                       \
+   "!2 = !{ptr @blit, !3, !4}\n!3 = !{!30}\n"                                                      \
+   "!30 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\","           \
+   " !\"air.arg_name\", !\"color\"}\n"                                                             \
+   "!4 = !{!40, !41}\n"                                                                            \
+   "!40 = !{i32 0, !\"air.fragment_input\", !\"user(uv)\", !\"air.center\", !\"air.perspective\"," \
+   " !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"uv\"}\n"                           \
+   "!41 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 9, i32 1, !\"air.read\","        \
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\","  \
+   " i32 1, !\"air.arg_type_name\", !\"uchar\", !\"air.arg_name\", !\"image\"}\n"
+
+/* The buffer reads of shader whose address a helper invocation replaces
+ * with another, and all its buffer reads. */
+static void
+helper_buffer_reads(nir_shader *shader, unsigned *moved, unsigned *reads)
+{
+   *moved = *reads = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *read = nir_instr_as_intrinsic(instr);
+         if (read->intrinsic != nir_intrinsic_load_global)
+            continue;
+         assert(!(nir_intrinsic_access(read) & ACCESS_SKIP_HELPERS));
+         (*reads)++;
+         nir_instr *address = nir_def_instr(read->src[0].ssa);
+         if (address->type != nir_instr_type_alu || nir_instr_as_alu(address)->op != nir_op_bcsel)
+            continue;
+         nir_instr *helper = nir_def_instr(nir_instr_as_alu(address)->src[0].src.ssa);
+         *moved += helper->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(helper)->intrinsic == nir_intrinsic_load_helper_invocation;
+      }
+   }
+}
+
+/* A fragment function's buffer read at an index from its inputs is made in
+ * helper invocations too, where the index can lie before the buffer, on a
+ * page nothing maps. A helper reads the stage's argument table instead,
+ * unless a derivative takes the value it reads. */
+static void
+helper_invocations_read_only_mapped_memory(void)
+{
+   const struct stela_metal_linked_varying linked[] = {{"user(uv)", 8, 0}};
+   const struct stela_metal_specialization specialization = {.varyings = linked, .varying_count = 1};
+   struct stela_air_error error;
+   unsigned moved, reads;
+   nir_shader *shader = compile(BYTE_BLIT("%g = fadd float %f, 1.0\n"), "blit", &specialization, &error);
+   if (!shader)
+      fprintf(stderr, "blit: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   helper_buffer_reads(shader, &moved, &reads);
+   assert(moved == 1 && reads >= 1);
+   assert(count_intrinsic(shader, nir_intrinsic_load_helper_invocation) == 1);
+   stela_metal_release(shader);
+
+   shader = compile(BYTE_BLIT("%g = call float @air.dfdx.f32(float %f)\n"), "blit", &specialization,
+                    &error);
+   assert(shader);
+   helper_buffer_reads(shader, &moved, &reads);
+   assert(moved == 0 && reads >= 1);
+   stela_metal_release(shader);
+}
+
 /* Each buffer a function loads from or stores to, on any path. */
 static void
 buffer_reads_name_each_accessed_slot(void)
@@ -4874,6 +5174,7 @@ main(void)
    glsl_type_singleton_init_or_ref();
    harness();
    modules_list_their_functions();
+   modules_list_any_number_of_entries();
    modules_list_their_exports();
    discovery_reports_malformed_metadata();
    reflection_requires_a_unique_listed_entry();
@@ -4886,6 +5187,7 @@ main(void)
    null_pointer_phis_stay_among_phis();
    render_stages_compile_at_their_linked_locations();
    patch_functions_compile_behind_their_tessellation_stages();
+   shaders_take_their_stages_options();
    kernels_compile_with_their_stage_in();
    vertex_inputs_decode_their_words();
    mesh_stages_compile_with_their_launch();
@@ -4897,6 +5199,7 @@ main(void)
    function_constants_select_outputs();
    older_kernels_compile();
    unoptimized_kernels_compile();
+   small_thread_arrays_live_in_registers();
    undefined_lanes_read_as_anything();
    function_constants_select_arguments();
    specialized_fragment_calls_preserve_graph_admission();
@@ -4930,6 +5233,7 @@ main(void)
    linked_modules_specialize_their_function_constants();
    command_encoding_reflects_barriers();
    buffer_reads_name_each_accessed_slot();
+   helper_invocations_read_only_mapped_memory();
    framebuffer_reads_access_storage_attachments();
    framebuffer_reads_run_their_own_fragment_tests();
    extended_range_outputs_clamp();

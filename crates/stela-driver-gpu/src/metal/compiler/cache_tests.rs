@@ -20,6 +20,34 @@ fn calls() -> (u32, u32, u32) {
 }
 
 std::thread_local! {
+    /// Serialized NIR the hosted image deserialized.
+    static DESERIALIZED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The hosted image's NIR deserializer: bytes that start with `N` are NIR,
+/// each at an address of its own; others are not.
+pub(super) fn deserialize(blob: &[u8]) -> Option<*mut c_void> {
+    (blob.first() == Some(&b'N')).then(|| {
+        DESERIALIZED.set(DESERIALIZED.get() + 1);
+        ptr::without_provenance_mut(0x10_0000 * DESERIALIZED.get() as usize)
+    })
+}
+
+/// The NIR cache's key of `entry` compiled with `specialization`.
+fn key_of(
+    compiler: &mut AirCompiler,
+    library: u64,
+    entry: &str,
+    specialization: &Specialization,
+) -> [u8; 32] {
+    compiler
+        .plan(library, entry, specialization, None, None, None)
+        .unwrap()
+        .key
+        .unwrap()
+}
+
+std::thread_local! {
     /// For the test that runs jobs on another thread: the compile lock and
     /// whether a thread is inside the service, which LLVM, built without
     /// threads, needs to be one at a time and only under the lock.
@@ -187,7 +215,7 @@ fn caching() -> (AirCompiler, u64) {
         decode_astc_kernel: kernel,
         release,
         buffer_reads,
-        nir_options: NonNull::dangling(),
+        nir_options: [NonNull::dangling(); super::NIR_STAGES],
     };
     // SAFETY: the fake service never reads the options.
     let mut compiler = unsafe { AirCompiler::new(service, &nvk(&CHIPS[0], 8 << 30)) };
@@ -244,6 +272,40 @@ fn a_compilation_made_again_is_lent_from_the_cache() {
     assert_eq!((calls().1, calls().2), (2, 0));
 }
 
+/// A key the service compiles a second time, its NIR evicted with no
+/// serialized copy to deserialize, counts as recompiled, in a turn or in a
+/// job; another shape does not.
+#[test]
+fn a_key_compiled_again_after_its_eviction_counts_as_recompiled() {
+    let (mut compiler, library) = caching();
+    let shapes = [32, 64].map(|width| Specialization {
+        workgroup_size: Some([width, 1, 1]),
+        ..Specialization::default()
+    });
+    let first = compiler.compile(library, "kernel", &shapes[0]).unwrap();
+    compiler.release(first.code);
+    compiler.end_call();
+    assert!(compiler.report().ends_with("recompiled=0"));
+    let other = compiler.compile(library, "kernel", &shapes[1]).unwrap();
+    compiler.release(other.code);
+    compiler.end_call();
+    assert!(compiler.report().ends_with("recompiled=0"));
+    // The cache loses both, as their evictions leave it.
+    compiler.nir = Some(NirCache::new(NIR_BUDGET));
+    let lock = compiler.compile_lock(core::hint::spin_loop);
+    compiler.set_deferring(true);
+    assert_eq!(
+        compiler.compile(library, "kernel", &shapes[0]),
+        Err(DEFERRED)
+    );
+    let job = compiler.take_deferred().unwrap();
+    compiler.end_call();
+    compiler.adopt(job.run_outside(&lock.hold(core::hint::spin_loop)));
+    let report = compiler.report();
+    assert!(report.contains("compiled=3 "), "{report}");
+    assert!(report.ends_with("recompiled=1"), "{report}");
+}
+
 #[test]
 fn a_deferred_compilation_runs_outside_and_the_call_finds_it() {
     let (mut compiler, library) = caching();
@@ -270,6 +332,52 @@ fn a_deferred_compilation_runs_outside_and_the_call_finds_it() {
     compiler.end_call();
     assert_eq!((calls().1, calls().2), (1, 0));
     assert!(compiler.report().contains("nir_hits=1"));
+}
+
+/// A call that goes on past a deferral, as a commit does, leaves a job for
+/// each compilation it misses, up to the bound, and compiles none in its
+/// turn; its next run finds them and leaves a job for the rest.
+#[test]
+fn a_call_that_goes_on_past_a_deferral_leaves_a_job_for_each_compilation() {
+    let (mut compiler, library) = caching();
+    let lock = compiler.compile_lock(core::hint::spin_loop);
+    let shapes: Vec<_> = (1..=LEFT_PER_CALL as u32 + 1)
+        .map(|width| Specialization {
+            workgroup_size: Some([width, 1, 1]),
+            ..Specialization::default()
+        })
+        .collect();
+    compiler.set_deferring(true);
+    for shape in &shapes {
+        assert_eq!(compiler.compile(library, "kernel", shape), Err(DEFERRED));
+    }
+    // Its key again leaves nothing more.
+    assert_eq!(
+        compiler.compile(library, "kernel", &shapes[0]),
+        Err(DEFERRED)
+    );
+    let jobs: Vec<_> = core::iter::from_fn(|| compiler.take_job()).collect();
+    assert_eq!(jobs.len(), LEFT_PER_CALL);
+    compiler.end_call();
+    assert_eq!(calls().1, 0, "nothing compiled in the turn");
+    for job in jobs {
+        let done = job.run(&lock.hold(core::hint::spin_loop));
+        compiler.adopt_job(done);
+    }
+    assert_eq!(calls().1, LEFT_PER_CALL as u32);
+
+    compiler.set_deferring(true);
+    for shape in &shapes[..LEFT_PER_CALL] {
+        let shader = compiler.compile(library, "kernel", shape).unwrap();
+        compiler.release(shader.code);
+    }
+    assert_eq!(
+        compiler.compile(library, "kernel", &shapes[LEFT_PER_CALL]),
+        Err(DEFERRED)
+    );
+    assert!(compiler.take_job().is_some() && compiler.take_job().is_none());
+    compiler.end_call();
+    assert_eq!(calls().1, LEFT_PER_CALL as u32);
 }
 
 #[test]
@@ -457,5 +565,99 @@ fn an_evicted_compilation_is_found_again_in_what_this_boot_serialized() {
     let recalled = compiler.serialized(&[2; 32]).unwrap();
     assert_eq!((&*recalled.0, recalled.1), (&[2u8, 2][..], true));
     assert!(compiler.serialized(&[3; 32]).is_none());
-    assert!(compiler.report().ends_with("recalled=0"));
+    assert!(compiler.report().ends_with("recalled=0 recompiled=0"));
+}
+
+#[test]
+fn a_deferring_call_leaves_stored_nir_to_its_job_which_deserializes_it() {
+    static STORED: [u8; 2] = *b"N1";
+    let (mut compiler, library) = caching();
+    let lock = compiler.compile_lock(core::hint::spin_loop);
+    let specialization = Specialization::default();
+    let key = key_of(&mut compiler, library, "kernel", &specialization);
+    compiler.stored.insert(key, &STORED);
+    compiler.set_deferring(true);
+    // The turn neither deserializes nor compiles.
+    assert_eq!(
+        compiler.compile(library, "kernel", &specialization),
+        Err(DEFERRED)
+    );
+    assert_eq!((DESERIALIZED.get(), calls().1), (0, 0));
+    let job = compiler.take_deferred().unwrap();
+    let finished = job.run_outside(&lock.hold(core::hint::spin_loop));
+    // The job deserialized in place of compiling.
+    assert_eq!((DESERIALIZED.get(), calls().1), (1, 0));
+    compiler.adopt(finished);
+    let shader = compiler
+        .compile(library, "kernel", &specialization)
+        .unwrap();
+    assert_eq!(shader.code.0, 0x10_0000);
+    compiler.release(shader.code);
+    compiler.end_call();
+    assert_eq!(DESERIALIZED.get(), 1);
+    assert!(
+        compiler
+            .report()
+            .contains("compiled=0 restored=1/1 deferred=1")
+    );
+}
+
+std::thread_local! {
+    /// The one key whose NIR this boot's store recalls as NIR.
+    static RECALLED: Cell<[u8; 32]> = const { Cell::new([0; 32]) };
+}
+
+#[test]
+fn a_job_deserializes_this_boots_nir_and_compiles_what_does_not_deserialize() {
+    fn recall(key: &[u8; 32]) -> Option<Vec<u8>> {
+        Some(match *key == RECALLED.get() {
+            true => b"N2".to_vec(),
+            false => b"X".to_vec(),
+        })
+    }
+    let (mut compiler, library) = caching();
+    let lock = compiler.compile_lock(core::hint::spin_loop);
+    compiler.recall = Some(recall);
+    let shapes = [32, 64].map(|width| Specialization {
+        workgroup_size: Some([width, 1, 1]),
+        ..Specialization::default()
+    });
+    RECALLED.set(key_of(&mut compiler, library, "kernel", &shapes[0]));
+    for specialization in &shapes {
+        compiler.set_deferring(true);
+        assert_eq!(
+            compiler.compile(library, "kernel", specialization),
+            Err(DEFERRED)
+        );
+        let job = compiler.take_deferred().unwrap();
+        compiler.end_call();
+        compiler.adopt(job.run_outside(&lock.hold(core::hint::spin_loop)));
+    }
+    // The first deserialized, the second's bytes are no NIR: it compiled.
+    assert_eq!((DESERIALIZED.get(), calls().1), (1, 1));
+    let report = compiler.report();
+    assert!(
+        report.contains("compiled=1 restored=0/0 deferred=2"),
+        "{report}"
+    );
+    assert!(report.ends_with("recalled=1 recompiled=0"), "{report}");
+}
+
+#[test]
+fn a_call_that_does_not_defer_deserializes_stored_nir_in_its_turn() {
+    static STORED: [u8; 2] = *b"N1";
+    let (mut compiler, library) = caching();
+    let specialization = Specialization::default();
+    let key = key_of(&mut compiler, library, "kernel", &specialization);
+    compiler.stored.insert(key, &STORED);
+    let shader = compiler
+        .compile(library, "kernel", &specialization)
+        .unwrap();
+    assert_eq!((DESERIALIZED.get(), calls().1), (1, 0));
+    compiler.release(shader.code);
+    assert!(
+        compiler
+            .report()
+            .contains("compiled=0 restored=1/1 deferred=0")
+    );
 }

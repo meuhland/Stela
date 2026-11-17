@@ -47,7 +47,7 @@ fn word(random: &mut Random) -> u32 {
             | n << 5
             | d
     };
-    match random.below(134) {
+    match random.below(138) {
         0 => three(0x4ea0_8400),        // add vd.4s,vn.4s,vm.4s
         1 => three(0x6ea0_8400),        // sub vd.4s
         2 => three(0x0e20_8400),        // add vd.8b (D write)
@@ -188,7 +188,11 @@ fn word(random: &mut Random) -> u32 {
             let m = if m == d { (d + 1) % 12 } else { m };
             0x2d40_0000 | random.below(60) << 15 | m << 10 | 1 << 5 | d
         }
-        _ => three(0x4e20_d400), // fadd vd.4s (uncached)
+        133 => three(0x5e00_4000),       // sha256h qd,qn,vm.4s
+        134 => three(0x5e00_5000),       // sha256h2 qd,qn,vm.4s
+        135 => 0x5e28_2800 | n << 5 | d, // sha256su0 vd.4s,vn.4s
+        136 => three(0x5e00_6000),       // sha256su1 vd.4s,vn.4s,vm.4s
+        _ => three(0x4e20_d400),         // fadd vd.4s (uncached)
     }
 }
 
@@ -265,6 +269,77 @@ fn tiers() -> Vec<TargetCpu> {
 fn blocks_with_cached_vectors_run_as_the_frame_layout() {
     for target in tiers() {
         run_random_blocks(target, 600);
+    }
+}
+
+/// The V slot loads and stores in `code`: MOVDQU between an XMM register
+/// and `[rdi+disp32]` inside `GuestState::v`.
+fn vector_slot_accesses(code: &[u8]) -> usize {
+    let v = core::mem::offset_of!(GuestState, v) as u32;
+    (0..code.len().saturating_sub(8))
+        .filter(|&at| {
+            let rex = usize::from(code[at + 1] & 0xf0 == 0x40);
+            at + 8 + rex <= code.len()
+                && code[at] == 0xf3
+                && code[at + 1 + rex] == 0x0f
+                && matches!(code[at + 2 + rex], 0x6f | 0x7f)
+                && code[at + 3 + rex] & 0xc7 == 0x87
+                && (v..v + 32 * 16).contains(&u32::from_le_bytes(
+                    code[at + 4 + rex..at + 8 + rex].try_into().unwrap(),
+                ))
+        })
+        .count()
+}
+
+/// A SHA-256 block update as compilers schedule it, the message schedule
+/// interleaved with the hash pairs and their ABCD copies, so that no fused
+/// group matches: with Intel SHA its V operands stay in their homes
+/// between the rounds, and it runs as the frame layout does.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn interleaved_sha256_rounds_keep_their_vectors_in_homes() {
+    let mut words = Vec::new();
+    for round in 0..4_u32 {
+        let (w0, w1, w2, w3) = (round % 4, (round + 1) % 4, (round + 2) % 4, (round + 3) % 4);
+        let k = 4 + round % 4;
+        words.extend([
+            0x4eb2_1e54,                           // mov v20.16b,v18.16b
+            0x5e28_2800 | w1 << 5 | w0,            // sha256su0 vw0.4s,vw1.4s
+            0x5e00_4000 | k << 16 | 19 << 5 | 18,  // sha256h q18,q19,vk.4s
+            0x5e00_6000 | w3 << 16 | w2 << 5 | w0, // sha256su1 vw0.4s,vw2.4s,vw3.4s
+            0x3dc0_0035 | round << 10,             // ldr q21,[x1,#16*round]
+            0x5e00_5000 | k << 16 | 20 << 5 | 19,  // sha256h2 q19,q20,vk.4s
+            0x4eb5_8400 | w0 << 5 | k,             // add vk.4s,vw0.4s,v21.4s
+        ]);
+    }
+    words.extend([0x4eb0_8652, 0x4eb1_8673]); // add v18.4s,v18,v16; add v19.4s,v19,v17
+    let instructions = lift(&words);
+    let end = GuestAddress(0x1000 + 4 * words.len() as u64);
+    let frame = emit(&instructions, None, end);
+    let mut random = Random(0x5a5a_0f0f_3c3c_9696);
+    for target in tiers() {
+        let (entered, block) = system(&instructions, end, target);
+        if target.supports(TargetCpu::Sha) {
+            let cached = vector_slot_accesses(&block.x86_64_code);
+            let uncached = vector_slot_accesses(&frame.x86_64_code);
+            // Twelve vectors share the eight homes, so some spill.
+            assert!(
+                cached * 5 < uncached * 3,
+                "{target:?}: {cached} V slot accesses against {uncached}"
+            );
+        }
+        let mut memory = [0; WORDS];
+        let mut state = initial(&mut random, &mut memory);
+        let mut expected_memory = memory;
+        let mut expected = state.clone();
+        expected.x[1] = expected_memory.as_mut_ptr() as u64;
+        let expected_exit = native::run(&frame.x86_64_code, &mut expected);
+        let exit = native::run(&entered, &mut state);
+        state.x[1] = 0;
+        expected.x[1] = 0;
+        assert_eq!(exit, expected_exit, "{target:?}");
+        assert_eq!(state, expected, "{target:?}");
+        assert_eq!(memory, expected_memory, "{target:?}");
     }
 }
 
@@ -466,7 +541,7 @@ fn an_exit_after_an_unstored_write_is_refused() {
 /// Running emitted code until it faults, as the engine's exception entry
 /// does: the GPRs and XMM8-15 at the faulting instruction.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod faulting {
+pub(super) mod faulting {
     use crate::GuestState;
     use core::{arch::global_asm, cell::Cell, ffi::c_void};
 
@@ -480,6 +555,9 @@ mod faulting {
         "push r14",
         "push r15",
         "mov [rdx], rsp",
+        // Every exit reloads RSP from here (`chain::EXIT_RETURN`).
+        "lea r11, [rsp - 8]",
+        "mov [rdi + {exit_rsp}], r11",
         "call rsi",
         "pop r15",
         "pop r14",
@@ -499,6 +577,7 @@ mod faulting {
         "pop rbp",
         "mov rax, -1",
         "ret",
+        exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
     );
     unsafe extern "sysv64" {
         fn stela_vreg_test_enter(state: *mut GuestState, code: usize, stack: *mut u64) -> u64;
@@ -508,10 +587,10 @@ mod faulting {
     /// Where a run faulted: its offset in the code, the GPRs in x86
     /// encoding order and XMM8-15.
     #[derive(Debug, Clone, Copy)]
-    pub(super) struct Fault {
-        pub(super) offset: usize,
-        pub(super) gprs: [u64; 16],
-        pub(super) vectors: [[u64; 2]; 8],
+    pub(in crate::x86_64::block) struct Fault {
+        pub(in crate::x86_64::block) offset: usize,
+        pub(in crate::x86_64::block) gprs: [u64; 16],
+        pub(in crate::x86_64::block) vectors: [[u64; 2]; 8],
     }
 
     struct Active {
@@ -615,7 +694,7 @@ mod faulting {
     }
 
     /// A page no access may touch, which stays mapped for the test.
-    pub(super) fn guard_page() -> u64 {
+    pub(in crate::x86_64::block) fn guard_page() -> u64 {
         // SAFETY: an anonymous PROT_NONE mapping, never unmapped.
         let page = unsafe {
             mmap(
@@ -632,7 +711,7 @@ mod faulting {
     }
 
     /// Run `code` with RDI = `state`: its exit's RAX, or the fault.
-    pub(super) fn run(
+    pub(in crate::x86_64::block) fn run(
         code: &[u8],
         state: &mut GuestState,
     ) -> Result<u64, alloc::boxed::Box<Fault>> {

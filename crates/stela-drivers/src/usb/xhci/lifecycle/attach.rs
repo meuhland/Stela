@@ -100,6 +100,9 @@ impl Host {
         if !self.sleep.awake() {
             return false;
         }
+        if self.settling.iter().any(storage::settle::Settling::due) || self.attaching() {
+            return true;
+        }
         self.hubs.iter().filter(|hub| !hub.retired).any(|hub| {
             !hub.attachments.is_empty() && {
                 let now = Clock::ticks();

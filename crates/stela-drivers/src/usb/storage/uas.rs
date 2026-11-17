@@ -1,8 +1,10 @@
 //! Native USB Attached SCSI command/data/status transport.
 //!
-//! USB2 uses READ/WRITE_READY handshakes; SuperSpeed uses the canonical
-//! xHCI primary stream service and opaque transfer tickets. The same serialized
-//! CDB owner keeps every contributor until completion or acknowledged drain.
+//! USB2 uses READ/WRITE_READY handshakes, one command at a time; SuperSpeed
+//! uses the xHCI primary stream service and opaque transfer tickets, with up
+//! to [`QUEUE_LIMIT`] commands in flight, each under its own tag and stream
+//! as Linux `uas` queues them. Every command keeps its contributors until
+//! completion or acknowledged drain.
 // SPDX-License-Identifier: GPL-2.0-only
 // Linux uas.c reference: Hans de Goede/Red Hat 2013-2016;
 // Matthew Wilcox/Intel Corp 2010; Sarah Sharp/Intel Corp 2010.
@@ -19,8 +21,27 @@ mod quirks;
 pub use abort::{AbortCommandResult, AbortTaskOutcome};
 pub use binding::Binding;
 
-/// Shared with alternate selection; readiness still requires allocation.
-pub const REQUESTED_STREAMS: u16 = 2;
+/// The most commands a SuperSpeed UAS device runs at once. Linux queues
+/// `min(streams, MAX_CMNDS) - 2`, about 30 on most bridges; each command
+/// here holds a 64 KiB data buffer of its own (a stream TD is one
+/// contiguous TRB), so 16 keep a device's buffers at the 1 MiB the NVMe
+/// and AHCI drivers give a disk in the 16 MiB boot DMA region.
+pub const QUEUE_LIMIT: usize = 16;
+
+/// The streams requested of the host: one per queued command, plus the two
+/// tags Linux leaves unused (`uas_probe`: one for untagged commands, one
+/// for bridge firmware off by one).
+pub const REQUESTED_STREAMS: u16 = QUEUE_LIMIT as u16 + 2;
+
+/// The commands a transport with `streams` allocated stream IDs runs at
+/// once: Linux's `can_queue = qdepth - 2`, within [`QUEUE_LIMIT`]; one
+/// without streams, or with too few to leave the two spare, runs one.
+fn queue_depth(streams: Option<u16>) -> usize {
+    match streams {
+        Some(streams) if streams > 2 => (usize::from(streams) - 2).min(QUEUE_LIMIT),
+        _ => 1,
+    }
+}
 
 const COMMAND_IU: u8 = 1;
 const STATUS_IU: u8 = 3;
@@ -30,7 +51,8 @@ const WRITE_READY_IU: u8 = 7;
 const TIMEOUT_US: u64 = 30_000_000;
 const IU_BUFFER_BYTES: usize = 512;
 const MAX_CDB: usize = 260;
-const PROTOCOL_ERROR: BlockError = BlockError::Protocol("malformed UAS information unit");
+pub(super) const PROTOCOL_ERROR: BlockError =
+    BlockError::Protocol("malformed UAS information unit");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pipe {
@@ -192,6 +214,25 @@ impl Host {
         &mut self,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Self, (alloc::string::String, BlockError)> {
+        let controller = self.engine.io.controller.clone();
+        let port = controller.borrow().root_port_of(self.device.id);
+        self.reset_and_rebind_once(dma)
+            .map_err(|(operation, error)| {
+                // The port as the failed step left it.
+                match port.map(|port| controller.borrow_mut().root_port_status(port)) {
+                    Some(status) => (alloc::format!("{operation} ({status})"), error),
+                    None => (operation, error),
+                }
+            })
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    fn reset_and_rebind_once(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<Self, (alloc::string::String, BlockError)> {
         self.engine.poisoned = true;
         let fail = |why| {
             (
@@ -217,11 +258,9 @@ impl Host {
         // SAFETY: this sole interface owns exactly all configured class DCIs,
         // and its shared owner was permanently poisoned before retirement.
         let mut fresh = unsafe {
-            controller.borrow_mut().reset_and_reuse_root(
-                &self.device,
-                &self.binding.endpoints(),
-                dma,
-            )?
+            controller
+                .borrow_mut()
+                .reset_and_reuse(&self.device, &self.binding.endpoints(), dma)?
         };
         let id = fresh.id;
         let result = (|| {
@@ -273,25 +312,14 @@ impl Host {
                 )
             })?;
             // Whole-device retirement and every fallible reconstruction
-            // step precede transferring any of the three unique allocations.
+            // step precede transferring any of the unique allocations.
             // Old aliases keep their permanently poisoned, empty engine.
-            let mut command = self.engine.command.transfer();
-            let mut status = self.engine.status.transfer();
-            let mut data = self.engine.data.transfer();
-            command.bytes_mut().fill(0);
-            status.bytes_mut().fill(0);
-            data.bytes_mut().fill(0);
+            let lanes = self.engine.lanes.iter_mut().map(Lane::transfer).collect();
             Ok(Self {
                 engine: Engine {
                     io,
-                    command,
-                    status,
-                    data,
-                    pending: core::array::from_fn(|_| None),
-                    touched: [false; 4],
-                    tag: 0,
+                    lanes,
                     poisoned: false,
-                    active: None,
                     failed_data: None,
                 },
                 flags: binding.flags,
@@ -309,6 +337,10 @@ impl Host {
     }
     pub(super) fn device(&self) -> &Device {
         &self.device
+    }
+    /// Whether the device is on `controller`.
+    pub(super) fn on(&self, controller: &super::Shared) -> bool {
+        alloc::rc::Rc::ptr_eq(&self.engine.io.controller, controller)
     }
     pub(super) fn interface(&self) -> u8 {
         self.binding.interface()
@@ -347,29 +379,41 @@ impl Host {
     }
 
     /// Begin a CDB as [`Self::command`] runs it, without waiting for any
-    /// of its transfers; [`Self::end`] gives its result.
+    /// of its transfers; [`Self::end`] gives its result by the returned
+    /// handle.
     pub(super) fn begin(
         &mut self,
         lun: [u8; 8],
         cdb: &[u8],
         data: Data<'_>,
-    ) -> Result<(), BlockError> {
+    ) -> Result<usize, BlockError> {
         if let Some(error) = &self.minimum_error {
             return Err(error.clone());
         }
         admit(self.flags, cdb, &data)?;
         self.engine.begin(lun, cdb, data)
     }
-    /// The begun command's result once it ended; never waits.
-    pub(super) fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
+    /// Begun command `handle`'s result once it ended; never waits.
+    pub(super) fn end(&mut self, handle: usize) -> Option<Result<Vec<u8>, BlockError>> {
         if let Some(error) = &self.minimum_error {
-            return self.engine.active.as_ref().map(|_| Err(error.clone()));
+            let lane = self.engine.lanes.get(handle)?;
+            return lane.active.as_ref().map(|_| Err(error.clone()));
         }
-        self.engine.poll(None, &mut None)
+        self.engine.poll(handle, None, &mut None)
+    }
+    /// The commands this transport runs at once.
+    pub(super) fn depth(&self) -> usize {
+        self.engine.usable()
+    }
+    /// Whether [`Self::begin`] takes a command now: a free tag, and no
+    /// failed command waiting for the others to leave its pipes; or an
+    /// interface that refuses every command at once.
+    pub(super) fn room(&self) -> bool {
+        self.minimum_error.is_some() || self.engine.room()
     }
     /// Whether a begun command has not ended.
     pub(super) fn busy(&self) -> bool {
-        self.engine.active.is_some()
+        self.engine.busy()
     }
 
     pub(super) fn delay(&mut self, micros: u64) -> Result<(), BlockError> {
@@ -616,16 +660,63 @@ impl core::ops::DerefMut for TransportBuffer {
     }
 }
 
-struct Engine<I: Io> {
-    io: I,
+/// One command's tag and buffers: its Command and Status IUs and its data.
+/// A lane takes a new command only once each of its transfers completed or
+/// was cancelled with acknowledgment.
+struct Lane<T> {
     command: TransportBuffer,
     status: TransportBuffer,
     data: TransportBuffer,
-    pending: [Option<I::Ticket>; 4],
+    pending: [Option<T>; 4],
     touched: [bool; 4],
     tag: u16,
     /// The begun command, until [`Engine::poll`] returns its result.
     active: Option<Active>,
+}
+impl<T> Lane<T> {
+    fn new(dma: &mut dyn DmaAllocator) -> Result<Self, BlockError> {
+        Ok(Self {
+            command: TransportBuffer::new(dma.allocate(IU_BUFFER_BYTES, IU_BUFFER_BYTES)?),
+            status: TransportBuffer::new(dma.allocate(IU_BUFFER_BYTES, IU_BUFFER_BYTES)?),
+            data: TransportBuffer::new(dma.allocate(MAX_TD, MAX_TD)?),
+            pending: core::array::from_fn(|_| None),
+            touched: [false; 4],
+            tag: 0,
+            active: None,
+        })
+    }
+    fn present(&self) -> bool {
+        self.command.present() && self.status.present() && self.data.present()
+    }
+    /// Move this lane's buffers, cleared, to a fresh engine.
+    fn transfer<U>(&mut self) -> Lane<U> {
+        let mut lane = Lane {
+            command: self.command.transfer(),
+            status: self.status.transfer(),
+            data: self.data.transfer(),
+            pending: core::array::from_fn(|_| None),
+            touched: [false; 4],
+            tag: 0,
+            active: None,
+        };
+        lane.command.bytes_mut().fill(0);
+        lane.status.bytes_mut().fill(0);
+        lane.data.bytes_mut().fill(0);
+        lane
+    }
+    fn idle(&self) -> bool {
+        self.active.is_none() && self.pending.iter().all(Option::is_none)
+    }
+    /// The command ended with a failing status, and some transfer of it
+    /// still waits for its cancellation.
+    fn draining(&self) -> bool {
+        self.active.as_ref().is_some_and(Active::failed) && self.pending.iter().any(Option::is_some)
+    }
+}
+
+struct Engine<I: Io> {
+    io: I,
+    lanes: Vec<Lane<I::Ticket>>,
     poisoned: bool,
     /// Input data that completed before the Sense IU failed its command,
     /// until the next command: sd keeps it when the sense is RECOVERED
@@ -638,39 +729,75 @@ impl<I: Io> Engine<I> {
             return Err(BlockError::Unsupported("UAS has no usable stream IDs"));
         }
         io.ready()?;
+        let depth = queue_depth(io.streams());
+        let mut lanes = Vec::new();
+        lanes
+            .try_reserve_exact(depth)
+            .map_err(|_| BlockError::NoDmaMemory)?;
+        for _ in 0..depth {
+            lanes.push(Lane::new(dma)?);
+        }
         Ok(Self {
             io,
-            command: TransportBuffer::new(dma.allocate(IU_BUFFER_BYTES, IU_BUFFER_BYTES)?),
-            status: TransportBuffer::new(dma.allocate(IU_BUFFER_BYTES, IU_BUFFER_BYTES)?),
-            data: TransportBuffer::new(dma.allocate(MAX_TD, MAX_TD)?),
-            pending: core::array::from_fn(|_| None),
-            touched: [false; 4],
-            tag: 0,
-            active: None,
+            lanes,
             poisoned: false,
             failed_data: None,
         })
     }
     fn buffers_present(&self) -> bool {
-        self.command.present() && self.status.present() && self.data.present()
+        self.lanes.iter().all(Lane::present)
     }
-    fn post(&mut self, pipe: Pipe, address: u64, length: usize) -> Result<(), BlockError> {
+    /// The lanes this attachment's stream IDs give tags to.
+    fn usable(&self) -> usize {
+        self.lanes.len().min(queue_depth(self.io.streams()))
+    }
+    fn draining(&self) -> bool {
+        self.lanes.iter().any(Lane::draining)
+    }
+    fn busy(&self) -> bool {
+        self.lanes.iter().any(|lane| lane.active.is_some())
+    }
+    /// A lane for the next command. None while a failed command waits for
+    /// the others to leave the pipes it must cancel, so that new commands
+    /// cannot keep it waiting.
+    fn free_lane(&self) -> Option<usize> {
+        if self.draining() {
+            return None;
+        }
+        self.lanes[..self.usable()].iter().position(Lane::idle)
+    }
+    fn room(&self) -> bool {
+        self.poisoned || !self.buffers_present() || self.free_lane().is_some()
+    }
+    fn post(
+        &mut self,
+        lane: usize,
+        pipe: Pipe,
+        address: u64,
+        length: usize,
+    ) -> Result<(), BlockError> {
         let index = pipe.index();
-        if self.pending[index].is_some() {
+        if self.lanes[lane].pending[index].is_some() {
             return Err(BlockError::Unsupported(
                 "UAS pipe already has a pending transfer",
             ));
         }
         // A failed submit may have published a TD before losing its receipt.
         // Include it in terminal cancellation even without a returned ticket.
-        self.touched[index] = true;
-        self.pending[index] = Some(self.io.submit(pipe, self.tag, address, length)?);
+        self.lanes[lane].touched[index] = true;
+        let tag = self.lanes[lane].tag;
+        let ticket = self.io.submit(pipe, tag, address, length)?;
+        self.lanes[lane].pending[index] = Some(ticket);
         Ok(())
     }
+    /// A transport failure ends every command: each pipe any lane used is
+    /// cancelled, which retires every lane's transfers on it, and nothing
+    /// is submitted again until the device is reset and rebound, as Linux's
+    /// SCSI error handling ends a uas host's commands with a device reset.
     fn failure<T>(&mut self, error: BlockError) -> Result<T, BlockError> {
         self.poisoned = true;
         for pipe in [Pipe::Command, Pipe::Status, Pipe::Input, Pipe::Output] {
-            if self.touched[pipe.index()] {
+            if self.lanes.iter().any(|lane| lane.touched[pipe.index()]) {
                 // Keep the owner and all allocations even on cancellation
                 // failure. There is no successful-looking tag reuse afterward.
                 let _ = self.io.cancel(pipe);
@@ -689,17 +816,17 @@ impl<I: Io> Engine<I> {
         abort_timeout: Option<u64>,
         abort: &mut Option<AbortTaskOutcome>,
     ) -> Result<Vec<u8>, BlockError> {
-        let received = self.wait(lun, cdb, data, abort_timeout, abort)?;
-        Ok(self.received_data(received).to_vec())
+        let (lane, received) = self.wait(lun, cdb, data, abort_timeout, abort)?;
+        Ok(self.received_data(lane, received).to_vec())
     }
     fn read_into(&mut self, lun: [u8; 8], cdb: &[u8], output: &mut [u8]) -> Result<(), BlockError> {
         // The caller's slice stays on the stack. Only a retired command
         // with successful status can give the CPU its received data.
-        let received = self.wait(lun, cdb, Data::In(output.len()), None, &mut None)?;
-        copy_read(output, self.received_data(received))
+        let (lane, received) = self.wait(lun, cdb, Data::In(output.len()), None, &mut None)?;
+        copy_read(output, self.received_data(lane, received))
     }
-    fn received_data(&self, received: Option<usize>) -> &[u8] {
-        received.map_or(&[], |bytes| &self.data.bytes()[..bytes])
+    fn received_data(&self, lane: usize, received: Option<usize>) -> &[u8] {
+        received.map_or(&[], |bytes| &self.lanes[lane].data.bytes()[..bytes])
     }
     fn wait(
         &mut self,
@@ -708,24 +835,25 @@ impl<I: Io> Engine<I> {
         data: Data<'_>,
         abort_timeout: Option<u64>,
         abort: &mut Option<AbortTaskOutcome>,
-    ) -> Result<Option<usize>, BlockError> {
-        self.begin(lun, cdb, data)?;
+    ) -> Result<(usize, Option<usize>), BlockError> {
+        let lane = self.begin(lun, cdb, data)?;
         loop {
-            if let Some(result) = self.poll_completion(abort_timeout, abort) {
-                return result;
+            if let Some(result) = self.poll_completion(lane, abort_timeout, abort) {
+                return result.map(|received| (lane, received));
             }
             self.io.pause();
         }
     }
-    /// Post `cdb`'s status, data and command requests without waiting for
-    /// any of them; [`Self::poll`] moves the command on.
-    fn begin(&mut self, lun: [u8; 8], cdb: &[u8], data: Data<'_>) -> Result<(), BlockError> {
+    /// Post `cdb`'s status, data and command requests in a free lane
+    /// without waiting for any of them; [`Self::poll`] moves the command on
+    /// by the returned lane.
+    fn begin(&mut self, lun: [u8; 8], cdb: &[u8], data: Data<'_>) -> Result<usize, BlockError> {
         if self.poisoned || !self.buffers_present() {
             return Err(BlockError::Unsupported("UAS interface requires rebind"));
         }
-        if self.active.is_some() {
-            return Err(BlockError::Protocol("a UAS command is already running"));
-        }
+        let Some(lane) = self.free_lane() else {
+            return Err(BlockError::Protocol("every UAS command tag is in use"));
+        };
         let (length, input) = match &data {
             Data::None => (0, false),
             Data::In(n) => (*n, true),
@@ -738,21 +866,33 @@ impl<I: Io> Engine<I> {
         // or an earlier endpoint error invalidated this attachment. Fence the
         // entire class owner before media code observes the failure. No DMA
         // buffer may be rewritten and no later command may reuse this epoch.
-        self.touched = [false; 4];
+        self.lanes[lane].touched = [false; 4];
         if let Err(error) = self.io.ready() {
             return self.failure(error);
         }
         let streams = self.io.streams();
-        let maximum = streams.unwrap_or(u16::MAX);
-        self.tag = if self.tag >= maximum { 1 } else { self.tag + 1 };
-        let command = command_iu(self.tag, lun, cdb);
-        self.command.bytes_mut()[..command.len()].copy_from_slice(&command);
-        self.status.bytes_mut().fill(0);
+        let tag = if self.usable() == 1 {
+            // One command at a time takes each tag in turn.
+            let maximum = streams.unwrap_or(u16::MAX);
+            let last = self.lanes[lane].tag;
+            if last >= maximum { 1 } else { last + 1 }
+        } else {
+            // Linux `uas_queuecommand_lck`: the uas tag is the stream ID,
+            // the lane's own; a command takes the lowest free one.
+            lane as u16 + 1
+        };
+        let command = command_iu(tag, lun, cdb);
+        let slot = &mut self.lanes[lane];
+        slot.tag = tag;
+        slot.command.bytes_mut()[..command.len()].copy_from_slice(&command);
+        slot.status.bytes_mut().fill(0);
         if let Data::Out(bytes) = data {
-            self.data.bytes_mut()[..length].copy_from_slice(bytes);
+            slot.data.bytes_mut()[..length].copy_from_slice(bytes);
         }
-        self.touched = [false; 4];
-        if let Err(error) = self.post(Pipe::Status, self.status.physical(), IU_BUFFER_BYTES) {
+        slot.touched = [false; 4];
+        let (status, data) = (slot.status.physical(), slot.data.physical());
+        let command_address = slot.command.physical();
+        if let Err(error) = self.post(lane, Pipe::Status, status, IU_BUFFER_BYTES) {
             return self.failure(error);
         }
         // USB3 has no READY handshake. Queue the stream-owned status
@@ -760,17 +900,18 @@ impl<I: Io> Engine<I> {
         if streams.is_some()
             && length != 0
             && let Err(error) = self.post(
+                lane,
                 if input { Pipe::Input } else { Pipe::Output },
-                self.data.physical(),
+                data,
                 length,
             )
         {
             return self.failure(error);
         }
-        if let Err(error) = self.post(Pipe::Command, self.command.physical(), command.len()) {
+        if let Err(error) = self.post(lane, Pipe::Command, command_address, command.len()) {
             return self.failure(error);
         }
-        self.active = Some(Active {
+        self.lanes[lane].active = Some(Active {
             lun,
             command: command.len(),
             length,
@@ -781,35 +922,61 @@ impl<I: Io> Engine<I> {
             moved: if length == 0 { Some(0) } else { None },
             terminal: None,
         });
-        Ok(())
+        Ok(lane)
     }
-    /// The begun command's result once it ended, failed or timed out; never
-    /// waits. `abort_timeout` replaces the command timeout with one that
-    /// aborts the task, as error handling's ABORT TASK does.
+    /// Lane `lane`'s command result once it ended, failed or timed out;
+    /// never waits. `abort_timeout` replaces the command timeout with one
+    /// that aborts the task, as error handling's ABORT TASK does.
     fn poll(
         &mut self,
+        lane: usize,
         abort_timeout: Option<u64>,
         abort: &mut Option<AbortTaskOutcome>,
     ) -> Option<Result<Vec<u8>, BlockError>> {
-        self.poll_completion(abort_timeout, abort)
-            .map(|result| result.map(|received| self.received_data(received).to_vec()))
+        self.poll_completion(lane, abort_timeout, abort)
+            .map(|result| result.map(|received| self.received_data(lane, received).to_vec()))
     }
     /// The byte count of a retired successful input command. Writes and
     /// no-data commands have no input to expose.
     fn poll_completion(
         &mut self,
+        lane: usize,
         abort_timeout: Option<u64>,
         abort: &mut Option<AbortTaskOutcome>,
     ) -> Option<Result<Option<usize>, BlockError>> {
-        let mut active = self.active.take()?;
-        let result = self.advance(&mut active, abort_timeout, abort);
+        let slot = self.lanes.get_mut(lane)?;
+        let mut active = slot.active.take()?;
+        // Another lane's transport failure cancelled this one's transfers
+        // too: only a command that had already completed keeps its result.
+        let complete = active
+            .terminal
+            .as_ref()
+            .is_some_and(|status| status.code == 0)
+            && slot.pending.iter().all(Option::is_none);
+        if self.poisoned && !complete {
+            return Some(Err(BlockError::Unsupported(
+                "UAS interface requires rebind",
+            )));
+        }
+        let result = self.advance(lane, &mut active, abort_timeout, abort);
         if result.is_none() {
-            self.active = Some(active);
+            self.lanes[lane].active = Some(active);
         }
         result
     }
+    /// Whether every lane with a transfer still on `pipe`, `lane` among
+    /// them, has failed with status: its cancellation then retires none
+    /// that may still complete.
+    fn only_failed_on(&self, pipe: Pipe, lane: usize) -> bool {
+        self.lanes.iter().enumerate().all(|(index, other)| {
+            index == lane
+                || other.pending[pipe.index()].is_none()
+                || other.active.as_ref().is_some_and(Active::failed)
+        })
+    }
     fn advance(
         &mut self,
+        lane: usize,
         active: &mut Active,
         abort_timeout: Option<u64>,
         abort: &mut Option<AbortTaskOutcome>,
@@ -817,13 +984,13 @@ impl<I: Io> Engine<I> {
         let (length, input, streams) = (active.length, active.input, active.streams);
         for pipe in [Pipe::Command, Pipe::Status, Pipe::Input, Pipe::Output] {
             let index = pipe.index();
-            let completion = self.pending[index]
+            let completion = self.lanes[lane].pending[index]
                 .as_ref()
                 .and_then(|ticket| self.io.completed(ticket));
             let Some(completion) = completion else {
                 continue;
             };
-            self.pending[index] = None;
+            self.lanes[lane].pending[index] = None;
             let count = match completion {
                 Ok(count) => count,
                 Err(error) => return Some(self.failure(error)),
@@ -838,11 +1005,12 @@ impl<I: Io> Engine<I> {
                     return Some(self.failure(PROTOCOL_ERROR));
                 }
                 Pipe::Status => {
-                    let frame = match self
+                    let slot = &self.lanes[lane];
+                    let frame = match slot
                         .status
                         .bytes()
                         .get(..count)
-                        .and_then(|bytes| status_iu(bytes, self.tag))
+                        .and_then(|bytes| status_iu(bytes, slot.tag))
                     {
                         Some(frame) => frame,
                         None => {
@@ -857,16 +1025,18 @@ impl<I: Io> Engine<I> {
                                 && direction == input =>
                         {
                             active.ready = true;
+                            let (status, data) = (slot.status.physical(), slot.data.physical());
                             // Repost the status request before data; a fast
                             // device may finish its CDB as soon as data ends.
                             if let Err(error) =
-                                self.post(Pipe::Status, self.status.physical(), IU_BUFFER_BYTES)
+                                self.post(lane, Pipe::Status, status, IU_BUFFER_BYTES)
                             {
                                 return Some(self.failure(error));
                             }
                             if let Err(error) = self.post(
+                                lane,
                                 if input { Pipe::Input } else { Pipe::Output },
-                                self.data.physical(),
+                                data,
                                 length,
                             ) {
                                 return Some(self.failure(error));
@@ -882,29 +1052,39 @@ impl<I: Io> Engine<I> {
         }
         if let Some(status) = &active.terminal {
             if status.code != 0 {
-                if input && self.pending[Pipe::Input.index()].is_none() {
+                let slot = &self.lanes[lane];
+                if input && slot.pending[Pipe::Input.index()].is_none() {
                     self.failed_data = active
                         .moved
-                        .map(|moved| self.data.bytes()[..moved].to_vec());
+                        .map(|moved| slot.data.bytes()[..moved].to_vec());
                 }
                 // Device-terminal error may precede host data completion.
-                // Drain each outstanding contributor before any CPU
-                // buffer access or later command is permitted.
+                // Drain each outstanding contributor before any CPU buffer
+                // access or later command is permitted. A pipe's cancellation
+                // retires every lane's transfer on it, so it waits until the
+                // others there have completed (Linux unlinks the one URB).
                 for pipe in [Pipe::Command, Pipe::Input, Pipe::Output] {
-                    if self.pending[pipe.index()].is_some() {
+                    if self.lanes[lane].pending[pipe.index()].is_some()
+                        && self.only_failed_on(pipe, lane)
+                    {
                         if let Err(error) = self.io.cancel(pipe) {
                             return Some(self.failure(error));
                         }
-                        self.pending[pipe.index()] = None;
+                        for (index, other) in self.lanes.iter_mut().enumerate() {
+                            if index == lane || other.active.as_ref().is_some_and(Active::failed) {
+                                other.pending[pipe.index()] = None;
+                            }
+                        }
                     }
                 }
-                return Some(Err(match status.response {
-                    Some(_) => BlockError::Protocol("UAS Response IU refused the command"),
-                    None => Sense::parse(&status.sense)
-                        .map_or(BlockError::CheckCondition, BlockError::Sense),
-                }));
-            }
-            if self.pending.iter().all(Option::is_none) {
+                if self.lanes[lane].pending.iter().all(Option::is_none) {
+                    return Some(Err(match status.response {
+                        Some(_) => BlockError::Protocol("UAS Response IU refused the command"),
+                        None => Sense::parse(&status.sense)
+                            .map_or(BlockError::CheckCondition, BlockError::Sense),
+                    }));
+                }
+            } else if self.lanes[lane].pending.iter().all(Option::is_none) {
                 let Some(moved) = active.moved else {
                     return Some(self.failure(PROTOCOL_ERROR));
                 };
@@ -924,7 +1104,7 @@ impl<I: Io> Engine<I> {
                         "UAS task already returned terminal status",
                     ))
                 } else {
-                    self.abort_task(active.lun)
+                    self.abort_task(lane, active.lun)
                 });
                 return Some(Err(BlockError::Timeout));
             }
@@ -947,6 +1127,14 @@ struct Active {
     ready: bool,
     moved: Option<usize>,
     terminal: Option<Status>,
+}
+impl Active {
+    /// The command ended with a failing status.
+    fn failed(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|status| status.code != 0)
+    }
 }
 
 fn command_iu(tag: u16, lun: [u8; 8], cdb: &[u8]) -> Vec<u8> {

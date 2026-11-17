@@ -4,10 +4,15 @@
 //! as Linux's `hub_event` services them. A controller that signals its
 //! events wakes the engine and is polled once it has work
 //! ([`xhci::Host::due`]); another is polled on a timer. A keyboard or
-//! pointer that arrives joins the host input; another new device is
-//! reported and its owners kept until every device they came with is
-//! removed. The USB storage interfaces probe configured stay owned here
-//! for the boot, with the disks the guest reaches through them.
+//! pointer that arrives joins the host input, behind a hub that arrives
+//! with it too; another new device is reported unused and is not started:
+//! a disk, network adapter, audio function or Bluetooth controller starts
+//! at the next boot. The exception is the device of a disk in use that left
+//! the bus and came back, the same one at the same port: it is started
+//! again in steps and the disk's users go on (`xhci::Host::keep_storage`).
+//! What a new device leaves is kept until every device it came with is
+//! removed. The USB storage interfaces probe configured stay owned here for
+//! the boot, with the disks the guest reaches through them.
 //!
 //! A USB4 host whose firmware runs the connection manager is looked at on the
 //! same timer: each firmware event is reported, as Linux's
@@ -65,8 +70,10 @@ impl Usb4Platform {
 }
 
 impl Platform for Usb4Platform {
+    /// The device clock: the transport refuses a time before its last, and
+    /// its polls run on whichever processor serves the host.
     fn now_ms(&self) -> u64 {
-        super::host::rdtsc() / self.tsc_per_ms
+        super::host::device_counter() / self.tsc_per_ms
     }
 
     fn report(&mut self, report: Report) {
@@ -181,6 +188,12 @@ impl HostUsb {
         root: u64,
         tsc_hz: u64,
     ) -> Self {
+        let mut hosts = hosts;
+        // A device of a disk in use that leaves the bus and comes back is
+        // started again for it.
+        for host in &mut hosts {
+            host.keep_storage(&storage);
+        }
         Self {
             hosts,
             usb4: usb4
@@ -261,18 +274,21 @@ impl HostUsb {
                 timed || host.attachment_due()
             };
             let changes = due.then(|| {
-                let changes = host.poll(&mut self.dma, firmware);
+                let changes = host.poll_after_boot(&mut self.dma, firmware);
                 // A new device's driver may have found its firmware missing;
-                // the record is reached under the same lock.
-                firmware.report();
-                changes
+                // the record is reached under the same lock, and printed
+                // after it.
+                (changes, firmware.take_report())
             });
             lap(&mut self.split, DRIVER);
             drop(root);
             lap(&mut self.split, LEAVE);
-            let Some(mut changes) = changes else {
+            let Some((mut changes, missing)) = changes else {
                 continue;
             };
+            if let Some(missing) = missing {
+                output::arguments(format_args!("{missing}"));
+            }
             for device in &changes.removed {
                 output::arguments(format_args!("USB removed {}\n", device.location));
                 for kept in &mut self.kept {
@@ -288,6 +304,11 @@ impl HostUsb {
             for (location, why) in &added.unused {
                 output::arguments(format_args!("USB UNUSED {location}: {why}\n"));
             }
+            for (location, units) in &added.resumed {
+                output::arguments(format_args!(
+                    "USB DISK RETURNED {location}: started again, {units} of its units go on\n"
+                ));
+            }
             inputs.extend(
                 added
                     .inputs
@@ -296,11 +317,6 @@ impl HostUsb {
             );
             for device in &added.devices {
                 output::arguments(format_args!("USB added {}\n", device.location));
-            }
-            if !added.disks.is_empty() || !added.storage.is_empty() || !added.links.is_empty() {
-                output::arguments(format_args!(
-                    "USB a disk or network adapter added after boot is kept unused until the next boot\n"
-                ));
             }
             if !changes.added.devices.is_empty() {
                 self.kept.push(Kept {

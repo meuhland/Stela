@@ -32,30 +32,89 @@ pub const TARGET: driver::Target<'static> = driver::Target {
     board: None,
 };
 
-/// Every recipe family, in the order a volume short of room keeps them: the
-/// small network and Bluetooth files first, the GPU's large images last.
-pub const FAMILIES: [(&str, &[Recipe]); 9] = [
-    ("Wi-Fi regulatory database", recipes::REGULATORY),
-    ("Realtek Ethernet", recipes::REALTEK),
-    ("Realtek USB Ethernet", recipes::REALTEK_USB),
-    ("Realtek Wi-Fi", recipes::REALTEK_WIFI),
-    ("MediaTek Wi-Fi", recipes::MEDIATEK_WIFI),
-    ("Intel Wi-Fi", recipes::INTEL_WIFI),
-    ("MediaTek Bluetooth", recipes::MEDIATEK_BLUETOOTH),
-    ("Intel Bluetooth", recipes::INTEL_RSA),
-    ("NVIDIA GSP-RM", recipes::GSP),
-];
-
-/// Every recipe of the catalog.
-pub fn recipes() -> impl Iterator<Item = &'static Recipe> {
-    FAMILIES.iter().flat_map(|(_, recipes)| recipes.iter())
+/// Which GPU ports a build runs, and so whose firmware its bundle holds:
+/// the AMD port (amdgpu), which a release leaves out with its driver. The
+/// boot image enables this crate's `amdgpu-port` exactly where it enables
+/// amdgpu (`crates/stela-boot/Cargo.toml`), and `stela` where it is built
+/// with `amdgpu-port` (`crates/stela-cli/Cargo.toml`), so a default stick
+/// holds the files of the default image's drivers and no others. No Intel
+/// GPU firmware is pinned yet; its port joins here with its recipes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ports {
+    pub amd: bool,
 }
 
-/// Each distinct file of the catalog once, by digest, in [`FAMILIES`]
+impl Ports {
+    /// This build's ports.
+    pub const BUILT: Self = Self {
+        amd: cfg!(feature = "amdgpu-port"),
+    };
+    /// A build without the AMD port, as a release is.
+    pub const NONE: Self = Self { amd: false };
+    /// A build with every port.
+    pub const ALL: Self = Self { amd: true };
+}
+
+/// The port a recipe family belongs to, if any.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Port {
+    Always,
+    Amd,
+}
+
+/// Every recipe family, in the order a volume short of room keeps them: the
+/// small network and Bluetooth files first, the GPU's large images last.
+const ALL: [(&str, &[Recipe], Port); 10] = [
+    (
+        "Wi-Fi regulatory database",
+        recipes::REGULATORY,
+        Port::Always,
+    ),
+    ("Realtek Ethernet", recipes::REALTEK, Port::Always),
+    ("Realtek USB Ethernet", recipes::REALTEK_USB, Port::Always),
+    ("Realtek Wi-Fi", recipes::REALTEK_WIFI, Port::Always),
+    ("MediaTek Wi-Fi", recipes::MEDIATEK_WIFI, Port::Always),
+    ("Intel Wi-Fi", recipes::INTEL_WIFI, Port::Always),
+    (
+        "MediaTek Bluetooth",
+        recipes::MEDIATEK_BLUETOOTH,
+        Port::Always,
+    ),
+    ("Intel Bluetooth", recipes::INTEL_RSA, Port::Always),
+    ("AMD GPU", recipes::AMDGPU, Port::Amd),
+    ("NVIDIA GSP-RM", recipes::GSP, Port::Always),
+];
+
+/// The recipe families a build with `ports` bundles, in [`ALL`] order.
+pub fn families_for(ports: Ports) -> impl Iterator<Item = (&'static str, &'static [Recipe])> {
+    ALL.iter()
+        .filter(move |(_, _, port)| match port {
+            Port::Always => true,
+            Port::Amd => ports.amd,
+        })
+        .map(|&(name, recipes, _)| (name, recipes))
+}
+
+/// The recipe families this build bundles ([`Ports::BUILT`]).
+pub fn families() -> impl Iterator<Item = (&'static str, &'static [Recipe])> {
+    families_for(Ports::BUILT)
+}
+
+/// Every recipe of the catalog this build bundles.
+pub fn recipes() -> impl Iterator<Item = &'static Recipe> {
+    families().flat_map(|(_, recipes)| recipes.iter())
+}
+
+/// Each distinct file of the catalog once, by digest, in [`families`]
 /// order with each family's files smallest first.
 pub fn objects() -> Vec<&'static Artifact> {
+    objects_for(Ports::BUILT)
+}
+
+/// [`objects`] of a build with `ports`.
+pub fn objects_for(ports: Ports) -> Vec<&'static Artifact> {
     let mut objects: Vec<&'static Artifact> = Vec::new();
-    for (_, family) in FAMILIES {
+    for (_, family) in families_for(ports) {
         let start = objects.len();
         for recipe in family {
             if !objects
@@ -346,6 +405,12 @@ impl Selection {
 /// and Ethernet adapters are not on PCI before the boot's own USB stack
 /// runs, so their files, about 2 MB in all, are always selected.
 pub fn select(functions: &[Pci]) -> Selection {
+    select_for(functions, Ports::BUILT)
+}
+
+/// [`select`] in a build with `ports`: a GPU of a port the build leaves out
+/// has no driver and so no files.
+pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
     let mut selection = Selection::default();
     selection.members(recipes::REALTEK_USB, &[], "usb ethernet");
     selection.members(recipes::MEDIATEK_BLUETOOTH, &[], "usb bluetooth");
@@ -363,6 +428,17 @@ pub fn select(functions: &[Pci]) -> Selection {
                         selection.unknown.push(why.clone());
                     }
                 }
+            }
+            continue;
+        }
+        if function.vendor == 0x1002 && function.class == 0x03 {
+            if !ports.amd {
+                continue;
+            }
+            if recipes::require_amdgpu(&mut inventory, function.device).is_ok() {
+                selection.plan(&inventory, &why);
+            } else if !selection.unknown.contains(&why) {
+                selection.unknown.push(why.clone());
             }
             continue;
         }

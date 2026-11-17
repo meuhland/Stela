@@ -288,7 +288,8 @@ impl Bindings {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Target {
-    pub(super) nir: *const c_void,
+    /// The driver's options for each stage, vertex through mesh.
+    pub(super) nir: [*const c_void; super::NIR_STAGES],
     pub(super) max_instructions: u32,
     pub(super) max_threadgroup_bytes: u32,
     pub(super) max_private_bytes: u32,
@@ -570,6 +571,7 @@ mod tests {
             ("STELA_METAL_BINDINGS_BYTES", size_of::<Bindings>()),
             ("STELA_METAL_REFLECTION_BYTES", size_of::<Reflection>()),
             ("STELA_METAL_TARGET_BYTES", size_of::<Target>()),
+            ("STELA_METAL_NIR_STAGES", super::super::NIR_STAGES),
             (
                 "STELA_METAL_LINKED_VARYING_BYTES",
                 size_of::<LinkedVarying>(),

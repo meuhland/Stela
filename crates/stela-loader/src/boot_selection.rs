@@ -104,10 +104,28 @@ pub const FAILURE_REASONS: [&[u8]; 2] = [b"iboot-failure-reason", b"iboot-failur
 /// what a finished erase install leaves: the next macOS boot is the same
 /// maintenance boot and removes the record, so a normal boot that still
 /// finds the plugin missing asks for the repair as usual.
+/// [`BUNDLE_REPAIR_RETRY`] is what a maintenance boot whose shell never took
+/// input leaves: like a request, but taken as [`BUNDLE_REPAIR_RETRIED`],
+/// after which nothing asks again by itself.
 pub const BUNDLE_REPAIR: &[u8] = b"stela-bundle-repair";
 pub const BUNDLE_REPAIR_PENDING: &[u8] = b"pending";
 pub const BUNDLE_REPAIR_ATTEMPTED: &[u8] = b"attempted";
 pub const BUNDLE_REPAIR_INSTALLED: &[u8] = b"installed";
+pub const BUNDLE_REPAIR_RETRY: &[u8] = b"retry";
+pub const BUNDLE_REPAIR_RETRIED: &[u8] = b"retried";
+/// What the repair's maintenance boot reported at its stop, as text: the
+/// step that failed and its status, or that every required step passed.
+/// A boot that still finds the plugin missing names it in its stop, and
+/// `stela status` shows it. Taking a new request removes it, so it always
+/// belongs to the latest attempt.
+pub const BUNDLE_REPAIR_RESULT: &[u8] = b"stela-bundle-repair-result";
+/// The Stela version whose loader took the request
+/// ([`BUNDLE_REPAIR_VERSION_VALUE`]): an attempt another version made, or
+/// one that names none as 0.4.1 and older left, does not stop a newer
+/// Stela from repairing once by itself.
+pub const BUNDLE_REPAIR_VERSION: &[u8] = b"stela-bundle-repair-version";
+/// This Stela's version, as [`BUNDLE_REPAIR_VERSION`] holds it.
+pub const BUNDLE_REPAIR_VERSION_VALUE: &[u8] = env!("CARGO_PKG_VERSION").as_bytes();
 const TRUE: &[u8] = b"true";
 const FALSE: &[u8] = b"false";
 /// `8-4-4-4-12` hexadecimal digits.
@@ -370,8 +388,9 @@ impl Selection {
             self.target = Target::SystemRecovery;
             // The repair waits for a macOS boot, as for any recoveryOS one.
             self.bundle_repair = false;
-            self.assigned.retain(|(name, _)| *name != BUNDLE_REPAIR);
-            self.consumed.retain(|name| *name != BUNDLE_REPAIR);
+            let repair = [BUNDLE_REPAIR, BUNDLE_REPAIR_RESULT, BUNDLE_REPAIR_VERSION];
+            self.assigned.retain(|(name, _)| !repair.contains(name));
+            self.consumed.retain(|name| !repair.contains(name));
             self.reasons
                 .push("missing-boot-media: the boot disk holds no installed system".into());
         }
@@ -528,12 +547,26 @@ pub fn select(variables: &Variables) -> Result<Selection> {
     if matches!(selection.target, Target::MacOs { .. })
         && let Some(value) = lookup(variables, BUNDLE_REPAIR)
     {
-        match strip(value) {
-            BUNDLE_REPAIR_PENDING => selection
-                .assigned
-                .push((BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED)),
-            BUNDLE_REPAIR_INSTALLED => selection.consumed.push(BUNDLE_REPAIR),
+        let taken = match strip(value) {
+            BUNDLE_REPAIR_PENDING => Some(BUNDLE_REPAIR_ATTEMPTED),
+            BUNDLE_REPAIR_RETRY => Some(BUNDLE_REPAIR_RETRIED),
+            BUNDLE_REPAIR_INSTALLED => None,
             _ => return Ok(selection),
+        };
+        match taken {
+            Some(record) => selection.assigned.extend([
+                (BUNDLE_REPAIR, record),
+                (BUNDLE_REPAIR_VERSION, BUNDLE_REPAIR_VERSION_VALUE),
+            ]),
+            None => selection.consumed.push(BUNDLE_REPAIR),
+        }
+        // The new attempt reports for itself; an install's leaves no
+        // record, so no version either.
+        if lookup(variables, BUNDLE_REPAIR_RESULT).is_some() {
+            selection.consumed.push(BUNDLE_REPAIR_RESULT);
+        }
+        if taken.is_none() && lookup(variables, BUNDLE_REPAIR_VERSION).is_some() {
+            selection.consumed.push(BUNDLE_REPAIR_VERSION);
         }
         selection.reasons.push(shown(BUNDLE_REPAIR, value));
         selection.bundle_repair = true;

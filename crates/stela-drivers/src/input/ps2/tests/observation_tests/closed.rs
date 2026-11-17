@@ -71,12 +71,11 @@ fn fault_and_repeated_refusal_after_close_do_not_capture_new_raw_payloads() {
     let prefix = c.poll_observed();
     let closed = c.close_observation();
     assert_eq!(closed.items.len(), 1);
-    h.borrow_mut().emit(Port::Keyboard, 0xff);
+    h.borrow_mut().emit(Port::Keyboard, 0x1c);
+    let at = h.borrow().consumed + 1;
+    h.borrow_mut().gone_at = Some(at);
     let failed = c.poll_observed();
-    assert_eq!(
-        failed.first_error.unwrap().kind,
-        ErrorKind::KeyboardSequence
-    );
+    assert_eq!(failed.first_error.unwrap().kind, ErrorKind::NoController);
     assert!(failed.observations.items.is_empty());
     assert!(c.keyboard.drain_observed().is_empty());
     for _ in 0..16 {

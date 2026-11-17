@@ -151,6 +151,58 @@ pub struct Mode {
     pub format: PixelFormat,
 }
 
+/// A monitor's identity as its EDID gives it, kept only as a hash: the
+/// base block's manufacturer, product code, serial number, week and year of
+/// manufacture, and its serial-number and name descriptors where present.
+/// Two monitors that differ in any of them, a serial alone included, have
+/// different identities; the same monitor has the same one on every boot.
+/// It holds no field itself, so printing it shows none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MonitorId(u64);
+
+impl core::fmt::Debug for MonitorId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("MonitorId(..)")
+    }
+}
+
+impl MonitorId {
+    /// The identity in `edid`, whose first 128 bytes are an EDID base
+    /// block; `None` when they are not one (no fixed header). The checksum
+    /// is not required: the identity bytes are read as they are.
+    pub fn from_edid(edid: &[u8]) -> Option<Self> {
+        const HEADER: [u8; 8] = [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
+        /// Display descriptor tags: product serial number and name.
+        const SERIAL: u8 = 0xff;
+        const NAME: u8 = 0xfc;
+        let base = edid.get(..128)?;
+        if base[..8] != HEADER {
+            return None;
+        }
+        // FNV-1a, 64-bit.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        feed(&base[8..18]);
+        let (descriptors, _) = base[54..126].as_chunks::<18>();
+        for descriptor in descriptors {
+            if descriptor[..3] == [0, 0, 0] && matches!(descriptor[3], SERIAL | NAME) {
+                feed(&descriptor[3..4]);
+                feed(&descriptor[5..18]);
+            }
+        }
+        Some(Self(hash))
+    }
+
+    /// The hash, to derive the identity the guest is shown from.
+    pub fn hash(self) -> u64 {
+        self.0
+    }
+}
+
 /// The refresh of a scanout that reports none: 60 Hz, in millihertz.
 pub const DEFAULT_REFRESH_MILLIHERTZ: u32 = 60_000;
 
@@ -169,6 +221,12 @@ pub trait Scanout {
     /// `None` when unknown, and the model's EDID assumes a usual one
     /// (`dcp::modes::assumed_size_mm`).
     fn physical_size_mm(&self) -> Option<(u32, u32)> {
+        None
+    }
+    /// The identity of the monitor on the output this scanout shows on,
+    /// from its EDID; `None` when it has none, and the model's display is
+    /// then known by its size alone.
+    fn monitor(&self) -> Option<MonitorId> {
         None
     }
     /// Present one completed frame: `rows` are its pixels top to bottom, each
@@ -194,6 +252,29 @@ pub trait Scanout {
         Ok(false)
     }
 
+    /// The refresh rates in millihertz the monitor runs [`Self::mode`] at,
+    /// fastest first, [`Self::refresh_millihertz`] among them: what the
+    /// model advertises for the mode.
+    fn refresh_rates(&self) -> Vec<u32> {
+        alloc::vec![self.refresh_millihertz()]
+    }
+
+    /// Run the monitor at `millihertz`, one of [`Self::refresh_rates`], as
+    /// the AP's mode set asks; the model paces at it from then on. A sink
+    /// with one rate refuses.
+    fn set_refresh(&mut self, _millihertz: u32) -> Result<()> {
+        Err(refuse!("the host scanout runs one refresh rate"))
+    }
+
+    /// How long ago, in nanoseconds, the monitor's last vertical blank
+    /// began, when the sink knows its real scanout's timing: the model then
+    /// keeps its vblanks on the monitor's, at a fixed offset. `None` (a
+    /// mirrored or headless sink, a display not yet read) leaves the model's
+    /// own grid, which keeps its phase on the counter.
+    fn vblank_age_ns(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether an earlier present left work only [`Self::flush`] finishes,
     /// such as a page flip whose request must wait for another processor.
     fn queued(&self) -> bool {
@@ -204,6 +285,19 @@ pub trait Scanout {
     /// what must wait for another processor stays queued for a later flush.
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    /// Turn the monitor off (`false`), as display sleep does, or on again
+    /// showing the last frame presented. A sink with no control of its
+    /// monitor's power refuses, and its picture stays lit.
+    fn set_power(&mut self, _on: bool) -> Result<()> {
+        Err(refuse!("the host scanout cannot turn its monitor off"))
+    }
+    /// Whether the sink shows nothing of the last frame presented, as a
+    /// display it took after that frame: the owner then presents the frame
+    /// on screen again, whole, without waiting for a new one.
+    fn wants_frame(&self) -> bool {
+        false
     }
 }
 
@@ -2547,86 +2641,88 @@ mod tests {
     #[test]
     #[ignore = "manual: opt-in"]
     fn refine_timings() {
-        const WIDTH: usize = 2560;
-        const HEIGHT: usize = 1440;
-        const SURFACE: usize = WIDTH * HEIGHT * 5;
-        let mode = Mode {
-            width: WIDTH as u32,
-            height: HEIGHT as u32,
-            format: PixelFormat::Bgra8888,
-        };
-        let whole = Rect::whole(WIDTH as u32, HEIGHT as u32);
-        let screen = |index: usize, extended: bool| {
-            let iova = (index * SURFACE) as u64;
-            Surface {
-                format: if extended {
-                    PixelFormat::Xr10A8 {
-                        alpha: iova + (WIDTH * HEIGHT * 4) as u64,
-                        alpha_stride: WIDTH as u32,
-                    }
-                } else {
-                    PixelFormat::Bgra8888
-                },
-                ..surface(WIDTH as u32, HEIGHT as u32, WIDTH as u32 * 4, iova)
-            }
-        };
-        let cursor_at = 2 * SURFACE;
-        let mut memory = alloc::vec![0u8; 2 * SURFACE + 32 * 32 * 4];
-        for (index, byte) in memory.iter_mut().enumerate() {
-            *byte = (index as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 0x40;
-        }
-        let first = memory[..SURFACE].to_vec();
-        for extended in [false, true] {
-            for cursor in [false, true] {
-                for (case, rows) in [("same", 0..0), ("band", 700..772), ("all", 0..HEIGHT)] {
-                    memory[SURFACE..2 * SURFACE].copy_from_slice(&first);
-                    for y in rows {
-                        memory[SURFACE + y * WIDTH * 4 + 8] ^= 0x10;
-                    }
-                    let layers = |index: usize| {
-                        let mut layers = alloc::vec![
-                            Layer::new(screen(index, extended), whole, whole, false).unwrap()
-                        ];
-                        if cursor {
-                            layers.push(
-                                Layer::new(
-                                    surface(32, 32, 128, cursor_at as u64),
-                                    Rect::whole(32, 32),
-                                    Rect {
-                                        x: 600,
-                                        y: 300,
-                                        ..Rect::whole(32, 32)
-                                    },
-                                    false,
-                                )
-                                .unwrap(),
-                            );
+        // The scanout sizes of a 1440p and a 4K monitor.
+        for (width, height) in [(2560usize, 1440usize), (3840, 2160)] {
+            let surface_bytes = width * height * 5;
+            let mode = Mode {
+                width: width as u32,
+                height: height as u32,
+                format: PixelFormat::Bgra8888,
+            };
+            let whole = Rect::whole(width as u32, height as u32);
+            let screen = |index: usize, extended: bool| {
+                let iova = (index * surface_bytes) as u64;
+                Surface {
+                    format: if extended {
+                        PixelFormat::Xr10A8 {
+                            alpha: iova + (width * height * 4) as u64,
+                            alpha_stride: width as u32,
                         }
-                        layers
-                    };
-                    let mut sink = Timed {
-                        mode,
-                        rows: alloc::vec![0; WIDTH * HEIGHT * 4],
-                    };
-                    let mut composed = Composed::default();
-                    present(&mut sink, &layers(0), None, reader(&memory), &mut composed).unwrap();
-                    const SWAPS: usize = 60;
-                    let start = std::time::Instant::now();
-                    for swap in 1..=SWAPS {
-                        present(
-                            &mut sink,
-                            &layers(swap % 2),
-                            Some(0..HEIGHT),
-                            reader(&memory),
-                            &mut composed,
-                        )
-                        .unwrap();
+                    } else {
+                        PixelFormat::Bgra8888
+                    },
+                    ..surface(width as u32, height as u32, width as u32 * 4, iova)
+                }
+            };
+            let cursor_at = 2 * surface_bytes;
+            let mut memory = alloc::vec![0u8; 2 * surface_bytes + 32 * 32 * 4];
+            for (index, byte) in memory.iter_mut().enumerate() {
+                *byte = (index as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 0x40;
+            }
+            let first = memory[..surface_bytes].to_vec();
+            for extended in [false, true] {
+                for cursor in [false, true] {
+                    for (case, rows) in [("same", 0..0), ("band", 700..772), ("all", 0..height)] {
+                        memory[surface_bytes..2 * surface_bytes].copy_from_slice(&first);
+                        for y in rows {
+                            memory[surface_bytes + y * width * 4 + 8] ^= 0x10;
+                        }
+                        let layers = |index: usize| {
+                            let mut layers = alloc::vec![
+                                Layer::new(screen(index, extended), whole, whole, false).unwrap()
+                            ];
+                            if cursor {
+                                layers.push(
+                                    Layer::new(
+                                        surface(32, 32, 128, cursor_at as u64),
+                                        Rect::whole(32, 32),
+                                        Rect {
+                                            x: 600,
+                                            y: 300,
+                                            ..Rect::whole(32, 32)
+                                        },
+                                        false,
+                                    )
+                                    .unwrap(),
+                                );
+                            }
+                            layers
+                        };
+                        let mut sink = Timed {
+                            mode,
+                            rows: alloc::vec![0; width * height * 4],
+                        };
+                        let mut composed = Composed::default();
+                        present(&mut sink, &layers(0), None, reader(&memory), &mut composed)
+                            .unwrap();
+                        const SWAPS: usize = 60;
+                        let start = std::time::Instant::now();
+                        for swap in 1..=SWAPS {
+                            present(
+                                &mut sink,
+                                &layers(swap % 2),
+                                Some(0..height),
+                                reader(&memory),
+                                &mut composed,
+                            )
+                            .unwrap();
+                        }
+                        let each = start.elapsed().as_secs_f64() * 1000.0 / SWAPS as f64;
+                        std::println!(
+                            "refine {width}x{height} {} cursor={cursor} {case}: {each:.3} ms",
+                            if extended { "&b38" } else { "BGRA" }
+                        );
                     }
-                    let each = start.elapsed().as_secs_f64() * 1000.0 / SWAPS as f64;
-                    std::println!(
-                        "refine {} cursor={cursor} {case}: {each:.3} ms",
-                        if extended { "&b38" } else { "BGRA" }
-                    );
                 }
             }
         }

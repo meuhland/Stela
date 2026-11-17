@@ -148,7 +148,7 @@ fn posted_commands_complete_before_payload_unmap() {
     let state = model.state.clone();
     let drops = model.drops.clone();
     let (mut life, domain) = lifecycle(model);
-    let mut returned = RetiredHierarchy(Rc::clone(&life.returned));
+    let mut returned = RetiredHierarchy(Rc::clone(&life.shared.borrow().returned));
     assert!(!returned.is_ready());
     let page_drops = Arc::new(AtomicUsize::new(0));
     let mut mapping = DmaMapping::map(
@@ -233,7 +233,7 @@ fn abandoned_retired_handle_preserves_the_whole_original_hierarchy() {
     let model = Model::default();
     let drops = model.drops.clone();
     let (mut life, domain) = lifecycle(model);
-    let returned = RetiredHierarchy(Rc::clone(&life.returned));
+    let returned = RetiredHierarchy(Rc::clone(&life.shared.borrow().returned));
     life.prepare().unwrap();
     life.disable_dma().unwrap();
     // SAFETY: no model engine started; hierarchy BM-clear acknowledged.
@@ -270,27 +270,160 @@ fn every_ancestor_window_and_unique_firmware_bus_route_is_required() {
 }
 
 #[test]
-fn stopped_siblings_remain_contained_and_a_second_nvme_is_explicitly_refused() {
+fn stopped_siblings_and_a_second_nvme_remain_contained() {
+    // Two NVMe controllers behind one VMD, as laptops with two SSD slots
+    // have: the endpoint is the one its BAR was claimed from, and the other
+    // stays a sibling without decode or bus mastering, as any other class.
     for extra_class in [0x0200_0000, 0x0108_0200] {
         let model = Model::default();
         let extra = NVME + (1 << 15);
-        model
-            .state
-            .lock()
-            .unwrap()
-            .add_function(extra, extra_class, 0, 0);
+        {
+            let mut state = model.state.lock().unwrap();
+            state.add_function(extra, extra_class, 0, 0);
+            // Firmware left its memory decode on.
+            state.set(
+                extra + COMMAND_OFFSET,
+                2,
+                u32::from(regs::COMMAND_INTX_DISABLE | regs::COMMAND_MEMORY),
+            );
+        }
         let state = model.state.clone();
         let (mut host, bar) = fixture(model);
-        let result = Hierarchy::discover(&mut host, &bar, NVME_CLASS);
-        if extra_class == 0x0108_0200 {
-            assert!(matches!(result, Err(Error::UnsupportedDevice)));
-        } else {
-            let mut hierarchy = result.unwrap();
-            hierarchy.prepare(&mut host, &*model_timer()).unwrap();
-            hierarchy.enable(&mut host).unwrap();
-            assert_eq!(state.lock().unwrap().child(extra + 4, 2) & 7, 0);
-        }
+        let mut hierarchy = Hierarchy::discover(&mut host, &bar, NVME_CLASS).unwrap();
+        hierarchy.prepare(&mut host, &*model_timer(), 0).unwrap();
+        hierarchy.enable(&mut host, 0).unwrap();
+        assert_eq!(state.lock().unwrap().child(extra + 4, 2) & 7, 0);
+        assert_ne!(state.lock().unwrap().child(NVME + 4, 2) & 6, 0);
+        hierarchy.disable(&mut host, 0).unwrap();
+        hierarchy.recheck(&mut host).unwrap();
     }
+    // A BAR claimed from a function of another class is no endpoint.
+    let model = Model::default();
+    let (mut host, bar) = fixture(model);
+    assert!(matches!(
+        Hierarchy::discover(&mut host, &bar, [0x02, 0x00, 0x00]),
+        Err(Error::UnsupportedDevice)
+    ));
+}
+
+/// The Command register's Memory and Bus Master bits of the function at
+/// `base`.
+fn decode_master(state: &Arc<Mutex<State>>, base: usize) -> (bool, bool) {
+    let command = state.lock().unwrap().child(base + COMMAND_OFFSET, 2) as u16;
+    (
+        command & regs::COMMAND_MEMORY != 0,
+        command & regs::COMMAND_MASTER != 0,
+    )
+}
+
+#[test]
+fn two_nvme_controllers_behind_one_vmd_each_run_their_own_lifecycle() {
+    let model = Model::default();
+    let state = model.state.clone();
+    let drops = model.drops.clone();
+    state.lock().unwrap().second_nvme();
+    let (host, bar) = fixture(model);
+    let second = second_bar(&host);
+    let domain = Arc::new(Domain {
+        state: state.clone(),
+        epoch: 1,
+    });
+    let (mut first, returned) = Endpoint::new(host, domain.clone(), model_timer());
+    first.discover(&bar, NVME_CLASS).unwrap();
+    // The same function, or a BAR overlapping an admitted one, is no
+    // second endpoint.
+    assert_eq!(
+        first.admit(&bar, NVME_CLASS).err(),
+        Some(Error::InvalidResource)
+    );
+    let mut other = first.admit(&second, NVME_CLASS).unwrap();
+    first.prepare().unwrap();
+    first.enable_dma().unwrap();
+    // The second controller stays stopped until its own driver prepares it.
+    assert_eq!(decode_master(&state, NVME2), (false, false));
+    other.prepare().unwrap();
+    assert_eq!(decode_master(&state, NVME2), (true, false));
+    assert_eq!(decode_master(&state, NVME), (true, true));
+    other.enable_dma().unwrap();
+    assert_eq!(decode_master(&state, NVME2), (true, true));
+    // The first controller stops while the second runs: the bridges above
+    // both and the parent keep mastering for the second.
+    first.disable_dma().unwrap();
+    assert_eq!(decode_master(&state, NVME), (true, false));
+    for base in [ROOT, BRIDGE, NVME2] {
+        assert_eq!(decode_master(&state, base), (true, true));
+    }
+    assert_ne!(
+        state.lock().unwrap().parent(regs::COMMAND, 2) & u32::from(regs::COMMAND_MASTER),
+        0
+    );
+    // SAFETY: the first model endpoint is stopped; this model has no mappings.
+    unsafe { first.release() }.unwrap();
+    assert!(!returned.is_ready());
+    assert_eq!(decode_master(&state, NVME), (false, false));
+    assert_eq!(decode_master(&state, BRIDGE), (true, true));
+    other.disable_dma().unwrap();
+    assert!(!state.lock().unwrap().any_master());
+    // SAFETY: every model BM bit acknowledged clear.
+    unsafe { domain.drain_posted_writes() }.unwrap();
+    // SAFETY: the second model endpoint is stopped and drained; no mappings.
+    unsafe { other.release() }.unwrap();
+    assert!(returned.is_ready());
+    drop((first, other));
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_second_endpoint_dropped_before_any_effect_leaves_the_host_to_the_first() {
+    let model = Model::default();
+    let state = model.state.clone();
+    state.lock().unwrap().second_nvme();
+    let (host, bar) = fixture(model);
+    let second = second_bar(&host);
+    let domain = Arc::new(Domain {
+        state: state.clone(),
+        epoch: 1,
+    });
+    let (mut first, returned) = Endpoint::new(host, domain.clone(), model_timer());
+    first.discover(&bar, NVME_CLASS).unwrap();
+    drop(first.admit(&second, NVME_CLASS).unwrap());
+    first.prepare().unwrap();
+    first.enable_dma().unwrap();
+    assert_eq!(decode_master(&state, NVME2), (false, false));
+    first.disable_dma().unwrap();
+    // SAFETY: all model BM bits acknowledged clear.
+    unsafe { domain.drain_posted_writes() }.unwrap();
+    // SAFETY: the model endpoint is stopped and drained; no mappings.
+    unsafe { first.release() }.unwrap();
+    assert!(returned.is_ready());
+}
+
+#[test]
+fn a_second_endpoint_quarantined_mid_lifecycle_keeps_the_whole_hierarchy() {
+    let model = Model::default();
+    let state = model.state.clone();
+    let drops = model.drops.clone();
+    state.lock().unwrap().second_nvme();
+    let (host, bar) = fixture(model);
+    let second = second_bar(&host);
+    let domain = Arc::new(Domain {
+        state: state.clone(),
+        epoch: 1,
+    });
+    let (mut first, returned) = Endpoint::new(host, domain.clone(), model_timer());
+    first.discover(&bar, NVME_CLASS).unwrap();
+    let mut other = first.admit(&second, NVME_CLASS).unwrap();
+    first.prepare().unwrap();
+    other.prepare().unwrap();
+    state.lock().unwrap().ack_failure = Some(NVME2 + 4);
+    assert!(other.enable_dma().is_err());
+    assert_eq!(other.phase, Phase::Quarantined);
+    // The first endpoint's next effect refuses: the hierarchy is kept.
+    state.lock().unwrap().ack_failure = None;
+    assert_eq!(first.enable_dma(), Err(Error::Quarantined));
+    drop((first, other));
+    assert!(!returned.is_ready());
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
 }
 
 /// Give `base` an MSI capability after its PCIe one, enabled as firmware
@@ -339,8 +472,8 @@ fn a_child_firmware_left_mastering_is_stopped_with_the_parent_unmastered() {
             Event::Parent(command) if command & regs::COMMAND_MASTER != 0
         )));
     }
-    hierarchy.prepare(&mut host, &*model_timer()).unwrap();
-    hierarchy.enable(&mut host).unwrap();
+    hierarchy.prepare(&mut host, &*model_timer(), 0).unwrap();
+    hierarchy.enable(&mut host, 0).unwrap();
 }
 
 #[test]
@@ -440,7 +573,7 @@ fn invalid_timing_precedes_hierarchy_and_capability_config_accesses() {
             },
         };
         assert_eq!(
-            hierarchy.prepare(&mut host, &clock),
+            hierarchy.prepare(&mut host, &clock, 0),
             Err(Error::PciPower(crate::bus::pci::power::Error::Clock))
         );
         assert_eq!(state.lock().unwrap().events, before);
@@ -554,7 +687,7 @@ fn reassignment_removal_and_wrong_host_epoch_never_restart_the_controller() {
                 _ => state.set_parent(0, 4, 0x28c1_8086),
             }
         }
-        assert!(hierarchy.prepare(&mut host, &*model_timer()).is_err());
+        assert!(hierarchy.prepare(&mut host, &*model_timer(), 0).is_err());
         assert!(!state.lock().unwrap().any_master());
     }
 }
@@ -590,7 +723,7 @@ fn provider_epoch_refusal_and_release_failure_keep_original_resources_pinned() {
     assert_eq!(drops.load(Ordering::Relaxed), 0);
     assert!(Arc::strong_count(&domain) > 1);
     assert_eq!(life.phase, Phase::Quarantined);
-    assert!(life.returned.borrow().0.is_none());
+    assert!(life.shared.borrow().returned.borrow().0.is_none());
     drop(life);
     assert_eq!(drops.load(Ordering::Relaxed), 0);
 }
@@ -603,12 +736,20 @@ fn malformed_capabilities_active_translation_and_bar_profiles_are_refused() {
             let mut state = model.state.lock().unwrap();
             match case {
                 0 => state.set(NVME + 0x40, 2, 0x4410), // Link into PCIe body.
-                1 => state.set(NVME + 0x48, 2, 1 << 11), // NoSnoop enabled.
+                1 => {
+                    // NoSnoop enabled and kept set when the stop clears it.
+                    state.set(NVME + 0x48, 2, 1 << 11);
+                    state.stuck = Some((NVME + 0x48, 1 << 11));
+                }
                 2 => {
                     state.set(NVME + 0x100, 4, 0x0001_000f);
                     state.set(NVME + 0x106, 2, 0x8000);
                 }
-                _ => state.set(NVME + 0x100, 4, 0x0001_0010), // Unqualified SR-IOV.
+                _ => {
+                    // SR-IOV with its virtual functions enabled.
+                    state.set(NVME + 0x100, 4, 0x0001_0010);
+                    state.set(NVME + 0x108, 2, 1);
+                }
             }
         }
         let (mut host, bar) = fixture(model);

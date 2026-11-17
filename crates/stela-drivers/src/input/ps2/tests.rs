@@ -27,8 +27,10 @@ fn idle_poll_reads_status_once_and_still_checks_a_silent_prefix() {
     assert!(controller.poll().unwrap().is_empty());
     assert_eq!(clock.get() - started, 3);
     clock.set(clock.get() + 500);
-    let error = controller.poll().unwrap_err();
-    assert_eq!(error.kind, ErrorKind::PacketTimeout(Port::Keyboard));
+    // The silent prefix expires and is dropped; the keyboard reads on.
+    assert!(controller.poll().unwrap().is_empty());
+    assert_eq!(controller.framing_errors(), 1);
+    assert!(controller.is_ready());
 }
 
 #[test]
@@ -86,82 +88,47 @@ fn full_side_queue_still_allows_primary_ack_without_consuming_another_sibling_by
     assert_eq!(c.retained_bytes().count(), 0);
 }
 #[test]
-fn consumed_framed_error_byte_survives_first_failure_even_with_full_side_queue() {
+fn framed_mouse_bytes_during_a_keyboard_command_are_dropped_as_psmouse_drops_them() {
     for queued in [0, QUEUE_LIMIT] {
         let (mut c, h) = controller(Config::default());
         c.initialize().unwrap();
         for byte in [8, 1, 0, 0].into_iter().cycle().take(queued) {
             h.borrow_mut().output.push_back((Port::Mouse, byte, 0));
         }
-        h.borrow_mut().output.push_back((Port::Mouse, 0x5a, 0x80));
-        let error = c.set_leds(7).unwrap_err();
-        assert!(matches!(error.kind,ErrorKind::Frame {port:Port::Mouse,status} if status&0x80!=0));
-        assert_eq!(
-            error.response,
-            Some(ObservedResponse {
-                port: Port::Mouse,
-                data: 0x5a
-            })
-        );
-        let retained: Vec<_> = c.retained_bytes().collect();
-        assert!(retained.len() >= queued);
-        assert!(
-            retained
-                .iter()
-                .take(queued)
-                .all(|(port, _, _)| *port == Port::Mouse)
-        );
-        if queued == 0 {
-            assert!(
-                retained
-                    .iter()
-                    .any(|(port, data, _)| *port == Port::Keyboard && *data == ACK)
-            );
-        }
-        assert!(c.needs_reset());
+        h.borrow_mut()
+            .output
+            .extend([(Port::Mouse, 0x5a, 0x80), (Port::Mouse, 0x6b, 0x40)]);
+        c.set_leds(7).unwrap();
+        assert_eq!(h.borrow().leds, 7);
+        assert_eq!(c.framing_errors(), 2);
+        assert_eq!(c.retained_bytes().count(), queued);
+        assert!(c.is_ready());
     }
 }
 #[test]
-fn original_and_containment_frame_failures_keep_their_distinct_bytes() {
-    let (mut c, h) = controller(Config::default());
-    c.initialize().unwrap();
-    for byte in [8, 1, 0, 0].into_iter().cycle().take(QUEUE_LIMIT) {
-        h.borrow_mut().output.push_back((Port::Mouse, byte, 0));
+fn a_mouse_port_sending_only_framed_bytes_fails_alone() {
+    let (mut c, h) = ready();
+    for _ in 0..QUEUE_LIMIT {
+        h.borrow_mut().output.push_back((Port::Mouse, 0x5a, 0x80));
     }
-    h.borrow_mut()
-        .output
-        .extend([(Port::Mouse, 0x5a, 0x80), (Port::Mouse, 0x6b, 0x80)]);
-    let error = c.set_leds(7).unwrap_err();
+    let error = c.poll().unwrap_err();
     assert!(matches!(
         error.kind,
         ErrorKind::Frame {
             port: Port::Mouse,
-            ..
-        }
+            status
+        } if status & 0x80 != 0
     ));
+    assert_eq!(error.recovery, Recovery::PortDisabled(Port::Mouse));
+    assert!(c.is_ready());
+    emit(&h, Port::Keyboard, &[0x1c]);
     assert_eq!(
-        error.response,
-        Some(ObservedResponse {
-            port: Port::Mouse,
-            data: 0x5a
-        })
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
     );
-    assert!(matches!(
-        error.recovery_error,
-        Some(ErrorKind::Frame {
-            port: Port::Mouse,
-            ..
-        })
-    ));
-    assert_eq!(
-        error.recovery_response,
-        Some(ObservedResponse {
-            port: Port::Mouse,
-            data: 0x6b
-        })
-    );
-    assert_eq!(error.recovery, Recovery::Failed);
-    assert_eq!(c.retained_bytes().count(), QUEUE_LIMIT);
 }
 mod synaptics_tests;
 
@@ -195,6 +162,11 @@ struct Hardware {
     resend: Option<(Port, u8, usize)>,
     resend_inject: Vec<(Port, u8)>,
     no_ack: Option<(Port, u8)>,
+    ignore_scan_query: bool,
+    refuse_scan_select: bool,
+    reset_without_id: bool,
+    /// The controller stops decoding once this many bytes were read.
+    gone_at: Option<usize>,
     inject_led: Vec<(Port, u8)>,
     writes: Vec<(bool, u8)>,
     consumed: usize,
@@ -232,6 +204,10 @@ impl Hardware {
             resend: None,
             resend_inject: Vec::new(),
             no_ack: None,
+            ignore_scan_query: false,
+            refuse_scan_select: false,
+            reset_without_id: false,
+            gone_at: None,
             inject_led: Vec::new(),
             writes: Vec::new(),
             consumed: 0,
@@ -331,6 +307,21 @@ impl Hardware {
             return;
         }
         let index = Self::index(port);
+        if port == Port::Keyboard
+            && data == SET_SCAN
+            && self.argument[index].is_none()
+            && self.refuse_scan_select
+        {
+            return;
+        }
+        if port == Port::Keyboard
+            && data == 0
+            && self.argument[index] == Some(SET_SCAN)
+            && self.ignore_scan_query
+        {
+            self.argument[index] = None;
+            return;
+        }
         if !(data == GET_ID && port == Port::Mouse && self.no_id_ack)
             && self.no_ack != Some((port, data))
         {
@@ -449,7 +440,9 @@ impl Hardware {
                 self.emit(port, BAT_OK);
                 if port == Port::Mouse {
                     self.mouse_id = 0;
-                    self.emit(port, 0);
+                    if !self.reset_without_id {
+                        self.emit(port, 0);
+                    }
                 }
             }
             DISABLE_REPORTING | DEFAULTS => {
@@ -483,6 +476,12 @@ impl Hardware {
             GET_ID if port == Port::Mouse => {
                 self.emit(port, self.force_id.unwrap_or(self.mouse_id))
             }
+            // An MF2 keyboard's ID, unless it does not answer GETID.
+            GET_ID if self.no_ack != Some((port, GET_ID)) => {
+                self.emit(port, 0xab);
+                self.emit(port, 0x83);
+            }
+            GET_ID => {}
             // A mouse's status: disabled, resolution 2, 100 reports a second.
             GET_INFO if port == Port::Mouse => {
                 for byte in [0, 2, 100] {
@@ -496,6 +495,9 @@ impl Hardware {
 impl Registers for Model {
     fn status(&mut self) -> u8 {
         let h = self.0.borrow();
+        if h.gone_at.is_some_and(|at| h.consumed >= at) {
+            return u8::MAX;
+        }
         h.time.set(h.time.get().wrapping_add(h.status_delay_us));
         let mut value = if h.input_busy() { INPUT_FULL } else { 0 };
         if let Some((port, _, error)) = h.output.front() {
@@ -637,6 +639,336 @@ fn controller(config: Config) -> (Controller<Model, Time>, Rc<RefCell<Hardware>>
         h,
     )
 }
+#[test]
+fn native_handoff_negotiates_input_without_controller_or_keyboard_reset() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    // A keyboard that will not acknowledge RESET must still negotiate and
+    // produce real set-2 input through the normal native-handoff path.
+    h.borrow_mut().no_ack = Some((Port::Keyboard, RESET));
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+    assert!(!h.borrow().writes.contains(&(true, SELF_TEST)));
+    assert!(!h.borrow().writes.contains(&(false, RESET)));
+    h.borrow_mut().emit(Port::Keyboard, 0x1c);
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+}
+
+#[test]
+fn embedded_keyboard_without_scan_query_works_after_acknowledged_set_selection() {
+    for query in [true, false] {
+        let (mut c, h) = controller(Config {
+            mouse: false,
+            reset_on_start: false,
+            query_scan_set: query,
+            ..Config::default()
+        });
+        h.borrow_mut().ignore_scan_query = true;
+        if query {
+            let error = c.initialize().unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Timeout(Phase::Response));
+            assert_eq!(
+                error.command,
+                Some(Command::Device {
+                    port: Port::Keyboard,
+                    byte: 0
+                })
+            );
+            assert_eq!(error.recovery, Recovery::PortsDisabled);
+        } else {
+            c.initialize().unwrap();
+            assert_eq!(h.borrow().scan, 2);
+            h.borrow_mut().emit(Port::Keyboard, 0x1c);
+            assert_eq!(
+                c.poll().unwrap(),
+                vec![Input::Key {
+                    usage: 4,
+                    pressed: true
+                }]
+            );
+            h.borrow_mut().emit(Port::Keyboard, 0xf0);
+            h.borrow_mut().emit(Port::Keyboard, 0x1c);
+            assert_eq!(
+                c.poll().unwrap(),
+                vec![Input::Key {
+                    usage: 4,
+                    pressed: false
+                }]
+            );
+            c.set_leds(2).unwrap();
+            assert_eq!(h.borrow().leds, 2);
+            c.stop().unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_keyboard_that_does_not_take_the_set_two_argument_is_used_with_the_command_kept() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, 2));
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+    assert_eq!(
+        c.refused_commands(),
+        [Command::Device {
+            port: Port::Keyboard,
+            byte: SET_SCAN
+        }]
+    );
+}
+
+#[test]
+fn command_timeout_identifies_original_keyboard_command_after_containment() {
+    // A keyboard that refuses reporting disable is kept, as atkbd keeps it.
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, DISABLE_REPORTING));
+    c.initialize().unwrap();
+    assert!(c.refused_commands().contains(&Command::Device {
+        port: Port::Keyboard,
+        byte: DISABLE_REPORTING
+    }));
+    // After a reset that was asked for, reporting disable is required,
+    // and its failure names the command.
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, DISABLE_REPORTING));
+    let error = c.initialize().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Timeout(Phase::Response));
+    assert_eq!(
+        error.command,
+        Some(Command::Device {
+            port: Port::Keyboard,
+            byte: DISABLE_REPORTING
+        })
+    );
+    assert_eq!(error.recovery, Recovery::PortsDisabled);
+    assert!(c.needs_reset());
+}
+#[test]
+fn a_keyboard_that_refuses_set_two_selection_is_used_in_set_two_as_linux_uses_it() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().refuse_scan_select = true;
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+    assert_eq!(
+        c.refused_commands(),
+        [Command::Device {
+            port: Port::Keyboard,
+            byte: SET_SCAN
+        }]
+    );
+    h.borrow_mut().emit(Port::Keyboard, 0x1c);
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+}
+
+#[test]
+fn a_keyboard_without_getid_is_proved_by_set_leds_and_one_that_answers_neither_fails() {
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, GET_ID));
+    c.initialize().unwrap();
+    assert!(c.refused_commands().is_empty());
+    let leds = h
+        .borrow()
+        .writes
+        .iter()
+        .filter(|write| **write == (false, SET_LEDS))
+        .count();
+    assert_eq!(leds, 1, "Set LEDs proves the keyboard once, not twice");
+
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, GET_ID));
+    h.borrow_mut().refuse_scan_select = true;
+    c.initialize().unwrap();
+    let (mut c, h) = controller(Config {
+        mouse: false,
+        reset_on_start: false,
+        query_scan_set: false,
+        ..Config::default()
+    });
+    h.borrow_mut().no_ack = Some((Port::Keyboard, SET_LEDS));
+    h.borrow_mut().refuse_scan_select = true;
+    c.initialize().unwrap();
+    assert!(c.refused_commands().contains(&Command::Device {
+        port: Port::Keyboard,
+        byte: SET_LEDS
+    }));
+}
+
+#[test]
+fn a_keyboard_byte_with_parity_or_timeout_bits_is_taken_and_a_mouse_byte_dropped() {
+    let (mut c, h) = ready();
+    h.borrow_mut()
+        .output
+        .push_back((Port::Keyboard, 0x1c, 0x80));
+    h.borrow_mut().output.push_back((Port::Mouse, 0x08, 0x40));
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+    assert_eq!(c.framing_errors(), 1);
+    assert!(c.is_ready());
+}
+
+#[test]
+fn the_auxiliary_port_test_passes_with_fa_or_ff_as_linux_accepts() {
+    for reply in [ACK, 0xff] {
+        let (mut c, h) = controller(Config {
+            keyboard: false,
+            reset_on_start: false,
+            ..Config::default()
+        });
+        h.borrow_mut().interface_test = reply;
+        c.initialize().unwrap();
+        assert!(!h.borrow().writes.contains(&(true, TEST_KEYBOARD)));
+    }
+    let (mut c, h) = controller(Config {
+        keyboard: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().interface_test = 1;
+    assert_eq!(
+        c.initialize().unwrap_err().kind,
+        ErrorKind::ControllerReply {
+            command: TEST_MOUSE,
+            received: 1
+        }
+    );
+}
+
+#[test]
+fn broken_keyboard_sequences_and_mouse_packets_resynchronize_without_a_stop() {
+    let (mut c, h) = ready();
+    // A spurious ACK, an overrun and a stray self-test result on the
+    // keyboard, a mouse byte without the sync bit, then a real key and a
+    // whole mouse packet.
+    emit(&h, Port::Keyboard, &[ACK, 0xff, BAT_OK]);
+    emit(&h, Port::Mouse, &[0x00]);
+    emit(&h, Port::Keyboard, &[0x1c]);
+    emit(&h, Port::Mouse, &[0x08, 3, 0, 0]);
+    let inputs = c.poll().unwrap();
+    assert_eq!(
+        inputs,
+        vec![
+            Input::Key {
+                usage: 4,
+                pressed: true
+            },
+            Input::Motion { dx: 3, dy: 0 }
+        ]
+    );
+    assert!(c.is_ready() && !c.needs_reset());
+    assert_eq!(c.framing_errors(), 4);
+    // A mouse packet that stops halfway is dropped once it expires.
+    emit(&h, Port::Mouse, &[0x08, 1]);
+    assert!(c.poll().unwrap().is_empty());
+    let time = h.borrow().time.clone();
+    time.set(time.get() + 1_000);
+    assert!(c.poll().unwrap().is_empty());
+    assert_eq!(c.framing_errors(), 5);
+    emit(&h, Port::Mouse, &[0x08, 2, 0, 0]);
+    assert_eq!(c.poll().unwrap(), vec![Input::Motion { dx: 2, dy: 0 }]);
+}
+
+#[test]
+fn a_mouse_reset_while_running_disables_only_the_mouse_port() {
+    let (mut c, h) = ready();
+    emit(&h, Port::Mouse, &[0x09, 0, 0, 0]);
+    assert_eq!(c.poll().unwrap(), vec![Input::MouseButtons(1)]);
+    emit(&h, Port::Mouse, &[BAT_OK, 0]);
+    let error = c.poll().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::DeviceReset(Port::Mouse));
+    assert_eq!(error.recovery, Recovery::PortDisabled(Port::Mouse));
+    assert_eq!(c.drain_events(), vec![Input::MouseButtons(0)]);
+    assert!(h.borrow().config & MOUSE_DISABLED != 0);
+    assert!(c.is_ready() && !c.needs_reset());
+    emit(&h, Port::Keyboard, &[0x1c]);
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+    c.set_leds(2).unwrap();
+}
+
+#[test]
+fn a_refused_set_leds_while_running_keeps_both_ports() {
+    let (mut c, h) = ready();
+    h.borrow_mut().no_ack = Some((Port::Keyboard, SET_LEDS));
+    let error = c.set_leds(2).unwrap_err();
+    assert_eq!(error.recovery, Recovery::Continued);
+    assert!(c.is_ready());
+    h.borrow_mut().no_ack = None;
+    emit(&h, Port::Keyboard, &[0x1c]);
+    assert_eq!(
+        c.poll().unwrap(),
+        vec![Input::Key {
+            usage: 4,
+            pressed: true
+        }]
+    );
+}
+
+#[test]
+fn a_mouse_reset_with_its_self_test_result_alone_passes_as_psmouse_reset() {
+    let (mut c, h) = controller(Config {
+        keyboard: false,
+        wheel: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    // A mouse that answers RESET with AA and no ID byte.
+    h.borrow_mut().reset_without_id = true;
+    c.initialize().unwrap();
+    assert!(c.is_ready());
+}
+
 #[test]
 fn a_probed_mouse_that_is_no_touchpad_is_reset_and_probed_for_its_wheel() {
     let (base, h) = controller(Config::default());
@@ -821,12 +1153,12 @@ fn one_resend_retries_only_the_rejected_byte_but_exhaustion_quarantines() {
             byte: SET_LEDS
         }
     );
-    assert_eq!(error.recovery, Recovery::PortsDisabled);
-    assert!(c.needs_reset());
-    let writes = h.borrow().writes.len();
-    assert_eq!(c.initialize().unwrap_err().kind, ErrorKind::NeedsReset);
-    assert_eq!(c.set_leds(1).unwrap_err().kind, ErrorKind::NeedsReset);
-    assert_eq!(h.borrow().writes.len(), writes);
+    // Linux's atkbd goes on after a refused Set LEDs.
+    assert_eq!(error.recovery, Recovery::Continued);
+    assert!(c.is_ready());
+    h.borrow_mut().resend = None;
+    c.set_leds(1).unwrap();
+    assert_eq!(h.borrow().leds, 1);
 }
 
 #[test]
@@ -899,32 +1231,23 @@ fn busy_controller_and_unbounded_stale_output_have_bounded_failures() {
 }
 
 #[test]
-fn framed_input_error_keeps_prior_events_and_requires_owner_reset() {
+fn a_framed_mouse_byte_is_dropped_and_input_goes_on() {
     let (mut c, h) = ready();
     emit(&h, Port::Keyboard, &[0x1c]);
     h.borrow_mut().output.push_back((Port::Mouse, 0x08, 0x80));
-    assert!(matches!(
-        c.poll().unwrap_err().kind,
-        ErrorKind::Frame {
-            port: Port::Mouse,
-            ..
-        }
-    ));
+    emit(&h, Port::Mouse, &[0x08, 1, 0, 0]);
     assert_eq!(
-        c.drain_events(),
-        vec![Input::Key {
-            usage: 4,
-            pressed: true
-        }]
+        c.poll().unwrap(),
+        vec![
+            Input::Key {
+                usage: 4,
+                pressed: true
+            },
+            Input::Motion { dx: 1, dy: 0 }
+        ]
     );
-    assert_eq!(
-        c.release_inputs(),
-        vec![Input::Key {
-            usage: 4,
-            pressed: false
-        }]
-    );
-    assert!(c.needs_reset());
+    assert_eq!(c.framing_errors(), 1);
+    assert!(c.is_ready());
 }
 
 #[test]
@@ -943,16 +1266,25 @@ fn truncated_frames_and_spontaneous_device_reset_never_emit_invented_input() {
         assert!(c.poll().unwrap().is_empty());
         let time = h.borrow().time.clone();
         time.set(time.get() + 500);
+        // The expired prefix is dropped and the byte starts afresh: a key
+        // on the keyboard, a packet's first byte on the mouse.
         emit(&h, port, &[0x1c]);
-        assert_eq!(c.poll().unwrap_err().kind, ErrorKind::PacketTimeout(port));
-        assert!(c.drain_events().is_empty());
+        let expected = if port == Port::Keyboard {
+            vec![Input::Key {
+                usage: 4,
+                pressed: true,
+            }]
+        } else {
+            vec![]
+        };
+        assert_eq!(c.poll().unwrap(), expected);
+        assert!(c.is_ready());
     }
     let (mut c, h) = ready();
     emit(&h, Port::Mouse, &[0xaa, 0]);
-    assert_eq!(
-        c.poll().unwrap_err().kind,
-        ErrorKind::DeviceReset(Port::Mouse)
-    );
+    let error = c.poll().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::DeviceReset(Port::Mouse));
+    assert_eq!(error.recovery, Recovery::PortDisabled(Port::Mouse));
     assert!(c.drain_events().is_empty());
 }
 
@@ -1081,9 +1413,9 @@ fn silent_partial_frames_expire_without_waiting_for_a_later_byte() {
         assert!(c.poll().unwrap().is_empty());
         let time = h.borrow().time.clone();
         time.set(time.get() + 500);
-        assert_eq!(c.poll().unwrap_err().kind, ErrorKind::PacketTimeout(port));
-        assert!(c.needs_reset());
-        assert!(c.drain_events().is_empty());
+        assert!(c.poll().unwrap().is_empty());
+        assert_eq!(c.framing_errors(), 1);
+        assert!(c.is_ready());
     }
 }
 
@@ -1177,8 +1509,8 @@ fn unnegotiated_explorer_enhanced_modes_never_masquerade_as_vertical_input() {
         h.borrow_mut().explorer_capable = true;
         c.initialize().unwrap();
         emit(&h, Port::Mouse, &[0x0f, 1, 2, byte]);
-        assert_eq!(c.poll().unwrap_err().kind, ErrorKind::MousePacketMode(byte));
-        assert!(c.needs_reset());
-        assert!(c.drain_events().is_empty());
+        assert!(c.poll().unwrap().is_empty());
+        assert_eq!(c.framing_errors(), 1);
+        assert!(c.is_ready());
     }
 }

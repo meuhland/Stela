@@ -31,15 +31,26 @@ pub struct Config {
     pub dns: Vec<Ipv4>,
 }
 
-/// smoltcp's DHCP client asks every 10 seconds within this. A switch port
+/// The DHCP client asks every [`DHCP_DISCOVER_SECONDS`] within this. A switch port
 /// that runs spanning tree forwards nothing for its first 30 seconds after
 /// the link comes up (IEEE 802.1D: 15 s listening, 15 s learning), and the
 /// adapter's start has just dropped and raised the link, so a wait of 30
 /// seconds lost every request there. Other systems' clients ask for a
 /// minute or longer.
 const DHCP_WAIT_US: u64 = 60_000_000;
-/// smoltcp's resolver retries each server within this.
+/// Seconds between DHCPDISCOVERs while no server answered: RFC 2131 4.1's
+/// first retransmission delay, where smoltcp's default waits 10 s. The
+/// first DISCOVER goes out as the link comes up, when a switch or the
+/// adapter itself often still drops it, so the lease came 10 s late.
+const DHCP_DISCOVER_SECONDS: u64 = 4;
+/// How long a lookup waits for an address family and a DNS server before
+/// it asks one.
 const DNS_WAIT_US: u64 = 15_000_000;
+/// One server's turn at a query. smoltcp's resolver asks a server for 10 s
+/// (its `RETRANSMIT_TIMEOUT`), then moves on to the next at its first poll
+/// past that, which a lookup makes when this turn ends. It keeps at most
+/// `DNS_MAX_SERVER_COUNT` servers, so a query takes at most that many turns.
+const DNS_SERVER_US: u64 = 11_000_000;
 /// How long a name's address is used before it is looked up again.
 const RESOLVED_US: u64 = 300_000_000;
 /// A POST, from connection to the response's end.
@@ -203,6 +214,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             buffer: 0,
             raw: false,
             query: None,
+            asked: 0,
             ipv4_only: false,
             deadline: 0,
         };
@@ -229,9 +241,12 @@ struct Lookup {
     /// An opaque stream, which no idle time ends.
     raw: bool,
     query: Option<(dns::QueryHandle, DnsQueryType)>,
+    /// The servers whose turn at the query has begun ([`DNS_SERVER_US`]).
+    asked: usize,
     /// An IPv6 lookup failed, so only IPv4 is asked.
     ipv4_only: bool,
-    /// When the address family, server or answer being waited for is late.
+    /// When the address family or server being waited for is late, or the
+    /// current server's turn at the query ends.
     deadline: u64,
 }
 
@@ -284,7 +299,11 @@ impl<L: Link, C: Clock> Stack<L, C> {
         let mut iface = Interface::new(config, &mut phy, now);
         iface.update_ip_addrs(|a| a.push(IpCidr::Ipv6(Ipv6Cidr::new(local_ipv6, 64))).unwrap());
         let mut sockets = SocketSet::new(Vec::new());
-        let dhcp = Some(sockets.add(dhcpv4::Socket::new()));
+        let mut client = dhcpv4::Socket::new();
+        let mut retry = dhcpv4::RetryConfig::default();
+        retry.discover_timeout = Duration::from_secs(DHCP_DISCOVER_SECONDS);
+        client.set_retry_config(retry);
+        let dhcp = Some(sockets.add(client));
         let dns = sockets.add(dns::Socket::new(&[], Vec::new()));
         Ok(Self {
             phy,
@@ -307,6 +326,12 @@ impl<L: Link, C: Clock> Stack<L, C> {
 
     pub fn link_mut(&mut self) -> &mut L {
         &mut self.phy.link
+    }
+
+    /// The link, for another owner once this stack is done with it: an
+    /// adapter that got no address here may still serve another use.
+    pub fn into_link(self) -> L {
+        self.phy.link
     }
 
     pub fn config(&self) -> Option<&Config> {
@@ -559,10 +584,14 @@ impl<L: Link, C: Clock> Stack<L, C> {
 
     fn lookup(&mut self, lookup: &mut Lookup, now: u64) -> Result<Option<IpAddress>, NetError> {
         let Some((query, kind)) = lookup.query else {
-            let kind = if !lookup.ipv4_only && self.ipv6_ready() {
+            // IPv6 first where it reaches the internet; from a unique local
+            // address alone only when there is no IPv4 at all.
+            let kind = if !lookup.ipv4_only && self.ipv6_global_ready() {
                 DnsQueryType::Aaaa
             } else if self.config.is_some() {
                 DnsQueryType::A
+            } else if !lookup.ipv4_only && self.ipv6_ready() {
+                DnsQueryType::Aaaa
             } else if now >= lookup.deadline {
                 return Err(NetError::Dns(alloc::format!(
                     "{}: no reachable address family",
@@ -585,9 +614,14 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 .start_query(self.iface.context(), &lookup.name, kind)
                 .map_err(|error| NetError::Dns(alloc::format!("{}: {error:?}", lookup.name)))?;
             lookup.query = Some((query, kind));
-            lookup.deadline = now.saturating_add(DNS_WAIT_US);
+            lookup.asked = 1;
+            lookup.deadline = now.saturating_add(DNS_SERVER_US);
             return Ok(None);
         };
+        let servers = self
+            .dns_servers
+            .len()
+            .min(smoltcp::config::DNS_MAX_SERVER_COUNT);
         let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
         let failure =
             match socket.get_query_result(query) {
@@ -598,6 +632,13 @@ impl<L: Link, C: Clock> Stack<L, C> {
                     });
                 }
                 Err(dns::GetQueryResultError::Pending) if now < lookup.deadline => return Ok(None),
+                // The next server's turn: smoltcp moves to it at the first
+                // poll past the last one's 10 s, which this wake makes.
+                Err(dns::GetQueryResultError::Pending) if lookup.asked < servers => {
+                    lookup.asked += 1;
+                    lookup.deadline = now.saturating_add(DNS_SERVER_US);
+                    return Ok(None);
+                }
                 Err(dns::GetQueryResultError::Pending) => {
                     socket.cancel_query(query);
                     NetError::Timeout("DNS")
@@ -641,6 +682,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 buffer,
                 raw,
                 query: None,
+                asked: 0,
                 ipv4_only: false,
                 deadline: 0,
             }),

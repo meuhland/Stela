@@ -31,6 +31,8 @@ _Noreturn void exit(int status);
 _Noreturn void _Exit(int status);
 int atexit(void (*function)(void));
 char *getenv(const char *name);
+/* There is no command processor: system(NULL) says so and a command fails. */
+int system(const char *command);
 char *secure_getenv(const char *name);
 int mkstemps(char *path, int suffix);
 int mkstemp(char *path);

@@ -1,9 +1,10 @@
 //! Buffers, textures and texture views: Metal descriptors validated against
 //! Metal's rules and the device, then lowered to Vulkan objects.
 //!
-//! Every texture uses one image layout for its whole life
-//! (`VK_KHR_unified_image_layouts`), so lowering never schedules layout
-//! transitions. Storage modes map to memory as a discrete Mac GPU realizes
+//! Every texture uses one image layout, `VK_IMAGE_LAYOUT_GENERAL`, for its
+//! whole life after its first barrier, so lowering never schedules layout
+//! transitions; `VK_KHR_unified_image_layouts`, where offered, promises
+//! that this layout costs nothing (`vulkan::backend::requirements`). Storage modes map to memory as a discrete Mac GPU realizes
 //! them: shared and managed resources live in host-visible memory, private
 //! resources in device-local memory. Memoryless textures live in device-local
 //! memory too: a pass may neither load nor store them, so no content outlives
@@ -190,9 +191,11 @@ pub enum CpuAccess {
     None,
     /// `vkCopyMemoryToImage` and `vkCopyImageToMemory`.
     HostImageCopy,
-    /// Metal's CPU copy of a managed texture, in a host-visible buffer:
-    /// CPU writes reach the image at the next commit, and
-    /// `synchronizeTexture` copies the image back.
+    /// A CPU copy in a host-visible buffer, which CPU writes reach the
+    /// image from at the next commit. A managed texture's is Metal's CPU
+    /// copy, which `synchronizeTexture` copies the image back into; a
+    /// shared texture's CPU reads copy the image out on the GPU
+    /// ([`Device::begin_read_back`](crate::metal::device::Device::begin_read_back)).
     Staged,
     /// The texture aliases a buffer's mapped rows.
     Linear,
@@ -298,12 +301,25 @@ pub fn texture(capabilities: &Capabilities, descriptor: &TextureDescriptor) -> R
             ));
         }
         StorageMode::Managed => CpuAccess::Staged,
-        // A staged copy only meets the GPU's writes at a synchronize.
-        StorageMode::Shared => {
+        // Metal copies no multisample texture's texels to or from the CPU
+        // (replaceRegion and getBytes take one sample), and no CPU call
+        // reaches a combined depth-stencil texture's: blits copy each
+        // aspect. Both are device images whose CPU copies answer
+        // Unsupported.
+        StorageMode::Shared
+            if descriptor.sample_count > 1 || matches!(description.kind, Kind::DepthStencil) =>
+        {
+            CpuAccess::None
+        }
+        StorageMode::Shared if !description.encoding().is_exact() => {
             return Err(super::error::Error::Unsupported(
-                "shared storage of a format without host image copy",
+                "shared storage of an extended-range format without host image copy",
             ));
         }
+        // Formats without host image copy, as NVK's depth and stencil
+        // formats: CPU writes reach the image at the next commit, and CPU
+        // reads copy the image out on the GPU, so each sees the GPU's.
+        StorageMode::Shared => CpuAccess::Staged,
     };
 
     let mut image = image_info(descriptor, description, realization, usage);
@@ -507,7 +523,15 @@ fn effective_usage(
         )?;
         return Ok(usage);
     }
-    let usage = descriptor.usage;
+    // Metal gives no depth or stencil format shader writes on any family
+    // (its feature set tables list none, and the shading language's depth
+    // textures take no write access), and Apple's drivers make such a
+    // texture whose descriptor asks for them: no shader can use the bit.
+    let usage = if descriptor.pixel_format.describe().is_color() {
+        descriptor.usage
+    } else {
+        descriptor.usage.difference(TextureUsage::SHADER_WRITE)
+    };
     if usage.contains(TextureUsage::SHADER_READ) {
         require(
             format.contains(C::READ),
@@ -1024,14 +1048,22 @@ pub fn linear_texture(
         descriptor.width.max(descriptor.height) <= capabilities.limits.max_texture_dimension_2d,
         "texture dimensions",
     )?;
-    let (row_alignment, offset_alignment) = capabilities.linear_texture_alignments();
+    // Metal asks rows and offsets aligned to the device's
+    // `minimumLinearTextureAlignmentForPixelFormat:`, and macOS's frameworks
+    // lay IOSurface planes out to Apple GPUs' answer, 16 bytes (an M-series
+    // Mac's for RGBA8 and RGBA32Float), as an '&b38' surface's alpha plane
+    // whose row is the screen's width. Any whole number of texels a row is
+    // taken: where the GPU's linear layout needs more
+    // ([`linear_layout_fits`]), the texture is an aligned copy of the rows
+    // ([`aligned_copy`]).
+    let texel = u64::from(description.block.bytes);
     ensure(
-        bytes_per_row.is_multiple_of(row_alignment),
-        "bytesPerRow is not aligned",
+        bytes_per_row.is_multiple_of(texel),
+        "bytesPerRow is not a whole number of pixels",
     )?;
     ensure(
-        offset.is_multiple_of(offset_alignment),
-        "offset is not aligned",
+        offset.is_multiple_of(texel),
+        "offset is not a whole number of pixels",
     )?;
     ensure(
         bytes_per_row >= description.row_bytes(descriptor.width),
@@ -1084,6 +1116,30 @@ pub fn linear_texture(
             CpuAccess::Linear
         },
     })
+}
+
+/// Whether a linear texture whose rows lie `bytes_per_row` apart from
+/// `place` bytes into their memory is one the GPU addresses in place: its
+/// linear layout's row pitch and binding offset alignments
+/// ([`Capabilities::linear_texture_alignments`]).
+pub fn linear_layout_fits(capabilities: &Capabilities, place: u64, bytes_per_row: u64) -> bool {
+    let (row, offset) = capabilities.linear_texture_alignments();
+    bytes_per_row.is_multiple_of(row) && place.is_multiple_of(offset)
+}
+
+/// The image of a linear texture's aligned copy, for rows the GPU cannot
+/// address in place ([`linear_layout_fits`]): the linear image's format,
+/// views and usages in the GPU's own layout, which copies fill from the
+/// rows and return to them.
+pub fn aligned_copy(linear: &ImageInfo) -> ImageInfo {
+    ImageInfo {
+        tiling: ImageTiling::Optimal,
+        linear: None,
+        // The CPU reaches the rows, never the copy.
+        usage: (linear.usage | ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST)
+            .difference(ImageUsage::HOST_TRANSFER),
+        ..linear.clone()
+    }
 }
 
 /// One plane of a two-plane texture: where it starts in the buffer and its

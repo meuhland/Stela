@@ -634,6 +634,27 @@ fn reads(plan: &mut Plan, library: &str) {
             .output(Output::new("out", Dtype::F32, Tolerance::default()).expect_same(f32s(&depths)))
             .texture(t2d("t", "depth32float", 8, 8).data(f32s(&depths))),
     );
+    // A shared depth texture, which the CPU writes.
+    plan.add(
+        Case::compute1(
+            "texture.read.depth32float.shared",
+            library,
+            "read_depth",
+            64,
+        )
+        .buffer(Buffer::data(
+            "coords",
+            0,
+            coords(&(0..64).map(|i| [i % 8, i / 8, 0, 0]).collect::<Vec<_>>()),
+        ))
+        .buffer(Buffer::zeroed("out", 1, 256))
+        .output(Output::new("out", Dtype::F32, Tolerance::default()).expect_same(f32s(&depths)))
+        .texture(
+            t2d("t", "depth32float", 8, 8)
+                .set("storage", "shared")
+                .data(f32s(&depths)),
+        ),
+    );
     if plan.has(SOURCE, "read_buffer") {
         let texels = make_texels(&f, 256, &mut rng);
         let expect: Vec<f64> = texels.iter().flat_map(|t| decode(&f, t)).collect();

@@ -109,14 +109,12 @@ fn guest_pause_pulse_is_not_fabricated_as_linux_press_release_or_syn() {
 fn fatal_byte_keeps_consumed_prefix_before_stop_and_original_first_cause() {
     let (mut c, h) = controller(Config::default());
     c.initialize().unwrap();
-    for byte in [0x1c, 0xff] {
-        h.borrow_mut().emit(Port::Keyboard, byte);
-    }
+    // The controller stops answering after the key's byte.
+    h.borrow_mut().emit(Port::Keyboard, 0x1c);
+    let at = h.borrow().consumed + 1;
+    h.borrow_mut().gone_at = Some(at);
     let polled = c.poll_observed();
-    assert_eq!(
-        polled.first_error.unwrap().kind,
-        ErrorKind::KeyboardSequence
-    );
+    assert_eq!(polled.first_error.unwrap().kind, ErrorKind::NoController);
     assert_eq!(
         polled.inputs,
         vec![Input::Key {
@@ -146,7 +144,7 @@ fn fatal_byte_keeps_consumed_prefix_before_stop_and_original_first_cause() {
         })
         .unwrap();
     assert!(report < stopped);
-    assert_eq!(scan_bytes(&polled), [0x1c, 0xff]);
+    assert_eq!(scan_bytes(&polled), [0x1c]);
     assert_eq!(
         c.observation_sources()[0].status(),
         Status::Stopped(StopCause::TransportFailed)

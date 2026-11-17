@@ -61,6 +61,7 @@ mod system_key;
 mod volume_key;
 
 use super::{
+    credentials::{Handle, Link},
     endpoint::Service,
     message::Frame,
     observe::Journal,
@@ -248,7 +249,11 @@ impl KeyStore {
     /// Run one bounded slice of the running derivation. When it completes,
     /// write the reply through `payload` and return the reply frame, or the
     /// refusal; until then, `None`.
-    pub fn resume(&mut self, payload: &mut dyn Payload) -> Option<Result<Frame, Refusal>> {
+    pub fn resume(
+        &mut self,
+        payload: &mut dyn Payload,
+        link: &mut dyn Link,
+    ) -> Option<Result<Frame, Refusal>> {
         // A derivation is only ever started by the keybags.
         let keybags = self.keybags.as_mut()?;
         let deferred = self.deferred.as_mut()?;
@@ -261,7 +266,9 @@ impl KeyStore {
         let refuse = |reason: stela_contracts::Refusal| {
             Refusal::answered(reason, Answer::frame(failure(frame)))
         };
+        let granted = keybags.take_grant();
         let result = done
+            .and_then(|fields| grant(granted, link).map(|()| fields))
             .map_err(|reason| keybag_refusal(frame, reason))
             .and_then(|fields| {
                 let reply = reply_message(&deferred.prefix, &fields);
@@ -362,20 +369,21 @@ impl KeyStore {
         frame: Frame,
         payload: &mut dyn Payload,
         entropy: &mut dyn super::Entropy,
+        link: &mut dyn Link,
     ) -> Result<Option<Frame>, Refusal> {
         let result = if self.deferred.is_some() {
             Err(Refusal::unanswerable(
                 "SEP keystore request arrived during a derivation",
             ))
         } else {
-            self.serve(frame, payload, entropy)
+            self.serve(frame, payload, entropy, link)
         };
         self.note_refusal(frame, result.as_ref().err());
         result
     }
 
     /// [`Self::begin`], then any derivation to its end, for tests: sepOS
-    /// runs one bounded slice per DMA step instead.
+    /// runs one bounded slice per DMA step instead. No ACM context exists.
     #[cfg(test)]
     pub fn request(
         &mut self,
@@ -383,11 +391,23 @@ impl KeyStore {
         payload: &mut dyn Payload,
         entropy: &mut dyn super::Entropy,
     ) -> Result<Frame, Refusal> {
-        if let Some(reply) = self.begin(frame, payload, entropy)? {
+        self.request_linked(frame, payload, entropy, &mut super::credentials::Unlinked)
+    }
+
+    /// [`Self::request`] with the credential manager `link`.
+    #[cfg(test)]
+    pub fn request_linked(
+        &mut self,
+        frame: Frame,
+        payload: &mut dyn Payload,
+        entropy: &mut dyn super::Entropy,
+        link: &mut dyn Link,
+    ) -> Result<Frame, Refusal> {
+        if let Some(reply) = self.begin(frame, payload, entropy, link)? {
             return Ok(reply);
         }
         loop {
-            if let Some(result) = self.resume(payload) {
+            if let Some(result) = self.resume(payload, link) {
                 return result;
             }
             if !self.deriving() {
@@ -418,6 +438,7 @@ impl KeyStore {
         frame: Frame,
         payload: &mut dyn Payload,
         entropy: &mut dyn super::Entropy,
+        link: &mut dyn Link,
     ) -> Result<Option<Frame>, Refusal> {
         let refuse = |reason: stela_contracts::Refusal| {
             Refusal::answered(reason, Answer::frame(failure(frame)))
@@ -541,6 +562,7 @@ impl KeyStore {
                     message.variant(),
                     &mut fields,
                     entropy,
+                    &*link,
                     &mut |note| diagnostics.record(note),
                 )
                 .map_err(|reason| keybag_refusal(frame, reason))?;
@@ -549,6 +571,8 @@ impl KeyStore {
             }
             return match outcome {
                 keybag::Outcome::Reply(reply_fields) => {
+                    grant(keybags.take_grant(), link)
+                        .map_err(|reason| keybag_refusal(frame, reason))?;
                     let reply = message.reply(&reply_fields);
                     payload.output(&reply).map_err(refuse)?;
                     Ok(Some(reply_frame(frame, &reply)))
@@ -601,6 +625,15 @@ impl KeyStore {
             self.environment = environment;
         }
         Ok(Some(reply_frame(frame, &reply)))
+    }
+}
+
+/// Give the ACM context a successful verify names its PasscodeValidated
+/// credential, before the verify is answered.
+fn grant(context: Option<Handle>, link: &mut dyn Link) -> Result<()> {
+    match context {
+        Some(context) => link.passcode_validated(&context),
+        None => Ok(()),
     }
 }
 

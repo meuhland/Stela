@@ -61,14 +61,18 @@ mod bare_host;
 pub(crate) mod chain_check;
 mod faults;
 pub(crate) mod pmu;
+#[cfg(feature = "nvk")]
+mod process_fault;
+pub(crate) mod sampling;
 mod signals;
 pub use bare_host::BareHost;
 use faults::*;
 pub(crate) use faults::{native_exception, page_fault};
 pub(crate) use signals::{
     clear_interrupted, completion_signal, device_signals, doorbell_counter, doorbells,
-    in_interrupt, interrupted, join_shootdown, ring, root_irq_active, shootdown,
-    shootdown_interrupt, signal_interrupt, sleep_for, undelivered_doorbells, wake_interrupt,
+    end_stale_in_service, in_interrupt, interrupted, join_shootdown, network_interrupt,
+    network_signal, nmi, ring, root_irq_active, shootdown, shootdown_interrupt, signal_interrupt,
+    sleep_for, stale_in_service_report, take_network_signal, undelivered_doorbells, wake_interrupt,
 };
 pub use signals::{spurious_interrupt, stray_interrupt, timer_interrupt};
 #[cfg(feature = "diagnostics")]
@@ -79,10 +83,12 @@ use stela_boot_core::native_profile as profile;
 use stela_boot_core::ram;
 mod translated;
 pub(crate) use local::activated_base;
-pub(crate) use local::context::RootIdentity;
 #[cfg(feature = "nvk")]
-pub(crate) use local::processor;
+pub(crate) use local::context::close_moves;
+pub(crate) use local::context::{RootIdentity, moved_here, moves_closed};
 use local::state;
+#[cfg(feature = "nvk")]
+pub(crate) use local::{processor, processors};
 
 /// Calls `action` with each host run behind `bytes` of guest RAM at `guest`, as
 /// (host physical, bytes). False, partway, if part of it is not RAM.
@@ -395,12 +401,69 @@ pub(crate) fn fresh_counter() -> u64 {
     counter_at_tsc(state, rdtsc())
 }
 
-/// Count this processor's 24 MHz clock from a base its software TSC
-/// correction moved (`tsc::sync::corrected_base`): its raw counter reads
-/// `offset` ticks behind the BSP's. Runs on the AP before it is ready.
-pub(crate) fn correct_tsc_base(offset: i64) {
-    let state = state();
-    state.tsc_base = stela_boot_core::tsc::sync::corrected_base(state.tsc_base, offset);
+/// Keep this processor's software TSC correction: its raw counter reads
+/// `offset` ticks behind the BSP's. From then on [`rdtsc`] reads the BSP's
+/// counter here (`tsc::sync::shared_tsc`), and native count reads, which
+/// take the raw counter, count from a base moved by it
+/// ([`State::native_tsc_base`]). Runs on the AP before it is ready.
+pub(crate) fn agree_tsc(offset: i64) {
+    local::set_tsc_offset(offset);
+    if offset != 0 {
+        TSC_OFFSETS.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Set once an AP agrees with the BSP only through a software offset
+/// ([`agree_tsc`]): until then every core's raw counter is the BSP's.
+static TSC_OFFSETS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// This processor's time-stamp counter as the BSP's reads at the same
+/// instant: the value every TSC stamp one core stores and another compares
+/// must be. A core whose counter agreed only through a software offset
+/// reads it moved by that offset. Cores take it only once their local
+/// record is active, which each AP's is before the first offset is kept.
+pub fn rdtsc() -> u64 {
+    shared_tsc(crate::apic::rdtsc())
+}
+
+/// This processor's raw counter value `raw` as the BSP's counter read at
+/// the same instant ([`rdtsc`]), for a caller that takes the raw value
+/// itself, as the native clock does after its LFENCE.
+pub(crate) fn shared_tsc(raw: u64) -> u64 {
+    if TSC_OFFSETS.load(core::sync::atomic::Ordering::Relaxed) {
+        stela_boot_core::tsc::sync::shared_tsc(raw, local::tsc_offset())
+    } else {
+        raw
+    }
+}
+
+/// The device clock: [`rdtsc`] on any core, never earlier than a value any
+/// core was given (`tsc::sync::Monotonic`).
+static DEVICE_COUNTER: stela_boot_core::tsc::sync::Monotonic =
+    stela_boot_core::tsc::sync::Monotonic::new();
+
+/// The counter the drivers' clock reads on every core (`on_counter`), and
+/// every other host time that one core takes and another compares: the
+/// network stack's, a USB4 fabric's, the boot screen's running step. It
+/// never goes back, even where a core's counter moved after its
+/// synchronization: that core reads the last value given until its own
+/// passes it ([`device_counter_behind`]).
+pub fn device_counter() -> u64 {
+    DEVICE_COUNTER.read(rdtsc())
+}
+
+/// The most a core's [`rdtsc`] trailed the device clock, in ticks.
+pub(crate) fn device_counter_behind() -> u64 {
+    DEVICE_COUNTER.longest_behind()
+}
+
+impl State {
+    /// The base native count reads, which take this core's raw counter,
+    /// subtract: `tsc_base`, the BSP's, moved by this core's software
+    /// offset (`tsc::sync::corrected_base`).
+    pub(crate) fn native_tsc_base(&self) -> u64 {
+        stela_boot_core::tsc::sync::corrected_base(self.tsc_base, local::tsc_offset())
+    }
 }
 
 fn counter_at_tsc(state: &State, tsc: u64) -> u64 {
@@ -529,6 +592,11 @@ pub struct State {
     pub scoped: u64,
     /// Pages mapped beside a fault's from the same leaf.
     pub prefills: u64,
+    /// Pages mapped beside a fault's from the window's other leaves
+    /// (fault-around), each from its own walk.
+    pub around: u64,
+    /// TSC ticks from a filled #PF's handler entry to its return.
+    pub fill_ticks: u64,
     pub stray: u64,
     /// TSC ticks spent in compiled guest code, its exits and faults.
     pub native_ticks: u64,
@@ -547,8 +615,6 @@ pub struct State {
     pub bounces: u64,
     pub guard_faults: u64,
 }
-
-pub use crate::apic::rdtsc;
 
 fn load_root(root: u64) {
     // SAFETY: every root maps the window, which holds all code and data in use.
@@ -729,6 +795,8 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
             kept_dropped: 0,
             scoped: 0,
             prefills: 0,
+            around: 0,
+            fill_ticks: 0,
             stray: 0,
             placement: config.placement,
             tlb: Tlb::default(),
@@ -750,10 +818,14 @@ pub unsafe fn install(config: Config) -> Result<HostOwner> {
 
 /// The host's counters for the statistics line.
 pub struct Statistics {
-    /// Shadow faults filled, and the pages beside them mapped from the
-    /// same leaves.
+    /// Shadow faults filled, the pages beside them mapped from the same
+    /// leaves, and those mapped from the window's other leaves.
     pub fills: u64,
     pub prefills: u64,
+    pub around: u64,
+    /// Nanoseconds the filled faults' handlers took, entry to return
+    /// (without the exception's delivery and IRETQ).
+    pub fill_ns: u64,
     /// Resets of the whole shadow, those because a half ran out of frames,
     /// of the lower half alone, and TLBIs that unmapped ranges instead.
     pub resets: u64,
@@ -800,6 +872,9 @@ pub fn statistics() -> Statistics {
     Statistics {
         fills: state.fills,
         prefills: state.prefills,
+        around: state.around,
+        fill_ns: (u128::from(state.fill_ticks) * 1_000_000_000 / u128::from(state.tsc_hz.max(1)))
+            as u64,
         resets: state.resets,
         exhausted: state.exhausted,
         lower_resets: state.lower_resets,

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sun, 15 Nov 2026 01:06:11 +0000
+Subject: [PATCH] radv: lower the point coordinate to its input in a shader
+ given as NIR, as in one from SPIR-V
+
+---
+ src/amd/vulkan/radv_shader.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 312b7c0..e9865d5 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -488,6 +488,14 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+       nir = nir_shader_clone(NULL, stage->internal_nir);
+       nir_validate_shader(nir, "in internal shader");
+ 
++      /* A shader built as NIR reads the point coordinate as a system value,
++       * as SPIR-V's does before the lowering below; ACO takes it only as the
++       * input it lowers to. */
++      const struct nir_lower_sysvals_to_varyings_options point_coord = {
++         .point_coord = true,
++      };
++      NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &point_coord);
++
+       assert(exec_list_length(&nir->functions) == 1);
+       radv_shader_choose_subgroup_size(compiler_info, nir, &stage->key, 0);
+    } else {
+-- 
+2.56.1
+

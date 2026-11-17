@@ -70,16 +70,20 @@ impl Usb {
         )
     }
 
-    /// Its model or size, typed back to erase a disk other than a USB
-    /// stick, or any disk when stela cannot tell which one this computer
-    /// runs from.
-    fn typed_back(&self, ui: &dyn Ui) -> Result<String> {
+    /// Why erasing it needs its model or size typed back: a disk other than
+    /// a USB stick, or any disk when stela cannot tell which one this
+    /// computer runs from (`host::typed_reason`).
+    fn why_typed(&self) -> Option<&'static str> {
+        host::typed_reason(self.removal, self.bytes)
+    }
+
+    /// Its model or size, typed back, saying `why` it is asked.
+    fn typed_back(&self, ui: &dyn Ui, why: &str) -> Result<String> {
         ui.warning(&format!(
-            "{} ({}, {}) {}.",
+            "{} ({}, {}) {why}.",
             self.name,
             self.size(),
             self.id,
-            self.removal.why_typed()
         ))?;
         let (name, bytes) = (self.name.clone(), self.bytes);
         let expected = format!("Type {} or {}", self.name, self.size());
@@ -196,17 +200,10 @@ impl Image {
             );
         }
         match (kind, self.bytes, self.boot_bytes) {
-            (InstallImage::Full, Some(bytes), _) => (
-                bytes,
-                format!(
-                    "{}, written to the stick as it arrives",
-                    host::size_text(bytes)
-                ),
-            ),
-            (InstallImage::Network, _, Some(bytes)) => {
-                (bytes, format!("{} now", host::size_text(bytes)))
+            (InstallImage::Full, Some(bytes), _) | (InstallImage::Network, _, Some(bytes)) => {
+                (bytes, host::size_text(bytes))
             }
-            _ => (0, "the size is unknown until Apple's server answers".into()),
+            _ => (0, "size not known yet".into()),
         }
     }
 }
@@ -312,15 +309,12 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
         ui.note(
             "Review",
             &format!(
-                "USB        {}\nInstaller  {}\nmacOS      {} ({})\nMac        {model_name}\n\
+                "Stick      {}\nInstaller  {}\nmacOS      {} ({})\nMac        {model_name}\n\
                  {network}Download   {download_text}\n{}",
-                usb.serial.as_ref().map_or_else(
-                    || usb.description(),
-                    |serial| format!("{} · serial {serial}", usb.description())
-                ),
+                usb.description(),
                 match online {
-                    false => "Offline · the install needs no internet",
-                    true => "Online · the install downloads macOS",
+                    false => InstallImage::Full.name(),
+                    true => InstallImage::Network.name(),
                 },
                 image.version,
                 command.build,
@@ -335,24 +329,48 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
         for note in firmware::host_notes(host)? {
             ui.info(&note)?;
         }
-        ui.info(super::create::SIGNING_SUMMARY)?;
         if let Some(record) = &stick.record {
+            // The command its state calls for, if any: a stick that needs
+            // nothing is kept by not erasing it.
+            let keep = match stick.next(true) {
+                Some(command) => format!("choose Quit and run `{command}`"),
+                None => "choose Quit".into(),
+            };
             ui.warning(&format!(
                 "This stick holds Stela with macOS {}: a new installer replaces it. To keep it, \
-                 choose Cancel and run `stela update`.",
+                 {keep}.",
                 super::home::macos_name(&record.build)
             ))?;
         }
-        ui.warning(&format!("Everything on {} will be erased.", usb.short()))?;
+        match &stick.state {
+            super::home::State::Unreadable(reason) => ui.warning(&format!(
+                "This stick may hold Stela, but stela cannot read it: {} A new installer \
+                 replaces whatever it holds. To keep it, choose Quit.",
+                super::home::sentence(reason)
+            ))?,
+            super::home::State::Newer(version) if stick.record.is_none() => {
+                ui.warning(&format!(
+                    "This stick holds Stela {version}: a new installer replaces it. To keep it, \
+                 choose Quit."
+                ))?
+            }
+            _ => {}
+        }
+        let contents = stick.disk.contents();
+        ui.warning(&match contents.is_empty() {
+            true => format!("Everything on {} will be erased.", usb.short()),
+            false => format!("Everything on {} will be erased: {contents}.", usb.short()),
+        })?;
         let create = match download {
             0 => "Erase and create".to_owned(),
             bytes => format!("Erase and create (downloads {})", host::size_text(bytes)),
         };
-        let rows = ui::rows(&[(&create, ""), ("Change something", ""), ("Cancel", "")]);
-        match ui.select("Create the installer?", &rows, 0)? {
+        let rows = ui::rows(&[(&create, ""), ("Change something", ""), ("Quit", "")]);
+        // Enter takes Quit: no row that erases or downloads is the default.
+        match ui.select("Create the installer?", &rows, QUIT)? {
             0 => {
-                if matches!(usb.removal, Removal::Typed | Removal::Unsure) {
-                    command.confirm_disk = Some(usb.typed_back(ui)?);
+                if let Some(why) = usb.why_typed() {
+                    command.confirm_disk = Some(usb.typed_back(ui, why)?);
                 }
                 usb.verify(host)?;
                 command.confirmed = true;
@@ -366,6 +384,9 @@ fn ask(environment: &Environment<'_>, command: &mut Request, stick: &Stick) -> R
         }
     }
 }
+
+/// The value of Quit in "Create the installer?".
+const QUIT: usize = 2;
 
 /// Which part of the installer to change.
 fn change(environment: &Environment<'_>, command: &Request, online: bool) -> Result<Part> {

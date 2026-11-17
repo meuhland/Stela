@@ -68,6 +68,118 @@ fn composes_includes_conditions_and_simple_references() {
 }
 
 #[test]
+fn reads_a_makefile_with_continuations_rules_and_tree_includes() {
+    let root = tree(
+        "makefile",
+        &[(
+            "Makefile",
+            "subdir-ccflags-y += $(call cc-option, -Wformat-truncation)\n\
+             subdir-ccflags-$(CONFIG_WERROR) += -Werror\n\
+             subdir-ccflags-y += -I$(obj) -I$(src)\n\
+             hostprogs := gen\n\
+             generated := $(obj)/generated/a.c $(obj)/generated/a.h\n\
+             quiet_cmd_gen = GEN     $(notdir $(generated))\n\
+             \x20     cmd_gen = mkdir -p $(@D); $(obj)/gen $(src)/a.rules $(generated)\n\
+             $(obj)/generated/%.c $(obj)/generated/%.h: $(obj)/gen \\\n\
+             \t\t $(src)/a.rules\n\
+             \t$(call cmd,gen)\n\
+             \n\
+             drv-y += a.o \\\n\
+             \tb.o\n\
+             drv-$(CONFIG_I2C)\t+= i2c.o \\\n\
+             \t\t   amc.o\n\
+             ifdef CONFIG_OFF\n\
+             $(obj)/off/%.o: $(src)/%.c\n\
+             \t$(call cmd,off)\n\
+             off_only := 1\n\
+             endif\n\
+             subdir-ccflags-$(CONFIG_DISPLAY) += \\\n\
+             \t-I$(src)/compat \\\n\
+             \t-I$(srctree)/drivers/shared/display/\n\
+             drv-$(CONFIG_DISPLAY) += \\\n\
+             \tdisplay/d.o \\\n\
+             \tshared-display/s.o\n\
+             ifeq ($(CONFIG_ACPI),y)\n\
+             \tdrv-$(CONFIG_DISPLAY) += \\\n\
+             \t\tshared-display/acpi.o\n\
+             endif\n\
+             ifneq ($(CONFIG_DISPLAY),y)\n\
+             \tfind_args += -not -path display/\\*\n\
+             endif\n\
+             always-$(CONFIG_WERROR) += $(patsubst %.h,%.hdrtest, $(shell ls))\n\
+             uses := $(addprefix $(obj)/, $(drv-y))\n\
+             $(uses): $(obj)/generated/a.h\n",
+        )],
+    );
+    let kbuild = Kbuild::read(
+        &root,
+        &config("#define CONFIG_I2C 1\n#define CONFIG_DISPLAY 1\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        kbuild.objects("drv").unwrap(),
+        [
+            "a.o",
+            "b.o",
+            "i2c.o",
+            "amc.o",
+            "display/d.o",
+            "shared-display/s.o"
+        ]
+    );
+    assert_eq!(kbuild.includes, [root.join("."), root.join("compat")]);
+    assert_eq!(
+        kbuild.tree_includes,
+        [PathBuf::from("drivers/shared/display")]
+    );
+    assert!(kbuild.generated_include && !kbuild.werror);
+    assert_eq!(kbuild.optional_flags, ["-Wformat-truncation"]);
+    assert_eq!(
+        kbuild
+            .definitions
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "cmd_gen",
+                "mkdir -p $(@D); $(obj)/gen $(src)/a.rules $(generated)"
+            ),
+            ("generated", "$(obj)/generated/a.c $(obj)/generated/a.h"),
+            ("hostprogs", "gen"),
+            ("quiet_cmd_gen", "GEN     $(notdir $(generated))"),
+            ("uses", "$(addprefix $(obj)/, $(drv-y))"),
+        ]
+    );
+    assert_eq!(
+        kbuild.rules,
+        [
+            kbuild::Rule {
+                targets: "$(obj)/generated/%.c $(obj)/generated/%.h".into(),
+                prerequisites: "$(obj)/gen $(src)/a.rules".into(),
+                recipe: vec!["$(call cmd,gen)".into()],
+            },
+            kbuild::Rule {
+                targets: "$(uses)".into(),
+                prerequisites: "$(obj)/generated/a.h".into(),
+                recipe: Vec::new(),
+            },
+        ]
+    );
+    let other = Kbuild::read(
+        &root,
+        &config("#define CONFIG_ACPI 1\n#define CONFIG_WERROR 1\n"),
+    );
+    // An enabled list holding a function call is refused.
+    assert!(other.is_err());
+    // A directory's Kbuild is read in place of its Makefile.
+    fs::write(root.join("Kbuild"), "drv-y := k.o\n").unwrap();
+    let kbuild = Kbuild::read(&root, &config("")).unwrap();
+    assert_eq!(kbuild.objects("drv").unwrap(), ["k.o"]);
+    assert_eq!(kbuild.files, [root.join("Kbuild")]);
+}
+
+#[test]
 fn refuses_what_it_cannot_evaluate_even_when_inactive() {
     for (name, text, header) in [
         ("unknown", "ifdef CONFIG_OFF\nifeq ($(A),b)\nendif\n", ""),
@@ -90,6 +202,16 @@ fn refuses_what_it_cannot_evaluate_even_when_inactive() {
         ("unbalanced", "ifdef CONFIG_X86\ndrv-y += a.o\n", ""),
         ("stray", "endif\n", ""),
         ("flag", "ccflags-y += -DDEBUG\n", ""),
+        ("option", "ccflags-y += $(call cc-option, -DDEBUG)\n", ""),
+        ("assigned flags", "ccflags-y := -I$(src)\n", ""),
+        ("outside", "ccflags-y += -I$(srctree)/../include\n", ""),
+        ("absolute", "ccflags-y += -I/usr/include\n", ""),
+        ("compare", "ifeq ($(CONFIG_A),m)\nendif\n", ""),
+        ("negated", "ifneq ($(A),y)\nendif\n", ""),
+        ("else", "ifdef CONFIG_A\nelse\nendif\n", ""),
+        ("recursive list", "drv-y = a.o\n", ""),
+        ("dashed", "drv-objs := a.o\n", ""),
+        ("word", "export\n", ""),
         ("loop", "include $(src)/Kbuild\n", ""),
     ] {
         let root = tree(name, &[("Kbuild", text)]);

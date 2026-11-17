@@ -1254,9 +1254,11 @@ pointer_phi_authority_refusals(void)
 static void
 cfg_limits_and_refusals(void)
 {
+   /* An array of pointers hides the resource each was proven to reach. */
    expect_refusal("entry:\n%c = icmp eq i32 %tid, 0\nbr i1 %c, label %left, label %right\n"
       "left:\nbr label %join\nright:\nbr label %join\n"
-      "join:\n%p = phi [2 x i32] [[i32 1, i32 2], %left], [[i32 3, i32 4], %right]\nret void\n",
+      "join:\n%p = phi [2 x ptr addrspace(1)] [[ptr addrspace(1) null, ptr addrspace(1) null], %left],"
+      " [[ptr addrspace(1) null, ptr addrspace(1) null], %right]\nret void\n",
       "", 100, STELA_AIR_TYPE);
    expect_refusal("unreachable\n", "", 100, STELA_AIR_CONTROL_FLOW);
    expect_refusal(loop_body, "", 20, STELA_AIR_LIMIT);
@@ -2650,12 +2652,133 @@ thread_memory_holds_only_accessed_variables(void)
    ralloc_free(nir);
 }
 
+/* PHIs of an array, of a struct holding one, and of an [8 x i8] whose one
+ * edge leaves a byte undefined join each leaf: each invocation stores what
+ * its edge put in every place. */
+static void
+aggregate_phis_join_each_leaf(void)
+{
+   const char *body =
+      "entry:\n%c = icmp eq i32 %tid, 0\nbr i1 %c, label %left, label %right\n"
+      "left:\n%la = insertvalue [2 x i32] [i32 1, i32 2], i32 %tid, 1\n"
+      "%lb = trunc i32 %tid to i8\n%lc = add i8 %lb, 9\n"
+      "%ls0 = insertvalue [8 x i8] undef, i8 %lc, 0\n"
+      "%ls = insertvalue [8 x i8] %ls0, i8 4, 7\nbr label %join\n"
+      "right:\n%ra = add i32 %tid, 40\n"
+      "%rn0 = insertvalue { [2 x i32], i16 } { [2 x i32] [i32 8, i32 9], i16 10 }, i32 %ra, 0, 1\n"
+      "%rn = insertvalue { [2 x i32], i16 } %rn0, i16 11, 1\nbr label %join\n"
+      "join:\n%p = phi [2 x i32] [%la, %left], [[i32 3, i32 4], %right]\n"
+      "%n = phi { [2 x i32], i16 } [{ [2 x i32] [i32 5, i32 6], i16 7 }, %left], [%rn, %right]\n"
+      "%s = phi [8 x i8] [%ls, %left], [[i8 1, i8 2, i8 3, i8 4, i8 5, i8 6, i8 7, i8 8], %right]\n"
+      "%p1 = extractvalue [2 x i32] %p, 1\n"
+      "store i32 %p1, ptr addrspace(1) %out, align 4\n"
+      "%n01 = extractvalue { [2 x i32], i16 } %n, 0, 1\n"
+      "%o1 = getelementptr i32, ptr addrspace(1) %out, i32 1\n"
+      "store i32 %n01, ptr addrspace(1) %o1, align 4\n"
+      "%n1 = extractvalue { [2 x i32], i16 } %n, 1\n%n1w = zext i16 %n1 to i32\n"
+      "%o2 = getelementptr i32, ptr addrspace(1) %out, i32 2\n"
+      "store i32 %n1w, ptr addrspace(1) %o2, align 4\n"
+      "%s0 = extractvalue [8 x i8] %s, 0\n%s7 = extractvalue [8 x i8] %s, 7\n"
+      "%s0w = zext i8 %s0 to i32\n%s7w = zext i8 %s7 to i32\n%s7h = shl i32 %s7w, 8\n"
+      "%sw = or i32 %s0w, %s7h\n"
+      "%o3 = getelementptr i32, ptr addrspace(1) %out, i32 3\n"
+      "store i32 %sw, ptr addrspace(1) %o3, align 4\nret void\n";
+   const uint64_t addresses[4] = {0x100000, 0x100004, 0x100008, 0x10000c};
+   for (uint32_t tid = 0; tid < 2; tid++) {
+      nir_shader *nir = translate_body(body);
+      specialize_invocation(nir, tid);
+      const uint32_t left[4] = {tid, 6, 7, (tid + 9) | 4 << 8};
+      const uint32_t right[4] = {4, tid + 40, 11, 1 | 8 << 8};
+      check_stores(nir, addresses, tid == 0 ? left : right, 4);
+      ralloc_free(nir);
+   }
+}
+
+/* @step8's body: x mixed with s[0] and s[7], then `rounds` rounds of
+ * x = (x * 33) ^ s[1]. */
+static uint32_t
+step8_reference(uint32_t x, uint8_t s0, uint8_t s1, uint8_t s7, unsigned rounds)
+{
+   x ^= (uint32_t)s0 | (uint32_t)s7 << 8;
+   for (unsigned i = 0; i < rounds; i++)
+      x = (x * 33) ^ s1;
+   return x;
+}
+
+/* Two calls in one block passing a by-value [8 x i8], as MPS's stitched
+ * reduction kernel passes its reduction state to the graph's reduce and
+ * write functions: the shared call takes the arrays through a PHI of
+ * [8 x i8], which translation joins leaf by leaf (it refused the kernel
+ * so), and each invocation stores what two separate copies would. */
+static void
+repeated_calls_passing_an_array_share_one_body(void)
+{
+   const unsigned rounds = 160;
+   char step[16384] =
+      "define internal i32 @step8(i32 %x0, [8 x i8] %s) {\n"
+      "%e0 = extractvalue [8 x i8] %s, 0\n%e1 = extractvalue [8 x i8] %s, 1\n"
+      "%e7 = extractvalue [8 x i8] %s, 7\n%z0 = zext i8 %e0 to i32\n%k = zext i8 %e1 to i32\n"
+      "%z7 = zext i8 %e7 to i32\n%h = shl i32 %z7, 8\n%m = or i32 %z0, %h\n"
+      "%y0 = xor i32 %x0, %m\n";
+   for (unsigned i = 0; i < rounds; i++) {
+      size_t used = strlen(step);
+      snprintf(step + used, sizeof(step) - used, "%%t%u = mul i32 %%y%u, 33\n%%y%u = xor i32 %%t%u, %%k\n",
+               i, i, i + 1, i);
+   }
+   size_t used = strlen(step);
+   snprintf(step + used, sizeof(step) - used, "ret i32 %%y%u\n}\n", rounds);
+   const char *body =
+      "%a = trunc i32 %tid to i8\n%b = add i8 %a, 5\n"
+      "%s0a = insertvalue [8 x i8] zeroinitializer, i8 %a, 0\n"
+      "%s0b = insertvalue [8 x i8] %s0a, i8 3, 1\n"
+      "%s0 = insertvalue [8 x i8] %s0b, i8 %b, 7\n"
+      "%r0 = call i32 @step8(i32 %tid, [8 x i8] %s0)\n"
+      "%c = trunc i32 %r0 to i8\n"
+      "%s1a = insertvalue [8 x i8] zeroinitializer, i8 %c, 0\n"
+      "%s1b = insertvalue [8 x i8] %s1a, i8 7, 1\n"
+      "%s1 = insertvalue [8 x i8] %s1b, i8 %a, 7\n"
+      "%r1 = call i32 @step8(i32 %r0, [8 x i8] %s1)\n"
+      "store i32 %r1, ptr addrspace(1) %out, align 4\n"
+      "%o1 = getelementptr i32, ptr addrspace(1) %out, i32 1\n"
+      "store i32 %r0, ptr addrspace(1) %o1, align 4\nret void\n";
+   for (uint32_t tid = 0; tid < 3; tid++) {
+      LLVMMemoryBufferRef input = stela_air_test_bitcode(body, step);
+      struct stela_air_error error;
+      nir_shader *nir = translate(input, &test_nir_options, 4000, &error);
+      if (!nir)
+         fprintf(stderr, "shared calls of arrays: %s\n", error.detail);
+      CHECK(nir);
+      LLVMDisposeMemoryBuffer(input);
+      unsigned loops = 0, multiplies = 0;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_cf_node *parent = block->cf_node.parent;
+            loops += parent->type == nir_cf_node_loop && nir_loop_first_block(nir_cf_node_as_loop(parent)) == block;
+            nir_foreach_instr(instr, block)
+               multiplies += instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == nir_op_imul;
+         }
+      }
+      /* One body, not two. */
+      CHECK(loops == 1 && multiplies < 2 * rounds);
+      specialize_invocation(nir, tid);
+      uint8_t a = (uint8_t)tid;
+      uint32_t r0 = step8_reference(tid, a, 3, (uint8_t)(a + 5), rounds);
+      uint32_t r1 = step8_reference(r0, (uint8_t)r0, 7, a, rounds);
+      const uint64_t addresses[2] = {0x100000, 0x100004};
+      const uint32_t values[2] = {r1, r0};
+      check_executed_stores(nir, addresses, values, 2);
+      ralloc_free(nir);
+   }
+}
+
 static void
 tests(void)
 {
    reject_declared_entry_in_a_recursive_module();
    repeated_calls_share_one_body(32, "noinline");
    repeated_calls_share_one_body(160, "");
+   repeated_calls_passing_an_array_share_one_body();
+   aggregate_phis_join_each_leaf();
    calls_of_null_buffers_stay_separate();
    calls_of_structs_holding_pointers_stay_separate();
    inlined_thread_reference_takes_no_thread_memory();

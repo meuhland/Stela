@@ -28,22 +28,17 @@ use stela_loader::{
     mount_interface::CHOSEN_DISK,
 };
 use {
-    stela_formats::payload::gpt::DEFAULT_MIN_APPLE_BYTES,
-    stela_formats::payload::gpt::SIGNATURE as GPT_SIGNATURE, stela_runtime::pc::board_flash,
+    stela_formats::payload::gpt::DEFAULT_MIN_APPLE_BYTES, stela_runtime::pc::board_flash,
     stela_runtime::pc::boot_log, stela_runtime::pc::machine_state,
     stela_runtime::pc::storage::Target, stela_soc::machine::sep_state,
     stela_soc_data::nor::CAPACITY, stela_soc_data::nor::Image, stela_soc_data::nor::SECTOR_SIZE,
     stela_soc_data::nor::nvram::Partition, stela_soc_data::nor::nvram::Variables,
 };
 
-/// LBA 1 at 512-byte or 4096-byte blocks.
-const GPT_HEADER_OFFSETS: [u64; 2] = [512, 4096];
+use super::signatures::{self, Found, GPT_HEADER_OFFSETS};
+
+/// The bytes a guest disk's GPT header is read from.
 const PROBE_BYTES: usize = 8192;
-/// The bytes at the start of an Apple region that `--erase-target` clears
-/// of another file system: the signatures every host OS finds one by (APFS's
-/// container superblock in block 0, HFS+'s and ext4's at 1 KiB, NTFS's and
-/// FAT's boot sector) lie in its first MiB.
-const FOREIGN_HEAD_BYTES: usize = 1 << 20;
 
 /// The installed disk, as `stela.cfg` names it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +54,7 @@ pub(super) struct InstalledDisk {
     /// the Apple region. None for a machine-state partition of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) machine_state_offset: Option<u64>,
-    /// The Apple region is a partition of the setup USB, and every PC disk
+    /// The Apple region is a partition of the Stela stick, and every PC disk
     /// is the Mac's external drive (`--external-disks`), which recoveryOS
     /// partitions, formats and installs macOS onto.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
@@ -105,18 +100,11 @@ impl InstalledDisk {
     /// Where the machine state is, for messages.
     pub(super) fn state_description(&self) -> String {
         if self.is_chosen() {
-            return format!("the tail of {CHOSEN_REGION}");
+            return "the end of the PC disk chosen at Install macOS".into();
         }
         match self.machine_state_offset {
-            Some(offset) => format!(
-                "the tail of {} from byte {offset:#x}, outside the Mac's SSD (serial {}, \
-                 partition {})",
-                self.apple_region, self.apple_region_serial, self.apple_region_guid
-            ),
-            None => format!(
-                "{} (serial {}, partition {})",
-                self.nor, self.nor_serial, self.nor_guid
-            ),
+            Some(_) => format!("the end of {}", self.apple_region),
+            None => self.nor.clone(),
         }
     }
 
@@ -139,7 +127,7 @@ impl InstalledDisk {
         })
     }
 
-    /// The options that boot the USB's bundle `bundle`, such as a restore
+    /// The options that boot the stick's bundle `bundle`, such as a restore
     /// bundle, with this disk and its NVRAM.
     pub(super) fn bundle_options(&self, bundle: &str, ecid: Option<Ecid>) -> Result<System> {
         Ok(System {
@@ -359,8 +347,8 @@ pub(super) enum Contents {
     /// A guest disk with a partition table: an installed or installing
     /// system, kept.
     GuestDisk,
-    /// Anything else, such as a host file system.
-    Other,
+    /// Anything else, such as a host file system: what it is.
+    Other(&'static str),
 }
 
 /// The choices the command line makes for the installed disk.
@@ -373,9 +361,9 @@ pub(super) struct Request<'a> {
     pub(super) erase_target: bool,
     pub(super) initialize_nor: bool,
     /// The setup USB's whole disk, which holds neither partition, unless
-    /// the Apple region is the USB's own (`external_disks`).
+    /// the Apple region is the stick's own (`external_disks`).
     pub(super) usb_disk: Option<&'a str>,
-    /// The Apple region is a partition of the setup USB, and the PC's disks
+    /// The Apple region is a partition of the Stela stick, and the PC's disks
     /// are the Mac's external drives.
     pub(super) external_disks: bool,
 }
@@ -395,18 +383,22 @@ pub(super) struct Checked {
     pub(super) notes: Vec<String>,
 }
 
-fn contents(host: &dyn Host, partition: &str) -> Result<Contents> {
-    let head = host.read(partition, 0, PROBE_BYTES)?;
-    if head.iter().all(|&b| b == 0) {
-        return Ok(Contents::Blank);
-    }
-    let gpt = GPT_HEADER_OFFSETS.iter().any(|&offset| {
-        head.get(offset as usize..offset as usize + GPT_SIGNATURE.len()) == Some(GPT_SIGNATURE)
-    });
-    Ok(if gpt {
-        Contents::GuestDisk
-    } else {
-        Contents::Other
+/// What the first `bytes` of `partition` hold, the bytes a guest disk may
+/// span: a known signature at its documented offset, near the start or
+/// the end, or at a copy past the start, is that kind of data
+/// (`signatures::probe`); a zeroed first MiB with no signature anywhere
+/// probed is blank, as Stela's erases leave it. A partition that cannot be
+/// read is refused, never taken for blank.
+fn contents(host: &dyn Host, partition: &str, bytes: u64) -> Result<Contents> {
+    let found = signatures::probe(bytes, &mut |offset, length| {
+        host.read(partition, offset, length)
+    })
+    .with_context(|| format!("cannot tell what {partition} holds"))?;
+    Ok(match found {
+        Found::Blank => Contents::Blank,
+        Found::Gpt => Contents::GuestDisk,
+        Found::Known(name) => Contents::Other(name),
+        Found::Unknown => Contents::Other("data"),
     })
 }
 
@@ -416,7 +408,7 @@ fn contents(host: &dyn Host, partition: &str) -> Result<Contents> {
 fn guest_disk_bytes(head: &[u8]) -> Option<u64> {
     GPT_HEADER_OFFSETS.iter().find_map(|&block| {
         let header = head.get(block as usize..block as usize + 56)?;
-        if &header[..GPT_SIGNATURE.len()] != GPT_SIGNATURE {
+        if &header[..signatures::GPT_HEADER.len()] != signatures::GPT_HEADER {
             return None;
         }
         let word = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
@@ -448,7 +440,7 @@ fn usable(
     );
     ensure!(
         usb_disk != Some(info.disk.as_str()),
-        "{identifier} is on the setup USB; the {role} belongs on the PC's own disk"
+        "{identifier} is on the Stela stick; the {role} belongs on the PC's own disk"
     );
     if erasing {
         return Ok(info);
@@ -528,8 +520,8 @@ pub(super) fn check(host: &dyn Host, request: &Request) -> Result<Checked> {
         },
         bytes_text(DEFAULT_MIN_APPLE_BYTES)
     );
-    let found = contents(host, &region.identifier)?;
-    let foreign = matches!(found, Contents::Other).then(|| region.clone());
+    let found = contents(host, &region.identifier, ssd_bytes)?;
+    let foreign = matches!(found, Contents::Other(_)).then(|| region.clone());
     match found {
         Contents::GuestDisk => {
             if let Some(split) = split {
@@ -552,13 +544,20 @@ pub(super) fn check(host: &dyn Host, request: &Request) -> Result<Checked> {
             ))
         }
         Contents::Blank => notes.push(format!("{} is blank", region.identifier)),
-        Contents::Other if request.erase_target => notes.push(format!(
-            "{} holds other data; --erase-target erases it",
+        Contents::Other(what) if request.erase_target => notes.push(format!(
+            "{} holds {what}; --erase-target erases it",
             region.identifier
         )),
-        Contents::Other => bail!(
-            "{} holds data that is not a Stela macOS disk; installing macOS onto it would erase \
-             it. Pass --erase-target to use it anyway.",
+        // A partition of the stick itself: `--target` names the PC's disks
+        // only, so `--erase-target` cannot reach it.
+        Contents::Other(what) if request.external_disks => bail!(
+            "{} on the stick holds {what}, not a Stela macOS disk; installing macOS onto it \
+             would erase it. Copy off what you keep, then delete or wipe that partition.",
+            region.identifier
+        ),
+        Contents::Other(what) => bail!(
+            "{} holds {what}, not a Stela macOS disk; installing macOS onto it would erase it. \
+             Pass --erase-target to use it anyway.",
             region.identifier
         ),
     }
@@ -721,20 +720,38 @@ pub(super) fn foreign(host: &dyn Host, disk: &InstalledDisk) -> Result<Option<Pa
         return Ok(None);
     }
     let identifier = confirm(host, disk, Role::AppleRegion, None)?;
-    Ok(match contents(host, &identifier)? {
-        Contents::Other => Some(host.partition(&identifier)?),
+    let info = host.partition(&identifier)?;
+    // A machine state in the region's tail is Stela's, not the guest's.
+    let guest_bytes = disk.machine_state_offset.unwrap_or(info.bytes);
+    Ok(match contents(host, &identifier, guest_bytes)? {
+        Contents::Other(_) => Some(info),
         Contents::Blank | Contents::GuestDisk => None,
     })
 }
 
-/// Clear the other file system at the start of `region`, unmounting it
-/// first, which `--erase-target` gave up.
-pub(super) fn erase_foreign(host: &dyn Host, region: &PartitionInfo) -> Result<()> {
+/// Clear the other file system of `region`, unmounting it first, which
+/// `--erase-target` gave up: zeros over every byte `signatures::probe`
+/// reads (`signatures::probed`) of the bytes the guest disk spans, up to
+/// the machine state at `state_offset` when it lives in the region's tail,
+/// so the region is blank to the next check.
+pub(super) fn erase_foreign(
+    host: &dyn Host,
+    region: &PartitionInfo,
+    state_offset: Option<u64>,
+) -> Result<()> {
     if region.mount.is_some() || region.container.is_some() {
         host.unmount(region)?;
     }
-    host.write(&region.identifier, 0, &vec![0; FOREIGN_HEAD_BYTES])
-        .with_context(|| format!("erasing the file system on {}", region.identifier))
+    let guest = state_offset.unwrap_or(region.bytes);
+    for range in signatures::probed(guest) {
+        host.write(
+            &region.identifier,
+            range.start,
+            &vec![0; usize::try_from(range.end - range.start)?],
+        )
+        .with_context(|| format!("erasing the file system on {}", region.identifier))?;
+    }
+    Ok(())
 }
 
 /// Write the machine-state bytes `check` planned: a fresh NOR image, a
@@ -872,6 +889,77 @@ pub(super) fn reinitialize(
             refusal,
         }),
     )
+}
+
+/// The NVRAM sectors `repair` writes to an install's machine state so the
+/// automatic Metal plugin repair runs again at its next start
+/// (`bundle_repair::again`).
+pub(super) struct BundleRepairAgain {
+    pub(super) area: StateArea,
+    /// Each changed sector's offset in the NOR image and its new bytes.
+    pub(super) sectors: Vec<(u64, Vec<u8>)>,
+}
+
+impl BundleRepairAgain {
+    pub(super) fn write(&self, host: &dyn Host) -> Result<()> {
+        for (offset, bytes) in &self.sectors {
+            self.area.write(host, *offset, bytes)?;
+            ensure!(
+                self.area.read(host, *offset, bytes.len())? == *bytes,
+                "{} did not read back as written",
+                self.area.describe()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The machine state of the partition `stela.efi`'s Install macOS chose,
+/// `identifier` on this computer: its tail, as the boot splits it
+/// (`pc::machine_state`).
+pub(super) fn chosen_state_area(host: &dyn Host, identifier: &str) -> Result<StateArea> {
+    let bytes = host.partition(identifier)?.bytes;
+    let layout = machine_state::split(bytes).map_err(|e| anyhow::anyhow!("{identifier}: {e}"))?;
+    Ok(StateArea {
+        identifier: identifier.into(),
+        offset: layout.state_offset(),
+        bytes: layout.state_bytes,
+    })
+}
+
+/// What lets the automatic Metal plugin repair of the install whose
+/// machine state is `area` run again: an attempt that did not install the
+/// plugin becomes a request for the next macOS start, as a boot that finds
+/// the plugin missing makes. None when its NVRAM holds no finished attempt,
+/// or is blank or unreadable, which status and `--initialize-nor` handle.
+pub(super) fn bundle_repair_again(
+    host: &dyn Host,
+    area: StateArea,
+) -> Result<Option<BundleRepairAgain>> {
+    let Ok(mut image) = Image::from_bytes(area.read(host, 0, CAPACITY)?) else {
+        return Ok(None);
+    };
+    let Ok(mut variables) = image
+        .current_bank()
+        .and_then(|bank| Variables::parse(image.bank(bank)?))
+    else {
+        return Ok(None);
+    };
+    if !stela_boot_core::bundle_repair::again(&mut variables).map_err(anyhow::Error::msg)? {
+        return Ok(None);
+    }
+    let bank = variables.encode().map_err(anyhow::Error::msg)?;
+    let (_, sectors) = image.save_bank(&bank).map_err(anyhow::Error::msg)?;
+    let sectors = sectors
+        .into_iter()
+        .map(|offset| {
+            (
+                offset as u64,
+                image.bytes()[offset..offset + SECTOR_SIZE].to_vec(),
+            )
+        })
+        .collect();
+    Ok(Some(BundleRepairAgain { area, sectors }))
 }
 
 /// What the next boot is.

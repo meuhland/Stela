@@ -1133,6 +1133,53 @@ void stela_linux_registry_source_test(bool parameter_failure)
 }
 #endif
 #ifdef STELA_LINUX_REGISTRY_TEST
+/* stela_linux_start hands its command line, length bytes without a NUL, to
+ * the built-ins' parameters before the first initcall, as the boot passes a
+ * claimed GPU's words to its driver. */
+static char *start_table;
+static int init_started(void)
+{
+ assert(start_table && !strcmp(start_table, "intel/vbt.bin"));
+ event(60);
+ return 0;
+}
+#define START_FIXTURE(f, p) \
+ struct registry_fixture f; fixture_init(&f); \
+ fixture_call(&f,0,STELA_LINUX_REG_MODULE_INIT,6,0,init_started); \
+ struct kernel_param p = {.name = "xe.vbt_firmware", .ops = &param_ops_charp, \
+  .level = -1, .arg = &start_table}; \
+ fixture_parameter(&f,0,&p)
+static void start_case(void)
+{
+ stela_linux_enter(&stela_linux_bare);
+ START_FIXTURE(f, p);
+ /* The bytes after the length are not the command line's. */
+ const char line[] = "xe.vbt_firmware=intel/vbt.bin absent=1";
+ assert(!stela_linux_start(&f.image, line, strlen("xe.vbt_firmware=intel/vbt.bin"), &test_registry));
+ assert(test_registry && event_count == 1 && events[0] == 60);
+ stela_linux_exit();
+}
+/* A word no built-in declares fails the start before any initcall. */
+static void start_unknown_case(void)
+{
+ stela_linux_enter(&stela_linux_bare);
+ START_FIXTURE(f, p);
+ const char line[] = "xe.vbt_firmware=intel/vbt.bin absent.word=1";
+ assert(stela_linux_start(&f.image, line, strlen(line), &test_registry) == -ENOENT);
+ assert(!event_count && !strcmp(start_table, "intel/vbt.bin"));
+ stela_linux_exit();
+}
+/* Without a command line every parameter keeps its default. */
+static int init_default(void) { assert(!start_table); event(61); return 0; }
+static void start_empty_case(void)
+{
+ stela_linux_enter(&stela_linux_bare);
+ START_FIXTURE(f, p);
+ f.init[0].target = init_default;
+ assert(!stela_linux_start(&f.image, NULL, 0, &test_registry));
+ assert(event_count == 1 && events[0] == 61);
+ stela_linux_exit();
+}
 static void missing_exit_case(void)
 {
  stela_linux_enter(&stela_linux_bare);
@@ -1256,6 +1303,9 @@ int main(void)
  assert(stela_test_registry_case(missing_exit_case));
  assert(stela_test_registry_case(console_returns_case));
  assert(stela_test_registry_case(positive_parameter_case));
+ assert(stela_test_registry_case(start_case));
+ assert(stela_test_registry_case(start_unknown_case));
+ assert(stela_test_registry_case(start_empty_case));
  printf("Linux static registry: source lifecycle/order/options/context fixtures passed\n");
  return 0;
 }

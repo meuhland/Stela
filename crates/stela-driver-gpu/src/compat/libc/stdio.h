@@ -53,6 +53,8 @@ int feof(FILE *file);
 int fileno(FILE *file);
 char *fgets(char *buffer, int size, FILE *file);
 int getc(FILE *file);
+ssize_t getdelim(char **line, size_t *size, int delimiter, FILE *file);
+ssize_t getline(char **line, size_t *size, FILE *file);
 void rewind(FILE *file);
 int remove(const char *path);
 int rename(const char *from, const char *to);

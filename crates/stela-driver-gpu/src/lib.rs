@@ -11,11 +11,15 @@ use crate::bus::pci::{Address, ConfigSpace, Function};
 #[cfg(feature = "metal")]
 pub mod metal;
 
-#[cfg(feature = "nouveau-port")]
-pub mod nouveau;
+#[cfg(feature = "amdgpu-port")]
+pub mod amdgpu;
+#[cfg(feature = "xe-port")]
+pub mod xe;
 
 pub mod cold;
+pub mod gsp_perf;
 pub mod nouveau_chip;
+pub mod stack;
 
 #[cfg(feature = "linux-kernel")]
 pub mod drm;
@@ -58,6 +62,16 @@ pub enum Vendor {
 }
 
 impl Vendor {
+    /// The PCI vendor ID.
+    pub fn pci_id(self) -> u16 {
+        match self {
+            Self::Nvidia => NVIDIA_VENDOR,
+            Self::Amd => AMD_VENDOR,
+            Self::Intel => INTEL_VENDOR,
+            Self::Other(id) => id,
+        }
+    }
+
     pub fn from_pci(id: u16) -> Self {
         match id {
             NVIDIA_VENDOR => Self::Nvidia,
@@ -95,7 +109,10 @@ impl Adapter {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
             Vendor::Amd => "AMDGPU is not ported to Stela",
-            Vendor::Intel => "Intel i915/xe are not ported to Stela",
+            Vendor::Intel => {
+                "it needs Linux's i915 driver, which Stela does not have: its xe driver runs \
+                 Tiger Lake and later"
+            }
             Vendor::Other(_) => "no Stela GPU backend for this PCI vendor",
         }
     }

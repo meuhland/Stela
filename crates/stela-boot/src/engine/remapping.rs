@@ -157,6 +157,24 @@ impl From<DmaError> for PreparationError {
     }
 }
 
+/// The bridges of the present topology, whose bus ranges say how far a
+/// role census issue reaches (`roles::Inventory::refusal`).
+fn bridges(topology: &[(u16, Vec<Present>)]) -> Vec<roles::Bridge> {
+    topology
+        .iter()
+        .flat_map(|(segment, present)| {
+            present.iter().filter_map(move |function| {
+                let (secondary, subordinate) = function.bridge?;
+                Some(roles::Bridge {
+                    address: address(*segment, function.rid),
+                    secondary,
+                    subordinate,
+                })
+            })
+        })
+        .collect()
+}
+
 fn address(segment: u16, rid: u16) -> Address {
     Address {
         segment,
@@ -271,14 +289,10 @@ impl Remappers {
             mmio.with_config_inventory(|windows, reader| {
                 let inventories =
                     remapping::try_enumerate_segments(windows, |window, rid, offset| {
-                        let address = address(window.segment, rid);
-                        let value = reader.read32(address, offset)?;
                         // The original containment census validated the
-                        // bridge layout and bus route before sealing them.
-                        if offset != 0 || value as u16 != u16::MAX {
-                            pci.check_observation(address, offset, value)?;
-                        }
-                        Ok::<_, MappingError>(Some(value))
+                        // bridge layout and bus route before sealing them;
+                        // what it left out reads as absent here too.
+                        pci.inventory_read(reader, address(window.segment, rid), offset)
                     })?;
                 let functions: Vec<_> = inventories
                     .iter()
@@ -886,7 +900,14 @@ impl Remappers {
     /// Initial complete PF/VF inventory, kept under the original PCI epoch.
     /// New arrivals require a fresh role inventory before a native claim.
     pub(super) fn function_role(&self, address: Address) -> FunctionRole {
-        self.roles.borrow().role(address)
+        let bridges = bridges(&self.topology.borrow());
+        self.roles.borrow().role(address, &bridges)
+    }
+
+    /// The census issue that leaves the function at `address` unverified.
+    pub(super) fn role_refusal(&self, address: Address) -> Option<roles::Issue> {
+        let bridges = bridges(&self.topology.borrow());
+        self.roles.borrow().refusal(address, &bridges)
     }
 
     /// Join the complete adopted subtree and the original bridge's updated
@@ -974,6 +995,8 @@ impl Remappers {
             }
         }
         present.sort_unstable_by_key(|entry| entry.rid);
+        let bridges = bridges(&topology);
+        drop(topology);
         let mut roles = self.roles.borrow_mut();
         let previous = roles.issues().len();
         roles.extend(fresh);
@@ -984,7 +1007,7 @@ impl Remappers {
         }
         Ok(functions
             .iter()
-            .all(|address| roles.role(*address) != FunctionRole::Unverified))
+            .all(|address| roles.role(*address, &bridges) != FunctionRole::Unverified))
     }
 
     /// Whether a taken unit confines the DMA of the function at `address`.

@@ -19,13 +19,23 @@
   },
   {
     "package": "stela-boot-core",
-    "test": "original_t8112_adapter_joins_dense_driver_ids_to_physical_first_p_resources",
+    "test": "original_t8112_adapter_projects_dense_driver_ids_for_every_worker_count",
     "source": "crates/stela-boot-core/src/assigned_topology/tests.rs",
     "kind": "oracle",
     "inputs": [
       "STELA_TEST_CPU_DT_DIR"
     ],
     "reason": "requires pinned original J473 ADT in STELA_TEST_CPU_DT_DIR"
+  },
+  {
+    "package": "stela-boot-core",
+    "test": "original_j475d_reduced_rosters_keep_the_harvested_pmgr_shape",
+    "source": "crates/stela-boot-core/src/assigned_topology/tests/t8112_pmgr.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_TEST_J475D_DIR"
+    ],
+    "reason": "requires the prepared original J475d boot files in STELA_TEST_J475D_DIR"
   },
   {
     "package": "stela-boot-core",
@@ -73,6 +83,33 @@
     "outputs": [
       "STELA_FIRMWARE_TEST_OUTPUT"
     ]
+  },
+  {
+    "package": "stela-cli",
+    "test": "nvidia_570_211_01_live_provisioning_matches_recipe_pins",
+    "source": "crates/stela-cli/src/setup/firmware.rs",
+    "kind": "oracle",
+    "inputs": [],
+    "reason": "downloads NVIDIA's 570.211.01 GB20x sources and checks the extracted images against their pins; set STELA_NVIDIA_570_211_TEST=1",
+    "values": [
+      "STELA_NVIDIA_570_211_TEST"
+    ]
+  },
+  {
+    "package": "stela-compiler",
+    "test": "executed_paths_of_real_blocks",
+    "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host instruction trace of real blocks named by DENSITY_IN; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "allocator_bound_census",
+    "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "system-mode and process-mode code of the blocks named by DENSITY_IN, for the allocator bound; run on request"
   },
   {
     "package": "stela-compiler",
@@ -4764,6 +4801,54 @@
   },
   {
     "package": "stela-engine",
+    "test": "eret_alternating_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/native_exceptions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "raised_timer_write_costs",
+    "source": "crates/stela-engine/src/machine/engine/tests/timer_native.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "memo_replay_of_a_process_mix",
+    "source": "crates/stela-engine/src/machine/engine/pointer.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "PAC memo miss measurement over a modelled process mix; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "miss_path_timing",
+    "source": "crates/stela-engine/src/machine/engine/pointer.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "PAC memo miss path timing and single-stepped host instruction counts; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "native_cipher_timing",
+    "source": "crates/stela-engine/src/machine/engine/pointer/native_tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "native PAC cipher, memo hit and memo miss timing and single-stepped host instruction counts; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "memo_replay_of_threads_on_pes",
+    "source": "crates/stela-engine/src/machine/engine/pointer/replay.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "PAC memo miss measurement over a modelled desktop on eight PEs with the census; run on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",
@@ -4913,5 +4998,61 @@
     "kind": "manual",
     "inputs": [],
     "reason": "needs a supported host Clang and llvm-nm; simulates a distribution Clang that hardens by default; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "time_compare_loop",
+    "source": "crates/stela-compiler/src/x86_64/block/flag_cost_tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a compare-and-branch loop run as the engine runs a self-loop; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "scanner_time_on_this_host",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/transfers.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of block transfers on this host; run on request"
+  },
+  {
+    "package": "stela-soc",
+    "test": "nor_access_cost",
+    "source": "crates/stela-soc/src/machine/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of SPI NOR register accesses through the board and through the device's own lock; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "device_site_cost",
+    "source": "crates/stela-engine/src/machine/engine/device_access/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of the engine's part of a trapped device load at a device site; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "device_site_boundary_cost",
+    "source": "crates/stela-compiler/src/x86_64/exit_boundary_tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of one native entry into a device site's stub and the return; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "paired_and_looked_up_return_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/paired.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a guest call and return pair, through the return's lookup tail and paired; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "transfer_path_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/costs.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of one transfer through a stamped tail, a cell tail, an empty cell and a lookup tail of one to many targets; run on request"
   }
 ]

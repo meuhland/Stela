@@ -321,10 +321,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.clock.end_slice(|| self.host.counter(), work);
         let paused = self.processor_paused(self.current);
         if paused || self.waiting.is_some() {
-            // Its guest waits: no stall of its holds the count (`clock`).
+            // Its guest waits: no stall of its holds the count, unless its
+            // WFE spins on a lock (`clock`).
             let phases = self.clock_phases();
             let retired = self.cpu.retired;
-            self.clock.idle(|| self.host.counter(), retired, phases);
+            if !paused && self.polls_monitor() {
+                let at_el0 = self.cpu.pstate.el == 0;
+                self.clock
+                    .spin(|| self.host.counter(), retired, phases, at_el0);
+            } else {
+                self.clock.idle(|| self.host.counter(), retired, phases);
+            }
         }
         if paused || self.waiting.is_some() && !self.polls_monitor() {
             // Waiting or paused, the PE has time to spare, so its timers
@@ -354,6 +361,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return Err(Stop::Waiting);
             }
             self.observe_writes();
+            self.wait_pass_clock();
             // The PEs that run may all be stopped, with nobody else to see.
             self.clock.look(|| self.host.counter());
             let now = self.now();
@@ -471,6 +479,27 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .is_some_and(|wait| wait.kind == WaitKind::Interrupt || wait.down)
     }
 
+    /// A wait pass as the shared count sees it (`clock`): a WFE that spins
+    /// on its Exclusives monitor has guest work, and the pass is its
+    /// progress; once it stops spinning without a wake, or its PE pauses,
+    /// its guest only waits and holds nothing. A PE that runs is left as
+    /// its blocks mark it.
+    fn wait_pass_clock(&mut self) {
+        let paused = self.processor_paused(self.current);
+        let spins = !paused && self.polls_monitor();
+        if !spins && (!(paused || self.waiting.is_some()) || !self.clock.has_guest_work()) {
+            return;
+        }
+        let (retired, phases) = (self.cpu.retired, self.clock_phases());
+        if spins {
+            let at_el0 = self.cpu.pstate.el == 0;
+            self.clock
+                .spin(|| self.host.counter(), retired, phases, at_el0);
+        } else {
+            self.clock.idle(|| self.host.counter(), retired, phases);
+        }
+    }
+
     /// A scheduling yield that leaves this PE waiting for an interrupt,
     /// including a host-time budget that expires during the wait.
     pub fn yielded_for_interrupt(&self, stop: &Stop) -> bool {
@@ -564,7 +593,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let device = self.device_lines_of(pe, now);
         let parked = self.parked(pe);
-        let timer = timer::deadline(&parked.cpu).is_some_and(|deadline| now >= deadline)
+        let timer = timer::deadline(&parked.cpu, || now).is_some_and(|deadline| now >= deadline)
             || super::monitor_asserted(&parked.cpu, now);
         let lines = parked.cpu.core_lines(Lines {
             irq: device.irq,
@@ -625,13 +654,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             consider(self.cpu.pmu.as_ref().and_then(|monitor| monitor.deadline()));
             consider(streams(&self.cpu, self.waiting));
             consider(timeout(self.waiting));
+            consider(self.devices.own_deadline(self.current));
         }
         for (pe, peer) in self.peers.iter().enumerate() {
             if let Peer::Parked(parked) = peer
                 && !self.processor_paused(pe)
                 && !down(parked.waiting)
             {
-                consider(timer::deadline(&parked.cpu));
+                consider(timer::deadline(&parked.cpu, || now));
                 consider(
                     parked
                         .cpu

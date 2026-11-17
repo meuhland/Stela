@@ -54,6 +54,19 @@ impl Device {
             None => self.ids(),
         }
     }
+    /// Whether any configuration offers the phone tethering interface
+    /// Linux `ipheth` drives: Apple's vendor ID with the vendor-specific
+    /// class ff, subclass fd, protocol 1. No driver here takes it
+    /// ([`super::bind::TETHERING`]).
+    pub fn offers_tethering(&self) -> bool {
+        const APPLE: u16 = 0x05ac;
+        u16::from_le_bytes([self.descriptor[8], self.descriptor[9]]) == APPLE
+            && self.configurations.iter().any(|configuration| {
+                interfaces(configuration).iter().any(|interface| {
+                    (interface.class, interface.subclass, interface.protocol) == (0xff, 0xfd, 1)
+                })
+            })
+    }
     /// The vendor and product IDs, as `vvvv:pppp`.
     fn ids(&self) -> String {
         format!(
@@ -158,5 +171,34 @@ mod tests {
             device.summary(),
             "00:14.0 port 3: high speed 0781:5581 class 09"
         );
+    }
+
+    /// A phone's tethering interface is found in whichever configuration
+    /// offers it, with the vendor and class triple Linux ipheth matches.
+    #[test]
+    fn a_phone_tethering_interface_is_found_in_any_configuration() {
+        let nodes = BTreeMap::from([(0, hub::model::Node::leaf(HIGH_SPEED))]);
+        let mut dma = TestRegion::new(256 * 1024 * 8);
+        let (mut controller, _) = hub::tests::controller(&mut dma, 32, nodes);
+        let mut failures = Vec::new();
+        let mut device = controller.enumerate(&mut dma, &mut failures).remove(0);
+        let still_image = vec![
+            9, 2, 18, 0, 1, 1, 0, 0x80, 50, //
+            9, 4, 0, 0, 0, 6, 1, 1, 0,
+        ];
+        let tethering = vec![
+            9, 2, 27, 0, 2, 4, 0, 0x80, 50, //
+            9, 4, 0, 0, 0, 6, 1, 1, 0, //
+            9, 4, 1, 0, 0, 0xff, 0xfd, 1, 0,
+        ];
+        device.descriptor[8..10].copy_from_slice(&0x05acu16.to_le_bytes());
+        device.configurations = vec![still_image.clone()];
+        device.configuration = still_image.clone();
+        assert!(!device.offers_tethering());
+        device.configurations.push(tethering.clone());
+        assert!(device.offers_tethering(), "a later configuration");
+        // Another vendor's vendor-specific triple is not this interface.
+        device.descriptor[8..10].copy_from_slice(&0x1234u16.to_le_bytes());
+        assert!(!device.offers_tethering());
     }
 }

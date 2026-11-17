@@ -203,7 +203,7 @@ fn ring_code(ring: Ring, base: u64, table: &mut LookupTable, key: u64) -> Option
             }
             Ring::Stamped => {
                 let current = table.find(table.slot(pc(next), key), pc(next), key);
-                let cell = table.link_cell(tail, pc(next), Some(current));
+                let cell = table.link_hot_cell(tail, pc(next), Some(current))?;
                 let number = table.site_cell_number(tail)?;
                 table.note_stamped(number);
                 let probe = base + (DISPATCHER + chain::STAMPING_PROBE_ENTRY) as u64;

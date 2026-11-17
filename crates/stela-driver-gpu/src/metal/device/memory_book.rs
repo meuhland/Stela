@@ -28,6 +28,10 @@ pub enum MemoryOwner {
 const FREED_KEPT: usize = 32;
 /// Frees the lost-device report shows, newest first.
 const FREED_SHOWN: usize = 12;
+/// Freed imports kept bound for reuse that the book follows.
+const KEPT_FOLLOWED: usize = 64;
+/// Live allocations a report names inside each freed range.
+const INSIDE_SHOWN: usize = 4;
 
 /// One whole allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,12 +54,19 @@ struct Freed {
     entry: Entry,
     /// The serial completed when its memory was freed.
     freed: u64,
+    /// The serial completed when the backend unbound it, for a freed import
+    /// it kept bound for reuse until then.
+    unbound: Option<u64>,
 }
 
 #[derive(Default)]
 pub(crate) struct MemoryBook {
     live: BTreeMap<Memory, Entry>,
     freed: VecDeque<Freed>,
+    /// Freed imports the backend keeps bound, by its name for each: their
+    /// GPU addresses still map until it unbinds them, which is when a read
+    /// of them faults.
+    kept: VecDeque<(u64, Freed)>,
 }
 
 impl MemoryBook {
@@ -103,21 +114,66 @@ impl MemoryBook {
         }
     }
 
-    /// `memory` was freed, with its GPU mapping, when `serial` completed.
-    pub(crate) fn free(&mut self, memory: Memory, serial: u64) {
+    /// Whether `memory` is noted without a known address.
+    pub(crate) fn lacks_address(&self, memory: Memory) -> bool {
+        self.live
+            .get(&memory)
+            .is_some_and(|entry| entry.va.is_none())
+    }
+
+    /// The noted allocations without a known address.
+    pub(crate) fn addressless(&self) -> Vec<Memory> {
+        self.live
+            .iter()
+            .filter(|(_, entry)| entry.va.is_none())
+            .map(|(&memory, _)| memory)
+            .collect()
+    }
+
+    /// `memory` was freed when `serial` completed: with its GPU mapping, or
+    /// kept bound by the backend as `kept` until [`Self::unbound`] names it.
+    pub(crate) fn free(&mut self, memory: Memory, serial: u64, kept: Option<u64>) {
         let Some(entry) = self.live.remove(&memory) else {
             return;
         };
-        if entry.va.is_none() {
-            return;
+        let freed = Freed {
+            entry,
+            freed: serial,
+            unbound: None,
+        };
+        match kept {
+            Some(key) => {
+                if self.kept.len() == KEPT_FOLLOWED {
+                    self.kept.pop_front();
+                }
+                self.kept.push_back((key, freed));
+            }
+            None => self.push_freed(freed),
         }
+    }
+
+    fn push_freed(&mut self, freed: Freed) {
         if self.freed.len() == FREED_KEPT {
             self.freed.pop_front();
         }
-        self.freed.push_back(Freed {
-            entry,
-            freed: serial,
-        });
+        self.freed.push_back(freed);
+    }
+
+    /// The backend unbound the kept allocations `keys` by `serial`.
+    pub(crate) fn unbound(&mut self, keys: &[u64], serial: u64) {
+        for key in keys {
+            if let Some(at) = self.kept.iter().position(|(kept, _)| kept == key) {
+                let (_, mut freed) = self.kept.remove(at).expect("found");
+                freed.unbound = Some(serial);
+                self.push_freed(freed);
+            }
+        }
+    }
+
+    /// The backend gave kept allocation `key` to a new import: no longer
+    /// freed.
+    pub(crate) fn retaken(&mut self, key: u64) {
+        self.kept.retain(|(kept, _)| *kept != key);
     }
 
     /// The live allocations with known addresses nearest below and above
@@ -138,28 +194,72 @@ impl MemoryBook {
         (below, above)
     }
 
-    /// The newest frees, each with the live ranges either side, for a
-    /// device lost while serial `now` was the newest submitted.
+    /// The live allocations with known addresses that overlap
+    /// `start..end`, lowest first: what the GPU addresses of a freed range
+    /// map now.
+    fn inside(&self, start: u64, end: u64) -> Vec<&Entry> {
+        let mut inside: Vec<&Entry> = self
+            .live
+            .values()
+            .filter(|entry| {
+                entry
+                    .va
+                    .is_some_and(|va| va < end && va + entry.bytes > start)
+            })
+            .collect();
+        inside.sort_by_key(|entry| entry.va);
+        inside
+    }
+
+    /// The newest frees, each with the live ranges either side and those
+    /// placed inside it since, for a device lost while serial `now` was the
+    /// newest submitted.
     pub(crate) fn report(&self, now: u64) -> Vec<String> {
         let mut lines = Vec::new();
         for freed in self.freed.iter().rev().take(FREED_SHOWN) {
             let entry = &freed.entry;
-            let start = entry.va.unwrap_or(0);
-            let end = start + entry.bytes;
-            let (below, above) = self.neighbours(start, end);
-            lines.push(format!(
-                "lost device memory: freed {} when serial {} completed (device at {}); \
+            let ((below, above), inside) = match entry.va {
+                Some(start) => (
+                    self.neighbours(start, start + entry.bytes),
+                    self.inside(start, start + entry.bytes),
+                ),
+                None => ((None, None), Vec::new()),
+            };
+            let unbound = freed.unbound.map_or_else(String::new, |serial| {
+                format!(", kept bound for reuse and unbound when serial {serial} completed")
+            });
+            let mut line = format!(
+                "lost device memory: freed {} when serial {} completed{unbound} (device at {}); \
                  live below: {}; live above: {}",
                 describe(entry),
                 freed.freed,
                 now,
                 below.map_or_else(|| String::from("none"), describe),
                 above.map_or_else(|| String::from("none"), describe),
-            ));
+            );
+            // A read of a page left unmapped beside one of these faults in
+            // the freed range without reaching what it held.
+            for (n, live) in inside.iter().take(INSIDE_SHOWN).enumerate() {
+                line.push_str(if n == 0 { "; live inside now: " } else { ", " });
+                line.push_str(&describe(live));
+            }
+            if inside.len() > INSIDE_SHOWN {
+                line.push_str(&format!(" and {} more", inside.len() - INSIDE_SHOWN));
+            }
+            lines.push(line);
         }
         if lines.is_empty() {
             lines.push(String::from(
-                "lost device memory: no whole allocation with a known address was freed",
+                "lost device memory: no whole allocation was freed",
+            ));
+        }
+        if !self.kept.is_empty() {
+            lines.push(format!(
+                "lost device memory: {} freed imports still bound for reuse, newest {}",
+                self.kept.len(),
+                self.kept
+                    .back()
+                    .map_or_else(String::new, |(_, freed)| describe(&freed.entry)),
             ));
         }
         lines
@@ -168,7 +268,10 @@ impl MemoryBook {
 
 /// An entry's range, size, owner and serials.
 fn describe(entry: &Entry) -> String {
-    let start = entry.va.unwrap_or(0);
+    let range = entry.va.map_or_else(
+        || String::from("an unknown address"),
+        |start| format!("{start:#x}-{:#x}", start + entry.bytes),
+    );
     let connection = entry.connection.map_or_else(
         || String::from("no connection"),
         |c| format!("connection {c}"),
@@ -177,11 +280,8 @@ fn describe(entry: &Entry) -> String {
         format!(", released at serial {serial}")
     });
     format!(
-        "{start:#x}-{:#x} ({} bytes) {} of {connection}, made at serial {}{released}",
-        start + entry.bytes,
-        entry.bytes,
-        entry.what,
-        entry.created,
+        "{range} ({} bytes) {} of {connection}, made at serial {}{released}",
+        entry.bytes, entry.what, entry.created,
     )
 }
 
@@ -207,7 +307,7 @@ mod tests {
         book.note(Memory(4), 0x1000, String::from("buffer"), 12);
         book.learn_address(Memory(4), 0x1000_0000);
         book.release(Memory(1), 20);
-        book.free(Memory(1), 20);
+        book.free(Memory(1), 20, None);
         let lines = book.report(25);
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
@@ -223,18 +323,54 @@ mod tests {
     }
 
     #[test]
-    fn frees_without_an_address_are_not_kept_and_old_frees_go() {
+    fn a_freed_range_names_what_was_placed_inside_it_since() {
         let mut book = MemoryBook::default();
-        book.note(Memory(1), 4096, String::from("texture"), 1);
-        book.free(Memory(1), 1);
+        book.note(Memory(1), 33_177_600, String::from("buffer"), 163);
+        book.learn_address(Memory(1), 0x3f_d935_c000);
+        book.release(Memory(1), 4313);
+        book.free(Memory(1), 4313, Some(5));
+        book.unbound(&[5], 4816);
+        // A heap at the first 2 MiB boundary in the freed range.
+        book.note(Memory(2), 0x40_0000, String::from("imported heap"), 4900);
+        book.learn_address(Memory(2), 0x3f_d940_0000);
+        book.note(Memory(3), 0x8000, String::from("image memory"), 163);
+        book.learn_address(Memory(3), 0x3f_d934_0000);
+        let line = &book.report(4987)[0];
+        assert!(
+            line.contains("live below: 0x3fd9340000-0x3fd9348000"),
+            "{line}"
+        );
+        assert!(line.contains("live above: none"), "{line}");
+        assert!(
+            line.ends_with(
+                "; live inside now: 0x3fd9400000-0x3fd9800000 (4194304 bytes) imported heap of no \
+                 connection, made at serial 4900"
+            ),
+            "{line}"
+        );
+        for n in 0..6u64 {
+            book.note(Memory(10 + n), 0x1000, format!("buffer {n}"), 4950);
+            book.learn_address(Memory(10 + n), 0x3f_da00_0000 + (n << 12));
+        }
+        assert!(book.report(4987)[0].ends_with(" and 3 more"));
+    }
+
+    #[test]
+    fn frees_without_an_address_are_named_and_old_frees_go() {
+        let mut book = MemoryBook::default();
         assert_eq!(
             book.report(1),
-            ["lost device memory: no whole allocation with a known address was freed"]
+            ["lost device memory: no whole allocation was freed"]
         );
+        book.note(Memory(1), 4096, String::from("texture"), 1);
+        book.free(Memory(1), 1, None);
+        assert!(book.report(1)[0].contains(
+            "freed an unknown address (4096 bytes) texture of no connection, made at serial 1"
+        ));
         for n in 0..(FREED_KEPT as u64 + 5) {
             book.note(Memory(n + 10), 4096, format!("buffer {n}"), n);
             book.learn_address(Memory(n + 10), (n + 1) << 20);
-            book.free(Memory(n + 10), n);
+            book.free(Memory(n + 10), n, None);
         }
         let lines = book.report(100);
         assert_eq!(lines.len(), FREED_SHOWN);
@@ -253,5 +389,29 @@ mod tests {
         assert_eq!(entry.va, Some(0x10_0000));
         assert_eq!(entry.what, "heap again");
         assert_eq!(entry.created, 1);
+    }
+
+    #[test]
+    fn a_kept_import_is_freed_in_the_report_when_unbound() {
+        let mut book = MemoryBook::default();
+        book.note(Memory(1), 0x4a_0000, String::from("imported buffer"), 5);
+        book.learn_address(Memory(1), 0x3f_9896_0000);
+        book.free(Memory(1), 9, Some(77));
+        assert!(book.report(10)[0].contains("no whole allocation was freed"));
+        assert!(book.report(10)[1].contains("1 freed imports still bound for reuse"));
+        book.unbound(&[77], 40);
+        let line = &book.report(41)[0];
+        assert!(line.contains(
+            "freed 0x3f98960000-0x3f98e00000 (4849664 bytes) imported buffer of no connection, \
+             made at serial 5 when serial 9 completed, kept bound for reuse and unbound when \
+             serial 40 completed (device at 41)"
+        ));
+        // One the backend gives to a new import again is not freed.
+        book.note(Memory(2), 4096, String::from("imported buffer"), 50);
+        book.learn_address(Memory(2), 0x1000);
+        book.free(Memory(2), 51, Some(78));
+        book.retaken(78);
+        book.unbound(&[78], 60);
+        assert_eq!(book.report(61).len(), 1);
     }
 }

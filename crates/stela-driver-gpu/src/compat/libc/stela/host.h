@@ -43,6 +43,8 @@ int stela_libc_drm_close(int fd);
 int stela_libc_drm_dup(int fd);
 /* The descriptor's device number. */
 long stela_libc_drm_rdev(int fd);
+/* The descriptor's llseek: the new offset. */
+long long stela_libc_drm_seek(int fd, long long offset, int whence);
 /* `argument` is in-process. */
 int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument);
 /* A pointer, or a negative errno. Every page is mapped on return. */
@@ -62,11 +64,13 @@ int stela_libc_file_resize(int fd, uint64_t size);
 void *stela_libc_file_mmap(int fd, uint64_t offset, size_t size, void *address);
 /* As stela_libc_drm_munmap, for these mappings. */
 int stela_libc_file_munmap(void *address, size_t size);
-/* The render nodes' count, and one's PCI location and IDs. */
+/* The render nodes' count, and one's PCI location, IDs and DRM minor. */
 unsigned int stela_libc_drm_devices(void);
 struct stela_libc_drm_device {
 	uint16_t segment, vendor, device, subsystem_vendor, subsystem_device;
 	uint8_t bus, slot, function, revision;
+	/* The device's DRM minor: its render node is RENDER_MINOR past it. */
+	uint32_t minor;
 };
 void stela_libc_drm_device(unsigned int index, struct stela_libc_drm_device *device);
 __END_DECLS

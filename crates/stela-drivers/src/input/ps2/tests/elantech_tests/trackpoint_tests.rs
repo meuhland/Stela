@@ -177,7 +177,6 @@ fn trackpoint_and_touchpad_state_stay_separate() {
     assert_eq!(c.elantech_trackpoint_buttons(), Some(5));
     let release = c.stop().unwrap();
     assert!(release.contains(&Input::MouseButtons(0)));
-    assert!(release.contains(&Input::Buttons(0)));
     c.initialize().unwrap();
     assert_eq!(c.elantech_trackpoint_buttons(), Some(0));
 }

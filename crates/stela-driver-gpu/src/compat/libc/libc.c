@@ -8,6 +8,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <link.h>
+#include <linux/futex.h>
 #include <locale.h>
 #include <math.h>
 #include <poll.h>
@@ -160,9 +162,14 @@ int atexit(void (*function)(void))
 	return 0;
 }
 
+/* RADV runs with color compression (DCC) off: under the unified image
+ * layouts Stela's Metal device requires, an image a copy fills and a shader
+ * then samples read back blank with DCC on (app icons and widgets drew
+ * empty on an RX 6800 XT). */
 char *getenv(const char *name)
 {
-	(void)name;
+	if (name && !strcmp(name, "RADV_DEBUG"))
+		return (char *)"nodcc";
 	return NULL;
 }
 
@@ -470,6 +477,11 @@ long long llabs(long long value)
 	return value < 0 ? -value : value;
 }
 
+intmax_t imaxabs(intmax_t value)
+{
+	return value < 0 ? -value : value;
+}
+
 static unsigned int random_state = 1;
 
 void srand(unsigned int seed)
@@ -714,11 +726,66 @@ int setpriority(int which, int who, int priority)
 	return 0;
 }
 
+/* Linux's futex on the host's word waits. A wake wakes every waiter of the
+ * word, which futex allows, since a waiter may always return early; the host
+ * does not count them, so a wake reports none. Waits time out on the
+ * monotonic clock only, as clock_nanosleep does. */
+static long futex(uint32_t *word, int operation, uint32_t value, va_list arguments)
+{
+	if (operation & FUTEX_CLOCK_REALTIME)
+		return fail(ENOTSUP);
+	int command = operation & ~FUTEX_PRIVATE_FLAG;
+	if (command != FUTEX_WAIT && command != FUTEX_WAKE && command != FUTEX_WAIT_BITSET &&
+	    command != FUTEX_WAKE_BITSET)
+		return fail(ENOSYS);
+	const struct timespec *timeout = NULL;
+	if (command != FUTEX_WAKE) {
+		timeout = va_arg(arguments, const struct timespec *);
+		(void)va_arg(arguments, uint32_t *);
+		/* A bitset operation names the waiters it is for. */
+		if (command != FUTEX_WAIT && !(uint32_t)va_arg(arguments, int))
+			return fail(EINVAL);
+	}
+	if (command == FUTEX_WAKE || command == FUTEX_WAKE_BITSET) {
+		stela_libc_wake(word);
+		return 0;
+	}
+	uint64_t until = UINT64_MAX;
+	if (timeout) {
+		int error = nanoseconds(timeout, &until);
+		if (error == EINVAL)
+			return fail(EINVAL);
+		if (error)
+			until = UINT64_MAX;
+		/* FUTEX_WAIT's timeout is relative, FUTEX_WAIT_BITSET's absolute. */
+		else if (command == FUTEX_WAIT) {
+			uint64_t now = stela_libc_now_ns();
+			until = until >= UINT64_MAX - 1 - now ? UINT64_MAX : until + now;
+		}
+	}
+	if (__atomic_load_n(word, __ATOMIC_SEQ_CST) != value)
+		return fail(EAGAIN);
+	stela_libc_wait(word, value, until);
+	if (until != UINT64_MAX && stela_libc_now_ns() >= until &&
+	    __atomic_load_n(word, __ATOMIC_SEQ_CST) == value)
+		return fail(ETIMEDOUT);
+	return 0;
+}
+
 long syscall(long number, ...)
 {
 	if (number == SYS_gettid)
 		return gettid();
-	return fail(ENOSYS);
+	if (number != SYS_futex)
+		return fail(ENOSYS);
+	va_list arguments;
+	va_start(arguments, number);
+	uint32_t *word = va_arg(arguments, uint32_t *);
+	int operation = va_arg(arguments, int);
+	uint32_t value = (uint32_t)va_arg(arguments, int);
+	long result = futex(word, operation, value, arguments);
+	va_end(arguments);
+	return result;
 }
 
 unsigned long getauxval(unsigned long type)
@@ -858,12 +925,23 @@ static int open_meminfo(void)
 int open(const char *path, int flags, ...)
 {
 	(void)flags;
+	/* Linux's answer to a path outside the process: ANV stats its device's
+	 * primary node, which libdrm leaves NULL when only a render node exists. */
+	if (!path)
+		return fail(EFAULT);
 	if (!strcmp(path, "/proc/meminfo"))
 		return open_meminfo();
 	static const char prefix[] = "/dev/dri/renderD";
 	if (strncmp(path, prefix, sizeof(prefix) - 1))
 		return fail(ENOENT);
 	return checked(stela_libc_drm_open((unsigned int)strtoul(path + sizeof(prefix) - 1, NULL, 10)));
+}
+
+int openat(int directory, const char *path, int flags, ...)
+{
+	if (directory != AT_FDCWD && path[0] != '/')
+		return fail(EBADF);
+	return open(path, flags);
 }
 
 int close(int fd)
@@ -1012,6 +1090,14 @@ int mkdir(const char *path, mode_t mode)
 	return fail(EACCES);
 }
 
+int mkfifoat(int directory, const char *path, mode_t mode)
+{
+	(void)directory;
+	(void)path;
+	(void)mode;
+	return fail(EACCES);
+}
+
 int access(const char *path, int mode)
 {
 	(void)path;
@@ -1069,12 +1155,16 @@ ssize_t write(int fd, const void *buffer, size_t size)
 	return (ssize_t)size;
 }
 
+/* Linux's own descriptors seek there: libdrm sizes a dma-buf it imports by
+ * seeking to its end. */
 off_t lseek(int fd, off_t offset, int whence)
 {
-	(void)fd;
-	(void)offset;
-	(void)whence;
-	return fail(EBADF);
+	if (fd < 0 || fd >= STELA_LIBC_FILE_BASE || text_file(fd))
+		return fail(EBADF);
+	long long result = stela_libc_drm_seek(fd, (long long)offset, whence);
+	if (result < 0)
+		return fail((int)-result);
+	return (off_t)result;
 }
 
 int flock(int fd, int operation)
@@ -1167,6 +1257,14 @@ int dladdr(const void *address, Dl_info *info)
 {
 	(void)address;
 	(void)info;
+	return 0;
+}
+
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *data),
+		    void *data)
+{
+	(void)callback;
+	(void)data;
 	return 0;
 }
 

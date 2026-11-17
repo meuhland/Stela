@@ -5,6 +5,7 @@
 //! identity of the old generation then fails.
 use super::*;
 
+mod after_boot;
 mod attach;
 mod recovery;
 mod suspend;
@@ -65,6 +66,16 @@ pub struct Host {
     /// The failures the last poll found, each reported then. One that
     /// stands from poll to poll is reported once, until it changes or ends.
     standing: Vec<(String, BlockError)>,
+    /// Bound Bulk-Only interfaces waiting out their settle time, each
+    /// discovered by the first poll after it.
+    settling: Vec<storage::settle::Settling>,
+    /// The connection after boot under way, and those waiting their turn.
+    attaching: Option<after_boot::Attaching>,
+    queued: alloc::collections::VecDeque<after_boot::Queued>,
+    /// The storage interfaces on this controller whose disks are in use,
+    /// started again when their device leaves the bus and comes back after
+    /// boot ([`Self::keep_storage`]).
+    storage: Vec<storage::UsbStorage>,
 }
 impl Host {
     /// Whether the controller stopped answering commands (Linux
@@ -124,9 +135,28 @@ impl Host {
             roots,
             sleep: suspend::Sleep::default(),
             standing: Vec::new(),
+            settling: Vec::new(),
+            attaching: None,
+            queued: Default::default(),
+            storage: Vec::new(),
         };
         host.register_hubs(devices, dma, failures);
         host
+    }
+
+    /// Keep those of `storage`, the interfaces whose disks the boot uses,
+    /// that are on this controller: a device of theirs that leaves the bus
+    /// and comes back after boot, at the same port path and with the same
+    /// vendor, product and serial number, is started again in steps and
+    /// their disks go on with it. Any other storage device that arrives
+    /// after boot stays unused until the next boot.
+    pub fn keep_storage(&mut self, storage: &[storage::UsbStorage]) {
+        let controller = &self.controller;
+        self.storage = storage
+            .iter()
+            .filter(|storage| storage.on(controller))
+            .cloned()
+            .collect();
     }
 
     fn register_hubs(
@@ -205,7 +235,8 @@ impl Host {
     /// Whether [`Self::poll`] has work, as `xhci_irq` and `hub_irq` find it:
     /// an event on the ring, a root port's status change or a hub's status
     /// transfer that completed, a queued reset, a hub to recover, a dead
-    /// controller, a device whose slot changed, or an attachment timer due.
+    /// controller, a device whose slot changed, an attachment timer due, or
+    /// a connection after boot to step.
     /// This does not access controller registers.
     pub fn due(&self) -> bool {
         let Ok(c) = self.controller.try_borrow() else {
@@ -239,6 +270,19 @@ impl Host {
             count += 1;
         }
         count != self.devices.len()
+    }
+
+    /// [`Self::poll`] once the boot handed the machine over, from a service
+    /// turn: from then on a device that arrives gets only the classes the
+    /// running system takes, input devices and the hubs they sit behind, and
+    /// the others are reported unused without being started.
+    pub fn poll_after_boot(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+        firmware: &dyn crate::firmware::Provider,
+    ) -> Changes {
+        self.controller.borrow_mut().after_boot = true;
+        self.poll(dma, firmware)
     }
 
     /// Poll root notifications/PORTSC and queued hub interrupt bitmaps.
@@ -276,6 +320,10 @@ impl Host {
         }
         self.reconcile(&mut changes);
         for port in 1..=self.roots.len() as u8 {
+            // A connection after boot owns its root port until it ends.
+            if self.holds_root(port) {
+                continue;
+            }
             if let Err(error) = self.root(port, dma, &mut changes) {
                 changes
                     .added
@@ -283,7 +331,11 @@ impl Host {
                     .push((format!("USB root port {port} lifecycle"), error));
             }
         }
-        for index in 0..self.hubs.len() {
+        // Hub status work and queued resets wait for a connection after
+        // boot to end: each would use a hub's control endpoint or a port the
+        // connection may be resetting.
+        let hubs = if self.attaching() { 0 } else { self.hubs.len() };
+        for index in 0..hubs {
             if self.hubs[index].recovery.is_some() {
                 if let Err(error) = self.recover_hub(index, dma, &mut changes) {
                     changes.added.failures.push((
@@ -312,7 +364,11 @@ impl Host {
             }
             self.poll_hub_attachments(index, dma, &mut changes);
         }
-        let queued = self.controller.borrow_mut().take_queued_resets();
+        let queued = if self.attaching() {
+            Vec::new()
+        } else {
+            self.controller.borrow_mut().take_queued_resets()
+        };
         for id in queued {
             self.queued_reset(id, dma, &mut changes);
         }
@@ -328,7 +384,37 @@ impl Host {
             );
         }
         self.devices.extend(added);
+        self.settle(&mut changes, dma);
+        self.step_attaching(dma, &mut changes);
         changes
+    }
+
+    /// The first poll once the Bulk-Only interfaces bound before have
+    /// settled, on a virtual clock: until then, no poll is due for them.
+    #[cfg(test)]
+    pub(crate) fn settled(&mut self, dma: &mut dyn DmaAllocator) -> Changes {
+        assert!(!self.settling.is_empty() && !self.attachment_due());
+        let clock = self.controller.borrow().clock;
+        crate::test_clock::advance(clock, storage::settle::SETTLE_US);
+        assert!(self.attachment_due());
+        let changes = self.poll(dma, &crate::firmware::HandoffProvider::new(None));
+        assert!(self.settling.is_empty());
+        changes
+    }
+
+    /// Keep the interfaces this poll bound until their settle time, and
+    /// discover those whose time passed. One whose device left the
+    /// inventory, removed or reset, is dropped.
+    pub(super) fn settle(&mut self, changes: &mut Changes, dma: &mut dyn DmaAllocator) {
+        self.settling.append(&mut changes.added.settling);
+        let devices = &self.devices;
+        self.settling.retain(|entry| {
+            entry
+                .xhci_device()
+                .is_some_and(|id| devices.iter().any(|device| device.id == id))
+        });
+        let settled = storage::settle::settle(&mut self.settling, Some(dma), false);
+        changes.added.absorb_settled(settled);
     }
 
     /// Service one class's `usb_queue_reset_device`. A device already gone
@@ -385,6 +471,10 @@ impl Host {
                 false
             }
         });
+        // A connection after boot adds the devices it found when it ends.
+        if self.attaching.is_some() {
+            return;
+        }
         for device in Self::current(&c) {
             if !self.devices.iter().any(|old| old.id == device.id) {
                 self.devices.push(device.clone());
@@ -507,36 +597,24 @@ impl Host {
             )?;
         }
         let location = format!("{} port {port}", c.location);
-        let mut acknowledged_speed = None;
-        let reset = |c: &mut Controller| {
-            let Some(speed) = c.root_port(port)? else {
-                return Ok(None);
-            };
-            let attachment = Attachment {
-                root_port: port,
-                route: 0,
-                tier: 0,
-                speed,
-                translator: None,
+        if c.after_boot {
+            self.queued.push_back(after_boot::Queued {
+                location,
                 parent: None,
-            };
-            // USB3 training alone does not retire the old physical address or
-            // current owner. A kept grant requires reset ACK.
-            if c.power.port_owner(None, port).is_some() {
-                c.reset_root_device(attachment)?;
-            }
-            acknowledged_speed = Some(speed);
-            Ok(Some(attachment))
-        };
-        c.connect(
+                reset: enumerate::Reset::Changed(port),
+                root: Some((port, status)),
+            });
+            return Ok(());
+        }
+        let connected = c.connect(
             location,
             None,
-            reset,
+            enumerate::Reset::Changed(port),
             dma,
             &mut changes.added.devices,
             &mut changes.added.failures,
         );
-        if let Some(speed) = acknowledged_speed {
+        if let Some(speed) = connected.speed {
             // Baseline only effects proved by our reset/training ACK: the
             // connection it found, and CAS a warm reset cleared. Preserve
             // prior power permission so a late physical change is observed
@@ -730,39 +808,29 @@ impl Host {
         &mut self,
         index: usize,
         port: u8,
-        mut debounced: bool,
+        debounced: bool,
         dma: &mut dyn DmaAllocator,
         changes: &mut Changes,
     ) {
         let hub = &self.hubs[index];
         let id = hub.device.id;
-        let slot = id.hardware_slot();
-        let attachment = hub.attachment;
-        let ss = attachment.speed >= SUPER_SPEED;
         let location = format!("{}.{port}", hub.device.location);
-        let ssp = hub.ssp.as_ref();
-        let reset = |c: &mut Controller| {
-            c.observe_current_ancestors_for(id, true)?;
-            let speed = if ss {
-                c.superspeed_port_for(id, port, ssp)
-            } else if core::mem::take(&mut debounced) {
-                c.reset_debounced_usb2_hub_port(id, port)
-            } else {
-                c.hub_port_for(id, port)
-            };
-            c.observe_current_ancestors_for(id, true)?;
-            Ok(speed?.map(|speed| Attachment {
-                root_port: attachment.root_port,
-                route: enumerate::child_route(attachment.route, attachment.tier, port),
-                tier: attachment.tier + 1,
-                speed,
-                parent: Some((slot, port)),
-                translator: match (speed, attachment.speed) {
-                    (LOW_SPEED | FULL_SPEED, HIGH_SPEED) => Some((slot, port)),
-                    _ => attachment.translator,
-                },
-            }))
+        let reset = enumerate::Reset::HubChanged {
+            hub: id,
+            port,
+            parent: hub.attachment,
+            ssp: hub.ssp.clone(),
+            debounced,
         };
+        if self.controller.borrow().after_boot {
+            self.queued.push_back(after_boot::Queued {
+                location,
+                parent: Some(id),
+                reset,
+                root: None,
+            });
+            return;
+        }
         self.controller.borrow_mut().connect(
             location,
             Some(id),
@@ -777,6 +845,9 @@ impl Host {
     /// disconnected, suspended ones included. No command can disable their
     /// slots, so each stays quarantined with every original allocation.
     fn hc_died(&mut self, changes: &mut Changes) {
+        self.settling.clear();
+        self.attaching = None;
+        self.queued.clear();
         let mut c = self.controller.borrow_mut();
         for slot in 1..c.slots.len() {
             if let Some(state) = c.slots[slot].as_mut() {

@@ -14,6 +14,7 @@ __BEGIN_DECLS
 #define O_APPEND 02000
 #define O_NONBLOCK 04000
 #define O_CLOEXEC 02000000
+#define AT_FDCWD (-100)
 #define F_DUPFD 0
 #define F_GETFD 1
 #define F_SETFD 2
@@ -39,6 +40,8 @@ struct flock {
 	pid_t l_pid;
 };
 int open(const char *path, int flags, ...);
+/* No directory has a descriptor, so only AT_FDCWD names one. */
+int openat(int directory, const char *path, int flags, ...);
 int fcntl(int fd, int command, ...);
 __END_DECLS
 #endif

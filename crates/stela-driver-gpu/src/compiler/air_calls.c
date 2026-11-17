@@ -939,18 +939,22 @@ stela_air_inline_specialized_calls(struct stela_air_metadata *m, LLVMValueRef en
 static bool
 name_references(struct stela_air_metadata *m)
 {
-   LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-   unsigned count;
-   if (!stela_air_named_md(m, "air.visible_function_references", nodes, &count))
+   struct stela_air_list nodes;
+   if (!stela_air_named_list(m, "air.visible_function_references", &nodes))
       return false;
-   for (unsigned i = 0; i < count; i++) {
+   bool named = true;
+   for (unsigned i = 0; named && i < nodes.count; i++) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned field_count, length;
-      if (!stela_air_md_node(m, nodes[i], fields, &field_count))
-         return false;
+      if (!stela_air_md_node(m, nodes.nodes[i], fields, &field_count)) {
+         named = false;
+         break;
+      }
       if (field_count != 3 || !stela_air_md_string(fields[0], "air.visible_function_reference") ||
-          !fields[1] || !LLVMIsAFunction(fields[1]) || !fields[2] || !LLVMIsAMDString(fields[2]))
-         return fail(m, STELA_AIR_METADATA, "invalid visible function reference");
+          !fields[1] || !LLVMIsAFunction(fields[1]) || !fields[2] || !LLVMIsAMDString(fields[2])) {
+         named = fail(m, STELA_AIR_METADATA, "invalid visible function reference");
+         break;
+      }
       const char *name = LLVMGetMDString(fields[2], &length);
       LLVMValueRef defined = LLVMGetNamedFunctionWithLength(m->module, name, length);
       if (!defined) {
@@ -960,7 +964,8 @@ name_references(struct stela_air_metadata *m)
          LLVMDeleteFunction(fields[1]);
       }
    }
-   return true;
+   stela_air_list_release(&nodes);
+   return named;
 }
 
 /* Nothing calls an entry point, so libraries may share their names. */
@@ -969,22 +974,24 @@ hide_entry_points(struct stela_air_metadata *m)
 {
    static const char *const stages[] = {"air.kernel", "air.vertex", "air.fragment", "air.object",
                                         "air.mesh"};
-   for (unsigned stage = 0; stage < ARRAY_SIZE(stages); stage++) {
-      LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-      unsigned count;
-      if (!stela_air_named_md(m, stages[stage], nodes, &count))
+   bool hidden = true;
+   for (unsigned stage = 0; hidden && stage < ARRAY_SIZE(stages); stage++) {
+      struct stela_air_list nodes;
+      if (!stela_air_named_list(m, stages[stage], &nodes))
          return false;
-      for (unsigned i = 0; i < count; i++) {
+      for (unsigned i = 0; hidden && i < nodes.count; i++) {
          LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
          unsigned field_count;
-         if (!stela_air_md_node(m, nodes[i], fields, &field_count))
-            return false;
-         if (!field_count || !fields[0] || !LLVMIsAFunction(fields[0]))
-            return fail(m, STELA_AIR_METADATA, "invalid entry point");
-         LLVMSetLinkage(fields[0], LLVMInternalLinkage);
+         if (!stela_air_md_node(m, nodes.nodes[i], fields, &field_count))
+            hidden = false;
+         else if (!field_count || !fields[0] || !LLVMIsAFunction(fields[0]))
+            hidden = fail(m, STELA_AIR_METADATA, "invalid entry point");
+         else
+            LLVMSetLinkage(fields[0], LLVMInternalLinkage);
       }
+      stela_air_list_release(&nodes);
    }
-   return true;
+   return hidden;
 }
 
 /* A target triple's architecture, vendor and system, past its AIR version
@@ -1157,15 +1164,17 @@ note_specialized_calls(struct stela_air_metadata *m, LLVMModuleRef module,
       return true;
    struct stela_air_error error = {0};
    struct stela_air_metadata linked = {.module = module, .error = &error};
-   LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-   unsigned node_count;
-   if (!stela_air_named_md(&linked, "air.visible", nodes, &node_count))
+   struct stela_air_list nodes;
+   if (!stela_air_named_list(&linked, "air.visible", &nodes))
       return fail(m, error.kind, error.detail);
-   for (unsigned i = 0; i < node_count; i++) {
+   bool noted = true;
+   for (unsigned i = 0; noted && i < nodes.count; i++) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned field_count;
-      if (!stela_air_md_node(&linked, nodes[i], fields, &field_count))
-         return fail(m, error.kind, error.detail);
+      if (!stela_air_md_node(&linked, nodes.nodes[i], fields, &field_count)) {
+         noted = fail(m, error.kind, error.detail);
+         break;
+      }
       if (!field_count || !fields[0] || !LLVMIsAFunction(fields[0]) ||
           LLVMIsDeclaration(fields[0]))
          continue;
@@ -1177,11 +1186,12 @@ note_specialized_calls(struct stela_air_metadata *m, LLVMModuleRef module,
                            snprintf(definition, sizeof(definition), "%.*s", (int)length, name);
       if (!stela_air_specialized_name(name, length, values, count, call, sizeof(call)) ||
           written < 0 || (size_t)written >= sizeof(definition))
-         return fail(m, STELA_AIR_LIMIT, "a specialized visible function's name is too long");
-      if (!add_specialized_call(m, calls, call, definition))
-         return false;
+         noted = fail(m, STELA_AIR_LIMIT, "a specialized visible function's name is too long");
+      else
+         noted = add_specialized_call(m, calls, call, definition);
    }
-   return true;
+   stela_air_list_release(&nodes);
+   return noted;
 }
 
 /* Notes each alias of a linked module, whose definition its copy's suffix

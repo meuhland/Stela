@@ -7,9 +7,34 @@
 use super::*;
 
 pub(super) const DISABLE_SLOT: u32 = 10;
+/// A hub port reset that found no device on the port.
+const DOWNSTREAM_GONE: BlockError =
+    BlockError::Unsupported("USB downstream reset found the device gone from its port");
+const ROOT_GONE: BlockError =
+    BlockError::Unsupported("USB root reset left the port without its device");
+const ROOT_UNPLUGGED: BlockError =
+    BlockError::Unsupported("USB reset root device is disconnected or unpowered");
+
+/// Whether a device reset failed with `error` because the device left its
+/// port, as Linux's `usb_reset_device` answers `-ENODEV`.
+pub(crate) fn departed(error: &BlockError) -> bool {
+    [DOWNSTREAM_GONE, ROOT_GONE, ROOT_UNPLUGGED].contains(error)
+}
 pub(super) const PORT_STATUS_CHANGE: u32 = 34;
 const POST_RESET_US: u64 = 50_000;
+/// Linux `PORT_RESET_TRIES`: resets one port reset request may take.
+const PORT_RESET_TRIES: usize = 5;
 pub(super) const EXHAUSTED: &str = "xHCI slot budget exhausted";
+
+/// The parent hub port a downstream device is reset through
+/// ([`Controller::downstream_port`]).
+pub(super) struct DownstreamPort {
+    pub(super) parent: SlotId,
+    pub(super) port: u8,
+    /// The parent hub's speed, which picks the USB 2 or USB 3 hub protocol.
+    pub(super) speed: u8,
+    pub(super) ssp: Option<hub::descriptor::Ssp>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Ownership {
@@ -55,17 +80,33 @@ impl Controller {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn fresh_slot(&mut self) -> Result<u8, BlockError> {
-        if self
-            .slot_ownership
-            .iter()
-            .skip(1)
-            .all(|state| !matches!(state, Ownership::Vacant | Ownership::Retired))
-        {
+        block_on(Self::fresh_slot_with(&Access::blocking(self, None)))
+    }
+
+    pub(super) async fn fresh_slot_with(a: &Access<'_>) -> Result<u8, BlockError> {
+        let max_slots = a.with(|c| c.max_slots);
+        if a.with(|c| {
+            c.slot_ownership
+                .iter()
+                .skip(1)
+                .all(|state| !matches!(state, Ownership::Vacant | Ownership::Retired))
+        }) {
             return Err(BlockError::Unsupported(EXHAUSTED));
         }
-        for _ in 0..self.max_slots {
-            let event = self.command(0, 0, ENABLE_SLOT << 10)?;
+        for _ in 0..max_slots {
+            let event = a.command(0, 0, ENABLE_SLOT << 10).await?;
+            if let Some(id) = a.with(|c| c.enabled_slot(event))? {
+                return Ok(id);
+            }
+        }
+        Err(BlockError::Unsupported(EXHAUSTED))
+    }
+
+    /// Enable Slot's completion: its slot, or `None` when it named a tombstone.
+    fn enabled_slot(&mut self, event: Event) -> Result<Option<u8>, BlockError> {
+        {
             let id = usize::from(event.slot());
             if id == 0 || id > self.max_slots || id >= self.slot_ownership.len() {
                 self.command_poisoned = true;
@@ -76,7 +117,7 @@ impl Controller {
                     // Keep this grant even if any following allocation fails.
                     // Enabled slots do not fetch DCBAA or accept doorbells.
                     self.slot_ownership[id] = Ownership::Enabled;
-                    return Ok(id as u8);
+                    Ok(Some(id as u8))
                 }
                 // xhci_free_virt_device ends the old device once Disable Slot
                 // completes, and Enable Slot may hand its ID to the next one.
@@ -85,18 +126,20 @@ impl Controller {
                 Ownership::Retired if !self.power.retained(id as u8) => {
                     self.slots[id] = None;
                     self.slot_ownership[id] = Ownership::Enabled;
-                    return Ok(id as u8);
+                    Ok(Some(id as u8))
                 }
-                Ownership::Retired => self.slot_ownership[id] = Ownership::Tombstone,
+                Ownership::Retired => {
+                    self.slot_ownership[id] = Ownership::Tombstone;
+                    Ok(None)
+                }
                 Ownership::Enabled | Ownership::Tombstone => {
                     self.command_poisoned = true;
-                    return Err(BlockError::Unsupported(
+                    Err(BlockError::Unsupported(
                         "xHCI returned an already-owned slot ID",
-                    ));
+                    ))
                 }
             }
         }
-        Err(BlockError::Unsupported(EXHAUSTED))
     }
 
     /// # Safety
@@ -132,54 +175,23 @@ impl Controller {
             "observe reset device physical ancestry",
             // Preflight requires a leaf. Its device status cannot supply a
             // hub power contract; observe the root and every parent.
-            self.observe_current_ancestors_for(device.id, false),
+            if attachment.parent.is_none() {
+                self.observe_reset_root(device.id, attachment.root_port)
+            } else {
+                self.observe_current_ancestors_for(device.id, false)
+            },
         )?;
-        let parent = attachment
-            .parent
-            .map(|(_, port)| {
-                let parent = original_parent
-                    .ok_or(BlockError::Unsupported("USB reset original parent absent"))?;
-                let slot = self.validate_topology_id(parent)?;
-                let speed = self.slot(slot)?.attachment.speed;
-                let ssp = if speed >= SUPER_SPEED {
-                    self.hub_ssp_for(parent)?
-                } else {
-                    None
-                };
-                Ok::<_, BlockError>((parent, port, speed, ssp))
-            })
-            .transpose()
+        let parent = self
+            .downstream_port(attachment, original_parent)
             .map_err(|error| ("retain reset parent protocol".into(), error))?;
         self.slot(slot).unwrap().retiring = true;
         // The whole-slot boundary supplies every Stop/Reset/Set Dequeue
         // acknowledgment and ordered event drain before Disable Slot.
         self.disable_slot(slot, Ownership::Retired)
             .map_err(|(operation, error)| (operation.into(), error))?;
-        if let Some((parent, port, speed, ssp)) = parent {
-            during(
-                "observe downstream reset parent",
-                self.observe_current_ancestors_for(parent, true),
-            )?;
-            let actual = during(
-                "acknowledge physical downstream-port reset",
-                if speed >= SUPER_SPEED {
-                    self.superspeed_port_for(parent, port, ssp.as_ref())
-                } else {
-                    self.hub_port_for(parent, port)
-                },
-            )?;
-            during(
-                "observe downstream reset completion ancestry",
-                self.observe_current_ancestors_for(parent, true),
-            )?;
-            if actual != Some(attachment.speed) {
-                return Err((
-                    "acknowledge downstream reset identity".into(),
-                    BlockError::Unsupported(
-                        "USB downstream reset lost the original speed or connection",
-                    ),
-                ));
-            }
+        if let Some(parent) = &parent {
+            self.reset_downstream_port(parent, attachment)
+                .map_err(|(operation, error)| (operation.into(), error))?;
         } else {
             during(
                 "acknowledge physical root-port reset",
@@ -206,9 +218,136 @@ impl Controller {
         }
         result
     }
-    /// Reset one exclusively owned leaf, reusing complete native storage when
-    /// it is directly attached to a root port. Downstream topology keeps the
-    /// original nonrecycling service until a parent/subtree reuse proof exists.
+    /// How the parent hub of a device at `attachment` resets its port: the
+    /// hub's original identity, the port, the hub's speed and, for a
+    /// SuperSpeedPlus hub, its lane description. `None` on a root port.
+    pub(super) fn downstream_port(
+        &mut self,
+        attachment: Attachment,
+        original_parent: Option<SlotId>,
+    ) -> Result<Option<DownstreamPort>, BlockError> {
+        let Some((_, port)) = attachment.parent else {
+            return Ok(None);
+        };
+        let parent =
+            original_parent.ok_or(BlockError::Unsupported("USB reset original parent absent"))?;
+        let slot = self.validate_topology_id(parent)?;
+        let speed = self.slot(slot)?.attachment.speed;
+        let ssp = if speed >= SUPER_SPEED {
+            self.hub_ssp_for(parent)?
+        } else {
+            None
+        };
+        Ok(Some(DownstreamPort {
+            parent,
+            port,
+            speed,
+            ssp,
+        }))
+    }
+
+    /// Linux `hub_port_reset` for a device behind a hub: SET_FEATURE
+    /// PORT_RESET (or BH_PORT_RESET on a USB 3 link that needs a warm reset)
+    /// on its parent's port, the reset change awaited and acknowledged, with
+    /// the root and every hub above it powered before and after. The port
+    /// must come back enabled at the device's original speed.
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    pub(super) fn reset_downstream_port(
+        &mut self,
+        downstream: &DownstreamPort,
+        attachment: Attachment,
+    ) -> Result<(), (&'static str, BlockError)> {
+        let DownstreamPort {
+            parent,
+            port,
+            speed,
+            ref ssp,
+        } = *downstream;
+        self.observe_current_ancestors_for(parent, true)
+            .map_err(|error| ("observe downstream reset parent", error))?;
+        let actual = if speed >= SUPER_SPEED {
+            self.superspeed_port_for(parent, port, ssp.as_ref())
+        } else {
+            self.hub_port_for(parent, port)
+        }
+        .map_err(|error| ("acknowledge physical downstream-port reset", error))?;
+        self.observe_current_ancestors_for(parent, true)
+            .map_err(|error| ("observe downstream reset completion ancestry", error))?;
+        match actual {
+            Some(speed) if speed == attachment.speed => Ok(()),
+            Some(_) => Err((
+                "acknowledge downstream reset identity",
+                BlockError::Unsupported(
+                    "USB downstream reset brought the device back at another speed",
+                ),
+            )),
+            None => Err(("acknowledge downstream reset identity", DOWNSTREAM_GONE)),
+        }
+    }
+
+    /// The root port `id` is on and its route string, while that device
+    /// generation holds its slot.
+    pub(crate) fn root_port_of(&self, id: SlotId) -> Option<(u8, u32)> {
+        if !self.known_id(id) {
+            return None;
+        }
+        self.slots[usize::from(id.hardware_slot())]
+            .as_ref()
+            .map(|slot| (slot.attachment.root_port, slot.attachment.route))
+    }
+
+    /// A root port's status for a log line: its PORTSC and link state, and
+    /// the route of the device behind a hub on it.
+    pub(crate) fn root_port_status(&mut self, (port, route): (u8, u32)) -> String {
+        if port == 0 || port > self.max_ports {
+            return format!("root port {port} absent");
+        }
+        let portsc = self.registers.read32(self.port_offset(port));
+        let link = match portsc >> PLS_SHIFT & PLS_FIELD {
+            0 => "U0",
+            1 => "U1",
+            2 => "U2",
+            3 => "U3",
+            4 => "Disabled",
+            5 => "RxDetect",
+            LINK_INACTIVE => "SS.Inactive",
+            7 => "Polling",
+            8 => "Recovery",
+            9 => "HotReset",
+            LINK_COMPLIANCE => "Compliance",
+            11 => "TestMode",
+            15 => "Resume",
+            _ => "reserved",
+        };
+        let mut status = format!("root port {port} PORTSC={portsc:#010x} link={link}");
+        if route != 0 {
+            status.push_str(&format!(" route={route:#x}"));
+        }
+        status
+    }
+
+    /// [`Self::root_port_status`] of the root port `id` is on.
+    pub(crate) fn port_status(&mut self, id: SlotId) -> Option<String> {
+        let port = self.root_port_of(id)?;
+        Some(self.root_port_status(port))
+    }
+
+    /// Whether [`Self::reset_and_reuse`] of `id` can run with its own
+    /// retired storage alone: a live device generation, on a root port or
+    /// behind hubs. A retired, suspended or departed one is never reset.
+    pub(crate) fn reset_reuses_storage(&self, id: SlotId) -> bool {
+        self.validate_id(id).is_ok()
+    }
+
+    /// Reset one exclusively owned leaf and address it again with its own
+    /// complete retired storage, as Linux `usb_reset_device` keeps a
+    /// device's URB buffers: a root port's device by a root-port reset, one
+    /// behind hubs (any depth) by its parent hub's port reset
+    /// ([`Self::reset_downstream_port`]). No DMA is allocated, so the
+    /// device's class owner can recover it where it stands.
     ///
     /// # Safety
     /// Same complete device/interface and alias-retirement contract as
@@ -218,7 +357,7 @@ impl Controller {
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    pub(crate) unsafe fn reset_and_reuse_root(
+    pub(crate) unsafe fn reset_and_reuse(
         &mut self,
         device: &Device,
         endpoints: &[Endpoint],
@@ -232,23 +371,32 @@ impl Controller {
             .as_ref()
             .unwrap()
             .attachment;
-        if attachment.parent.is_some() {
-            // SAFETY: the identical exclusive contract was just checked.
-            return unsafe { self.reset_and_identify(device, endpoints, dma) };
-        }
+        let original_parent = during(
+            "retain original reset parent",
+            self.original_parent(device.id),
+        )?;
         during(
-            "observe reusable root ancestry",
-            self.observe_current_ancestors_for(device.id, false),
+            "observe reusable ancestry",
+            if attachment.parent.is_none() {
+                self.observe_reset_root(device.id, attachment.root_port)
+            } else {
+                self.observe_current_ancestors_for(device.id, false)
+            },
+        )?;
+        let downstream = during(
+            "retain reset parent protocol",
+            self.downstream_port(attachment, original_parent),
         )?;
         let consumer = self.slots[usize::from(device.slot)]
             .as_ref()
             .unwrap()
             .consumer;
         let resources = self
-            .retire_reset_root(device.id)
+            .retire_reset_leaf(device.id, downstream)
             .map_err(|(operation, error)| (operation.into(), error))?;
         self.retry_resources.offer(resources);
-        let result = self.identify_parent(attachment, None, device.location.clone(), dma);
+        let result =
+            self.identify_parent(attachment, original_parent, device.location.clone(), dma);
         match result {
             Ok(fresh) => {
                 if fresh.descriptor != device.descriptor
@@ -266,6 +414,11 @@ impl Controller {
                     .as_mut()
                     .unwrap()
                     .consumer = consumer;
+                if attachment.parent.is_some() {
+                    // usb_reset_and_verify_device turns hardware LPM back on,
+                    // as the downstream reset this replaces did.
+                    self.initial_usb2_lpm(&fresh, attachment);
+                }
                 Ok(fresh)
             }
             Err(error) => {
@@ -421,29 +574,66 @@ impl Controller {
         }
         Ok(())
     }
+    /// Linux `hub_port_reset` for a root port's device: a hot reset (PR),
+    /// or a warm reset (WPR) where the USB 3 link sits in SS.Inactive or
+    /// Compliance Mode or never trained (`hub_port_warm_reset_required`),
+    /// as a device whose link failed after it hung needs. Up to
+    /// [`PORT_RESET_TRIES`] resets run; one that ends with the link needing a
+    /// warm reset is followed by one. The port must come back enabled at the
+    /// device's speed, a USB 3 link in U0.
     pub(super) fn reset_root_device(&mut self, attachment: Attachment) -> Result<(), BlockError> {
         self.check_minimum()?;
         let port = attachment.root_port;
         self.validate_current_graph(port)?;
         let at = self.port_offset(port);
         let before = self.registers.read32(at);
-        if before & (CCS | PP) != CCS | PP {
-            return Err(BlockError::Unsupported(
-                "USB reset root device is disconnected or unpowered",
-            ));
+        let mut warm = self.warm_reset_required(port, before);
+        if before & PP == 0 || before & CCS == 0 && !warm {
+            return Err(ROOT_UNPLUGGED);
         }
         // usb_reset_and_verify_device turns hardware LPM off first; a
         // failure is ignored, as in Linux.
         let _ = self.disable_usb2_lpm(port);
-        // Clear all prior change bits to establish a fresh PRC/event transition.
-        self.write_port(port, before & PORT_CHANGES);
-        self.drain();
-        if self.registers.read32(at) & PORT_CHANGES != 0 {
-            return Err(BlockError::Unsupported(
-                "USB reset could not acknowledge previous port changes",
-            ));
+        let superspeed = matches!(attachment.speed, SUPER_SPEED | SUPER_SPEED_PLUS);
+        for _ in 0..PORT_RESET_TRIES {
+            // Clear all prior change bits to establish a fresh PRC/event
+            // transition.
+            let current = self.registers.read32(at);
+            self.write_port(port, current & PORT_CHANGES);
+            self.drain();
+            if self.registers.read32(at) & PORT_CHANGES != 0 {
+                return Err(BlockError::Unsupported(
+                    "USB reset could not acknowledge previous port changes",
+                ));
+            }
+            self.write_port(port, if warm { WPR } else { PR });
+            let portsc = self.root_reset_done(port)?;
+            self.write_port(port, portsc & PORT_CHANGES);
+            if portsc & (CCS | PED) == CCS | PED
+                && (portsc >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8 == attachment.speed
+                && (!superspeed || portsc & PLS == 0)
+            {
+                self.minimum_wait(POST_RESET_US)?;
+                self.current_port_reset(None, port)?;
+                return Ok(());
+            }
+            let needs_warm = self.warm_reset_required(port, portsc);
+            // hub_port_reset: a reset that leaves no connection ends it.
+            if portsc & CCS == 0 && !needs_warm {
+                return Err(ROOT_GONE);
+            }
+            warm |= needs_warm;
         }
-        self.write_port(port, PR);
+        Err(BlockError::Unsupported(
+            "USB root reset did not restore the original enabled link",
+        ))
+    }
+
+    /// The root port's status once the reset written to it ended: its
+    /// port status event, Port Reset clear, and Port Reset Change or Warm
+    /// Port Reset Change set.
+    fn root_reset_done(&mut self, port: u8) -> Result<u32, BlockError> {
+        let at = self.port_offset(port);
         let deadline = self.clock.deadline(PORT_RESET_US);
         let mut acknowledged_event = false;
         loop {
@@ -467,20 +657,8 @@ impl Controller {
             }
             self.publish_events();
             let portsc = self.registers.read32(at);
-            if acknowledged_event && portsc & PRC != 0 && portsc & PR == 0 {
-                if portsc & (CCS | PED) != CCS | PED
-                    || (portsc >> 10 & 15) as u8 != attachment.speed
-                    || matches!(attachment.speed, SUPER_SPEED | SUPER_SPEED_PLUS)
-                        && portsc & PLS != 0
-                {
-                    return Err(BlockError::Unsupported(
-                        "USB root reset did not restore the original enabled link",
-                    ));
-                }
-                self.write_port(port, portsc & PORT_CHANGES);
-                self.minimum_wait(POST_RESET_US)?;
-                self.current_port_reset(None, port)?;
-                return Ok(());
+            if acknowledged_event && portsc & (PRC | WRC) != 0 && portsc & PR == 0 {
+                return Ok(portsc);
             }
             if deadline.passed() {
                 return Err(BlockError::Timeout);
@@ -488,6 +666,26 @@ impl Controller {
             crate::waiting();
             core::hint::spin_loop();
         }
+    }
+
+    /// The root port a reset device is on still holds it, before its slot
+    /// is retired: its power and current as [`Self::observe_current_ancestors_for`]
+    /// reads them, or, for a USB 3 link that only a warm reset brings back,
+    /// power without over-current, as its connection and speed are unknown
+    /// until that reset.
+    fn observe_reset_root(&mut self, id: SlotId, port: u8) -> Result<(), BlockError> {
+        self.validate_current_graph(port)?;
+        let portsc = self.registers.read32(self.port_offset(port));
+        if !self.warm_reset_required(port, portsc) {
+            return self.observe_current_ancestors_for(id, false);
+        }
+        self.validate_ancestry(id)?;
+        if portsc & PP == 0 || portsc & OVER_CURRENT != 0 {
+            return Err(BlockError::Unsupported(
+                "USB root port power absent or over-current",
+            ));
+        }
+        Ok(())
     }
 }
 

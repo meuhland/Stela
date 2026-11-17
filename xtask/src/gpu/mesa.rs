@@ -126,7 +126,18 @@ fn inspect_archive(path: &Path, stela_library: bool) -> Result<Value> {
     let mut count = 0;
     for member in archive.members() {
         let member = member?;
-        let object = object::File::parse(member.data(&*data)?)
+        // Meson links static libraries it does not install as thin
+        // archives, whose members stay in their own files, named relative
+        // to the archive.
+        let stored;
+        let bytes = if archive.is_thin() {
+            let name = std::str::from_utf8(member.name()).context("thin archive member name")?;
+            stored = fs::read(path.parent().context("archive directory")?.join(name))?;
+            &stored[..]
+        } else {
+            member.data(&*data)?
+        };
+        let object = object::File::parse(bytes)
             .with_context(|| format!("non-object member in {}", path.display()))?;
         ensure!(
             object.kind() == object::ObjectKind::Relocatable,

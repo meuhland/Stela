@@ -107,11 +107,8 @@ fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result = unsafe {
-        let run: unsafe extern "sysv64" fn(*mut GuestState, u64) -> u128 =
-            core::mem::transmute(region.0);
-        run(&mut *frame, target)
-    };
+    let result =
+        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
     (result as u64, (result >> 64) as u64)
 }
 
@@ -185,8 +182,7 @@ fn stamped_tails_transfer_as_their_cell_tails() {
     for (index, &pc) in pcs.iter().enumerate() {
         let site = 0x1000 + index as u64;
         let held = table.find(table.slot(pc, KEYS[0]), pc, KEYS[0]);
-        table.link_cell(site, pc, Some(held));
-        table.settle_heat(table.site_cell_number(site).unwrap());
+        table.link_hot_cell(site, pc, Some(held)).unwrap();
         sites.push((site, pc, Some(held)));
     }
     let mut contexts = [CONTEXTS[0], CONTEXTS[1]];
@@ -235,8 +231,7 @@ fn stamped_tails_transfer_as_their_cell_tails() {
                 let key = KEYS[rng.below(2) as usize];
                 let held = table.find(table.slot(pc, key), pc, key);
                 let current = (held.pc == pc && held.key == key).then_some(held);
-                table.link_cell(sites[index].0, pc, current);
-                table.settle_heat(table.site_cell_number(sites[index].0).unwrap());
+                table.link_hot_cell(sites[index].0, pc, current).unwrap();
                 sites[index] = (sites[index].0, pc, current);
             }
             6 => {
@@ -268,8 +263,9 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             cells,
             ..ChainControl::default()
         };
-        let number = table.site_cell_number(site).unwrap() as usize;
-        let heat = table.cell_heat(number as u32);
+        // SAFETY: the table's stamps, which live.
+        let hits = || unsafe { stamp_counts(stamps) }[StampCount::Hits as usize];
+        let before = hits();
         let stamped_first = rng.below(2) == 0;
         let (mut a, mut b) = (base, base);
         let (ra, rb) = if stamped_first {
@@ -279,23 +275,42 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             let rb = run(&plain, &mut b, target);
             (run(&stamped, &mut a, target), rb)
         };
-        if stamped_first && table.cell_heat(number as u32) == heat {
+        if stamped_first && hits() != before {
             hit += 1;
         }
         // The one difference allowed: the cell probe missed a page this
         // ITLB put out for another (a capacity eviction, not a drop), and
         // the stamped tail entered the cell's block while the page tables
         // still map the page to the cell's key, as a refill would find.
-        let context = contexts[half(pc)];
+        // A lower-half page is translated in the upper half's context too
+        // (`translate`), where an entry of the cell's key may have stamped
+        // the cell while the lower half's context took another key since:
+        // a TLB holding both (a conflict) may give either.
         let page = pc & !0xfff;
-        let resident = itlb.find(itlb.page_slot(pc, context), page, context);
+        let candidates = match half(pc) {
+            0 => &contexts[..],
+            _ => &contexts[1..],
+        };
+        let translated = candidates.iter().find_map(|&context| {
+            let resident = itlb.find(itlb.page_slot(pc, context), page, context);
+            (resident.pc == page && resident.key == context).then_some(resident.entry)
+        });
         let cell = table.site_cell(site).unwrap();
         let exit = (
             pc,
             u64::from(ExitWord::from(ExitKind::Direct).encoded() | ran << ExitWord::RAN_SHIFT),
         );
-        let evicted = !(resident.pc == page && resident.key == context)
-            && keys.get(&(page, context)) == Some(&cell.key)
+        // The stamp names the lower half's context alone, so for a
+        // lower-half page it outlives a change of the upper half's: its
+        // translation stays good until a TLBI grows the epoch.
+        let stamped_in = match half(pc) {
+            0 => &CONTEXTS[..],
+            _ => &contexts[1..],
+        };
+        let evicted = translated != Some(cell.key)
+            && stamped_in
+                .iter()
+                .any(|&context| keys.get(&(page, context)) == Some(&cell.key))
             && rb == exit
             && linked.is_some_and(|linked| linked.entry == cell.entry)
             && (ra == (0x7700 + u64::from(cell.block), 99)
@@ -309,6 +324,8 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             ra, rb,
             "trial {trial}: target {target:#x} linked {linked:?}"
         );
+        // Only the cell probes count and sample their transfers.
+        (a.heat, a.sampled, b.heat, b.sampled) = (0, 0, 0, 0);
         assert_eq!(a, b, "trial {trial}: the controls differ");
         if ra.1 == 99 {
             entered += 1;
@@ -316,8 +333,9 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             exited += 1;
         }
     }
+    // Stamp hits are few among the changes each trial makes, but there.
     assert!(
-        hit > 10_000 && entered > 10_000 && exited > 10_000,
+        hit > 500 && entered > 10_000 && exited > 10_000,
         "{hit} {entered} {exited} {refilled}"
     );
 }
@@ -339,9 +357,7 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     );
     let held = entry_of(&blocks, 3, pc, KEYS[0]);
     table.insert(table.slot(pc, KEYS[0]), held);
-    table.link_cell(0x1000, pc, Some(held));
-    let number = table.site_cell_number(0x1000).unwrap();
-    table.settle_heat(number);
+    table.link_hot_cell(0x1000, pc, Some(held)).unwrap();
     tail(&region, &table, 0x1000, pc, Some(held), 4);
     let mut control = ChainControl {
         budget: 100,
@@ -354,18 +370,17 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
         cells,
         ..ChainControl::default()
     };
-    let heat = |table: &LookupTable| table.cell_heat(number);
     // SAFETY: the table's stamps, which live.
     let counts = || unsafe { stamp_counts(stamps) };
     let count = |was: [u64; STAMP_COUNTS], count: StampCount| {
         counts()[count as usize] - was[count as usize]
     };
     // A transfer into a block was a stamp's hit or a counted miss that
-    // went through the cell probe, which counts its heat.
-    let through = |control: &mut ChainControl, table: &LookupTable| {
-        let (before, was) = (heat(table), counts());
+    // went through the cell probe, which counts it in the control.
+    let through = |control: &mut ChainControl, _: &LookupTable| {
+        let (before, was) = (control.heat, counts());
         let result = run(&region, control, pc);
-        let probed = heat(table) != before;
+        let probed = control.heat != before;
         if result.1 == 99 {
             let missed = count(was, StampCount::Epoch)
                 + count(was, StampCount::Context)
@@ -427,10 +442,8 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     // No budget on the stamp's path: the exit, the budget wrapped. The
     // table taking the entry the cell holds again changes nothing, so the
     // stamp holds.
-    table.link_cell(0x1000, pc, Some(held));
+    table.link_hot_cell(0x1000, pc, Some(held)).unwrap();
     table.insert(table.slot(pc, KEYS[0]), held);
-    let number = table.site_cell_number(0x1000).unwrap();
-    table.settle_heat(number);
     tail(&region, &table, 0x1000, pc, Some(held), 4);
     let was = counts();
     assert_eq!(run(&region, &mut control, pc), (0x7703, 99));
@@ -449,11 +462,15 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(count(was, StampCount::Interrupted), 1);
     assert_eq!(control.budget, 10);
     control.interrupt_epoch = 0;
-    // A cell made hot: its exit's link comes back from the sweep once.
-    table.link_cell(0x1000, pc, Some(held));
+    // A cell past the stamped ones: one transfer in CELL_SAMPLE names its
+    // cell, which names the exit's link.
+    let address = table.link_cell(0x1000, pc, Some(held));
     let number = table.site_cell_number(0x1000).unwrap();
+    assert!(number as usize >= STAMPED_CELLS);
     tail(&region, &table, 0x1000, pc, None, 4);
     control.budget = 1000;
+    control.heat = 0;
+    control.sampled = 0;
     let link = CellLink {
         site: 0x1000,
         pc,
@@ -462,14 +479,14 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
         btype: 0,
     };
     table.note_link(number, link);
-    for _ in 1..HOT_CELL {
+    for _ in 1..CELL_SAMPLE {
         assert_eq!(run(&region, &mut control, pc), (0x7703, 99));
     }
-    assert!(table.hot_links(0..STAMPED_CELLS as u32).is_empty());
+    assert_eq!(control.sampled, 0);
     assert_eq!(run(&region, &mut control, pc), (0x7703, 99));
-    assert_eq!(table.hot_links(0..STAMPED_CELLS as u32), [link]);
-    table.settle_heat(number);
-    assert!(table.hot_links(0..STAMPED_CELLS as u32).is_empty());
+    assert_eq!(control.sampled, address);
+    assert_eq!(control.heat, u64::from(CELL_SAMPLE));
+    assert_eq!(table.sampled_link(control.sampled), Some((number, link)));
 }
 
 /// While another thread retires and relinks the cell's block, a thread
@@ -491,8 +508,7 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
     );
     let held = entry_of(&blocks, 1, pc, KEYS[0]);
     table.insert(table.slot(pc, KEYS[0]), held);
-    table.link_cell(0x1000, pc, Some(held));
-    table.settle_heat(table.site_cell_number(0x1000).unwrap());
+    table.link_hot_cell(0x1000, pc, Some(held)).unwrap();
     tail(&region, &table, 0x1000, pc, Some(held), 2);
     let (address, mask) = (table.address(), table.mask());
     let changed = AtomicBool::new(false);
@@ -517,9 +533,7 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
                 let mut guard = table.lock().unwrap();
                 // Back to block 1, relinked as a new link would be.
                 guard.insert(slot, held);
-                guard.link_cell(0x1000, pc, Some(held));
-                let number = guard.site_cell_number(0x1000).unwrap();
-                guard.settle_heat(number);
+                guard.link_hot_cell(0x1000, pc, Some(held)).unwrap();
                 let _ = round;
             }
             done.store(true, Ordering::SeqCst);

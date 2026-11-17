@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "metal_compiler.h"
 #include "threadgroup.h"
+#include "nir_serialize.h"
+#include "util/blob.h"
 #include "util/ralloc.h"
 #include "vulkan/vulkan_core.h"
 #include <assert.h>
@@ -12,6 +14,8 @@ static_assert(sizeof(struct stela_metal_reflection) == STELA_METAL_REFLECTION_BY
               "metal/compiler.rs mirrors the reflection");
 static_assert(sizeof(struct stela_metal_target) == STELA_METAL_TARGET_BYTES,
               "metal/compiler.rs mirrors the target");
+static_assert(MESA_SHADER_MESH + 1 == STELA_METAL_NIR_STAGES,
+              "the target holds options from the vertex to the mesh stage");
 static_assert(sizeof(struct stela_metal_linked_varying) == STELA_METAL_LINKED_VARYING_BYTES,
               "metal/compiler.rs mirrors the linked varyings");
 static_assert(sizeof(struct stela_metal_specialization) == STELA_METAL_SPECIALIZATION_BYTES,
@@ -871,6 +875,131 @@ attachment_accesses(const struct stela_metal_specialization *specialization,
    return true;
 }
 
+/* Thread memory of at most this many 32-bit words lives in registers. */
+#define REGISTER_THREAD_WORDS 16
+
+/* Moves small thread memory out of scratch into registers. The front end
+ * lays a function's thread memory out as scratch; when it fits in
+ * REGISTER_THREAD_WORDS words, scratch becomes one array of words and each
+ * word an SSA value. Loops that index the array by their induction
+ * variable unroll first (NIR forces that for a function-temporary array no
+ * longer than the trip count), so their indices become constants; an index
+ * still dynamic after that becomes a select tree over the words. Larger
+ * thread memory stays in scratch: more registers per thread would cost
+ * occupancy. Thread memory is private to its thread, so only its storage
+ * changes, never a value. */
+static void
+thread_memory_to_registers(nir_shader *shader)
+{
+   if (!shader->scratch_size || shader->scratch_size > REGISTER_THREAD_WORDS * 4)
+      return;
+   nir_lower_scratch_to_var(shader);
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, shader, nir_opt_loop_unroll);
+      NIR_PASS(progress, shader, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, shader, nir_opt_constant_folding);
+      NIR_PASS(progress, shader, nir_opt_algebraic);
+      NIR_PASS(progress, shader, nir_opt_copy_prop);
+      NIR_PASS(progress, shader, nir_opt_dead_cf);
+      NIR_PASS(progress, shader, nir_opt_dce);
+   } while (progress);
+   nir_lower_indirect_derefs_to_if_else_trees(shader, nir_var_function_temp,
+                                              REGISTER_THREAD_WORDS);
+   nir_lower_vars_to_ssa(shader);
+   nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
+   /* Words read before any store become undefined values carried through
+    * loops; zero is one of their values, and what NAK picks for them too. */
+   nir_lower_undef_to_zero(shader, NULL);
+   nir_opt_dce(shader);
+}
+
+/* Whether a helper invocation's buffer read may take another address: a
+ * device read that may fault, by a 64-bit address. A read translation
+ * proved to fall in mapped memory (ACCESS_CAN_SPECULATE) keeps its own. */
+static bool
+helper_read_moves(nir_intrinsic_instr *read, void *data)
+{
+   (void)data;
+   return (read->intrinsic == nir_intrinsic_load_global ||
+           read->intrinsic == nir_intrinsic_load_global_constant) &&
+          !(nir_intrinsic_access(read) & ACCESS_CAN_SPECULATE) && read->src[0].ssa->bit_size == 64;
+}
+
+/* A fragment function also runs in helper invocations, the lanes of a quad
+ * outside the primitive that exist for derivatives. Their inputs extrapolate
+ * past the primitive's edges, so an index a function computes from them can
+ * lie outside every covered fragment's: Core Animation's buffer image blit
+ * reads byte offset + floor(uv.x) + floor(uv.y) * bpr, clamped only above,
+ * and a helper left of or above the rectangle reads up to a row and a byte
+ * before the image, below the buffer's first byte when the image starts it.
+ * NVIDIA's helpers perform such reads, and a read of a page nothing maps
+ * faults the channel and loses the device. A helper's read counts only where
+ * a derivative, a subgroup or quad operation or control flow takes its value
+ * (nir_opt_load_skip_helpers). Every other read a helper makes of memory
+ * that may be unmapped reads the start of the stage's argument table
+ * instead: every draw binds one before its fragments run, 16-byte aligned
+ * (ArgumentTable::ALIGNMENT) and larger than any one read, and the helper's
+ * value goes nowhere. Covered fragments read as before. */
+static void
+helpers_read_mapped_memory(nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_FRAGMENT)
+      return;
+   /* The analysis follows values within the entry point alone. */
+   unsigned functions = 0;
+   nir_foreach_function_impl(impl, shader)
+      functions++;
+   if (functions != 1)
+      return;
+   nir_divergence_analysis(shader);
+   nir_opt_load_skip_helpers_options options = {
+      .no_add_divergence = true,
+      .intrinsic_cb = helper_read_moves,
+   };
+   if (!nir_opt_load_skip_helpers(shader, &options))
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_builder b = nir_builder_create(impl);
+   nir_def *helper = NULL, *table = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         /* Texture reads cannot fault; the driver's compiler marks them. */
+         if (instr->type == nir_instr_type_tex)
+            nir_instr_as_tex(instr)->skip_helpers = false;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *read = nir_instr_as_intrinsic(instr);
+         if (!nir_intrinsic_has_access(read) ||
+             !(nir_intrinsic_access(read) & ACCESS_SKIP_HELPERS))
+            continue;
+         nir_intrinsic_set_access(read, nir_intrinsic_access(read) & ~ACCESS_SKIP_HELPERS);
+         if (!helper_read_moves(read, NULL))
+            continue;
+         if (!helper) {
+            b.cursor = nir_before_impl(impl);
+            helper = nir_load_helper_invocation(&b, 1);
+            table = stela_metal_load_table(&b, STELA_METAL_TABLE_FRAGMENT);
+         }
+         b.cursor = nir_before_instr(instr);
+         nir_src_rewrite(&read->src[0], nir_bcsel(&b, helper, table, read->src[0].ssa));
+      }
+   }
+   nir_progress(true, impl, helper ? nir_metadata_control_flow : nir_metadata_all);
+}
+
+/* Whether the driver gave options for every stage. */
+static bool
+every_stage_has_options(const struct stela_metal_target *target)
+{
+   for (unsigned stage = 0; stage < STELA_METAL_NIR_STAGES; stage++) {
+      if (!target->nir[stage])
+         return false;
+   }
+   return true;
+}
+
 nir_shader *
 stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
                               const struct stela_metal_target *target,
@@ -882,7 +1011,7 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
    if (!error)
       error = &local;
    *error = (struct stela_air_error){0};
-   if (!entry || !target || !target->nir || !specialization ||
+   if (!entry || !target || !every_stage_has_options(target) || !specialization ||
        (specialization->threadgroup_length_count && !specialization->threadgroup_lengths) ||
        (specialization->varying_count && !specialization->varyings) ||
        (specialization->constant_count && !specialization->constants) ||
@@ -1030,7 +1159,8 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       resources.tile = &tile;
    }
    if (stage == STELA_METAL_KERNEL) {
-      shader = stela_air_to_nir(air, size, entry, target->nir, &resources, error);
+      shader = stela_air_to_nir(air, size, entry, target->nir[MESA_SHADER_COMPUTE], &resources,
+                                error);
       goto done;
    }
    struct stela_air_varying_slot rows[STELA_METAL_VARYINGS];
@@ -1067,8 +1197,19 @@ stela_metal_compile_reflected(const void *air, size_t size, const char *entry,
       .vertex_input_words = fetches_words ? words : NULL,
       .decode_vertex_input = decode_vertex_input,
    };
-   shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir, &options, error);
+   /* As stela_air_metal_stage_to_nir builds it: a post-tessellation vertex
+    * function is an evaluation shader. */
+   static const mesa_shader_stage nir_stages[] = {
+      [STELA_METAL_VERTEX] = MESA_SHADER_VERTEX, [STELA_METAL_FRAGMENT] = MESA_SHADER_FRAGMENT,
+      [STELA_METAL_MESH] = MESA_SHADER_MESH, [STELA_METAL_OBJECT] = MESA_SHADER_TASK,
+   };
+   mesa_shader_stage built = patch ? MESA_SHADER_TESS_EVAL : nir_stages[stage];
+   shader = stela_air_metal_stage_to_nir(air, size, entry, target->nir[built], &options, error);
 done:
+   if (shader) {
+      thread_memory_to_registers(shader);
+      helpers_read_mapped_memory(shader);
+   }
    free(owned_reflection);
    return shader;
 }
@@ -1087,14 +1228,35 @@ stela_metal_tessellation_stages(const struct stela_metal_target *target,
                                 const struct stela_metal_tessellation *tessellation,
                                 nir_shader *stages[2])
 {
-   stages[0] = stela_metal_tessellation_vertex(target->nir);
-   stages[1] = stela_metal_tessellation_control(target->nir, tessellation);
+   stages[0] = stela_metal_tessellation_vertex(target->nir[MESA_SHADER_VERTEX]);
+   stages[1] = stela_metal_tessellation_control(target->nir[MESA_SHADER_TESS_CTRL], tessellation);
 }
 
 void
 stela_metal_release(nir_shader *shader)
 {
    ralloc_free(shader);
+}
+
+nir_shader *
+stela_metal_deserialize(const void *data, size_t size, const struct stela_metal_target *target)
+{
+   if (!data || !target || !every_stage_has_options(target))
+      return NULL;
+   struct blob_reader reader;
+   blob_reader_init(&reader, data, size);
+   /* nir_deserialize takes the options before it reads the stage and only
+    * keeps them; the stage's replace them once the stage is known. */
+   nir_shader *shader = nir_deserialize(NULL, target->nir[MESA_SHADER_COMPUTE], &reader);
+   if (!shader)
+      return NULL;
+   if (reader.overrun || reader.current != reader.end ||
+       (unsigned)shader->info.stage >= STELA_METAL_NIR_STAGES) {
+      ralloc_free(shader);
+      return NULL;
+   }
+   shader->options = target->nir[shader->info.stage];
+   return shader;
 }
 
 /* The buffer slots def's address derives from, one bit each: loads of a

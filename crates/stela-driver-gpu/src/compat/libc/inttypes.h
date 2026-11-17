@@ -30,4 +30,8 @@
 #define SCNx64 "lx"
 #define SCNuPTR "lu"
 #define SCNxPTR "lx"
+#include <sys/cdefs.h>
+__BEGIN_DECLS
+intmax_t imaxabs(intmax_t value);
+__END_DECLS
 #endif

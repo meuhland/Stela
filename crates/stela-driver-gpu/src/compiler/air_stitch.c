@@ -188,17 +188,26 @@ load_source(struct stela_air_metadata *m, LLVMContextRef context,
       return fail(m, STELA_AIR_LIMIT, "a stitched function's name is too long");
    if (!from->constant_count)
       memcpy(source->callee, from->name, name_bytes + 1);
-   LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-   unsigned count;
-   if (!stela_air_named_md(m, "air.visible", nodes, &count))
+   struct stela_air_list nodes;
+   if (!stela_air_named_list(m, "air.visible", &nodes))
       return false;
-   for (unsigned i = 0; source->function && i < count; i++) {
+   LLVMValueRef node = NULL;
+   for (unsigned i = 0; source->function && !node && i < nodes.count; i++) {
+      LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
+      unsigned field_count;
+      if (!stela_air_md_node(m, nodes.nodes[i], fields, &field_count)) {
+         stela_air_list_release(&nodes);
+         return false;
+      }
+      if (field_count >= 3 && fields[0] == source->function)
+         node = nodes.nodes[i];
+   }
+   stela_air_list_release(&nodes);
+   if (node) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned field_count, input_count;
-      if (!stela_air_md_node(m, nodes[i], fields, &field_count))
+      if (!stela_air_md_node(m, node, fields, &field_count))
          return false;
-      if (field_count < 3 || fields[0] != source->function)
-         continue;
       source->outputs = fields[1];
       if (!stela_air_md_node(m, fields[2], source->inputs, &input_count))
          return false;

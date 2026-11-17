@@ -23,6 +23,21 @@ pub(super) struct Disk {
     media: Vec<u8>,
     phase: Phase,
     pub(super) commands: Vec<(u32, u8)>,
+    /// Hung after its configuration, as a stick may be: it takes no bulk
+    /// transfer and stalls the class reset until a port reset readdresses it.
+    pub(super) wedged: bool,
+    /// The hung peer acknowledges a class reset and stays hung.
+    pub(super) acks_reset: bool,
+    /// Its link is broken: every bulk TD ends with a USB transaction error
+    /// and the class reset fails with one, until a port reset readdresses it.
+    pub(super) broken: bool,
+    /// A READ that covers this block fails with MEDIUM ERROR, as a worn
+    /// stick's unreadable block does.
+    pub(super) unreadable: Option<usize>,
+    /// The command under way fails at its status.
+    failing: bool,
+    /// The sense the next REQUEST SENSE gives: key, ASC, ASCQ.
+    sense: Option<[u8; 3]>,
 }
 
 impl Disk {
@@ -31,7 +46,18 @@ impl Disk {
             media: alloc::vec![0; BLOCK_BYTES * BLOCKS],
             phase: Phase::Command,
             commands: Vec::new(),
+            wedged: false,
+            acks_reset: false,
+            broken: false,
+            unreadable: None,
+            failing: false,
+            sense: None,
         }
+    }
+
+    /// The RAM medium the peer serves.
+    pub(super) fn media(&mut self) -> &mut [u8] {
+        &mut self.media
     }
 
     pub(super) fn reset(&mut self) {
@@ -66,6 +92,11 @@ impl Disk {
                         assert!(bytes >= 18);
                         data[0] = 0x70;
                         data[7] = 10;
+                        if let Some([key, asc, ascq]) = self.sense.take() {
+                            data[2] = key;
+                            data[12] = asc;
+                            data[13] = ascq;
+                        }
                     }
                     0x12 => {
                         assert_eq!(cdb.len(), 6);
@@ -100,6 +131,14 @@ impl Disk {
                         let offset = lba * BLOCK_BYTES;
                         if cdb[0] == 0x28 {
                             data.copy_from_slice(&self.media[offset..offset + bytes]);
+                            if self
+                                .unreadable
+                                .is_some_and(|block| (lba..lba + blocks).contains(&block))
+                            {
+                                // Unrecovered read error.
+                                self.failing = true;
+                                self.sense = Some([3, 0x11, 0]);
+                            }
                         } else {
                             write_offset = Some(offset);
                         }
@@ -140,6 +179,8 @@ impl Disk {
                 wire.fill(0);
                 wire[..4].copy_from_slice(b"USBS");
                 wire[4..8].copy_from_slice(&tag.to_le_bytes());
+                // Command Failed.
+                wire[12] = u8::from(core::mem::take(&mut self.failing));
             }
         }
     }

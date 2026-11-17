@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sun, 15 Nov 2026 01:18:42 +0000
+Subject: [PATCH] aco: start a program with no debug callback, so an error a
+ compile reports before setting one is printed, not called through an
+ indeterminate pointer
+
+---
+ src/amd/compiler/aco_ir.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
+index 4082a95..e7ac8f3 100644
+--- a/src/amd/compiler/aco_ir.h
++++ b/src/amd/compiler/aco_ir.h
+@@ -2394,8 +2394,8 @@ public:
+    struct {
+       FILE* output = stderr;
+       bool shorten_messages = false;
+-      void (*func)(void* private_data, enum aco_compiler_debug_level level, const char* message);
+-      void* private_data;
++      void (*func)(void* private_data, enum aco_compiler_debug_level level, const char* message) = NULL;
++      void* private_data = NULL;
+    } debug;
+ 
+    void allocateRange(unsigned amount)
+-- 
+2.56.1
+

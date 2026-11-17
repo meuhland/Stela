@@ -4,6 +4,8 @@
 use std::{env, path::PathBuf, process::Command};
 
 #[cfg(feature = "linux")]
+pub mod kbuild_make;
+#[cfg(feature = "linux")]
 pub mod linux;
 #[cfg(feature = "native")]
 pub mod linux_build;

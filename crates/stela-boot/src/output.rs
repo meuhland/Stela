@@ -22,6 +22,7 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use stela_boot_core::first_stop::{Claim, FirstStop};
 use stela_drivers::block::{BlockDevice, BlockError, Submission};
 use stela_runtime::pc::boot_log::{PENDING_BYTES, Pending, Unkept, Writer};
 
@@ -132,6 +133,18 @@ static SHARED_DRAINING: AtomicBool = AtomicBool::new(false);
 /// Bursts a draining processor sends at once ([`drain_some`]): a few
 /// hundred bytes, a few hundred microseconds under a hypervisor.
 const DRAIN_BURSTS: usize = 32;
+/// When a processor whose guest waits last sent from the queue, or the
+/// queue last had nothing to send: the counter then. Processors whose guest
+/// waits send the queue in their waits; one whose guest runs sends only
+/// once they left it this long ([`drain_due`]).
+static SERVED_AT: AtomicU64 = AtomicU64::new(0);
+/// How long the queue may wait for a processor whose guest waits before
+/// one whose guest runs sends it between slices. Each burst is a port
+/// access, and under a hypervisor two exits, each of which can wait there
+/// for its device model's lock as long as the host refreshes its display:
+/// 8 to 15 ms on every processor that sent a beat's reports. A waiting
+/// processor's guest loses nothing by it.
+const STARVED_MILLIS: u64 = 100;
 
 /// A ring of bytes not yet sent.
 struct Queue {
@@ -195,6 +208,9 @@ impl Queue {
 
     /// Append `data`, which fits.
     fn copy(&mut self, data: &[u8]) {
+        if self.len == 0 {
+            SERVED_AT.store(rdtsc(), Ordering::Relaxed);
+        }
         let size = self.bytes.len();
         let tail = (self.head + self.len) % size;
         let first = data.len().min(size - tail);
@@ -254,8 +270,11 @@ impl Queue {
         skipped
     }
 
-    /// Send what the port takes now, never waiting for it; nothing while
-    /// another processor sends or once processors drain the queue.
+    /// Send what the port takes now, never waiting for it, for
+    /// [`DRAIN_BURSTS`] bursts at most; nothing while another processor
+    /// sends or once processors drain the queue. A port that always takes
+    /// bytes at once (a hypervisor's) would otherwise have the writer send
+    /// the whole queue, each burst an exit to the host's device model.
     fn send_now(&mut self) {
         if self.len == 0
             || SHARED_DRAINING.load(Ordering::Relaxed)
@@ -266,7 +285,9 @@ impl Queue {
             return;
         }
         let mut burst = [0u8; SERIAL_FIFO];
-        while self.len != 0 && crate::serial::ready() {
+        let mut bursts = 0;
+        while self.len != 0 && bursts < DRAIN_BURSTS && crate::serial::ready() {
+            bursts += 1;
             let taken = self.take_burst(&mut burst);
             crate::serial::burst(&burst[..taken]);
         }
@@ -368,8 +389,15 @@ pub fn pump_serial() {
 
 /// Send a burst of queued bytes if the port takes it now without waiting;
 /// whether this processor should send more. Never waits for another
-/// processor: while one sends, the others leave the port to it.
+/// processor: while one sends, the others leave the port to it. For a
+/// processor whose guest waits, which serves the queue first
+/// ([`drain_due`]).
 pub fn send_queued() -> bool {
+    send_burst(true)
+}
+
+/// [`send_queued`], from a processor whose guest `waits` or not.
+fn send_burst(waits: bool) -> bool {
     if !SERIAL_QUEUED.load(Ordering::Acquire)
         || SENDING
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -389,6 +417,9 @@ pub fn send_queued() -> bool {
         })
         .unwrap_or(0);
         crate::serial::burst(&burst[..taken]);
+        if waits {
+            SERVED_AT.store(rdtsc(), Ordering::Relaxed);
+        }
     }
     SENDING.store(false, Ordering::Release);
     SERIAL_QUEUED.load(Ordering::Acquire)
@@ -400,11 +431,25 @@ pub fn share_draining() {
     SHARED_DRAINING.store(true, Ordering::Relaxed);
 }
 
+/// Whether a processor whose guest runs sends queued output between two
+/// slices ([`drain_some`]): only once no processor whose guest waits served
+/// the queue for [`STARVED_MILLIS`], as when every guest CPU is busy.
+pub fn drain_due() -> bool {
+    let hz = TSC_HZ.load(Ordering::Relaxed);
+    SERIAL_QUEUED.load(Ordering::Relaxed)
+        && stela_boot_core::service_watch::starved(
+            rdtsc(),
+            SERVED_AT.load(Ordering::Relaxed),
+            hz / 1000 * STARVED_MILLIS,
+        )
+}
+
 /// Send up to [`DRAIN_BURSTS`] bursts of queued output, as far as the port
-/// takes them now; never waits for the port or another processor.
+/// takes them now, from a processor whose guest runs; never waits for the
+/// port or another processor.
 pub fn drain_some() {
     for _ in 0..DRAIN_BURSTS {
-        if !send_queued() {
+        if !send_burst(false) {
             break;
         }
     }
@@ -466,16 +511,20 @@ struct Sink {
 
 impl Sink {
     /// Move the store in progress on: collect the running request's result
-    /// and start the next; with `wait`, until the store is done.
-    fn advance(&mut self, wait: bool) -> Result<(), BlockError> {
+    /// and start the next; with a counter deadline `wait`, until the store
+    /// is done or the deadline passed. Whether it is done: a device that
+    /// never completes leaves the store in progress at the deadline.
+    fn advance(&mut self, wait: Option<u64>) -> Result<bool, BlockError> {
         loop {
             if let Some(request) = self.request.as_mut() {
                 let Some(finished) = request.poll(&mut *self.device) else {
-                    if !wait {
-                        return Ok(());
+                    match wait {
+                        Some(deadline) if !passed(deadline) => {
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        _ => return Ok(false),
                     }
-                    core::hint::spin_loop();
-                    continue;
                 };
                 self.request = None;
                 self.writer.completed(finished)?;
@@ -486,7 +535,7 @@ impl Sink {
                     self.stores += 1;
                     self.ticks += self.flushed.wrapping_sub(began);
                 }
-                return Ok(());
+                return Ok(true);
             };
             match Submission::new(request, self.device.identity()) {
                 Ok(request) => self.request = Some(request),
@@ -499,15 +548,31 @@ impl Sink {
     }
 }
 
+/// The longest a store that waits for the logs (at a stop, or the USB's log
+/// before a device starts) waits for their disks: a disk that never
+/// completes a command must not keep the PC at the stop. On expiry it is
+/// reported once and the stop goes on.
+const STORE_WAIT_MILLIS: u64 = 2000;
+
+/// The TSC rate taken before it is measured, for [`STORE_WAIT_MILLIS`]: no
+/// PC's is higher, so the wait is at least that long.
+const UNMEASURED_TSC_HZ: u64 = 6_000_000_000;
+
+/// Whether the counter passed `deadline`.
+fn passed(deadline: u64) -> bool {
+    rdtsc().wrapping_sub(deadline) < u64::MAX / 2
+}
+
 /// Seconds between the machine state's log stores while the engine runs:
 /// ext4's default journal commit interval. A stop stores at once.
 const MACHINE_FLUSH_SECONDS: u64 = 5;
 /// Seconds between the USB log's stores while the engine runs.
 const USB_FLUSH_SECONDS: u64 = 10;
 
+/// The BSP's counter on any core (`engine::host::rdtsc`): log times and
+/// flush deadlines are compared across cores.
 fn rdtsc() -> u64 {
-    // SAFETY: RDTSC has no memory effects.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    crate::engine::host::rdtsc()
 }
 
 pub use stela_boot_core::log_sinks::Log;
@@ -647,6 +712,43 @@ pub fn leave_boot_services() {
 /// drivers write the log on, and a stop before that keeps them in the
 /// firmware ([`keep_stop_record`]).
 static UNKEPT_FROM: AtomicU64 = AtomicU64::new(0);
+
+/// Copy the lines no log stored since the firmware's log closed into
+/// `into`, the newest whole lines that fit (`loader_lines`), for the engine
+/// to put at the head of its own record ([`carry_loader_lines`]); the
+/// bytes used.
+pub fn unkept_lines(into: &mut [u8]) -> usize {
+    use stela_boot_core::loader_lines::{Carry, first};
+    exclusive(|| {
+        let Ok(record) = RECORD.0.try_borrow() else {
+            return 0;
+        };
+        let unkept = UNKEPT_FROM.load(Ordering::Relaxed);
+        let from = first(unkept, record.pushed(), into.len());
+        let mut carry = Carry::new(into, from - unkept);
+        let Ok(_) = record.copy_since(from, |bytes| {
+            carry.push(bytes);
+            Ok::<_, Infallible>(())
+        });
+        carry.finish()
+    })
+    .unwrap_or(0)
+}
+
+/// Put the loader's lines that no log stored ([`unkept_lines`]) at the
+/// head of this image's record, with their stamps, for every log it opens
+/// to store first. The serial port had them from the loader.
+pub fn carry_loader_lines(lines: &[u8]) {
+    if lines.is_empty() {
+        return;
+    }
+    let _ = exclusive(|| {
+        if let Ok(mut record) = RECORD.0.try_borrow_mut() {
+            record.push(lines);
+            LINE_START.store(lines.ends_with(b"\n"), Ordering::Relaxed);
+        }
+    });
+}
 
 /// Leave the newest lines in the PC's firmware (`stop_record::keep`), for
 /// the next start to copy into the log and to say this one stopped: those
@@ -858,6 +960,16 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         return;
     }
     let mut failed = Vec::new();
+    let mut late = Vec::new();
+    // One deadline for every log's store.
+    let started = rdtsc();
+    let deadline = wait.then(|| {
+        let hz = match TSC_HZ.load(Ordering::Relaxed) {
+            0 => UNMEASURED_TSC_HZ,
+            hz => hz,
+        };
+        started.wrapping_add(hz / 1000 * STORE_WAIT_MILLIS)
+    });
     let reached = with_sinks(false, |sinks| {
         // A log whose store is in progress takes new bytes at its next one.
         let is_due = |sink: &Sink| !sink.writer.storing() && due(sink);
@@ -889,8 +1001,13 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
             if is_due(sink) && sink.writer.begin_store() {
                 sink.began = Some(rdtsc());
             }
-            match sink.advance(wait) {
-                Ok(()) => index += 1,
+            match sink.advance(deadline) {
+                Ok(done) => {
+                    if wait && !done {
+                        late.push(sink.kind);
+                    }
+                    index += 1;
+                }
                 Err(error) => failed.push((sinks.remove(index).kind, error)),
             }
         }
@@ -900,16 +1017,33 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         );
     });
     if wait {
-        UNSTORED.store(reached.is_none(), Ordering::Relaxed);
+        UNSTORED.store(reached.is_none() || !late.is_empty(), Ordering::Relaxed);
     }
     for (kind, error) in failed {
         log_lost(kind, error);
+    }
+    // Reported once a boot: its store stays in progress and goes on at the
+    // next turn, if any.
+    static LATE: AtomicBool = AtomicBool::new(false);
+    if let Some(kind) = late.first()
+        && !LATE.swap(true, Ordering::Relaxed)
+    {
+        arguments(format_args!(
+            "BOOT LOG refusal: the {} log's store timed out after {} ms; going on without it\n",
+            kind.name(),
+            millis_since(started)
+        ));
     }
 }
 
 /// The counter now, for [`millis_since`].
 pub fn now() -> u64 {
     rdtsc()
+}
+
+/// The counter's rate; 0 before it is known.
+pub fn counter_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
 }
 
 /// Milliseconds since counter value `start`; 0 before the rate is known.
@@ -974,20 +1108,82 @@ pub fn terminate(code: u32) -> ! {
 
 /// Stop before allocator initialization. UART/record formatting and UEFI's
 /// stack-buffered text writer need no Rust allocation; neither log flushing nor
-/// the allocating status/panic presentation path is entered here. Call only
-/// while firmware boot services and its system table remain live.
+/// the allocating status/panic presentation path is entered here. No log is
+/// open yet, so the lines go to the firmware's variables, which need no
+/// allocation either, for the next start to copy into the log
+/// (`stop_record::carry`). Call only while firmware boot services and its
+/// system table remain live.
 pub(crate) fn early_fatal(message: &str) -> ! {
+    if let Claim::Later { first_here } = FIRST_STOP.claim(stopping_processor()) {
+        later_stop(&message, first_here)
+    }
+    crate::engine::write_guest_output_at_stop();
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     firmware_console("\nStela stopped: ");
     firmware_console(message);
     firmware_console("\n");
+    crate::stop_record::arm(crate::stop_record::Services::capture_without_heap(), None);
+    keep_stop_record(Some(message));
     arguments(format_args!(
         "STELA STOPPED code=0x11; power off to continue\n"
     ));
     halt(0x11)
 }
 
+/// The boot's first stop: the one whose reason is shown and recorded.
+pub static FIRST_STOP: FirstStop = FirstStop::new();
+
+/// This processor's APIC ID, without the engine's per-processor state, which
+/// a stop before it exists has none of.
+fn stopping_processor() -> u32 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    match __cpuid(0).eax >= 0xb && __cpuid_count(0xb, 0).ebx != 0 {
+        true => __cpuid_count(0xb, 0).edx,
+        false => __cpuid(1).ebx >> 24,
+    }
+}
+
+/// A stop raised after the boot's first stop began, on another processor
+/// or after the first finished (a watcher's NMI to the stopped processor):
+/// one line names it, and the first stop's reason stays the one on the
+/// screen and in the kept record. The processor that made the first stop
+/// goes back to its wait for the power button; any other halts.
+fn later_stop(message: &dyn core::fmt::Display, first_here: bool) -> ! {
+    // Whatever guest lines the first stop has not written, as its
+    // processor may be the one that stopped making progress.
+    crate::engine::write_guest_output_at_stop();
+    arguments(format_args!(
+        "\nSTELA LATER STOP {message}; the first stop's reason above stands\n"
+    ));
+    unqueue_serial();
+    if first_here {
+        crate::stop::wait()
+    }
+    loop {
+        // SAFETY: a stopped boot resumes no task on this processor.
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+    }
+}
+
+/// An NMI once a stop began, which only a watcher's look that raced the
+/// stop or a platform's NMI sends: a later stop ([`later_stop`]), even on
+/// the processor still stopping, as nothing in the stop's own work raises
+/// one. Returns while no stop began. Allocates nothing: the first stop may
+/// be the heap's.
+pub(crate) fn nmi_after_stop(message: impl core::fmt::Display) {
+    if !FIRST_STOP.began() {
+        return;
+    }
+    let first_here = match FIRST_STOP.claim(stopping_processor()) {
+        Claim::Later { first_here } => first_here,
+        Claim::First | Claim::Within => true,
+    };
+    later_stop(&message, first_here)
+}
+
 fn halt(code: u32) -> ! {
+    // Any stop after this one is a later one, and watchers end.
+    FIRST_STOP.finish(stopping_processor());
     debug_exit(code);
     // After the debug-exit attempt no task resumes; the stop answers only
     // the PC's power button.
@@ -998,6 +1194,7 @@ fn halt(code: u32) -> ! {
 /// Stela's console, followed by `next`, or on the firmware's before it
 /// exists.
 fn stopped(message: &str, next: &dyn Fn() -> &'static str) {
+    crate::native_mmio::shootdown::before_stop_screen();
     console::reclaim();
     if console::active() && !RAW_SCREEN.load(Ordering::Relaxed) {
         crate::status::fail(message);
@@ -1067,6 +1264,11 @@ fn stop_advice(reason: Option<&str>) -> &'static str {
 }
 
 pub fn fatal(message: impl core::fmt::Display) -> ! {
+    if let Claim::Later { first_here } = FIRST_STOP.claim(stopping_processor()) {
+        later_stop(&message, first_here)
+    }
+    // The guest's last lines, which often explain the stop, before it.
+    crate::engine::write_guest_output_at_stop();
     let message = alloc::string::ToString::to_string(&message);
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.
@@ -1098,6 +1300,7 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
 /// GPUs to rest and unloads their firmware first, unlike [`fatal`].
 #[cfg(feature = "nvk")]
 pub fn stopping(message: &str) {
+    crate::engine::write_guest_output_at_stop();
     arguments(format_args!("\nSTELA STOP {message}\n"));
     unqueue_serial();
     stopped(message, &|| "Stela stopped. The PC turns off.");

@@ -23,6 +23,7 @@ pub(crate) struct Counts {
     pub(crate) mappings: AtomicUsize,
     pub(crate) destroyed: AtomicBool,
     pub(crate) memory: AtomicU64,
+    pub(crate) memory_accesses: AtomicUsize,
     pub(crate) port_writes: AtomicUsize,
     pub(crate) preflight_status: AtomicU32,
     pub(crate) flush_status: AtomicU32,
@@ -334,6 +335,11 @@ pub(crate) unsafe extern "C" fn read_memory(
     value: *mut u64,
     width: u32,
 ) -> Status {
+    // SAFETY: ACPICA passes back the provider context, a live `TestPlatform` until `destroy`.
+    unsafe { platform(p) }
+        .counts
+        .memory_accesses
+        .fetch_add(1, Ordering::SeqCst);
     if address != 0x9000 || width != 32 {
         return SUPPORT.0;
     }
@@ -348,6 +354,11 @@ pub(crate) unsafe extern "C" fn write_memory(
     value: u64,
     width: u32,
 ) -> Status {
+    // SAFETY: ACPICA passes back the provider context, a live `TestPlatform` until `destroy`.
+    unsafe { platform(p) }
+        .counts
+        .memory_accesses
+        .fetch_add(1, Ordering::SeqCst);
     if address != 0x9000 || width != 32 {
         return SUPPORT.0;
     }
@@ -527,6 +538,16 @@ pub(crate) fn fixture_tables(dsdt: Vec<u8>, extra: Vec<Vec<u8>>) -> (Services, A
         },
         counts,
     )
+}
+
+/// The fixture platform for an interpreter-only session whose DSDT holds
+/// `body`, the AML after the table header; its PCI configuration
+/// callbacks refuse until the caller replaces them.
+pub fn dsdt_fixture(body: &[u8]) -> Services {
+    let mut dsdt = table(b"DSDT", 36 + body.len(), 2);
+    dsdt[36..].copy_from_slice(body);
+    checksum(&mut dsdt, 9);
+    fixture_dsdt(dsdt).0
 }
 
 /// Reuse the ACPICA fixture with a reduced-hardware FADT. Hardware

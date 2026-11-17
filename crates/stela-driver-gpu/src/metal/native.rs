@@ -17,6 +17,7 @@
 //! submission, and stay there.
 mod blocks;
 mod deferral;
+pub use deferral::take_turn_work as take_pipeline_turn_work;
 mod device_generated;
 mod memory;
 mod objects;
@@ -36,8 +37,8 @@ use super::{
     vulkan::{
         SampleCounts,
         backend::{
-            Backend, BufferAllocation, Descriptor, MemoryBlocks, Object, Outside, PreparedImport,
-            Requirements, requirements,
+            Backend, BufferAllocation, Descriptor, IdleStep, MemoryBlocks, Object, Outside,
+            PreparedImport, Requirements, requirements,
         },
         command::{BufferImageCopy, Command, Subresource},
         object::{
@@ -86,9 +87,48 @@ pub struct Loader {
     /// Submissions the driver refused while keeping the device. `None` for
     /// a driver that loses the device instead.
     pub refusals: Option<Refusals>,
+    /// The device is never released once its GPU may have hung: releasing
+    /// it closes the driver's file, whose close waits for the kernel
+    /// driver's recovery from the hang, which may never end. Its open waits
+    /// for a first submission before the device is served.
+    pub keep_lost: bool,
     /// Waits a moment, as the platform's waits do: a call outside the
     /// service's turn may wait for the boot processor.
     pub relax: fn(),
+}
+
+/// A Vulkan driver linked into the image: its loader entry point and the
+/// driver-internal calls Vulkan cannot express, with the same signatures for
+/// every driver. A [`Loader`] is made from it ([`Driver::loader`]).
+#[derive(Clone, Copy)]
+pub struct Driver {
+    /// The driver's own `vk_icdGetInstanceProcAddr`.
+    pub get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    /// The `nir_shader_compiler_options` the driver builds a device's shaders
+    /// of a stage (Mesa's `mesa_shader_stage`) with, for the AIR compiler,
+    /// lasting as long as the physical device; null for a stage it has none
+    /// for.
+    pub nir_options: unsafe extern "C" fn(vk::PhysicalDevice, u32) -> *const c_void,
+    /// [`Loader::submit_thread`].
+    pub submit_thread: Option<unsafe extern "C" fn(vk::Queue) -> vk::Result>,
+    /// [`Loader::refusals`].
+    pub refusals: Option<Refusals>,
+    /// [`Loader::keep_lost`].
+    pub keep_lost: bool,
+}
+
+impl Driver {
+    /// The driver's loader, with the platform's message sink and wait.
+    pub fn loader(&self, log: fn(&str), relax: fn()) -> Loader {
+        Loader {
+            get_instance_proc_addr: self.get_instance_proc_addr,
+            log,
+            submit_thread: self.submit_thread,
+            refusals: self.refusals,
+            keep_lost: self.keep_lost,
+            relax,
+        }
+    }
 }
 
 /// The driver's record of submissions it refused while keeping the device:
@@ -197,7 +237,21 @@ unsafe extern "system" fn forward(
     if let Some(data) = data.filter(|data| !data.p_message.is_null()) {
         // SAFETY: the driver's message is a NUL-terminated string for the call.
         if let Ok(message) = unsafe { CStr::from_ptr(data.p_message) }.to_str() {
-            log(message.trim_end());
+            // Mesa names a message by the source line that made it, which
+            // says where a bare result such as an out-of-memory came from.
+            let name = (!data.p_message_id_name.is_null())
+                .then(|| {
+                    // SAFETY: as above, for the name when the driver gives one.
+                    unsafe { CStr::from_ptr(data.p_message_id_name) }
+                        .to_str()
+                        .ok()
+                })
+                .flatten()
+                .filter(|name| !name.is_empty());
+            match name {
+                Some(name) => log(&alloc::format!("{name}: {}", message.trim_end())),
+                None => log(message.trim_end()),
+            }
         }
     }
     vk::FALSE
@@ -369,11 +423,38 @@ impl CommandBuffers {
 /// completed rather than waiting for a completion poll to.
 const RECLAIM_AFTER: usize = 64;
 
+/// The longest the backend waits for the queue's submitted work before it
+/// proves the device idle: a processor waits for the call, and a hung
+/// channel's fences signal only once the kernel driver's job timeout kills
+/// it, 10 s later. Work unfinished by then is not proven stopped.
+const IDLE_WAIT_NS: u64 = 1_000_000_000;
+
+/// The longest one [`Backend::idle_step`] waits: under a quarter of the
+/// half second XNU allows a processor out of its guest. The host ends a
+/// queue idle wait a held processor posts at about this bound too, which
+/// a step counts as waited when it does.
+const IDLE_STEP_NS: u64 = 200_000_000;
+
+/// What the idle steps proved before the backend is dropped.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum IdleProof {
+    /// No step ran: dropping waits as an idle proof does.
+    #[default]
+    Unknown,
+    /// The queue drained: dropping waits for nothing and frees.
+    Idle,
+    /// Not proven: dropping waits for nothing and keeps everything.
+    Unproven,
+}
+
 /// Command buffers of one submission, freed once the queue's timeline
 /// passes `value`.
 #[derive(Debug)]
 struct InFlight {
     buffers: CommandBuffers,
+    /// The semaphore its last signal reaches: the queue's completion
+    /// timeline, or for a command buffer's part submitted ahead of a wait,
+    /// a Metal event's. Null once that event's semaphore is destroyed.
     timeline: vk::Semaphore,
     value: u64,
 }
@@ -389,6 +470,10 @@ impl InFlight {
         let mut observed = None;
         let mut ready = 0;
         for entry in flights {
+            if entry.timeline == vk::Semaphore::null() {
+                ready += 1;
+                continue;
+            }
             let value = match observed {
                 Some((timeline, value)) if timeline == entry.timeline => value,
                 _ => {
@@ -403,6 +488,20 @@ impl InFlight {
             ready += 1;
         }
         Ok(ready)
+    }
+
+    /// Forgets `semaphore`, which the Metal device destroys: it does so only
+    /// once the work that signals it completed, so the submissions whose
+    /// last signal it was are finished. Querying a destroyed semaphore is a
+    /// use after free in the driver, and a new semaphore given its handle
+    /// would answer for them.
+    fn forget(flights: &mut VecDeque<Self>, semaphore: vk::Semaphore) {
+        for entry in flights
+            .iter_mut()
+            .filter(|entry| entry.timeline == semaphore)
+        {
+            entry.timeline = vk::Semaphore::null();
+        }
     }
 }
 
@@ -481,6 +580,12 @@ pub struct NativeBackend {
     import_cache: ImportCache,
     /// The tokens of imported memory now freed.
     retired: VecDeque<NonZeroU64>,
+    /// Whole allocations dedicated to an image, which no buffer may be
+    /// bound to, by their memory's handle.
+    image_dedicated: alloc::collections::BTreeSet<u64>,
+    /// Kept imports unbound since the Metal device last asked
+    /// ([`Backend::take_unbound`]), by their memory's handle.
+    unbound: Vec<u64>,
     /// [`Loader::refusals`].
     refusals: Option<Refusals>,
     /// The count the driver raises by each refusal it keeps
@@ -516,6 +621,9 @@ pub struct NativeBackend {
     /// `submit` it timed since the device took them.
     ticks: fn() -> u64,
     split: [u64; 3],
+    /// What [`Backend::idle_step`] proved, and how long its steps waited.
+    idle: IdleProof,
+    idle_waited: u64,
 }
 
 impl NativeBackend {
@@ -738,6 +846,8 @@ impl NativeBackend {
             imports: BTreeMap::new(),
             import_cache: ImportCache::default(),
             retired: VecDeque::new(),
+            image_dedicated: alloc::collections::BTreeSet::new(),
+            unbound: Vec::new(),
             refusals: loader.refusals,
             outstanding: None,
             new_images: Vec::new(),
@@ -760,6 +870,8 @@ impl NativeBackend {
             premade: premade::Premade::default(),
             ticks: super::timing::no_clock,
             split: [0; 3],
+            idle: IdleProof::Unknown,
+            idle_waited: 0,
         };
         // Dropping a partly built backend destroys what was created.
         let kernels = kernels?;
@@ -1271,6 +1383,9 @@ impl NativeBackend {
         let Some(allocation) = self.memories.remove(memory) else {
             return;
         };
+        if let memory::Allocation::Whole { memory, .. } = allocation {
+            self.image_dedicated.remove(&raw(memory));
+        }
         if let memory::Allocation::Whole { memory, resource } = allocation
             && let Some((exported, token, ranges)) = self.imports.remove(&raw(memory))
         {
@@ -1281,6 +1396,7 @@ impl NativeBackend {
             self.zeroing.forget(&self.device, memory);
             self.retired.push_back(token);
             for evicted in self.import_cache.keep(ranges, memory, exported) {
+                self.unbound.push(raw(evicted.memory));
                 self.free_after_turn(Freed {
                     memory: evicted.memory,
                     exported: Some(evicted.exported),
@@ -1589,6 +1705,7 @@ impl NativeBackend {
             self.report_executables(pipeline);
             return Ok(pipeline);
         }
+        let started = (self.ticks)();
         let pipeline = self.through_store(info.source, |backend, source, feedback| {
             let info = ComputePipelineInfo { source, ..*info };
             objects::compute_pipeline(&info, backend.layout, |create| {
@@ -1606,14 +1723,15 @@ impl NativeBackend {
                 .map_err(|(_, error)| failure(error))
             })
         })?;
+        deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
         self.report_executables(pipeline);
         Ok(pipeline)
     }
 
     /// Creates a pipeline of `source` with `create`, which builds it from
-    /// the source it is given and fills the feedback. A compiled pipeline
-    /// goes through the pipeline store's cache: found there or added, and
-    /// once the store is full, found there or compiled without it.
+    /// the source it is given and fills the feedback. A compiled pipeline is
+    /// looked up in the pipeline store's cache; one it lacks compiles into a
+    /// scratch cache whose objects the store keeps by their cost.
     fn through_store<T>(
         &mut self,
         source: PipelineSource,
@@ -1624,35 +1742,40 @@ impl NativeBackend {
         ) -> Result<T>,
     ) -> Result<T> {
         let mut feedback = vk::PipelineCreationFeedback::default();
-        let (PipelineSource::Compiled, Some((cache, grows))) = (source, self.store.cache()) else {
+        let (PipelineSource::Compiled, Some(cache)) = (source, self.store.cache()) else {
             return create(self, source, &mut feedback);
         };
-        let cache = PipelineCache(raw(cache));
-        let hit = |feedback: &vk::PipelineCreationFeedback| {
-            feedback.flags.contains(
-                vk::PipelineCreationFeedbackFlags::VALID
-                    | vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT,
-            )
-        };
-        if !grows {
-            return match create(self, PipelineSource::Archived(cache), &mut feedback) {
-                Err(Error::NotArchived) => {
-                    let created = create(self, PipelineSource::Compiled, &mut feedback)?;
-                    pipeline_store::note_lookup(false, feedback.duration);
-                    Ok(created)
-                }
-                created => {
-                    let created = created?;
-                    pipeline_store::note_lookup(true, feedback.duration);
-                    Ok(created)
-                }
-            };
+        match create(
+            self,
+            PipelineSource::Archived(PipelineCache(raw(cache))),
+            &mut feedback,
+        ) {
+            Err(Error::NotArchived) => {}
+            created => {
+                let created = created?;
+                pipeline_store::note_lookup(true, feedback.duration);
+                return Ok(created);
+            }
         }
-        let created = create(self, PipelineSource::Cached(cache), &mut feedback)?;
-        let hit = hit(&feedback);
-        pipeline_store::note_lookup(hit, feedback.duration);
-        self.store.created(&self.device, hit);
-        Ok(created)
+        let Some(scratch) = self.store.scratch(&self.device) else {
+            let created = create(self, PipelineSource::Compiled, &mut feedback)?;
+            pipeline_store::note_lookup(false, feedback.duration);
+            return Ok(created);
+        };
+        let created = create(
+            self,
+            PipelineSource::Cached(PipelineCache(raw(scratch))),
+            &mut feedback,
+        );
+        pipeline_store::note_lookup(false, feedback.duration);
+        let cost = pipeline_store::Cost {
+            ns: feedback.duration,
+            heap: 0,
+        };
+        // SAFETY: the scratch cache was made on this device just above, and
+        // the creation that used it returned.
+        unsafe { self.store.adopt(&self.device, scratch, None, cost) };
+        created
     }
 
     /// Logs each of `pipeline`'s shaders that spills or runs past
@@ -1730,6 +1853,79 @@ impl NativeBackend {
         result
     }
 
+    /// Waits at most `timeout` ns for every submission in flight to finish:
+    /// the last value each of their timelines reaches. `DeviceLost` when
+    /// they do not finish in time.
+    fn wait_submitted(&self, timeout: u64) -> Result<()> {
+        match self.reach_submitted(timeout)? {
+            true => Ok(()),
+            false => Err(Error::DeviceLost),
+        }
+    }
+
+    /// Waits up to `timeout` ns for the last value of each timeline in
+    /// flight: whether all were reached.
+    fn reach_submitted(&self, timeout: u64) -> Result<bool> {
+        let mut last: Vec<(vk::Semaphore, u64)> = Vec::new();
+        for entry in &self.in_flight {
+            if entry.timeline == vk::Semaphore::null() {
+                continue;
+            }
+            match last
+                .iter_mut()
+                .find(|(timeline, _)| *timeline == entry.timeline)
+            {
+                Some((_, value)) => *value = (*value).max(entry.value),
+                None => last.push((entry.timeline, entry.value)),
+            }
+        }
+        if last.is_empty() {
+            return Ok(true);
+        }
+        let (semaphores, values): (Vec<_>, Vec<_>) = last.into_iter().unzip();
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the timelines are alive while submissions use them.
+        match unsafe { self.device.wait_semaphores(&info, timeout) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => Err(failure(error)),
+        }
+    }
+
+    /// [`Backend::idle_step`]: first the queue's own timelines, then the
+    /// driver's queue idle wait, one wait a step.
+    fn step_idle(&mut self) -> IdleStep {
+        let waited = |backend: &mut Self| {
+            backend.idle_waited = backend.idle_waited.saturating_add(IDLE_STEP_NS);
+            if backend.idle_waited >= IDLE_WAIT_NS {
+                IdleStep::Unproven
+            } else {
+                IdleStep::Waiting
+            }
+        };
+        match self.reach_submitted(0) {
+            Ok(true) => {}
+            Ok(false) => {
+                return match self.reach_submitted(IDLE_STEP_NS) {
+                    // The next step proves the queue idle.
+                    Ok(true) => IdleStep::Waiting,
+                    Ok(false) => waited(self),
+                    Err(_) => IdleStep::Unproven,
+                };
+            }
+            Err(_) => return IdleStep::Unproven,
+        }
+        // SAFETY: the device belongs to this backend and no caller submits
+        // to it now: it is about to be dropped.
+        match unsafe { self.device.device_wait_idle() } {
+            Ok(()) => IdleStep::Idle,
+            Err(vk::Result::TIMEOUT) => waited(self),
+            Err(_) => IdleStep::Unproven,
+        }
+    }
+
     /// Frees the command buffers of submissions the queue has finished.
     fn reclaim(&mut self) -> Result<()> {
         // Leave the queue intact if observing a completion fails.
@@ -1780,13 +1976,23 @@ impl Drop for NativeBackend {
         // does a call's import after its turn.
         self.deferral.retire();
         let deferred = self.outside.close();
-        // An error is not evidence that queued DMA stopped. Keep every native
-        // handle, the driver's code and the exporter on that uncertain path.
-        // SAFETY: the device belongs to this backend and no caller uses it now.
-        if unsafe { self.device.device_wait_idle() }.is_err() {
-            return;
+        // An error is not evidence that queued DMA stopped, nor is work that
+        // does not finish in time. Keep every native handle, the driver's
+        // code and the exporter on that uncertain path.
+        match self.idle {
+            IdleProof::Idle => {}
+            IdleProof::Unproven => return,
+            IdleProof::Unknown => {
+                if self.wait_submitted(IDLE_WAIT_NS).is_err() {
+                    return;
+                }
+                // SAFETY: the device belongs to this backend and no caller
+                // uses it now.
+                if unsafe { self.device.device_wait_idle() }.is_err() {
+                    return;
+                }
+            }
         }
-        self.store.idle(&self.device);
         // Images jobs made that no call took; the device is idle.
         for image in self.premade.drain() {
             premade::destroy(&self.device, premade::Kind::Image(image));
@@ -2099,6 +2305,8 @@ impl NativeOutside {
     }
 
     fn with_state<T>(&self, body: impl FnOnce(&mut Upkeep) -> T) -> T {
+        // A job's pipeline creation may free through it; its bodies allocate.
+        let _held = crate::metal::deferred::hold_lock();
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2302,12 +2510,31 @@ fn raw<T: vk::Handle>(handle: T) -> u64 {
 }
 
 impl Backend for NativeBackend {
+    fn idle_step(&mut self) -> IdleStep {
+        let step = match self.idle {
+            IdleProof::Idle => IdleStep::Idle,
+            IdleProof::Unproven => IdleStep::Unproven,
+            IdleProof::Unknown => self.step_idle(),
+        };
+        self.idle = match step {
+            IdleStep::Idle => IdleProof::Idle,
+            IdleStep::Unproven => IdleProof::Unproven,
+            IdleStep::Waiting => IdleProof::Unknown,
+        };
+        step
+    }
+
     fn acknowledge_idle(&mut self) -> Result<()> {
+        self.wait_submitted(IDLE_WAIT_NS)?;
         // SAFETY: this backend exclusively owns the device. The Metal owner
         // closes admission and drains its submission timeline before asking;
         // only a successful Vulkan acknowledgement establishes idleness.
-        unsafe { self.device.device_wait_idle() }.map_err(failure)?;
-        self.store.idle(&self.device);
+        unsafe { self.device.device_wait_idle() }.map_err(|error| match error {
+            // The host ends a fence wait at its bound: the queue did not
+            // drain in time, so nothing is proven stopped.
+            vk::Result::TIMEOUT => Error::DeviceLost,
+            error => failure(error),
+        })?;
         Ok(())
     }
 
@@ -2543,6 +2770,13 @@ impl Backend for NativeBackend {
                 }
             };
         let allocated = (self.ticks)();
+        if self
+            .memories
+            .resolve(memory)
+            .is_some_and(|r| r.size.is_none())
+        {
+            self.image_dedicated.insert(raw(device_memory));
+        }
         // SAFETY: the memory, or the place at `offset` in it, was allocated
         // for this image's requirements.
         let bound =
@@ -2683,7 +2917,8 @@ impl Backend for NativeBackend {
             self.report_executables(pipeline);
             return Ok(Pipeline(raw(pipeline)));
         }
-        self.through_store(info.source, |backend, source, feedback| {
+        let started = (self.ticks)();
+        let created = self.through_store(info.source, |backend, source, feedback| {
             // Only a full store's lookup changes the creation flags.
             let replaced;
             let info = if create_flags_differ(info.source, source) {
@@ -2711,8 +2946,9 @@ impl Backend for NativeBackend {
                 .map(|pipelines| pipelines[0])
                 .map_err(|(_, error)| failure(error))
             })
-        })
-        .map(|pipeline| {
+        });
+        deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
+        created.map(|pipeline| {
             self.report_executables(pipeline);
             Pipeline(raw(pipeline))
         })
@@ -2757,8 +2993,8 @@ impl Backend for NativeBackend {
     }
 
     fn pipeline_cache_data(&mut self, cache: PipelineCache) -> Result<Vec<u8>> {
-        // SAFETY: the cache is alive and the service creates no pipeline
-        // meanwhile.
+        // SAFETY: the cache is alive and internally synchronized: a job may
+        // create through it meanwhile.
         unsafe { self.device.get_pipeline_cache_data(handle(cache.0)) }.map_err(failure)
     }
 
@@ -2886,11 +3122,14 @@ impl Backend for NativeBackend {
                 Object::Pipeline(pipeline) => {
                     self.device.destroy_pipeline(handle(pipeline.0), None);
                 }
-                Object::PipelineCache(cache) => {
+                // A job creating through it destroys it once done.
+                Object::PipelineCache(cache) if !self.cache_in_use(handle(cache.0)) => {
                     self.device.destroy_pipeline_cache(handle(cache.0), None);
                 }
+                Object::PipelineCache(_) => {}
                 Object::QueryPool(pool) => self.device.destroy_query_pool(handle(pool.0), None),
                 Object::Semaphore(semaphore) => {
+                    InFlight::forget(&mut self.in_flight, handle(semaphore.0));
                     // After the turn when the outside work takes it, as the
                     // destruction is a host kernel call.
                     if let Some(semaphore) = self.outside.defer_destroy(handle(semaphore.0)) {
@@ -2921,6 +3160,11 @@ impl Backend for NativeBackend {
         let aligned =
             (mapped.pointer.as_ptr() as usize).is_multiple_of(core::mem::align_of::<AtomicU32>());
         (mapped.coherent && aligned).then(|| mapped.pointer.cast())
+    }
+
+    fn host_bytes(&mut self, memory: Memory, offset: u64, length: u64) -> Option<NonNull<u8>> {
+        let mapped = self.mapping(memory, offset, length).ok()?;
+        mapped.coherent.then_some(mapped.pointer)
     }
 
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -3091,7 +3335,10 @@ impl Backend for NativeBackend {
         let ready = self
             .in_flight
             .iter()
-            .take_while(|entry| entry.timeline == timeline && entry.value <= value)
+            .take_while(|entry| {
+                entry.timeline == vk::Semaphore::null()
+                    || entry.timeline == timeline && entry.value <= value
+            })
             .count();
         self.free_completed(ready);
     }
@@ -3156,10 +3403,11 @@ impl Backend for NativeBackend {
         let submitted = recorded.and_then(|()| self.queue_segments(segments, handles));
         self.time_split([started, reclaimed, recorded_at, (self.ticks)()]);
         if let Err(error) = submitted {
-            // Some segments may have reached the queue. A failed idle query
-            // leaves their buffers owned by the command pool until device
-            // teardown can prove idleness.
-            let _ = free_after_idle(&self.device, self.queue, self.command_pool, handles);
+            // Some segments may have reached the queue: their buffers go with
+            // the next submission that signals, whose signal follows them, or
+            // with the pool. Waiting here for the queue to idle would wait
+            // without a bound on a hung channel.
+            self.unsignaled.extend_from_slice(handles);
             self.new_images = new_images;
             self.zeroing.pending = pending;
             return Err(error);
@@ -3224,21 +3472,60 @@ impl Backend for NativeBackend {
             .resolve(memory)
             .is_some_and(|resolved| resolved.size.is_none())
     }
-}
 
-/// Free possibly submitted buffers only after the driver acknowledges idle.
-fn free_after_idle(
-    device: &ash::Device,
-    queue: vk::Queue,
-    pool: vk::CommandPool,
-    buffers: &[vk::CommandBuffer],
-) -> Result<()> {
-    // SAFETY: the backend exclusively owns this queue, pool and buffers.
-    unsafe {
-        device.queue_wait_idle(queue).map_err(failure)?;
-        device.free_command_buffers(pool, buffers);
+    /// The address of a byte-long buffer bound at the allocation's start,
+    /// made and destroyed at once: no driver call reaches the kernel.
+    fn memory_address(&mut self, memory: Memory) -> Option<u64> {
+        let resolved = self.memories.resolve(memory)?;
+        if resolved.size.is_some() || self.image_dedicated.contains(&raw(resolved.memory)) {
+            return None;
+        }
+        let info = BufferInfo {
+            size: 1,
+            usage: super::vulkan::BufferUsage::SHADER_DEVICE_ADDRESS,
+            flags: super::vulkan::BufferCreate::EMPTY,
+        };
+        let create = |create: &vk::BufferCreateInfo<'_>| {
+            // SAFETY: the create info outlives the call.
+            unsafe { self.device.create_buffer(create, None) }.map_err(failure)
+        };
+        let buffer = if self.imports.contains_key(&raw(resolved.memory)) {
+            objects::imported_buffer(&info, DMA_BUF, create)
+        } else {
+            objects::buffer(&info, create)
+        }
+        .ok()?;
+        let (needs, own) = self.buffer_needs(buffer);
+        let every = u32::try_from(self.snapshot.memory.types.len())
+            .ok()
+            .and_then(|count| 1u32.checked_shl(count))
+            .map_or(u32::MAX, |bit| bit - 1);
+        // Only where any memory takes the buffer, so binding it is valid
+        // whatever type the allocation has.
+        let address = (!own && needs.memory_type_bits & every == every)
+            .then(|| {
+                // SAFETY: the allocation is live and takes a buffer of one
+                // byte at offset zero.
+                unsafe { self.device.bind_buffer_memory(buffer, resolved.memory, 0) }.ok()?;
+                let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
+                // SAFETY: the buffer is bound and has device-address usage.
+                Some(unsafe { self.device.get_buffer_device_address(&info) })
+            })
+            .flatten();
+        // SAFETY: nothing used the buffer.
+        unsafe { self.device.destroy_buffer(buffer, None) };
+        address
     }
-    Ok(())
+
+    fn kept_bound(&self, memory: Memory) -> Option<u64> {
+        let resolved = self.memories.resolve(memory)?;
+        let key = raw(resolved.memory);
+        (resolved.size.is_none() && self.imports.contains_key(&key)).then_some(key)
+    }
+
+    fn take_unbound(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.unbound)
+    }
 }
 
 /// Submits `pending` in one `vkQueueSubmit2` and empties it.

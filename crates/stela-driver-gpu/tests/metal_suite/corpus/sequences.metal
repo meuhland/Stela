@@ -53,6 +53,11 @@ kernel void read_target(texture2d<float> t [[texture(0)]], device float4 *out [[
                         uint2 p [[thread_position_in_grid]])
 { out[p.y * t.get_width() + p.x] = t.read(p) * 2.0f; }
 
+// A depth target's depth at each pixel.
+kernel void read_depth_target(depth2d<float> t [[texture(0)]], device float *out [[buffer(0)]],
+                              uint2 p [[thread_position_in_grid]])
+{ out[p.y * t.get_width() + p.x] = t.read(p); }
+
 kernel void write_texture(texture2d<float, access::write> t [[texture(0)]], uint2 p [[thread_position_in_grid]])
 { t.write(float4(float(p.x) * 0.125f, float(p.y) * 0.25f, 0.5f, 1.0f), p); }
 

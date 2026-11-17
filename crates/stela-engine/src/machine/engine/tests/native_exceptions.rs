@@ -4,10 +4,10 @@
 //! `Cpu::take` and `Cpu::exception_return` make, and the normal exit for
 //! each case the record does not cover.
 
-use super::super::transitions::tests::run_native;
+use super::super::transitions::tests::{enter_native, run_native};
 use super::*;
 use crate::machine::cpu::{RESERVATION_GRANULE, Reservation};
-use stela_compiler::x86_64::transition::{EXCEPTION_RETURN, SUPERVISOR_CALL};
+use stela_compiler::x86_64::transition::{EXCEPTION_RETURN, RETURN_WITHIN, SUPERVISOR_CALL};
 
 /// HCR_EL2.E2H and TGE: the host.
 const HCR_HOST: u64 = 1 << 34 | 1 << 27;
@@ -242,6 +242,121 @@ fn uncovered_svc_and_eret_take_the_normal_exit() {
         assert_eq!(exit, (pc, ExitKind::System as u64), "{name}");
         assert_eq!(observed(&machine), before, "{name}");
     }
+}
+
+/// SPSR of a return within EL2 to EL2h with IRQ and FIQ masked: N.
+const KERNEL_SPSR: u64 = 0x8 << 28 | 0b0011 << 6 | 0b1001;
+/// Where a return within EL2 continues.
+const KERNEL: u64 = BASE + 0x200;
+
+/// [`prepare`] for a return to `spsr` at `elr`.
+fn prepare_return(machine: &mut Machine<FakeHost, NoDevices>, spsr: u64, elr: u64) {
+    prepare(machine);
+    machine.cpu.pstate.sp = true;
+    let registers = &mut machine.cpu.registers;
+    registers.set(SystemRegister::SPSR_EL2, 0, spsr);
+    registers.set(SystemRegister::ELR_EL2, 0, elr);
+}
+
+/// Engine-path ERETs to EL0 and within EL2 in turn, each followed by the
+/// SVC or exception back that a kernel's next return starts from, until
+/// both ERET records hold.
+fn warm_both(machine: &mut Machine<FakeHost, NoDevices>) {
+    for _ in 0..2 {
+        prepare_return(machine, USER_SPSR, USER);
+        machine.system_instruction(ERET).unwrap();
+        machine.finish_transition(1);
+        assert_eq!(machine.cpu.pc, USER);
+        machine.system_instruction(SVC_WORD).unwrap();
+        machine.finish_transition(1);
+        prepare_return(machine, KERNEL_SPSR, KERNEL);
+        machine.system_instruction(ERET).unwrap();
+        machine.finish_transition(1);
+        assert_eq!((machine.cpu.pc, machine.cpu.pstate.el), (KERNEL, 2));
+    }
+    let table = &machine.mirrors.transitions;
+    for slot in [EXCEPTION_RETURN, RETURN_WITHIN] {
+        assert_eq!(
+            table.records[2][slot].generation, table.generation,
+            "slot {slot}"
+        );
+    }
+}
+
+/// A kernel's ERETs to its processes and from its own exceptions in turn
+/// each complete natively from their own record, as the engine completes
+/// them, over a grid of SPSRs and waiting interrupts: the mode returned to
+/// (EL0t and EL2h, which have records, and EL2t, which has none), the
+/// masks, an interrupt waiting since entry, and single-step. Each case
+/// either completes with every effect the engine's has, or takes the
+/// normal exit with nothing changed: those with no record for their mode,
+/// that unmask the waiting interrupt, or that single-step.
+#[test]
+fn native_erets_to_el0_and_within_el2_alternate_from_their_own_records() {
+    let (mut engine, mut native) = (host(), host());
+    warm_both(&mut engine);
+    warm_both(&mut native);
+    let (eret, _) = thunks();
+    let modes = [
+        (USER_SPSR & !0b1111, USER, true),
+        (KERNEL_SPSR & !(0b11 << 6), KERNEL, true),
+        (KERNEL_SPSR & !(0b11 << 6) & !1, KERNEL, false),
+    ];
+    let mut completed = 0;
+    for _round in 0..2 {
+        for (spsr, elr, recorded) in modes {
+            for masks in [0, 0b0011, 0b0010] {
+                for pending in [0u32, 0b10, 0b01] {
+                    for step in [0, 1 << 21] {
+                        let spsr = spsr | masks << 6 | step;
+                        let case = alloc::format!(
+                            "spsr {spsr:#x} pending {pending:#b} recorded {recorded}"
+                        );
+                        for machine in [&mut engine, &mut native] {
+                            prepare_return(machine, spsr, elr);
+                            machine.cpu.state.nzcv = 0x2000_0000;
+                            machine.cpu.state.pending = pending;
+                            machine.cpu.state.exclusive_bytes = 4;
+                            machine.cpu.consume_event();
+                        }
+                        native.mirrors.lines_until = u64::MAX;
+                        let before = observed(&native);
+                        assert_eq!(observed(&engine), before, "{case}");
+                        let unmasks = pending & !(masks as u32) & 0b11 != 0;
+                        let completes = recorded && !unmasks && step == 0;
+                        let exit = run_native(&mut native, &eret.code);
+                        if completes {
+                            engine.system_instruction(ERET).unwrap();
+                            assert_eq!(exit, (elr, ExitKind::Return as u64), "{case}");
+                            assert_eq!(observed(&engine), observed(&native), "{case}");
+                            completed += 1;
+                        } else {
+                            assert_eq!(exit, (ERET_PC, ExitKind::System as u64), "{case}");
+                            assert_eq!(observed(&native), before, "{case}");
+                        }
+                        // Both back at EL2h for the next case.
+                        for machine in [&mut engine, &mut native] {
+                            machine.cpu.pstate = Pstate {
+                                el: 2,
+                                sp: true,
+                                daif: 0b1111,
+                                ..machine.cpu.pstate
+                            };
+                            machine.cells_moved();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        native.statistics.native_transitions[EXCEPTION_RETURN],
+        completed
+    );
+    // Per round and recorded mode, without single-step: nothing waiting
+    // with no mask, anything waiting with I and F masked, and nothing or
+    // an IRQ waiting with I masked.
+    assert_eq!(completed, 2 * 2 * (1 + 3 + 2));
 }
 
 /// SCTLR_EL2's four PAC key enables.
@@ -885,4 +1000,102 @@ fn native_counter_reads_in_each_logged_segment_equal_the_engine_path() {
         assert_ne!(expected.0, 1_000, "{filter:#x} PMC0 counted");
         assert_ne!(expected.1, 2_000, "{filter:#x} PMC1 counted");
     }
+}
+
+/// `cargo test -p stela-engine --release --lib eret_alternating_costs --
+/// --ignored --nocapture`: nanoseconds per ERET of a kernel's returns to
+/// EL0 and within EL2 in turn, through the engine path (what each took
+/// while the two shared one record) and through the thunk from the two
+/// records, each with the same reset of the PE to EL2 before it. The VM's
+/// engine path adds its native exit and entry and the next fetch on top.
+#[test]
+#[ignore = "manual: opt-in"]
+fn eret_alternating_costs() {
+    use core::ffi::c_void;
+    unsafe extern "C" {
+        fn mmap(
+            address: *mut c_void,
+            bytes: usize,
+            protection: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        fn mprotect(address: *mut c_void, bytes: usize, protection: i32) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const ROUNDS: u64 = 20_000;
+    let returns = [
+        (USER_SPSR, USER, ExitKind::Return as u64),
+        (KERNEL_SPSR, KERNEL, ExitKind::Return as u64),
+    ];
+    let reset = |machine: &mut Machine<FakeHost, NoDevices>, spsr: u64, elr: u64| {
+        machine.cpu.pstate = Pstate {
+            el: 2,
+            sp: true,
+            daif: 0b1111,
+            ..machine.cpu.pstate
+        };
+        machine.cpu.pc = ERET_PC;
+        let registers = &mut machine.cpu.registers;
+        registers.set(SystemRegister::SPSR_EL2, 0, spsr);
+        registers.set(SystemRegister::ELR_EL2, 0, elr);
+    };
+    let time = |round: &mut dyn FnMut(usize)| {
+        for index in 0..ROUNDS as usize / 10 {
+            round(index);
+        }
+        (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for index in 0..ROUNDS as usize {
+                    round(index);
+                }
+                started.elapsed().as_nanos() as u64 / ROUNDS
+            })
+            .min()
+            .unwrap()
+    };
+    let mut engine = host();
+    warm_both(&mut engine);
+    let ns = time(&mut |index| {
+        let (spsr, elr, _) = returns[index % 2];
+        reset(&mut engine, spsr, elr);
+        engine.system_instruction(ERET).unwrap();
+    });
+    std::println!("ERET alternating path=engine ns_per_eret={ns}");
+    let mut native = host();
+    warm_both(&mut native);
+    native.mirrors.lines_until = u64::MAX;
+    let (eret, _) = thunks();
+    let code = stela_compiler::x86_64::pinned::entered(&eret.code);
+    // SAFETY: private anonymous memory made RX after the copy, kept for
+    // the process; the thunk touches only the machine's frame and what its
+    // anchors and records name, which outlive the calls.
+    let entry: unsafe extern "sysv64" fn(*mut GuestState) -> [u64; 2] = unsafe {
+        let page = mmap(core::ptr::null_mut(), 4096, 3, 2 | MAP_ANONYMOUS, -1, 0);
+        assert_ne!(page as usize, usize::MAX);
+        core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
+        assert_eq!(mprotect(page, 4096, 5), 0);
+        core::mem::transmute(page)
+    };
+    let ns = time(&mut |index| {
+        let (spsr, elr, kind) = returns[index % 2];
+        reset(&mut native, spsr, elr);
+        enter_native(&mut native);
+        // SAFETY: as above.
+        let exit = unsafe { entry(&mut native.cpu.state) };
+        assert_eq!(exit, [elr, kind]);
+        core::hint::black_box(exit);
+    });
+    std::println!("ERET alternating path=native ns_per_eret={ns} (with the entry setup)");
+    let ns = time(&mut |index| {
+        let (spsr, elr, _) = returns[index % 2];
+        reset(&mut native, spsr, elr);
+        enter_native(&mut native);
+    });
+    std::println!("ERET alternating path=entry-setup-alone ns={ns}");
 }

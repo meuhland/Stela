@@ -34,6 +34,7 @@ mod library_cache;
 #[cfg(feature = "metal-linked")]
 mod linked;
 mod nir_cache;
+mod pins;
 #[cfg(test)]
 mod tests;
 
@@ -74,8 +75,9 @@ use core::{
 use triomphe::Arc;
 
 use library_cache::{LoadedLibrary, ModuleSource, Selected};
-pub use nir_cache::{CompileGuard, CompileLock};
+pub use nir_cache::{CompileGuard, CompileLock, SharedHold};
 use nir_cache::{NirCache, ReflectionCache, ReflectionKey, Returned};
+pub use pins::{PinnedNir, pin_nir};
 
 /// The shader stages the AIR frontend lowers completely; other constructs
 /// are refused with a typed diagnostic.
@@ -206,9 +208,16 @@ pub struct Service {
     pub release: unsafe extern "C" fn(*mut c_void),
     /// `stela_metal_buffer_reads`.
     pub buffer_reads: unsafe extern "C" fn(*const c_void) -> u32,
-    /// The Vulkan driver's `nir_shader_compiler_options`.
-    pub nir_options: NonNull<c_void>,
+    /// The Vulkan driver's `nir_shader_compiler_options` for each stage,
+    /// indexed by Mesa's `mesa_shader_stage` from vertex to mesh.
+    pub nir_options: [NonNull<c_void>; NIR_STAGES],
 }
+
+/// The stages a device's shaders take, Mesa's `mesa_shader_stage` from
+/// vertex (0) to mesh (7), which index [`Service::nir_options`].
+pub const NIR_STAGES: usize = 8;
+/// Mesa's `MESA_SHADER_COMPUTE`, the stage of the device's internal kernels.
+pub const COMPUTE_STAGE: usize = 5;
 
 /// One of the device's internal kernels' builders (`metal_abi.h`).
 pub type KernelBuilder = unsafe extern "C" fn(*const c_void) -> *mut c_void;
@@ -241,7 +250,7 @@ impl Service {
         for (code, build) in kernels.code.iter_mut().zip(builders) {
             // SAFETY: the caller guarantees the builder and the options it
             // reads.
-            let shader = unsafe { build(self.nir_options.as_ptr()) };
+            let shader = unsafe { build(self.nir_options[COMPUTE_STAGE].as_ptr()) };
             if shader.is_null() {
                 return Err(Error::OutOfMemory);
             }
@@ -275,23 +284,16 @@ impl Drop for InternalKernelCode {
     }
 }
 
-/// How many NIR shaders the compilers released: while it stands, a
-/// [`ShaderCode`] still names the shader it named, since only a release
-/// frees an address another shader may take ([`nir_releases`]).
-static NIR_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// The count of NIR releases, which a holder of a [`ShaderCode`] compares
-/// later to know that the code still names the same shader.
-pub fn nir_releases() -> u64 {
-    NIR_RELEASES.load(core::sync::atomic::Ordering::Acquire)
-}
-
-/// Releases `code` through the service's `release`, counting it first.
+/// Releases `code` through the service's `release`, at once or, while a
+/// pipeline job pins it ([`pin_nir`]), at its last unpin.
 ///
 /// # Safety
-/// `code` is NIR the service built, released once, which nothing uses.
+/// `code` is NIR the service built, released once, which nothing but pins
+/// uses.
 unsafe fn release_nir(release: unsafe extern "C" fn(*mut c_void), code: ShaderCode) {
-    NIR_RELEASES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    if pins::release_when_unpinned(code, release) {
+        return;
+    }
     // SAFETY: the caller's.
     unsafe { release(code.0 as usize as *mut c_void) }
 }
@@ -313,9 +315,10 @@ pub struct AirCompiler {
     reflections: Option<ReflectionCache>,
     nir: Option<NirCache>,
     /// A compilation the cache misses defers rather than runs
-    /// ([`AirCompiler::set_deferring`]), and the one deferred.
+    /// ([`AirCompiler::set_deferring`]), and those deferred, at most
+    /// [`LEFT_PER_CALL`].
     deferring: bool,
-    deferred: Option<CompileJob>,
+    deferred: Vec<CompileJob>,
     /// A reflection the cache missed, deferred as a compilation is.
     reflecting: Option<ReflectJob>,
     /// A stitched library deferred as a compilation is, what such jobs
@@ -348,7 +351,16 @@ pub struct AirCompiler {
     /// recalled.
     restored: u64,
     recalled: u64,
+    /// The keys the service compiled this boot, and its compilations of a
+    /// key it had compiled before: NIR the cache evicted that neither an
+    /// earlier boot's store nor this boot's recall held.
+    compiled_keys: alloc::collections::BTreeSet<[u8; 32]>,
+    recompiled: u64,
 }
+
+/// Keys [`AirCompiler::compiled_keys`] remembers; past this it forgets them
+/// all, which only undercounts `recompiled` for a while.
+const COMPILED_KEYS: usize = 1 << 14;
 
 /// Where a compilation's serialized NIR goes for the next boot, by key.
 pub type Persist = fn(&[u8; 32], &[u8]);
@@ -359,6 +371,10 @@ pub type Recall = fn(&[u8; 32]) -> Option<Vec<u8>>;
 /// Stitched libraries jobs made that wait for their calls' next runs; past
 /// this the oldest is dropped, and its call stitches again.
 const STITCHED: usize = 16;
+
+/// Compilations one call leaves at most: a commit that misses more runs
+/// again for the rest. Each holds its library until it ran.
+const LEFT_PER_CALL: usize = 8;
 
 /// The NIR budget of a device's compiled shaders.
 pub const NIR_BUDGET: usize = 96 << 20;
@@ -394,7 +410,9 @@ impl AirCompiler {
             .max_vertex_output_components
             .min(limits.max_fragment_input_components);
         let target = ffi::Target {
-            nir: service.nir_options.as_ptr(),
+            nir: service
+                .nir_options
+                .map(|options| options.as_ptr().cast_const()),
             max_instructions: MAX_INSTRUCTIONS,
             // NAK sizes shared memory in 16 bits.
             max_threadgroup_bytes: limits.max_compute_shared_memory_size.min(u16::MAX.into()),
@@ -431,7 +449,7 @@ impl AirCompiler {
             reflections: None,
             nir: None,
             deferring: false,
-            deferred: None,
+            deferred: Vec::new(),
             reflecting: None,
             stitching: None,
             stitched: Kept::new(STITCHED),
@@ -448,6 +466,23 @@ impl AirCompiler {
             recall: None,
             restored: 0,
             recalled: 0,
+            compiled_keys: alloc::collections::BTreeSet::new(),
+            recompiled: 0,
+        }
+    }
+
+    /// Counts a compilation the service ran for `key`, and whether it had
+    /// compiled that key before this boot.
+    fn note_compiled(&mut self, key: Option<[u8; 32]>) {
+        self.compiled += 1;
+        let Some(key) = key else {
+            return;
+        };
+        if self.compiled_keys.len() >= COMPILED_KEYS {
+            self.compiled_keys.clear();
+        }
+        if !self.compiled_keys.insert(key) {
+            self.recompiled += 1;
         }
     }
 
@@ -469,6 +504,16 @@ impl AirCompiler {
         self.recall = Some(recall);
     }
 
+    /// Where a job finds the serialized NIR of `key`, when this image keeps
+    /// any: the lookup of this boot's copies the bytes, so the job makes it.
+    fn restorable(&self, key: &[u8; 32]) -> Option<Restore> {
+        let stored = self.stored.get(key).copied();
+        (stored.is_some() || self.recall.is_some()).then_some(Restore {
+            stored,
+            recall: self.recall,
+        })
+    }
+
     /// The serialized NIR of `key`: an earlier boot's, else this boot's.
     fn serialized(&self, key: &[u8; 32]) -> Option<(Cow<'static, [u8]>, bool)> {
         if let Some(&blob) = self.stored.get(key) {
@@ -482,7 +527,7 @@ impl AirCompiler {
     /// make.
     fn restore(&mut self, job: &CompileJob) -> Option<(CompiledShader, usize)> {
         let (blob, recalled) = self.serialized(&job.key?)?;
-        let shader = deserialize(&blob, self.target.nir)?;
+        let shader = deserialize(&blob, &self.target)?;
         if recalled {
             self.recalled += 1;
         } else {
@@ -523,37 +568,33 @@ impl AirCompiler {
         self.lock.clone()
     }
 
-    /// Whether a compilation the NIR cache misses defers: the first is kept
-    /// for [`Self::take_deferred`] and the call fails, to run again once it
-    /// is compiled outside the service's lock ([`Self::adopt`]).
+    /// Whether a compilation the NIR cache misses defers: each is kept for
+    /// [`Self::take_deferred`] and the call fails, to run again once they
+    /// are compiled outside the service's lock ([`Self::adopt`]).
     pub fn set_deferring(&mut self, deferring: bool) {
         self.deferring = deferring && self.nir.is_some();
         self.lock.set_deferred(false);
     }
 
-    /// Whether the call may still leave a job: it defers, and has left
-    /// none yet.
-    fn may_wait(&self) -> bool {
-        self.deferring
-            && self.deferred.is_none()
-            && self.reflecting.is_none()
-            && self.stitching.is_none()
-    }
-
-    /// The compilation the call deferred.
+    /// The oldest compilation the call deferred.
     pub fn take_deferred(&mut self) -> Option<CompileJob> {
         self.lock.set_deferred(false);
-        self.deferred.take()
+        (!self.deferred.is_empty()).then(|| self.deferred.remove(0))
     }
 
     /// Keeps what a deferred compilation made, for the call's next run.
     pub fn adopt(&mut self, finished: Finished) {
-        self.compiled += 1;
         let Finished {
             key,
             result,
             serialized,
+            restored,
         } = finished;
+        match restored {
+            Some(false) => self.restored += 1,
+            Some(true) => self.recalled += 1,
+            None => self.note_compiled(Some(key)),
+        }
         self.keep_serialized(&key, serialized.as_deref());
         let Some(nir) = self.nir.as_mut() else {
             if let Ok((shader, _)) = result {
@@ -579,26 +620,39 @@ impl AirCompiler {
 
     /// Holds the compile lock for a use of LLVM in a call's turn: LLVM is
     /// built without threads, and a job may be using it. A call that may
-    /// defer does not wait for the job: it fails with `DEFERRED` and leaves
-    /// a job that does nothing, which runs once the lock is free.
+    /// defer does not wait for the job: it fails with `DEFERRED` and, unless
+    /// it left a job already, leaves one that does nothing, which runs once
+    /// the lock is free.
     fn llvm<'a>(
         lock: &'a CompileLock,
         waiting: &mut Waiting,
-        may_defer: bool,
+        defer: Defer,
         relax: fn(),
     ) -> Result<CompileGuard<'a>> {
         if let Some(held) = lock.try_hold() {
             return Ok(held);
         }
-        if may_defer && waiting.job.is_none() {
-            waiting.count += 1;
-            let mut key = [0xff; 32];
-            key[..8].copy_from_slice(&waiting.count.to_le_bytes());
-            waiting.job = Some(Job::new(key, Owner::Compiler, || Box::new(()) as Made));
-            lock.set_deferred(true);
-            return Err(DEFERRED);
+        match defer {
+            Defer::No => Ok(lock.hold(relax)),
+            Defer::Left => Err(DEFERRED),
+            Defer::May => {
+                waiting.count += 1;
+                let mut key = [0xff; 32];
+                key[..8].copy_from_slice(&waiting.count.to_le_bytes());
+                waiting.job = Some(Job::new(key, Owner::Compiler, || Box::new(()) as Made));
+                lock.set_deferred(true);
+                Err(DEFERRED)
+            }
         }
-        Ok(lock.hold(relax))
+    }
+
+    /// Whether the call served now may defer, and whether it left a job.
+    fn defer(&self) -> Defer {
+        match (self.deferring, self.deferred()) {
+            (false, _) => Defer::No,
+            (true, false) => Defer::May,
+            (true, true) => Defer::Left,
+        }
     }
 
     /// Keeps what a deferred reflection made, for the call's next run.
@@ -643,10 +697,11 @@ impl AirCompiler {
 
     /// `GPU COMPILER reflected=… reflections=… nir_hits=… nir_misses=…
     /// compiled=… restored=…/stored deferred=… nir=entries/MiB evicted=…
-    /// recalled=…`, since the device opened: reflections and compilations
+    /// recalled=… recompiled=…`, since the device opened: reflections and compilations
     /// the service ran, cache hits and misses, stored NIR deserialized of
     /// what the store held, calls that compiled outside the lock, the cache,
-    /// and evicted compilations of this boot deserialized again.
+    /// evicted compilations of this boot deserialized again, and
+    /// compilations of a key the service had compiled before this boot.
     pub fn report(&self) -> String {
         let (hits, misses, entries, bytes, evicted) =
             self.nir.as_ref().map_or((0, 0, 0, 0, 0), |nir| {
@@ -661,7 +716,7 @@ impl AirCompiler {
         alloc::format!(
             "GPU COMPILER reflected={} reflections={} nir_hits={hits} nir_misses={misses} \
              compiled={} restored={}/{} deferred={} nir={entries}/{}M evicted={evicted} \
-             recalled={}",
+             recalled={} recompiled={}",
             self.reflected,
             self.reflections.as_ref().map_or(0, ReflectionCache::len),
             self.compiled,
@@ -670,6 +725,7 @@ impl AirCompiler {
             self.deferrals,
             bytes >> 20,
             self.recalled,
+            self.recompiled,
         )
     }
 
@@ -697,10 +753,10 @@ impl AirCompiler {
         // A large module's reflection, which parses and specializes its
         // AIR, can take seconds: it runs outside the turn like a compile.
         if let Some(key) = &key
-            && self.may_wait()
+            && self.deferring
         {
             let digest = reflection_digest(key);
-            if !self.failed.remove(&digest) {
+            if self.reflecting.is_none() && !self.failed.contains(&digest) {
                 let library = self
                     .libraries
                     .get(&library)
@@ -716,14 +772,20 @@ impl AirCompiler {
                 self.lock.set_deferred(true);
                 return Err(DEFERRED);
             }
+            // The call runs again for the job it left: nothing it makes
+            // now stays.
+            if self.deferred() {
+                return Err(DEFERRED);
+            }
+            self.failed.remove(&digest);
         }
         let raw = values.map(constant_values);
         // LLVM, built without threads, runs on one processor at a time: a
         // job holds this lock while it runs.
         let reflection = {
             let lock = self.lock.clone();
-            let may_wait = self.may_wait();
-            let _held = Self::llvm(&lock, &mut self.waiting, may_wait, self.relax)?;
+            let defer = self.defer();
+            let _held = Self::llvm(&lock, &mut self.waiting, defer, self.relax)?;
             let selected = select(&self.libraries, library, entry)?;
             selected.reflect_raw(&self.service, raw.as_deref(), &mut self.refusal)?
         };
@@ -757,13 +819,15 @@ impl Compiler for AirCompiler {
 
     fn stop_deferring(&mut self) {
         self.deferring = false;
+        self.lock.set_may_defer(false);
     }
 
     fn deferred(&self) -> bool {
-        self.deferred.is_some()
+        !self.deferred.is_empty()
             || self.reflecting.is_some()
             || self.stitching.is_some()
             || self.waiting.job.is_some()
+            || self.lock.waited()
     }
 
     fn defer_compiles(&mut self, deferring: bool) {
@@ -836,8 +900,8 @@ impl Compiler for AirCompiler {
         let mut error = ffi::AirError::NONE;
         // LLVM, built without threads, runs on one processor at a time.
         let lock = self.lock.clone();
-        let may_wait = self.may_wait();
-        let _held = Self::llvm(&lock, &mut self.waiting, may_wait, self.relax)?;
+        let defer = self.defer();
+        let _held = Self::llvm(&lock, &mut self.waiting, defer, self.relax)?;
         list_functions(&self.service, air, &mut error)?
             .ok_or_else(|| refuse(&mut self.refusal, "the library", &error))
     }
@@ -868,8 +932,8 @@ impl Compiler for AirCompiler {
         let mut error = ffi::AirError::NONE;
         // LLVM, built without threads, runs on one processor at a time.
         let lock = self.lock.clone();
-        let may_wait = self.may_wait();
-        let _held = Self::llvm(&lock, &mut self.waiting, may_wait, self.relax)?;
+        let defer = self.defer();
+        let _held = Self::llvm(&lock, &mut self.waiting, defer, self.relax)?;
         // SAFETY: the bitcode and the list outlive the call, which writes
         // the list through `visit` and the error.
         let listed = unsafe {
@@ -907,8 +971,12 @@ impl Compiler for AirCompiler {
             Taken::Stale(_) | Taken::Missing => false,
         };
         // Stitching and listing its functions run LLVM for milliseconds:
-        // outside the turn, like a compile.
-        if !refused && self.may_wait() {
+        // outside the turn, like a compile. A call that left one already
+        // runs again: a second stitch waits for that run.
+        if !refused && self.deferring && self.stitching.is_some() {
+            return Err(DEFERRED);
+        }
+        if !refused && self.deferring {
             let sources = sources
                 .iter()
                 .map(|function| {
@@ -940,8 +1008,8 @@ impl Compiler for AirCompiler {
         let mut error = ffi::AirError::NONE;
         // LLVM, built without threads, runs on one processor at a time.
         let lock = self.lock.clone();
-        let may_wait = self.may_wait();
-        let _held = Self::llvm(&lock, &mut self.waiting, may_wait, self.relax)?;
+        let defer = self.defer();
+        let _held = Self::llvm(&lock, &mut self.waiting, defer, self.relax)?;
         let selected = sources
             .iter()
             .map(|function| select(&self.libraries, function.library, &function.entry))
@@ -1017,8 +1085,8 @@ impl Compiler for AirCompiler {
         let count = u32::try_from(values.as_ref().map_or(0, Vec::len)).map_err(|_| MALFORMED)?;
         // LLVM, built without threads, runs on one processor at a time.
         let lock = self.lock.clone();
-        let may_wait = self.may_wait();
-        let _held = Self::llvm(&lock, &mut self.waiting, may_wait, self.relax)?;
+        let defer = self.defer();
+        let _held = Self::llvm(&lock, &mut self.waiting, defer, self.relax)?;
         // SAFETY: the AIR, entry and values outlive the call, which writes
         // only the bindings and the error.
         let reflected = unsafe {
@@ -1067,8 +1135,8 @@ impl Compiler for AirCompiler {
             let mut error = ffi::AirError::NONE;
             // LLVM, built without threads, runs on one processor at a time.
             let lock = self.lock.clone();
-            let may_wait = self.may_wait();
-            let _held = Self::llvm(&lock, &mut self.waiting, may_wait, self.relax)?;
+            let defer = self.defer();
+            let _held = Self::llvm(&lock, &mut self.waiting, defer, self.relax)?;
             // SAFETY: the bitcode outlives the call, which writes at most
             // SAMPLER_STATES states, the count and the error.
             let valid = unsafe {
@@ -1245,22 +1313,36 @@ impl AirCompiler {
         {
             return Ok(shader);
         }
+        // Deserializing stored NIR took a large shader's turn 50-60 ms: a
+        // call that defers leaves it to the job, which compiles only when
+        // no stored NIR deserializes. A call that goes on past a deferral,
+        // as a commit does to find every compilation it misses, leaves a
+        // job for each, up to a bound; past it, and for a key whose job
+        // failed, it does nothing in a turn whose work does not stay.
+        if self.deferring {
+            if let Some(key) = job.key
+                && !self.failed.contains(&key)
+                && self.deferred.len() < LEFT_PER_CALL
+                && !self.deferred.iter().any(|left| left.key == Some(key))
+            {
+                self.deferrals += 1;
+                self.deferred.push(CompileJob {
+                    restore: self.restorable(&key),
+                    ..job
+                });
+                self.lock.set_deferred(true);
+                return Err(DEFERRED);
+            }
+            if self.deferred() {
+                return Err(DEFERRED);
+            }
+        }
         if let Some((shader, bytes)) = self.restore(&job) {
             let key = job.key.expect("restored by its key");
             let nir = self.nir.as_mut().expect("restoring keeps compilations");
             nir.insert(key, shader.clone(), bytes, true);
             self.release_doomed();
             return Ok(shader);
-        }
-        if let Some(key) = job.key
-            && self.deferring
-            && self.deferred.is_none()
-            && !self.failed.contains(&key)
-        {
-            self.deferrals += 1;
-            self.deferred = Some(job);
-            self.lock.set_deferred(true);
-            return Err(DEFERRED);
         }
         if let Some(key) = job.key {
             self.failed.remove(&key);
@@ -1269,7 +1351,7 @@ impl AirCompiler {
             let _held = self.lock.hold(self.relax);
             job.run()
         };
-        self.compiled += 1;
+        self.note_compiled(job.key);
         match result {
             Ok((shader, bytes)) => {
                 if let Some(key) = job.key
@@ -1441,6 +1523,12 @@ impl AirCompiler {
                 );
             }
             hasher.update(alloc::format!("{names:?}").as_bytes());
+            // The target's limits shape the NIR too, and a build may change
+            // them without changing the compiler archive that keys the
+            // store: NIR an earlier build stored under others is not read.
+            for limit in target_limits(&self.target) {
+                hasher.update(limit.to_le_bytes());
+            }
             let digest: [u8; 32] = hasher.finalize().into();
             digest
         });
@@ -1483,6 +1571,7 @@ impl AirCompiler {
             provenance,
             key,
             serializing: self.persist.is_some(),
+            restore: None,
         })
     }
 }
@@ -1529,11 +1618,33 @@ pub struct CompileJob {
     key: Option<[u8; 32]>,
     /// The next boot keeps its NIR.
     serializing: bool,
+    /// Where a deferred compilation's serialized NIR may be, which its job
+    /// deserializes in place of compiling.
+    restore: Option<Restore>,
 }
 
 // SAFETY: its pointers are the held libraries' immutable bytes and the
 // driver's NIR options, which any thread reads; nothing else holds them.
 unsafe impl Send for CompileJob {}
+
+/// Where a deferred compilation's serialized NIR may be: an earlier boot's
+/// bytes, else this boot's, which the store copies out.
+#[derive(Clone, Copy)]
+struct Restore {
+    stored: Option<&'static [u8]>,
+    recall: Option<Recall>,
+}
+
+/// What a call's use of LLVM does while a job holds the lock.
+#[derive(Clone, Copy)]
+enum Defer {
+    /// Waits: the call cannot run again.
+    No,
+    /// Leaves a job that waits, and runs again after it.
+    May,
+    /// Runs again for a job it left already, waiting for nothing.
+    Left,
+}
 
 /// A job that waits for the compile lock, for a call whose turn would.
 #[derive(Default)]
@@ -1609,6 +1720,9 @@ pub struct Finished {
     result: core::result::Result<(CompiledShader, usize), ()>,
     /// Its NIR, serialized for the next boot, when that keeps it.
     serialized: Option<Vec<u8>>,
+    /// Deserialized rather than compiled: `true` from this boot's NIR,
+    /// `false` from an earlier boot's.
+    restored: Option<bool>,
 }
 
 impl CompileJob {
@@ -1619,8 +1733,17 @@ impl CompileJob {
         self.complete()
     }
 
-    /// [`Self::run_outside`], for a [`Job`] whose runner holds the lock.
+    /// [`Self::run_outside`], for a [`Job`] whose runner holds the lock:
+    /// the stored NIR deserialized, where it is, else the compilation.
     fn complete(self) -> Finished {
+        if let Some((shader, recalled)) = self.restore() {
+            return Finished {
+                key: self.key.expect("a deferred compilation has its key"),
+                result: Ok(shader),
+                serialized: None,
+                restored: Some(recalled),
+            };
+        }
         let serializing = self.serializing;
         let result = self.run();
         let serialized = match &result {
@@ -1631,7 +1754,21 @@ impl CompileJob {
             key: self.key.expect("a deferred compilation has its key"),
             result: result.map_err(|_| ()),
             serialized,
+            restored: None,
         }
+    }
+
+    /// The shader of the serialized NIR [`Restore`] finds, and whether it
+    /// was this boot's.
+    fn restore(&self) -> Option<((CompiledShader, usize), bool)> {
+        let Restore { stored, recall } = self.restore?;
+        let (blob, recalled) = match (stored, recall) {
+            (Some(blob), _) => (Cow::Borrowed(blob), false),
+            (None, Some(recall)) => (Cow::Owned(recall(&self.key?)?), true),
+            (None, None) => return None,
+        };
+        let shader = deserialize(&blob, &self.target)?;
+        Some((self.finish(shader), recalled))
     }
 
     /// The function's name.
@@ -1810,25 +1947,47 @@ struct Blob {
 }
 
 #[cfg(all(feature = "metal-linked", target_os = "uefi"))]
-#[repr(C)]
-struct BlobReader {
-    data: *const u8,
-    end: *const u8,
-    current: *const u8,
-    overrun: bool,
-}
-
-#[cfg(all(feature = "metal-linked", target_os = "uefi"))]
 unsafe extern "C" {
     fn blob_init(blob: *mut Blob);
-    fn blob_reader_init(reader: *mut BlobReader, data: *const c_void, size: usize);
     fn nir_serialize(blob: *mut Blob, shader: *const c_void, strip: bool);
-    fn nir_deserialize(
-        context: *mut c_void,
-        options: *const c_void,
-        reader: *mut BlobReader,
+    fn stela_metal_deserialize(
+        data: *const c_void,
+        size: usize,
+        target: *const ffi::Target,
     ) -> *mut c_void;
     fn free(pointer: *mut c_void);
+}
+
+/// Every limit of `target`, which the NIR it compiles depends on, in the
+/// order of its fields; the driver's NIR options are keyed by its build.
+fn target_limits(target: &ffi::Target) -> [u32; 11] {
+    let ffi::Target {
+        nir: _,
+        max_instructions,
+        max_threadgroup_bytes,
+        max_private_bytes,
+        max_constant_bytes,
+        max_varying_slots,
+        max_payload_bytes,
+        max_mesh_vertices,
+        max_mesh_primitives,
+        stencil_export,
+        raster_order_groups,
+        fragment_tests,
+    } = *target;
+    [
+        max_instructions,
+        max_threadgroup_bytes,
+        max_private_bytes,
+        max_constant_bytes,
+        max_varying_slots,
+        max_payload_bytes,
+        max_mesh_vertices,
+        max_mesh_primitives,
+        stencil_export,
+        raster_order_groups,
+        fragment_tests,
+    ]
 }
 
 /// Whether this image serializes NIR: the linked Mesa does.
@@ -1870,78 +2029,27 @@ fn serialize(code: ShaderCode) -> Option<Vec<u8>> {
     }
 }
 
-/// The NIR `blob` serialized, compiled for the driver's `options`.
-fn deserialize(blob: &[u8], options: *const c_void) -> Option<*mut c_void> {
+/// The NIR `blob` serialized, with the driver's options for its stage
+/// (`stela_metal_deserialize`).
+fn deserialize(blob: &[u8], target: &ffi::Target) -> Option<*mut c_void> {
     #[cfg(all(feature = "metal-linked", target_os = "uefi"))]
     {
-        let mut reader = BlobReader {
-            data: ptr::null(),
-            end: ptr::null(),
-            current: ptr::null(),
-            overrun: false,
-        };
-        // SAFETY: the stored bytes outlive the read, and the options are the
-        // driver's, as the compiler's own NIR is made with.
-        let shader = unsafe {
-            blob_reader_init(&mut reader, blob.as_ptr().cast(), blob.len());
-            nir_deserialize(ptr::null_mut(), options, &mut reader)
-        };
-        if shader.is_null() {
-            return None;
-        }
-        if reader.overrun || reader.current != reader.end {
-            // SAFETY: the deserialized shader, a ralloc context of its own.
-            unsafe { free_nir(shader) };
-            return None;
-        }
-        Some(shader)
+        // SAFETY: the stored bytes outlive the read, and the target holds the
+        // driver's options, as the compiler's own NIR is made with.
+        let shader = unsafe { stela_metal_deserialize(blob.as_ptr().cast(), blob.len(), target) };
+        (!shader.is_null()).then_some(shader)
     }
     #[cfg(not(all(feature = "metal-linked", target_os = "uefi")))]
     {
-        let _ = (blob, options);
-        None
-    }
-}
-
-/// A copy of `code`'s NIR that the caller owns until [`free_nir_copy`], as
-/// a deferred pipeline creation needs once its call has returned the
-/// original; `None` where this image links no Mesa.
-pub fn clone_nir(code: ShaderCode) -> Option<ShaderCode> {
-    #[cfg(all(feature = "metal-linked", target_os = "uefi"))]
-    {
-        unsafe extern "C" {
-            fn nir_shader_clone(context: *mut c_void, shader: *const c_void) -> *mut c_void;
+        let _ = target;
+        #[cfg(test)]
+        return cache_tests::deserialize(blob);
+        #[cfg(not(test))]
+        {
+            let _ = blob;
+            None
         }
-        // SAFETY: the compiler's live NIR, which cloning only reads.
-        let copy = unsafe { nir_shader_clone(ptr::null_mut(), code.0 as usize as *const c_void) };
-        (!copy.is_null()).then_some(ShaderCode(copy as usize as u64))
     }
-    #[cfg(not(all(feature = "metal-linked", target_os = "uefi")))]
-    {
-        let _ = code;
-        None
-    }
-}
-
-/// Frees a copy [`clone_nir`] made.
-pub fn free_nir_copy(code: ShaderCode) {
-    #[cfg(all(feature = "metal-linked", target_os = "uefi"))]
-    // SAFETY: the copy, a ralloc context of its own that nothing else holds.
-    unsafe {
-        free_nir(code.0 as usize as *mut c_void);
-    }
-    #[cfg(not(all(feature = "metal-linked", target_os = "uefi")))]
-    let _ = code;
-}
-
-/// Frees NIR deserialized here.
-#[cfg(all(feature = "metal-linked", target_os = "uefi"))]
-unsafe fn free_nir(shader: *mut c_void) {
-    unsafe extern "C" {
-        fn ralloc_free(context: *mut c_void);
-    }
-    // SAFETY: the caller's shader, which nothing else holds.
-    unsafe { ralloc_free(shader) }
 }
 
 /// The bytes `shader`'s NIR takes, for the cache's budget.

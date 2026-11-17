@@ -24,6 +24,7 @@ use uefi::{
 };
 #[cfg(feature = "diagnostics")]
 mod audio_check;
+mod boot_exit;
 mod choice;
 mod console;
 mod cpu;
@@ -155,6 +156,25 @@ fn host_identity() -> alloc::string::String {
     })
 }
 
+/// What ended this PC's last boot, where its chipset records it
+/// (`stela_boot_core::reset_reason`): a boot whose log stops with no stop
+/// line is told apart from a reset or a power-button hold at the next one.
+fn previous_reset() -> Option<alloc::string::String> {
+    use core::arch::x86_64::__cpuid;
+    use stela_boot_core::{host_identity, reset_reason};
+    let leaf0 = __cpuid(0);
+    let vendor = host_identity::vendor([leaf0.ebx, leaf0.edx, leaf0.ecx]);
+    let (family, _, _) = host_identity::signature_parts(__cpuid(1).eax);
+    if !reset_reason::applies(&vendor, family) || !firmware::identity_mapped(reset_reason::ADDRESS)
+    {
+        return None;
+    }
+    // SAFETY: the FCH register Zen processors decode at this address, which
+    // the firmware's page tables map (checked above); a read has no effect.
+    let status = unsafe { (reset_reason::ADDRESS as *const u32).read_volatile() };
+    reset_reason::line(status)
+}
+
 /// The longest [`EarlyText`]: room for the low-RAM refusal, small enough
 /// to return by value.
 const EARLY_BYTES: usize = 112;
@@ -231,6 +251,15 @@ fn stop_firmware_watchdog() {
     }
 }
 
+/// Say once that the firmware's ACPI table `signature` has a wrong checksum
+/// and is used as it is (`acpi::table`).
+fn acpi_checksum_fault(signature: [u8; 4]) {
+    output::arguments(format_args!(
+        "FIRMWARE ACPI {} checksum wrong: table used as it is\n",
+        signature.escape_ascii()
+    ));
+}
+
 #[uefi::entry]
 fn main() -> Status {
     // Before any Rust state exists: the system engine runs from this copy.
@@ -243,6 +272,7 @@ fn main() -> Status {
         "STELA UEFI MOUNT version={}\n",
         env!("CARGO_PKG_VERSION")
     ));
+    stela_runtime::pc::acpi::on_checksum_fault(acpi_checksum_fault);
     if !serial::present() {
         output::arguments(format_args!(
             "SERIAL no UART at COM1: nothing is sent to it or read from it\n"
@@ -274,6 +304,9 @@ fn main() -> Status {
         stop_record::carry();
     }
     output::arguments(format_args!("{}", host_identity()));
+    if let Some(line) = previous_reset() {
+        output::arguments(format_args!("{line}"));
+    }
     if output::hypervisor_exit_port() {
         output::arguments(format_args!(
             "HOST hypervisor present: stop codes also go to its exit port\n"
@@ -292,10 +325,10 @@ fn main() -> Status {
         host_firmware::read(&mut firmware_root).unwrap_or_else(|e| output::fatal(e));
     drop(firmware_root);
     let options = firmware::options(&mut volume).unwrap_or_else(|e| output::fatal(e));
-    let options = choice::resolve(&mut volume, options);
     // What this start changes on a PC disk is pending until Stela's own
     // drivers run: before the firmware exits, a PC disk is only read.
     let mut pending = stela_runtime::pc::disk_writes::Pending::default();
+    let options = choice::resolve(&mut volume, options, &pending);
     status::done("");
     let held = system::held_at_start(&options, &pending);
     let choice::Chosen { options, plan } = choice::choose(&mut volume, options, held, &pending);
@@ -333,8 +366,7 @@ fn main() -> Status {
     unsafe {
         asm!("cli", options(nomem, nostack));
         handoff.active_tables = Some(paging::activate(tables).unwrap_or_else(|error| {
-            output::arguments(format_args!("native table activation refused: {error}"));
-            output::fatal("native table activation failed");
+            output::fatal(format_args!("native table activation failed: {error}"));
         }));
         asm!(
             "mov rsp, {top}",
@@ -355,8 +387,9 @@ extern "sysv64" fn run(handoff: &mut firmware::Handoff) -> ! {
         .as_ref()
         .unwrap_or_else(|| output::fatal("actual activated native table owner is missing"));
     root.check_current().unwrap_or_else(|error| {
-        output::arguments(format_args!("activated native root refused: {error}\n"));
-        output::fatal("activated native root is unavailable");
+        output::fatal(format_args!(
+            "activated native root is unavailable: {error}"
+        ));
     });
     if let Some(storage) = handoff.storage.take() {
         storage.run(

@@ -129,6 +129,10 @@ pub mod modeled {
         crate::TargetCpu::detect()
     }
 }
+#[cfg(target_arch = "x86_64")]
+pub mod block_entry;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod executed_paths;
 pub(crate) mod memory_store;
 #[cfg(all(
     test,
@@ -1265,9 +1269,9 @@ pub(super) fn register_store(
     Some(scratch)
 }
 
-/// `movabs rax,value`.
+/// RAX = `value`, in its shortest form ([`asm::Asm::mov_imm`]).
 fn immediate(code: &mut Code, value: u64) {
-    code.asm().mov_imm64(asm::Gpr::Rax, value);
+    code.asm().mov_imm(asm::Gpr::Rax, value);
 }
 
 /// `movabs rax,address`, its field a relocation of the block.
@@ -1532,9 +1536,9 @@ pub(crate) fn emit_instruction(
                 WideMove::Keep => {
                     load(code, destination);
                     let mut asm = code.asm();
-                    asm.mov_imm64(Rcx, !(0xffffu64 << shift));
+                    asm.mov_imm(Rcx, !(0xffffu64 << shift));
                     asm.alu(Alu::And, Qword, Rax, Rcx);
-                    asm.mov_imm64(Rcx, value);
+                    asm.mov_imm(Rcx, value);
                     asm.alu(Alu::Or, Qword, Rax, Rcx);
                 }
             }
@@ -1596,6 +1600,8 @@ impl Emitter {
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod exit_boundary_tests;
 #[cfg(test)]
 mod range_check_tests;
 #[cfg(test)]

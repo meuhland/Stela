@@ -226,6 +226,7 @@ impl PowerStates {
                 let node = &expected.nodes[expected.locate(path)?];
                 let valid = match (path, note) {
                     ("/defaults", "serial-device") => node.property("serial-device").is_none(),
+                    ("/defaults", "entangle-nonce") => node.property("entangle-nonce").is_none(),
                     ("/", "secure-root-prefix") => node.property("secure-root-prefix").is_none(),
                     (_, "acio-parent") => node.property("acio-parent").is_none(),
                     (_, "+no-pmu") => node.property("no-pmu").is_some(),

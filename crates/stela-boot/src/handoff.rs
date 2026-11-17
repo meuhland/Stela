@@ -47,6 +47,10 @@ pub struct Handoff {
     /// with (`status::replay`).
     pub history: [u8; crate::status::HISTORY_BYTES],
     pub history_bytes: usize,
+    /// The loader's lines that no log stored, after the firmware's log
+    /// closed (`output::unkept_lines`), in the handoff allocation's tail,
+    /// which the engine's record starts with (`output::carry_loader_lines`).
+    pub loader_lines: Region,
     /// The loader's facts about the PC, as a host record, which the engine
     /// takes up (`host_inventory::restore`).
     pub host: [u8; crate::host_inventory::HANDOFF_BYTES],
@@ -123,6 +127,10 @@ pub struct Handoff {
     /// in the USB's log: what a stop the log cannot keep leaves its record
     /// with (`stop_record`).
     pub(crate) stop_record: crate::stop_record::Services,
+    /// Whether the loader found a UART at COM1 (`serial::present`). The
+    /// engine runs a copy of this image taken before any Rust state
+    /// existed, so it learns the result here, not from its own statics.
+    pub(crate) serial_present: bool,
 }
 
 /// A read of the firmware's real-time clock: its time as UTC and its

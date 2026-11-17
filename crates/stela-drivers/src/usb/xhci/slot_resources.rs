@@ -3,7 +3,7 @@
 //!
 //! Only retirement's noncopyable proof can return storage. Neither a slot ID,
 //! physical-port status nor the current ledger can manufacture that proof.
-//! Published root-leaf storage requires retirement's physical-reset witness.
+//! Published leaf storage requires retirement's physical-reset witness.
 //! Storage never restores a generation or the permanent raw-slot fence.
 use super::*;
 
@@ -160,6 +160,7 @@ impl Cache {
             poisoned: false,
             enabled: false,
             in_flight: 0,
+            stopped: false,
         });
     }
 

@@ -47,6 +47,9 @@ final class HostInventoryTests: XCTestCase {
     XCTAssertNil(host.system)
     XCTAssertNil(host.firmware)
     XCTAssertEqual(host.gpus.first?.name, "NVIDIA AD102")
+    // An AMD GPU keeps amdgpu's chip name under AMD's.
+    let amd = HostInventory(properties: ["GPU0Chip": "navi21", "GPU0PCIID": "1002:73bf"])
+    XCTAssertEqual(amd.gpus.first?.name, "AMD navi21")
     XCTAssertNil(host.gpus.first?.vramBytes)
     XCTAssertEqual(
       HostInventory(properties: ["TranslatorTarget": "x86_64-baseline+ssse3+sse4.1+sse4.2+avx2"])

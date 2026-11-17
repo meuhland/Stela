@@ -19,6 +19,7 @@ use core::{
 use stela_contracts::refuse;
 
 mod mailbox;
+mod park;
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -32,7 +33,14 @@ const ENTERED: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartupFailure {
-    Resources,
+    /// A startup input that is missing or out of range, and which.
+    Resources(&'static str),
+    /// The live local APIC of the processor starting the others is not the
+    /// bootstrap processor the firmware listed.
+    BootProcessorApic {
+        live: u32,
+        captured: u64,
+    },
     Bootstrap(Refusal),
     FaultRecord {
         slot: usize,
@@ -133,13 +141,16 @@ impl Processor {
         }
         // SAFETY: the AP published this pinned read-only atomic reference before
         // READY. No Cpu, native frame, Host or recovery state is read here.
-        let counter = unsafe { (&*self.argument.doorbells.get()).as_ref().copied() }
-            .ok_or(StartupFailure::Resources)?;
+        let counter = unsafe { (&*self.argument.doorbells.get()).as_ref().copied() }.ok_or(
+            StartupFailure::Resources("the AP published no doorbell counter"),
+        )?;
         let before = counter.load(Ordering::Acquire);
         // SAFETY: caller owns the BSP ICR and this AP's private IDT is ready.
         unsafe {
             sender.notify(
-                u32::try_from(self.apic_id()).map_err(|_| StartupFailure::Resources)?,
+                u32::try_from(self.apic_id()).map_err(|_| {
+                    StartupFailure::Resources("the AP's APIC ID is wider than 32 bits")
+                })?,
                 interrupts::NATIVE_WAKE_VECTOR,
                 tsc_hz,
             )
@@ -281,14 +292,18 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
             *argument.descriptors.get() = Some(descriptors);
             *argument.doorbells.get() = Some(host::doorbell_counter());
         }
+        // SAFETY: CPL0 on this ready AP with interrupts masked and its own
+        // descriptors installed, before it runs a PE; nothing else writes
+        // its P-state registers.
+        unsafe { stela_boot_core::host_performance::request_full_performance() };
         Ok(owner)
     })()
     .and_then(|owner| {
         argument.status.store(SYNCING, Ordering::Release);
         let offset = argument.tsc.target()?;
-        // This AP's 24 MHz counter counts from a base its software
-        // correction moved, so that it reads the BSP's count.
-        host::correct_tsc_base(offset);
+        // This AP reads the BSP's counter, and counts its guest clock,
+        // through its software correction from now on.
+        host::agree_tsc(offset);
         Ok(owner)
     });
     match initialized {
@@ -301,7 +316,7 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
                     continue;
                 }
                 // SAFETY: interrupts are disabled and this AP's IDT takes its
-                // 0x60 doorbell, which ends the wait even when already pending.
+                // doorbell, which ends the wait even when already pending.
                 unsafe { crate::native_idle::wait(|| None) };
             }
         }
@@ -343,12 +358,16 @@ pub(crate) unsafe fn quiesce_firmware_aps(
     let source = capture
         .processors
         .get(..capture.processor_count as usize)
-        .ok_or(StartupFailure::Resources)?;
+        .ok_or(StartupFailure::Resources(
+            "the processor capture counts more processors than it holds",
+        ))?;
     let selected = capture
         .selected
         .get(..capture.core_count as usize)
         .filter(|selected| !selected.is_empty())
-        .ok_or(StartupFailure::Resources)?;
+        .ok_or(StartupFailure::Resources(
+            "the processor capture selects no processor, or more than it holds",
+        ))?;
     // Validate the entire captured assignment before exposing any target. Only
     // the BSP is excluded from INIT at this boundary; selected APs still use
     // firmware idle code until their later owned INIT/SIPI sequence.
@@ -421,8 +440,15 @@ pub(crate) unsafe fn start(
     _fp_qualification: bool,
 ) -> Result<Executors, StartupFailure> {
     let cores = handoff.native_resources.cores as usize;
-    if cores == 0 || cores > capture.core_count as usize || handoff.tsc_hz == 0 {
-        return Err(StartupFailure::Resources);
+    if cores == 0 || cores > capture.core_count as usize {
+        return Err(StartupFailure::Resources(
+            "the reserved cores are none or more than the processor capture selects",
+        ));
+    }
+    if handoff.tsc_hz == 0 {
+        return Err(StartupFailure::Resources(
+            "the time-stamp counter rate is unknown",
+        ));
     }
     let sender = Apic::new(
         handoff.apic_base,
@@ -431,16 +457,35 @@ pub(crate) unsafe fn start(
     let mut processors = Vec::with_capacity(cores - 1);
     let mut started: Vec<Starting> = Vec::with_capacity(cores - 1);
     // SAFETY: CPL0, BSP; PAT exists under the validated native floor.
-    let memory_source = unsafe { firmware::observe() }.map_err(|_| StartupFailure::Resources)?;
-    let source_expected = topology::Snapshot {
+    let memory_source = unsafe { firmware::observe() }.map_err(|_| {
+        StartupFailure::Resources("the boot processor's controls could not be read")
+    })?;
+    let memory_types = super::memory_types::Image::from_snapshot(&memory_source)
+        .map_err(StartupFailure::Bootstrap)?;
+    let captured = topology::Snapshot {
         pat: memory_source.pat,
         ..capture.snapshots[0]
     };
-    memory_source
-        .same_memory_types(&source_expected)
-        .map_err(|_| StartupFailure::Resources)?;
-    let memory_types = super::memory_types::Image::from_snapshot(&memory_source)
-        .map_err(StartupFailure::Bootstrap)?;
+    // Firmware may change the memory types between Stela's capture and its
+    // exit (an exit handler, or a cache attribute set through its CPU
+    // driver). Every core takes the boot processor's current ones, as
+    // Linux copies the boot processor's MTRRs to each AP it starts; each
+    // change is named, and each AP is checked to hold them.
+    if memory_source.same_memory_types(&captured).is_err() {
+        for (index, was, now) in captured.memory_type_differences(&memory_source) {
+            crate::output::arguments(format_args!(
+                "NATIVE MEMORY TYPES msr={index:#x} {} at the firmware's capture, {} now: \
+                 every core takes the current value\n",
+                Register(was),
+                Register(now),
+            ));
+        }
+        for snapshot in &capture.snapshots[1..cores] {
+            memory_types
+                .compatible(snapshot)
+                .map_err(StartupFailure::Bootstrap)?;
+        }
+    }
     if memory_types.amd.is_some() {
         for range in ram {
             memory_types
@@ -470,16 +515,18 @@ pub(crate) unsafe fn start(
     }
     let effective_pat = memory_source.pat;
     let bsp = sender.id();
-    if u64::from(bsp) != capture.processors[capture.selected[0] as usize].apic_id {
-        return Err(StartupFailure::Resources);
+    let captured_bsp = capture.processors[capture.selected[0] as usize].apic_id;
+    if u64::from(bsp) != captured_bsp {
+        return Err(StartupFailure::BootProcessorApic {
+            live: bsp,
+            captured: captured_bsp,
+        });
     }
     // The BSP's host and handlers are installed. Publish its local slot
     // before any AP can run or issue a retirement.
-    host::join_shootdown(
-        crate::native_mmio::PROCESSORS
-            .join_bsp(bsp)
-            .ok_or(StartupFailure::Resources)?,
-    );
+    host::join_shootdown(crate::native_mmio::PROCESSORS.join_bsp(bsp).ok_or(
+        StartupFailure::Resources("the boot processor already shares the MMIO aperture"),
+    )?);
     // An AP that does not start ends the startup of the ones after it, and
     // the guest runs on the cores before it (`Executors::failure`).
     let mut failed: Vec<(usize, StartupFailure)> = Vec::new();
@@ -490,10 +537,12 @@ pub(crate) unsafe fn start(
         let attempt = (|| -> Result<(), StartupFailure> {
             let part =
                 resources::partition(cores, cores, slot, handoff.code.bytes, handoff.pool.bytes)
-                    .map_err(|_| StartupFailure::Resources)?;
+                    .map_err(|_| {
+                        StartupFailure::Resources("the code and pool do not divide into its part")
+                    })?;
             let processor = capture.processors[capture.selected[slot] as usize];
-            let destination =
-                u32::try_from(processor.apic_id).map_err(|_| StartupFailure::Resources)?;
+            let destination = u32::try_from(processor.apic_id)
+                .map_err(|_| StartupFailure::Resources("its APIC ID is wider than 32 bits"))?;
             let config = host::Config {
                 ram: ram.to_vec(),
                 pool_physical: handoff.pool.physical + part.pool_offset,
@@ -574,7 +623,7 @@ pub(crate) unsafe fn start(
                     bootstrap::Entry {
                         processor_signature: capture.snapshots[slot]
                             .get(1, 0)
-                            .ok_or(StartupFailure::Resources)?
+                            .ok_or(StartupFailure::Resources("its capture has no CPUID leaf 1"))?
                             .eax,
                         root: handoff.root,
                         five_level: matches!(
@@ -605,9 +654,11 @@ pub(crate) unsafe fn start(
             // so it shares the aperture's shootdowns from now on, and answers
             // them while it waits for an engine or driver lock whose holder may
             // be retiring.
-            crate::native_mmio::PROCESSORS
-                .join_ap(destination)
-                .ok_or(StartupFailure::Resources)?;
+            crate::native_mmio::PROCESSORS.join_ap(destination).ok_or(
+                StartupFailure::Resources(
+                    "it already shares the MMIO aperture, or the aperture is full",
+                ),
+            )?;
             stela_engine::platform::sync::set_wait(crate::native_mmio::shootdown::service);
             stela_drivers::on_spin(crate::native_mmio::shootdown::service);
             // SAFETY: validated physical AP and pinned complete startup resources.
@@ -673,6 +724,18 @@ pub(crate) unsafe fn start(
         // their mailbox loop, answering shootdowns, and run no PE.
         processors.retain(|processor| processor.slot < *first);
     }
+    // SAFETY: every started AP is ready, or failed and then nothing starts
+    // from the page again; the memory types are the BSP's, checked above.
+    unsafe {
+        park::park(
+            handoff,
+            capture,
+            &sender,
+            &memory_types,
+            effective_pat,
+            failure.is_some(),
+        )
+    };
     Ok(Executors {
         processors,
         failure: failure.map(|(_, error)| error),
@@ -707,27 +770,41 @@ fn serve(
         match argument.status.load(Ordering::Acquire) {
             SYNCING if !started[index].synced => {
                 let begun = apic::rdtsc();
-                argument.tsc.source();
+                let met = argument.tsc.source();
                 started[index].synced = true;
                 // The APs waiting meanwhile lose none of their second.
                 let spent = apic::rdtsc().wrapping_sub(begun);
                 for other in started.iter_mut() {
                     other.since = other.since.wrapping_add(spent);
                 }
+                if !met {
+                    // The AP stopped mid-synchronization; the abandoned
+                    // rendezvous refuses its later points, so it never
+                    // reports ready on its own.
+                    crate::output::arguments(format_args!(
+                        "NATIVE TSC slot={slot} missed a synchronization point: left out\n"
+                    ));
+                    let failing = started.swap_remove(index);
+                    crate::native_mmio::PROCESSORS.exclude(failing.destination);
+                    failed.push((slot, StartupFailure::Timeout { slot }));
+                    continue;
+                }
                 let outcome = argument.tsc.outcome();
                 crate::output::arguments(format_args!(
-                    "NATIVE TSC slot={slot} adjusted={} offset={} rounds={}\n",
-                    outcome.adjusted, outcome.offset, outcome.rounds,
+                    "NATIVE TSC slot={slot} adjusted={} offset={} rounds={} retried={}\n",
+                    outcome.adjusted, outcome.offset, outcome.rounds, outcome.retried,
                 ));
                 static OFFSET_REPORTED: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);
                 if outcome.offset != 0 && !OFFSET_REPORTED.swap(true, Ordering::Relaxed) {
-                    // Only the guest counter's base takes the offset: raw
-                    // counter reads on this core, such as cross-PE deadlines,
-                    // stay off by it.
+                    // The guest clock and the host's counter reads
+                    // (`host::rdtsc`) take the offset; the raw counter
+                    // stays apart, and only durations measured on one core
+                    // read it.
                     crate::output::arguments(format_args!(
-                        "UNSUPPORTED host TSC agreement in software: slot={slot} offset={}; \
-                         raw counter reads on that core stay off by it\n",
+                        "NATIVE TSC slot={slot} agrees through a software offset of {}: \
+                     its counter has no IA32_TSC_ADJUST or did not converge, and is \
+                     never written\n",
                         outcome.offset,
                     ));
                 }
@@ -778,6 +855,18 @@ fn serve(
             _ => {}
         }
         index += 1;
+    }
+}
+
+/// A memory-type register's value, or that the observation lacks it.
+struct Register(Option<u64>);
+
+impl core::fmt::Display for Register {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(value) => write!(f, "{value:#x}"),
+            None => f.write_str("absent"),
+        }
     }
 }
 

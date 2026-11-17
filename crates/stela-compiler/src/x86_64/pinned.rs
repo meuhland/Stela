@@ -112,10 +112,7 @@ fn take(asm: &mut Asm, size: Size, destination: Gpr, register: Register) {
 
 /// `destination` = `value`, in the fewest bytes.
 fn constant(asm: &mut Asm, destination: Gpr, value: u64) {
-    match u32::try_from(value) {
-        Ok(low) => asm.mov_imm32(destination, low),
-        Err(_) => asm.mov_imm64(destination, value),
-    }
+    asm.mov_imm(destination, value);
 }
 
 /// The result in `work` stored if it is not already home, then NZCV.
@@ -470,7 +467,7 @@ pub(super) fn emit_direct_with_add_sub_capture(
             match i32::try_from(immediate as i64) {
                 Ok(short) => asm.alu_imm(logical(kind), size, work, short),
                 Err(_) => {
-                    asm.mov_imm64(Gpr::Rcx, immediate);
+                    constant(&mut asm, Gpr::Rcx, immediate);
                     asm.alu(logical(kind), size, work, Gpr::Rcx);
                 }
             }
@@ -491,7 +488,7 @@ pub(super) fn emit_direct_with_add_sub_capture(
                 WideMove::Not if width == Width::W32 => {
                     asm.mov_imm32(work, !value as u32);
                 }
-                WideMove::Not => asm.mov_imm64(work, !value),
+                WideMove::Not => constant(&mut asm, work, !value),
                 WideMove::Keep => {
                     take(&mut asm, Size::Qword, work, destination);
                     // The field brought down to bits 15:0, replaced, and
@@ -536,7 +533,8 @@ pub fn capture(state: &mut GuestState) -> HostGprSnapshot {
 }
 
 /// `body`, whose exits return, in code that runs it as the engine does: the
-/// pinned registers loaded around it. The engine's own entry does this; this
+/// pinned registers loaded around it and the exits' stack pointer set
+/// ([`super::chain::EXIT_RSP_STORE`]). The engine's own entry does this; this
 /// is for running a block anywhere else.
 pub fn entered(body: &[u8]) -> alloc::vec::Vec<u8> {
     const SAVE: [u8; 10] = [0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
@@ -549,6 +547,7 @@ pub fn entered(body: &[u8]) -> alloc::vec::Vec<u8> {
     write_back(&mut stores);
     let mut code = SAVE.to_vec();
     code.extend_from_slice(&loads);
+    code.extend(super::chain::EXIT_RSP_STORE);
     code.push(0xe8);
     code.extend(((stores.len() + RESTORE.len()) as i32).to_le_bytes());
     code.extend_from_slice(&stores);
@@ -557,7 +556,8 @@ pub fn entered(body: &[u8]) -> alloc::vec::Vec<u8> {
     code
 }
 
-/// Code that runs the block at RCX as the engine does, for a host that keeps
+/// Code that runs the block at RCX as the engine does, the exits' stack
+/// pointer set, for a host that keeps
 /// the callee-saved registers itself and calls this with RDI at the frame.
 pub fn entry() -> alloc::vec::Vec<u8> {
     const TAKE_BLOCK: [u8; 3] = [0x49, 0x89, 0xcb]; // mov r11,rcx
@@ -567,7 +567,9 @@ pub fn entry() -> alloc::vec::Vec<u8> {
     reload(&mut loads);
     let mut stores = Code::new();
     write_back(&mut stores);
-    let mut code = TAKE_BLOCK.to_vec();
+    // RSP stays where the call takes it from, and the store takes R11 first.
+    let mut code = super::chain::EXIT_RSP_STORE.to_vec();
+    code.extend(TAKE_BLOCK);
     code.extend_from_slice(&loads);
     code.extend(CALL_BLOCK);
     code.extend_from_slice(&stores);
@@ -667,6 +669,82 @@ mod tests {
                     assert_eq!(state.nzcv, expected << 28);
                 }
             }
+        }
+    }
+
+    /// MOVZ and MOVN into X0 (R15) take the shortest MOV of their value.
+    #[test]
+    fn wide_moves_take_their_shortest_mov() {
+        for (width, kind, immediate, shift, expected) in [
+            (
+                Width::X64,
+                WideMove::Zero,
+                0x1234,
+                0,
+                &[0x41, 0xbf, 0x34, 0x12, 0, 0][..],
+            ),
+            (
+                Width::X64,
+                WideMove::Zero,
+                0x8000,
+                16,
+                &[0x41, 0xbf, 0, 0, 0, 0x80],
+            ),
+            (
+                Width::X64,
+                WideMove::Zero,
+                1,
+                32,
+                &[0x49, 0xbf, 0, 0, 0, 0, 1, 0, 0, 0],
+            ),
+            (
+                Width::X64,
+                WideMove::Not,
+                0,
+                0,
+                &[0x49, 0xc7, 0xc7, 0xff, 0xff, 0xff, 0xff],
+            ),
+            (
+                Width::X64,
+                WideMove::Not,
+                0x7fff,
+                16,
+                &[0x49, 0xc7, 0xc7, 0xff, 0xff, 0x00, 0x80],
+            ),
+            (
+                Width::X64,
+                WideMove::Not,
+                0x8000,
+                16,
+                &[0x49, 0xbf, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff],
+            ),
+            (
+                Width::X64,
+                WideMove::Not,
+                1,
+                32,
+                &[0x49, 0xbf, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xff],
+            ),
+            (
+                Width::W32,
+                WideMove::Not,
+                0,
+                0,
+                &[0x41, 0xbf, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ] {
+            let code = direct(Operation::MoveWide {
+                width,
+                kind,
+                destination: Register::X(0),
+                immediate,
+                shift,
+            });
+            assert_eq!(
+                &code[..],
+                expected,
+                "{width:?} {kind:?} {immediate:#x} {shift}"
+            );
         }
     }
 

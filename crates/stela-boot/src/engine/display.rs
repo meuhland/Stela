@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_boot_core::staged_frame::StagedFrame;
 use stela_contracts::refuse;
 use stela_formats::boot_bundle;
-use stela_soc::machine::{DisplayLog, Scanout, ScanoutFormat, ScanoutMode};
+use stela_soc::machine::{DisplayLog, MonitorId, Scanout, ScanoutFormat, ScanoutMode};
 use stela_soc::scanout::union;
 
 #[cfg(feature = "nvk")]
@@ -54,6 +54,7 @@ pub struct GopScanout {
     mode: ScanoutMode,
     refresh_millihertz: u32,
     size_mm: Option<(u32, u32)>,
+    monitor: Option<MonitorId>,
 }
 
 /// The screen and the frame kept for it ([`GopScanout`]).
@@ -342,6 +343,10 @@ impl Scanout for MirroredScanout {
         self.scanout.physical_size_mm()
     }
 
+    fn monitor(&self) -> Option<MonitorId> {
+        self.scanout.monitor()
+    }
+
     fn present(&mut self, rows: &[u8]) -> Result<()> {
         timed(|| {
             self.fit(rows.len());
@@ -382,12 +387,28 @@ impl Scanout for MirroredScanout {
         })
     }
 
+    fn refresh_rates(&self) -> Vec<u32> {
+        self.scanout.refresh_rates()
+    }
+
+    fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
+        self.scanout.set_refresh(millihertz)
+    }
+
+    fn vblank_age_ns(&self) -> Option<u64> {
+        self.scanout.vblank_age_ns()
+    }
+
     fn queued(&self) -> bool {
         self.scanout.queued()
     }
 
     fn flush(&mut self) -> Result<()> {
         timed(|| self.scanout.flush())
+    }
+
+    fn wants_frame(&self) -> bool {
+        self.scanout.wants_frame()
     }
 }
 
@@ -407,6 +428,7 @@ impl GopScanout {
             },
             refresh_millihertz: screen.refresh_millihertz(),
             size_mm: screen.size_mm(),
+            monitor: screen.monitor(),
         };
         let frame = StagedFrame::new(width * 4, height);
         if mirror {
@@ -434,6 +456,25 @@ impl GopScanout {
         });
         scanout
     }
+
+    /// This scanout shows frames a bound GPU drew while no output of any
+    /// GPU has a display: on a PC whose screen is wired to another adapter,
+    /// as a laptop with no display mux wires its panel to the integrated
+    /// GPU. The CPU copies each frame's changed rows, at the panel's rate
+    /// as its EDID prefers it, which the DCP model advertises and paces
+    /// macOS by. Said once in the log and on the boot screen.
+    pub fn copying_gpu_frames(self) -> Self {
+        let ScanoutMode { width, height, .. } = self.mode;
+        output::arguments(format_args!(
+            "DISPLAY no GPU output has a display: macOS is drawn on the GPU and copied to the \
+             firmware's framebuffer on the other display adapter at {width}x{height}, {} mHz, \
+             which is slower than a display on the GPU; if the screen does not change, the \
+             firmware may have turned that adapter off\n",
+            self.refresh_millihertz
+        ));
+        crate::status::info(stela_boot_core::gpu_status::SHOWN_BY_COPY);
+        self
+    }
 }
 
 impl Scanout for GopScanout {
@@ -447,6 +488,10 @@ impl Scanout for GopScanout {
 
     fn physical_size_mm(&self) -> Option<(u32, u32)> {
         self.size_mm
+    }
+
+    fn monitor(&self) -> Option<MonitorId> {
+        self.monitor
     }
 
     fn present(&mut self, rows: &[u8]) -> Result<()> {
@@ -499,4 +544,33 @@ pub fn boot_framebuffer(
         height,
         bits_per_pixel: BYTES_PER_PIXEL * 8,
     })
+}
+
+/// The scanout of a machine whose only screen was the firmware's on a GPU
+/// that amdgpu claimed headless: the guest's DCP keeps one connected monitor
+/// at the firmware's mode, and its frames go nowhere until amdgpu can display.
+pub struct HeadlessScanout {
+    mode: ScanoutMode,
+}
+
+impl HeadlessScanout {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            mode: ScanoutMode {
+                width: width as u32,
+                height: height as u32,
+                format: ScanoutFormat::Bgra8888,
+            },
+        }
+    }
+}
+
+impl Scanout for HeadlessScanout {
+    fn mode(&self) -> ScanoutMode {
+        self.mode
+    }
+
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
 }

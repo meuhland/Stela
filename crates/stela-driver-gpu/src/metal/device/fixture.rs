@@ -9,7 +9,8 @@ use crate::metal::{
     command_buffer::Segment,
     error::{Error, NO_FUNCTION, Result},
     library::tests::fixture,
-    nvidia::{CHIPS, Chip, PcieLink, fixture::nvk},
+    nvidia::{CHIPS, Chip, fixture::nvk},
+    open::PcieLink,
     reflection::{
         ArrayType, Binding, BindingAccess, BindingKind, PointerType, StructMember, StructType,
         TextureReferenceType, Type,
@@ -53,6 +54,17 @@ fn gated_job(key: u8, owner: Owner, gate: Arc<AtomicBool>) -> Job {
     Job::new([key; 32], owner, move || {
         while !gate.load(Ordering::Acquire) {
             core::hint::spin_loop();
+        }
+        Box::new(()) as Made
+    })
+}
+
+/// A deferred job that computes in `steps` steps, calling `pause` after
+/// each, as a long compilation its platform may suspend at each.
+fn stepped_job(key: u8, owner: Owner, steps: u32, pause: fn()) -> Job {
+    Job::new([key; 32], owner, move || {
+        for _ in 0..steps {
+            pause();
         }
         Box::new(()) as Made
     })
@@ -133,6 +145,8 @@ impl Outside for MockOutside {
 pub(crate) struct MockBackend {
     pub(crate) idle_calls: usize,
     pub(crate) idle_error: Option<Error>,
+    /// What each idle step answers, in order; idle once used up.
+    pub(crate) idle_steps: alloc::collections::VecDeque<crate::metal::vulkan::backend::IdleStep>,
     pub(crate) semaphore_error: Option<Error>,
     /// Timeline values the device told the backend passed without a query,
     /// in order.
@@ -168,8 +182,18 @@ pub(crate) struct MockBackend {
     /// a job that runs until this opens, as the driver's kernel allocation
     /// waits for Linux.
     pub(crate) image_gate: Option<Arc<AtomicBool>>,
+    /// The next allocation's kernel call is withdrawn, no task having taken
+    /// it in time: the allocation tells the platform's hook, as the
+    /// platform's withdrawal does, and fails as the driver then does.
+    pub(crate) withdrawn_allocation: Option<fn() -> bool>,
+    /// While a call may defer, this many more compute pipeline creations
+    /// each defer to a job of its own that runs at once.
+    pub(crate) deferred_pipelines: u8,
+    /// While a call may defer, this many more archive lookups each leave a
+    /// job of its own, which answers nothing back.
+    pub(crate) deferred_lookups: u8,
     deferring: Option<JobLock>,
-    job: Option<Job>,
+    jobs: Vec<Job>,
     /// Pipeline jobs adopted.
     pub(crate) adopted: usize,
     pub(crate) submissions: Vec<Vec<Segment>>,
@@ -183,6 +207,9 @@ pub(crate) struct MockBackend {
     /// The word a test's GPU writes as the completion marker, when the
     /// test gives one: every mapped word answers it.
     pub(crate) marker: Option<Box<core::sync::atomic::AtomicU32>>,
+    /// The descriptor each export of a semaphore answers, when a test gives
+    /// one.
+    pub(crate) exported: Option<i32>,
     pub(crate) retired: VecDeque<NonZeroU64>,
     pub(crate) semaphores: BTreeMap<u64, u64>,
     /// The highest value each semaphore's submitted signals reach.
@@ -202,6 +229,10 @@ pub(crate) struct MockBackend {
     /// The bytes of each host image copy into an image, which copies out
     /// of it read back.
     pub(crate) image_bytes: BTreeMap<u64, Vec<u8>>,
+    /// The host's view of each memory mapped through `host_bytes`, which a
+    /// submitted copy of an image to its buffer fills from `image_bytes`,
+    /// as the GPU would.
+    pub(crate) host: BTreeMap<u64, Box<[u8]>>,
 }
 
 impl MockBackend {
@@ -250,10 +281,20 @@ impl Backend for MockBackend {
         self.idle_error.map_or(Ok(()), Err)
     }
 
+    fn idle_step(&mut self) -> crate::metal::vulkan::backend::IdleStep {
+        self.idle_steps
+            .pop_front()
+            .unwrap_or(crate::metal::vulkan::backend::IdleStep::Idle)
+    }
+
     fn physical_device(&self) -> &PhysicalDevice {
         self.physical.as_ref().unwrap()
     }
     fn allocate_memory(&mut self, _: u64, _: MemoryRequest, _: u32) -> Result<Memory> {
+        if let Some(withdrawn) = self.withdrawn_allocation.take() {
+            withdrawn();
+            return Err(Error::OutOfMemory);
+        }
         Ok(Memory(self.id()))
     }
     fn buffer_requirements(&mut self, info: &BufferInfo) -> Result<Requirements> {
@@ -272,6 +313,10 @@ impl Backend for MockBackend {
         })
     }
     fn create_buffer(&mut self, info: &BufferInfo, _: MemoryRequest) -> Result<BufferAllocation> {
+        if let Some(withdrawn) = self.withdrawn_allocation.take() {
+            withdrawn();
+            return Err(Error::OutOfMemory);
+        }
         let id = self.id();
         Ok(BufferAllocation {
             buffer: Buffer(id),
@@ -323,7 +368,7 @@ impl Backend for MockBackend {
             && let Some(gate) = self.image_gate.take()
         {
             lock.lock.set_deferred(true);
-            self.job = Some(gated_job(3, Owner::Backend, gate));
+            self.jobs.push(gated_job(3, Owner::Backend, gate));
             return Err(crate::metal::compiler::DEFERRED);
         }
         let requirements = self.image_requirements(info)?;
@@ -370,10 +415,10 @@ impl Backend for MockBackend {
         self.deferring = None;
     }
     fn deferred(&self) -> bool {
-        self.job.is_some()
+        !self.jobs.is_empty()
     }
     fn take_job(&mut self) -> Option<Job> {
-        self.job.take()
+        (!self.jobs.is_empty()).then(|| self.jobs.remove(0))
     }
     fn adopt_job(&mut self, _: Done) {
         self.adopted += 1;
@@ -397,7 +442,29 @@ impl Backend for MockBackend {
             && let Some(gate) = self.pipeline_gate.take()
         {
             lock.lock.set_deferred(true);
-            self.job = Some(gated_job(2, Owner::Backend, gate));
+            self.jobs.push(gated_job(2, Owner::Backend, gate));
+            return Err(crate::metal::compiler::DEFERRED);
+        }
+        if let Some(lock) = &self.deferring
+            && matches!(info.source, PipelineSource::Archived(_))
+            && self.deferred_lookups > 0
+        {
+            lock.lock.set_deferred(true);
+            let key = 0x60 + self.deferred_lookups;
+            self.deferred_lookups -= 1;
+            let open = Arc::new(AtomicBool::new(true));
+            self.jobs.push(gated_job(key, Owner::Backend, open));
+            return Err(crate::metal::compiler::DEFERRED);
+        }
+        if let Some(lock) = &self.deferring
+            && info.source == PipelineSource::Compiled
+            && self.deferred_pipelines > 0
+        {
+            lock.lock.set_deferred(true);
+            let key = 0x40 + self.deferred_pipelines;
+            self.deferred_pipelines -= 1;
+            let open = Arc::new(AtomicBool::new(true));
+            self.jobs.push(gated_job(key, Owner::Backend, open));
             return Err(crate::metal::compiler::DEFERRED);
         }
         self.source(info.source)?;
@@ -422,7 +489,7 @@ impl Backend for MockBackend {
         Ok(Semaphore(id))
     }
     fn export_semaphore(&mut self, _: Semaphore) -> Option<i32> {
-        None
+        self.exported
     }
     fn create_indirect_commands_layout(
         &mut self,
@@ -479,6 +546,20 @@ impl Backend for MockBackend {
         _: u64,
     ) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
         self.marker.as_deref().map(core::ptr::NonNull::from)
+    }
+    fn host_bytes(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        let end = usize::try_from(offset.checked_add(length)?).ok()?;
+        let bytes = self
+            .host
+            .entry(memory.0)
+            .or_insert_with(|| alloc::vec![0; end].into_boxed_slice());
+        let place = bytes.get_mut(offset as usize..end)?;
+        core::ptr::NonNull::new(place.as_mut_ptr())
     }
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()> {
         if let Some(error) = self.write_error.take() {
@@ -594,6 +675,19 @@ impl Backend for MockBackend {
                 }
             }
         }
+        // A buffer and its memory share an id: a copy of an image the host
+        // wrote to a mapped buffer lands where the host reads it.
+        for command in segments.iter().flat_map(|segment| &segment.commands) {
+            if let crate::metal::vulkan::command::Command::CopyImageToBuffer { src, dst, region } =
+                command
+                && let (Some(written), Some(host)) =
+                    (self.image_bytes.get(&src.0), self.host.get_mut(&dst.0))
+                && let Some(place) = host.get_mut(region.buffer_offset as usize..)
+            {
+                let count = written.len().min(place.len());
+                place[..count].copy_from_slice(&written[..count]);
+            }
+        }
         self.submissions.push(segments.to_vec());
         Ok(())
     }
@@ -611,7 +705,9 @@ impl Backend for MockBackend {
 /// constant. Library `n` is the `n`-th added, `None` once removed.
 #[derive(Default)]
 pub(crate) struct MockCompiler {
-    pub(crate) libraries: Vec<Option<Vec<u8>>>,
+    /// Each library's bytes; a shared library holds the same ones, as the
+    /// AIR compiler's does.
+    pub(crate) libraries: Vec<Option<alloc::sync::Arc<Vec<u8>>>>,
     pub(crate) compiled: Vec<Specialization>,
     pub(crate) tessellations: Vec<Tessellation>,
     pub(crate) released: Vec<ShaderCode>,
@@ -623,6 +719,8 @@ pub(crate) struct MockCompiler {
     /// While a call may defer, the deferred compilation leaves a job that
     /// runs until this opens.
     pub(crate) job_gate: Option<Arc<AtomicBool>>,
+    /// Or one that runs this many steps, calling the function after each.
+    pub(crate) job_steps: Option<(u32, fn())>,
     deferring: bool,
     job: Option<Job>,
     /// Jobs adopted.
@@ -784,12 +882,15 @@ impl Compiler for MockCompiler {
         self.adopted += 1;
     }
     fn add_library(&mut self, data: Vec<u8>) -> Result<u64> {
-        self.libraries.push(Some(data));
+        self.libraries.push(Some(alloc::sync::Arc::new(data)));
         Ok(self.libraries.len() as u64 - 1)
     }
     fn share_library(&mut self, library: u64) -> Result<u64> {
-        let data = self.library_data(library)?.to_vec();
-        self.add_library(data)
+        let data = self.libraries[library as usize]
+            .clone()
+            .ok_or(Error::Invalid("unknown library"))?;
+        self.libraries.push(Some(data));
+        Ok(self.libraries.len() as u64 - 1)
     }
     fn functions(&mut self, _: &[u8]) -> Result<Vec<(String, FunctionType)>> {
         Ok(alloc::vec![
@@ -806,6 +907,7 @@ impl Compiler for MockCompiler {
     fn library_data(&self, library: u64) -> Result<&[u8]> {
         self.libraries[library as usize]
             .as_deref()
+            .map(Vec::as_slice)
             .ok_or(Error::Invalid("unknown library"))
     }
     fn remove_library(&mut self, library: u64) -> Result<()> {
@@ -868,6 +970,11 @@ impl Compiler for MockCompiler {
             {
                 self.job = Some(gated_job(1, Owner::Compiler, gate));
             }
+            if self.deferring
+                && let Some((steps, pause)) = self.job_steps.take()
+            {
+                self.job = Some(stepped_job(1, Owner::Compiler, steps, pause));
+            }
             return Err(crate::metal::compiler::DEFERRED);
         }
         self.compiled.push(specialization.clone());
@@ -912,7 +1019,7 @@ pub(crate) fn device() -> TestDevice {
 /// A device of the first chip over `backend`, holding [`LIBRARY`].
 pub(crate) fn device_on(backend: MockBackend) -> TestDevice {
     let chip: &Chip = &CHIPS[0];
-    let platform = chip.platform(crate::metal::nvidia::Attachment {
+    let platform = chip.platform(crate::metal::open::Attachment {
         link: PcieLink {
             speed: 4,
             width: 16,

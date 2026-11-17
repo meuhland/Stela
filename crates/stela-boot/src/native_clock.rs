@@ -109,6 +109,10 @@ pub(crate) struct RootCpu {
     source: Prepared,
     previous: AtomicU64,
     elapsed: AtomicU64,
+    /// Held while a processor updates the `previous`/`elapsed` pair: the
+    /// boot processor and the one running Linux for it
+    /// (`RootIdentity::affinity`) both sample.
+    sampling: AtomicBool,
     closed: AtomicBool,
     health: source::Health,
 }
@@ -126,31 +130,54 @@ impl RootCpu {
     }
     /// Caller holds local IRQ exclusion. A source fault does not
     /// revoke the time-free CPU identity needed to drain/release resources.
+    /// The pair is updated under [`Self::sampling`], as the processor that
+    /// runs Linux for the boot processor samples too; a read on that
+    /// processor up to `source::Prepared::skew` behind the last sample
+    /// counts one tick (`stela_boot_core::linux_pump::advance`).
     fn sample_ticks(&self) -> Result<u64, WorkError> {
+        use stela_boot_core::linux_pump::{Sample, advance};
         SAMPLES.fetch_add(1, Ordering::Relaxed);
         self.health.check()?;
+        // Held for one counter read and two stores, with IRQs off on every
+        // holder, so a waiter spins at most that long.
+        while self
+            .sampling
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
         let result = (|| {
             // No CPUID here: it is slow on every CPU and exits under a
             // hypervisor. The caller's `affinity` already proved this is the
-            // owning processor (its unique GS record and descriptors), whose
-            // leaves 0, 1 and 6 cannot change; ARAT matters only to the
-            // timer, and `rearm` checks it before every arm.
+            // owning processor (its unique GS record and descriptors) or
+            // the one running Linux for it, whose vendor and family are the
+            // same; ARAT matters only to the timer, and `rearm` checks it
+            // before every arm.
             // SAFETY: original owner and CPU remain held. Source checks
             // real control/power eligibility around the coherent read.
-            let mut raw = unsafe { self.source.read()? };
+            let raw = unsafe { self.source.read()? };
             let previous = self.previous.load(Ordering::Relaxed);
-            if raw == previous {
-                raw = self.source.progress_after(previous)?;
-            }
-            let elapsed = self
-                .elapsed
-                .load(Ordering::Relaxed)
-                .checked_add(self.source.delta(previous, raw)?)
-                .ok_or(WorkError::Exhausted)?;
+            let elapsed = self.elapsed.load(Ordering::Relaxed);
+            let (raw, delta) = match advance(previous, raw, self.source.skew()) {
+                Sample::Moved { delta } => (raw, delta),
+                Sample::Same => {
+                    let raw = self.source.progress_after(previous)?;
+                    match advance(previous, raw, self.source.skew()) {
+                        Sample::Moved { delta } => (raw, delta),
+                        Sample::Same | Sample::Behind => (previous, 1),
+                        Sample::Corrupt => return Err(WorkError::corrupt()),
+                    }
+                }
+                Sample::Behind => (previous, 1),
+                Sample::Corrupt => return Err(WorkError::corrupt()),
+            };
+            let elapsed = elapsed.checked_add(delta).ok_or(WorkError::Exhausted)?;
             self.previous.store(raw, Ordering::Relaxed);
             self.elapsed.store(elapsed, Ordering::Release);
             Ok(elapsed)
         })();
+        self.sampling.store(false, Ordering::Release);
         result.map_err(|error| self.health.fail(error))
     }
     fn sample(&self) -> Result<u64, WorkError> {
@@ -170,8 +197,10 @@ impl RootCpu {
     }
 }
 // SAFETY: immutable root/CPU witnesses are checked before entry; all mutable
-// clock publication is atomic and serialized by same-CPU IRQ exclusion.
-// The lease prevents HostOwner destruction, and foreign CPU entry is refused.
+// clock publication is atomic, and the sample pair is serialized by
+// `sampling` under IRQ exclusion. The lease prevents HostOwner destruction,
+// and foreign CPU entry is refused but for the one processor running Linux
+// in the boot processor's place (`RootIdentity::move_here`).
 unsafe impl Cpu for RootCpu {
     fn check_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
@@ -197,8 +226,7 @@ unsafe impl Cpu for RootCpu {
         self.now().unwrap_or_else(|error| self.fatal(error))
     }
     fn fatal(&self, error: WorkError) -> ! {
-        crate::output::arguments(format_args!("NATIVE CLOCK FATAL {error:?}\n"));
-        crate::output::fatal("native clock/root contract failed")
+        crate::output::fatal(format_args!("native clock/root contract failed: {error:?}"))
     }
 }
 
@@ -362,13 +390,13 @@ unsafe impl stela_linux::owner::MinimumDeadline for MinimumDeadline {
         }
         let elapsed = now
             .checked_sub(self.start)
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         let lower_ns = self.epoch.cpu.source.elapsed_bounds(elapsed)?.lower_ns;
         let remaining = self
             .minimum_ns
             .checked_sub(lower_ns)
             .filter(|ns| *ns != 0)
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         // A fresh delay for this remainder reapplies the HPET edge bound.
         // The elapsed lower bound never credits more ticks than actually ran.
         Ok(remaining.div_ceil(quantum_ns))
@@ -437,6 +465,8 @@ struct State {
     guest: AtomicU64,
     idle: AtomicU64,
     heartbeat: AtomicU64,
+    /// Timer interrupts taken, which end a polled idle wait ([`State::poll`]).
+    ticks: AtomicU64,
 }
 // SAFETY: pointer fields never leave the owning CPU, every effect checks
 // affinity first, and process mutation excludes the same real ISR with CLI.
@@ -469,11 +499,83 @@ impl State {
             let ticks = self.cpu.controller().read(apic::CURRENT);
             Some(u64::from(ticks) * 1_000_000 / self.apic_hz)
         };
-        // SAFETY: caller supplies the live IDT/LAPIC and the explicit wait scope.
-        unsafe { crate::native_idle::wait(budget) };
+        match crate::engine::alone_idle_stage() {
+            Some(stage) => {
+                // SAFETY: as below.
+                unsafe { self.poll(stage) };
+                // The boot processor alone writes no service report.
+                if let Some(line) = host::stale_in_service_report() {
+                    crate::output::arguments(format_args!("{line}\n"));
+                }
+            }
+            // SAFETY: caller supplies the live IDT/LAPIC and the explicit wait scope.
+            None => unsafe { crate::native_idle::wait(budget) },
+        }
         self.idle.store(NONE, Ordering::Relaxed);
         self.pending.swap(false, Ordering::AcqRel);
         self.rearm(self.cpu.sample()?)
+    }
+
+    /// Wait for the next timer interrupt or a raised wake with interrupts
+    /// enabled, polling the time-stamp counter instead of halting: on the
+    /// boot processor running alone, where a halted wait whose interrupt
+    /// never comes counts no cycles for the step watchdog and leaves a
+    /// black screen. After two `IDLE_LIMIT_MS` windows with neither (the
+    /// heartbeat fires every millisecond; `IdleWatch` lets a counter jump
+    /// end only the first) the boot stops with the local APIC state that
+    /// kept the interrupt away.
+    ///
+    /// # Safety
+    /// As [`crate::native_idle::wait`]: interrupts disabled on entry, the
+    /// live IDT and local APIC, and the caller's explicit wait scope.
+    unsafe fn poll(&self, stage: &str) {
+        use stela_boot_core::step_watchdog::{Idle, IdleApic, IdleWatch, idle_message};
+        let ticks = self.ticks.load(Ordering::Relaxed);
+        let tsc_hz = crate::firmware::tsc_hz();
+        let mut watch = IdleWatch::new(crate::apic::rdtsc());
+        // SAFETY: the caller's contract; interrupts are taken between polls.
+        unsafe { asm!("sti", options(nostack)) };
+        loop {
+            if self.pending.load(Ordering::Acquire) || self.ticks.load(Ordering::Relaxed) != ticks {
+                break;
+            }
+            if let Idle::Stop { waited_ms } = watch.check(crate::apic::rdtsc(), tsc_hz) {
+                // SAFETY: as above.
+                unsafe { asm!("cli", options(nostack)) };
+                // An interrupt held off by a long system management call
+                // was taken before the CLI, after the check above.
+                if self.pending.load(Ordering::Acquire)
+                    || self.ticks.load(Ordering::Relaxed) != ticks
+                {
+                    return;
+                }
+                let apic = self.cpu.controller();
+                // This wait runs no handler, so a vector in service has
+                // none: one above the timer's class holds it off. End it,
+                // as the timer's handler does those below, and wait again.
+                if host::end_stale_in_service(&apic) {
+                    watch = IdleWatch::new(crate::apic::rdtsc());
+                    // SAFETY: as above.
+                    unsafe { asm!("sti", options(nostack)) };
+                    continue;
+                }
+                let mut state = IdleApic {
+                    lvt_timer: apic.read(apic::LVT_TIMER),
+                    initial: apic.read(apic::INITIAL),
+                    current: apic.read(apic::CURRENT),
+                    tpr: apic.read(apic::TPR),
+                    ..IdleApic::default()
+                };
+                for word in 0..8 {
+                    state.in_service[word] = apic.read(apic::ISR + 0x10 * word as u32);
+                    state.requested[word] = apic.read(apic::IRR + 0x10 * word as u32);
+                }
+                crate::output::fatal(idle_message(stage, waited_ms, &state));
+            }
+            core::hint::spin_loop();
+        }
+        // SAFETY: as above.
+        unsafe { asm!("cli", options(nostack)) };
     }
 
     fn rearm(&self, now: u64) -> Result<(), WorkError> {
@@ -493,7 +595,7 @@ impl State {
             .clamp(1, u128::from(u32::MAX)) as u32;
         let apic = self.cpu.controller();
         if apic.read(apic::DIVIDE) & 0b1011 != 0b1011 {
-            return Err(self.cpu.health.fail(WorkError::CorruptContext));
+            return Err(self.cpu.health.fail(WorkError::corrupt()));
         }
         apic.write(apic::LVT_TIMER, u32::from(interrupts::TIMER_VECTOR));
         apic.write(apic::INITIAL, ticks);
@@ -577,7 +679,7 @@ unsafe impl EnteredProcess for DriverProcess<'_, '_> {
     fn check(&self) -> Result<(), WorkError> {
         self.execution.check()?;
         if !self.execution.process_borrowed.get() || self.execution.root != root() {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let flags: u64;
         // SAFETY: read-only flag observation on the admitted physical CPU.
@@ -625,7 +727,7 @@ impl DriverExecution<'_> {
     ) -> Result<R, WorkError> {
         self.check()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if self.process_borrowed.get() {
             return Err(WorkError::Busy);
@@ -643,7 +745,7 @@ impl DriverExecution<'_> {
 impl Drop for DriverExecution<'_> {
     fn drop(&mut self) {
         if self.check().is_err() {
-            self.installed.state.cpu.fatal(WorkError::CorruptContext);
+            self.installed.state.cpu.fatal(WorkError::corrupt());
         }
         if self.process_borrowed.get() {
             self.installed.state.cpu.fatal(WorkError::Busy);
@@ -734,6 +836,7 @@ impl Installed {
                 source,
                 previous: AtomicU64::new(previous),
                 elapsed: AtomicU64::new(0),
+                sampling: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
                 health: source::Health::new(),
             });
@@ -749,6 +852,7 @@ impl Installed {
                 guest: AtomicU64::new(NONE),
                 idle: AtomicU64::new(NONE),
                 heartbeat: AtomicU64::new(now.checked_add(TICK_NS).ok_or(WorkError::Exhausted)?),
+                ticks: AtomicU64::new(0),
             });
             // Complete fallible hardware validation before publishing an IRQ
             // registration. A changed controller must leave no orphaned Arc.
@@ -991,6 +1095,7 @@ pub(crate) fn interrupt() {
     if state.cpu.affinity().is_err() {
         return;
     } // Other physical CPUs own their timers.
+    state.ticks.fetch_add(1, Ordering::Relaxed);
     let result = (|| {
         let now = state.cpu.sample()?;
         let heartbeat = state.heartbeat.load(Ordering::Relaxed);

@@ -22,10 +22,14 @@
 //! modes the panel cannot show (QEMU's OVMF lists 2048x2048 on any display).
 //!
 //! The guest's display caps the choice ([`guest_takes`]): the modeled DCP
-//! advertises the screen's mode to macOS as an EDID detailed timing
-//! (`stela_soc::dcp::modes`), which holds at most 4095 pixels on each
-//! axis and a 655.35 MHz pixel clock. 3840x2160 at 60 Hz fits; a 5K or 6K
-//! panel runs the largest smaller mode its firmware offers.
+//! advertises the screen's mode to macOS (`stela_soc::dcp::modes`) with at
+//! most 4095 pixels on each axis. 3840x2160 fits; a 5K or 6K panel runs the
+//! largest smaller mode its firmware offers.
+//!
+//! A monitor whose fastest timing needs more than a detailed timing's
+//! 655.35 MHz lists it in a DisplayID extension block, and one with no
+//! detailed timing at all in its base block (QEMU's generator for such a
+//! timing) has its preferred timing only there ([`native`], [`refresh`]).
 use core::{cmp::Reverse, fmt};
 use stela_soc::scanout::DEFAULT_REFRESH_MILLIHERTZ;
 
@@ -101,12 +105,87 @@ fn preferred_timing(edid: &[u8]) -> Option<&[u8]> {
 }
 
 /// The active width and height of an EDID's preferred timing: the panel's
-/// native resolution.
+/// native resolution. Without a detailed timing in the base block, its
+/// DisplayID extension's preferred timing ([`displayid_timing`]).
 pub fn native(edid: &[u8]) -> Option<(u32, u32)> {
-    let d = preferred_timing(edid)?;
+    let Some(d) = preferred_timing(edid) else {
+        return displayid_timing(edid).map(|(width, height, _)| (width, height));
+    };
     let width = u32::from(d[2]) | u32::from(d[4] >> 4) << 8;
     let height = u32::from(d[5]) | u32::from(d[7] >> 4) << 8;
     (width != 0 && height != 0).then_some((width, height))
+}
+
+/// The extension tag of a DisplayID section in an EDID (VESA DisplayID 1.3
+/// section 2.2; E-EDID block maps).
+const DISPLAYID_EXTENSION: u8 = 0x70;
+/// DisplayID 1.3's type I detailed timing data block, its clock in 10 kHz
+/// units, and DisplayID 2.0's type VII one, in 1 kHz units: each a list of
+/// 20-byte descriptors (Linux `drm_mode_displayid_detailed`).
+const TYPE_I_TIMING: u8 = 0x03;
+const TYPE_VII_TIMING: u8 = 0x22;
+const DISPLAYID_TIMING_BYTES: usize = 20;
+
+/// The first preferred timing, else the first timing, of an EDID's
+/// DisplayID extension blocks: `(width, height, refresh in millihertz)`.
+/// Each field of a descriptor is stored less one (DisplayID 1.3 section
+/// 4.4.1), as Linux reads them. `None` without a valid base block, a
+/// DisplayID extension or a timing in it.
+fn displayid_timing(edid: &[u8]) -> Option<(u32, u32, u32)> {
+    let block = edid.get(..EDID_BLOCK)?;
+    if block[..8] != EDID_HEADER || block.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0 {
+        return None;
+    }
+    let mut first = None;
+    for extension in edid[EDID_BLOCK..]
+        .as_chunks::<EDID_BLOCK>()
+        .0
+        .iter()
+        .take(usize::from(block[126]))
+    {
+        if extension[0] != DISPLAYID_EXTENSION {
+            continue;
+        }
+        // Section: version, payload bytes, product type, extension count,
+        // then the data blocks, each a tag, a revision and its length.
+        let end = (5 + usize::from(extension[2])).min(EDID_BLOCK - 1);
+        let mut at = 5;
+        while at + 3 <= end {
+            let (tag, length) = (extension[at], usize::from(extension[at + 2]));
+            let payload = extension.get(at + 3..(at + 3 + length).min(end))?;
+            let unit_khz = match tag {
+                TYPE_I_TIMING => 10,
+                TYPE_VII_TIMING => 1,
+                _ => {
+                    at += 3 + length;
+                    continue;
+                }
+            };
+            for d in payload.as_chunks::<DISPLAYID_TIMING_BYTES>().0 {
+                let field = |at: usize, mask: u16| {
+                    u32::from(u16::from_le_bytes([d[at], d[at + 1]]) & mask) + 1
+                };
+                let clock_khz =
+                    (u64::from(d[0]) | u64::from(d[1]) << 8 | u64::from(d[2]) << 16) + 1;
+                let (width, height) = (field(4, 0xffff), field(12, 0xffff));
+                let total =
+                    u64::from(width + field(6, 0xffff)) * u64::from(height + field(14, 0xffff));
+                let Some(refresh) = u32::try_from(clock_khz * unit_khz * 1_000_000 / total)
+                    .ok()
+                    .filter(|&refresh| refresh != 0)
+                else {
+                    continue;
+                };
+                let timing = (width, height, refresh);
+                if d[3] & 0x80 != 0 {
+                    return Some(timing);
+                }
+                first = first.or(Some(timing));
+            }
+            at += 3 + length;
+        }
+    }
+    first
 }
 
 /// The smallest image an EDID's size is believed for: a 7" panel's width.
@@ -117,21 +196,30 @@ const MINIMUM_SIZE_MM: (u32, u32) = (100, 50);
 /// else the base block's centimetres (E-EDID 1.4 sections 3.6.2 and
 /// 3.10.2). `None` when neither is a plausible monitor size.
 pub fn physical_size(edid: &[u8]) -> Option<(u32, u32)> {
-    let d = preferred_timing(edid)?;
     let plausible =
         |(w, h): (u32, u32)| (w >= MINIMUM_SIZE_MM.0 && h >= MINIMUM_SIZE_MM.1).then_some((w, h));
+    let base = || plausible((u32::from(edid[21]) * 10, u32::from(edid[22]) * 10));
+    let Some(d) = preferred_timing(edid) else {
+        // A base block with no detailed timing still has its centimetres.
+        return displayid_timing(edid).and_then(|_| base());
+    };
     plausible((
         u32::from(d[12]) | u32::from(d[14] >> 4) << 8,
         u32::from(d[13]) | u32::from(d[14] & 0xf) << 8,
     ))
-    .or_else(|| plausible((u32::from(edid[21]) * 10, u32::from(edid[22]) * 10)))
+    .or_else(base)
 }
 
 /// The refresh of an EDID's preferred timing in millihertz, rounded: its
 /// pixel clock over its total pixels, active and blanking, a frame (a
 /// field, for an interlaced timing, whose descriptor counts field lines).
+/// Without a detailed timing in the base block, its DisplayID extension's
+/// preferred timing's, truncated. A base block's detailed timing wins over
+/// a faster DisplayID one: it is what a firmware's mode of the size runs.
 pub fn refresh(edid: &[u8]) -> Option<u32> {
-    let d = preferred_timing(edid)?;
+    let Some(d) = preferred_timing(edid) else {
+        return displayid_timing(edid).map(|(_, _, refresh)| refresh);
+    };
     let clock = u64::from(u16::from_le_bytes([d[0], d[1]])) * 10_000;
     let axis = |active: u8, blank: u8, high: u8| {
         u64::from(u32::from(active) | u32::from(high >> 4) << 8)
@@ -148,6 +236,19 @@ pub fn refresh(edid: &[u8]) -> Option<u32> {
 /// DCP model can advertise it at 60 Hz.
 pub fn guest_takes(width: u32, height: u32) -> bool {
     guest_takes_at(width, height, DEFAULT_REFRESH_MILLIHERTZ)
+}
+
+/// The refresh in millihertz a `width` by `height` screen runs at, given
+/// the EDID's preferred timing `native` as width, height and millihertz:
+/// that timing's when it is the screen's size and the guest's display can
+/// advertise it, else 60 Hz, which every monitor runs a mode it lists at.
+pub fn screen_refresh(native: Option<(u32, u32, u32)>, width: u32, height: u32) -> u32 {
+    match native {
+        Some((w, h, refresh)) if (w, h) == (width, height) && guest_takes_at(w, h, refresh) => {
+            refresh
+        }
+        _ => DEFAULT_REFRESH_MILLIHERTZ,
+    }
 }
 
 /// Whether the DCP model can advertise a `width` by `height` screen at
@@ -312,6 +413,68 @@ mod tests {
         assert_eq!(refresh(&bad), None);
     }
 
+    /// QEMU 10.2's EDID for its standard VGA at `xres=2560,yres=1440,
+    /// refresh_rate=240000`, read from the device's EDID registers: a base
+    /// block with no detailed timing (its clock passes 655.35 MHz), a CTA
+    /// block and a DisplayID 1.3 block with one preferred type I timing.
+    fn qemu_large(clock: [u8; 3]) -> alloc::vec::Vec<u8> {
+        let mut e = alloc::vec![0u8; 3 * EDID_BLOCK];
+        e[..8].copy_from_slice(&EDID_HEADER);
+        e[8..24].copy_from_slice(&[
+            0x49, 0x14, 0x34, 0x12, 0, 0, 0, 0, 0x2a, 0x18, 1, 4, 0xa5, 0x41, 0x24, 0x78,
+        ]);
+        // Established timings III, no detailed timing.
+        e[0x36..0x3c].copy_from_slice(&[0, 0, 0, 0xf7, 0, 0x0a]);
+        e[126] = 2;
+        e[127] = 0u8.wrapping_sub(e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        e[128..132].copy_from_slice(&[0x02, 0x03, 0x0b, 0x00]);
+        let did = &mut e[256..];
+        did[..8].copy_from_slice(&[0x70, 0x13, 0x17, 0x03, 0x00, 0x03, 0x00, 0x14]);
+        did[8..11].copy_from_slice(&clock);
+        did[11..28].copy_from_slice(&[
+            0x88, 0xff, 0x09, 0x7f, 0x03, 0x7f, 0x02, 0x4b, 0x00, 0x9f, 0x05, 0x31, 0x00, 0x06,
+            0x00, 0x06, 0x00,
+        ]);
+        e
+    }
+
+    #[test]
+    fn a_base_block_without_a_detailed_timing_takes_its_displayid_timing() {
+        // 1235.86 MHz over 3456 by 1490: 240 Hz (QEMU stores the clock
+        // without the less-one, so it reads 10 kHz fast: 240.0009 Hz).
+        let e = qemu_large([0xc2, 0xe2, 0x01]);
+        assert_eq!(native(&e), Some((2560, 1440)));
+        assert_eq!(refresh(&e), Some(240_000));
+        assert_eq!(physical_size(&e), Some((650, 360)));
+        assert!(guest_takes_at(2560, 1440, 240_000));
+        // A type VII block counts kilohertz.
+        let mut seven = qemu_large([0x99, 0xdb, 0x12]);
+        seven[256 + 5] = TYPE_VII_TIMING;
+        assert_eq!(refresh(&seven), Some(240_000));
+        // A detailed timing in the base block wins: the firmware runs it.
+        let mut both = qemu_large([0xc2, 0xe2, 0x01]);
+        both[..128].copy_from_slice(
+            &stela_soc::dcp::modes::edid(
+                ScanoutMode {
+                    width: 2560,
+                    height: 1440,
+                    format: PixelFormat::Bgra8888,
+                },
+                60_000,
+            )
+            .unwrap(),
+        );
+        both[126] = 2;
+        both[127] = 0;
+        both[127] = 0u8.wrapping_sub(both[..128].iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        assert_eq!(refresh(&both), Some(60_000));
+        // No extension, or a broken base block: nothing.
+        assert_eq!(refresh(&e[..128]), None);
+        let mut bad = e.clone();
+        bad[127] ^= 1;
+        assert_eq!(native(&bad), None);
+    }
+
     #[test]
     fn the_native_resolution_is_the_preferred_timing() {
         assert_eq!(native(&edid(2560, 1440)), Some((2560, 1440)));
@@ -398,6 +561,26 @@ mod tests {
         assert_eq!(
             choose(&modes, 1, Some((1920, 1920))),
             Some((modes[1], Reason::OtherShape))
+        );
+    }
+
+    #[test]
+    fn a_screen_runs_at_its_edids_preferred_rate_in_its_native_size() {
+        let native = Some((1600, 900, 240_000));
+        assert_eq!(screen_refresh(native, 1600, 900), 240_000);
+        assert_eq!(
+            screen_refresh(Some((2560, 1440, 239_970)), 2560, 1440),
+            239_970
+        );
+        assert_eq!(
+            screen_refresh(native, 1280, 800),
+            DEFAULT_REFRESH_MILLIHERTZ
+        );
+        assert_eq!(screen_refresh(None, 1600, 900), DEFAULT_REFRESH_MILLIHERTZ);
+        // A timing the guest's display cannot publish is not run.
+        assert_eq!(
+            screen_refresh(Some((5120, 2880, 60_000)), 5120, 2880),
+            DEFAULT_REFRESH_MILLIHERTZ
         );
     }
 }

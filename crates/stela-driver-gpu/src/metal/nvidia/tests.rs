@@ -7,6 +7,7 @@ use crate::metal::{
     capabilities::{
         ApiFeatures, Capabilities, Cause, FormatCapabilities as C, ShaderFeatures, Size,
     },
+    open::PcieLink,
     pixel_format::PixelFormat as P,
 };
 

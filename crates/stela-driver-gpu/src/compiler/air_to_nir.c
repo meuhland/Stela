@@ -3396,7 +3396,7 @@ static void
 attachment_texel(struct translator *t, nir_def **coord, nir_def **sample)
 {
    nir_builder *b = &t->b;
-   nir_def *xy = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_def *xy = nir_f2i32(b, nir_trim_vector(b, nir_build_frag_coord(b, 4), 2));
    *coord = nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1), nir_load_layer_id(b),
                      nir_imm_int(b, 0));
    *sample = t->stage_options->samples > 1 ? nir_load_sample_id(b) : nir_imm_int(b, 0);
@@ -3838,7 +3838,7 @@ fragment_imageblock_prelude(struct translator *t)
    nir_def *samples = device_value(t, STELA_AIR_SAMPLE_COUNT);
    if (!samples || !(t->imageblock_pass = device_value(t, STELA_AIR_IMAGEBLOCK)))
       return false;
-   t->imageblock_pixel = nir_f2u32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   t->imageblock_pixel = nir_f2u32(b, nir_trim_vector(b, nir_build_frag_coord(b, 4), 2));
    nir_def *all = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), samples), -1);
    t->imageblock_mask = nir_iand(b, nir_load_sample_mask_in(b), all);
    t->fragment_imageblock = true;
@@ -4064,7 +4064,7 @@ fragment_tests_begin(struct translator *t, struct fragment_tests *tests)
       return fail(t, STELA_AIR_ARGUMENT, "the fragment tests' state is not supplied");
    if (!tested_image(t, false, &tests->depth_image) || !tested_image(t, true, &tests->stencil_image))
       return false;
-   tests->frag = nir_load_frag_coord(b);
+   tests->frag = nir_build_frag_coord(b, 4);
    tests->z = nir_channel(b, tests->frag, 2);
    tests->dzdx = nir_ddx_fine(b, tests->z);
    tests->dzdy = nir_ddy_fine(b, tests->z);
@@ -4573,7 +4573,7 @@ mark_dirty_tiles(struct translator *t)
    nir_builder *b = &t->b;
    b->cursor = nir_after_block_before_jump(nir_impl_last_block(impl));
    nir_def *stamp = nir_channel(b, t->dirty, 0), *marked = nir_channel(b, t->dirty, 1);
-   nir_def *tile = nir_ushr_imm(b, nir_f2u32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2)),
+   nir_def *tile = nir_ushr_imm(b, nir_f2u32(b, nir_trim_vector(b, nir_build_frag_coord(b, 4), 2)),
                                 STELA_AIR_DIRTY_TILE_SHIFT);
    nir_def *coord = nir_vec4(b, nir_channel(b, tile, 0), nir_channel(b, tile, 1),
                              nir_imm_int(b, STELA_AIR_DIRTY_LAYER), nir_imm_int(b, 0));
@@ -4650,7 +4650,7 @@ stage_arguments(struct translator *t, LLVMValueRef fn)
          t->b.shader->info.fs.origin_upper_left = true;
          t->b.shader->info.fs.pixel_center_integer = false;
          if (!io->used) continue;
-         def = nir_load_frag_coord(&t->b);
+         def = nir_build_frag_coord(&t->b, 4);
       } else if (io->semantic == STELA_AIR_ATTACHMENT) {
          if (!(def = attachment_input(t, io)))
             return false;
@@ -8127,29 +8127,34 @@ edge_to(LLVMBasicBlockRef from, LLVMBasicBlockRef to)
 static bool
 linked_references(struct translator *t, LLVMValueRef fn)
 {
-   LLVMValueRef nodes[AIR_MAX_METADATA_OPERANDS];
-   unsigned count;
-   if (!stela_air_named_md(&t->metadata, "air.visible_function_references", nodes, &count))
+   struct stela_air_list nodes;
+   if (!stela_air_named_list(&t->metadata, "air.visible_function_references", &nodes))
       return false;
-   LLVMValueRef unlinked[AIR_MAX_METADATA_OPERANDS];
+   /* The unlinked functions take the places of the nodes already read. */
+   LLVMValueRef *unlinked = nodes.nodes;
    unsigned unlinked_count = 0;
-   for (unsigned i = 0; i < count; i++) {
+   for (unsigned i = 0; i < nodes.count; i++) {
       LLVMValueRef fields[AIR_MAX_METADATA_OPERANDS];
       unsigned field_count;
-      if (!stela_air_md_node(&t->metadata, nodes[i], fields, &field_count))
+      if (!stela_air_md_node(&t->metadata, nodes.nodes[i], fields, &field_count)) {
+         stela_air_list_release(&nodes);
          return false;
+      }
       if (field_count == 3 && fields[1] && LLVMIsAFunction(fields[1]) &&
           LLVMIsDeclaration(fields[1]))
          unlinked[unlinked_count++] = fields[1];
    }
-   if (!unlinked_count)
+   if (!unlinked_count) {
+      stela_air_list_release(&nodes);
       return true;
+   }
    unsigned blocks = LLVMCountBasicBlocks(fn);
    LLVMBasicBlockRef *stack = malloc(sizeof(*stack) * (blocks ? blocks : 1));
    struct set *seen = _mesa_pointer_set_create(NULL);
    if (!stack || !seen) {
       free(stack);
       _mesa_set_destroy(seen, NULL);
+      stela_air_list_release(&nodes);
       return fail(t, STELA_AIR_ALLOCATION, "visible function reference walk allocation failed");
    }
    unsigned depth = 0;
@@ -8185,6 +8190,7 @@ linked_references(struct translator *t, LLVMValueRef fn)
    }
    free(stack);
    _mesa_set_destroy(seen, NULL);
+   stela_air_list_release(&nodes);
    return linked;
 }
 
@@ -8693,22 +8699,23 @@ pointer_provenance(struct translator *t)
    return pointer_solve(t, dfs, stack);
 }
 
+/* A PHI of a numeric value, matrix or proven pointer is one NIR PHI. A PHI
+ * of a struct or array of numeric leaves and smaller such aggregates, as
+ * every other use of an aggregate takes it (aggregate_count), is a PHI for
+ * each leaf: a by-value array such as MPS's reduction state, [8 x i8], is
+ * joined so when calls passing it share one body. */
 static bool
-cfg_phi_shape(struct translator *t, LLVMTypeRef type, unsigned *leaves)
+cfg_phi_shape(struct translator *t, LLVMTypeRef type, bool *aggregate)
 {
    unsigned components, bits;
-   *leaves = 0;
+   *aggregate = false;
    if (value_shape(type, &components, &bits) || stela_air_matrix_type(type, &bits) ||
        pointer_space(type))
       return true;
-   if (LLVMGetTypeKind(type) != LLVMStructTypeKind || LLVMIsOpaqueStruct(type) ||
-       !LLVMCountStructElementTypes(type) || LLVMCountStructElementTypes(type) > AIR_MAX_ARGUMENTS)
-      return fail(t, STELA_AIR_TYPE, "PHI requires a numeric value, proven pointer or flat struct");
-   *leaves = LLVMCountStructElementTypes(type);
-   for (unsigned i = 0; i < *leaves; i++) {
-      if (!leaf_shape(LLVMStructGetTypeAtIndex(type, i)))
-         return fail(t, STELA_AIR_TYPE, "aggregate PHI requires flat scalar/vector leaves");
-   }
+   if (!aggregate_count(type))
+      return fail(t, STELA_AIR_TYPE,
+                  "PHI requires a numeric value, proven pointer or aggregate of numeric leaves");
+   *aggregate = true;
    return true;
 }
 
@@ -8737,6 +8744,62 @@ cfg_phi_leaf(struct translator *t, LLVMTypeRef type)
    value->components = components;
    value->bits = bits;
    return value;
+}
+
+/* An aggregate PHI: a leaf PHI for each numeric leaf, nested as the type
+ * nests. */
+static struct value *
+cfg_phi_aggregate(struct translator *t, LLVMTypeRef type, unsigned depth)
+{
+   if (depth >= 16) {
+      fail(t, STELA_AIR_TYPE, "aggregate PHI nests too deeply");
+      return NULL;
+   }
+   unsigned count = aggregate_count(type);
+   struct value *value = new_aggregate(t, count, NULL);
+   for (unsigned i = 0; value && i < count; i++) {
+      LLVMTypeRef element = aggregate_element_type(type, i);
+      value->elements[i] = aggregate_count(element) ? cfg_phi_aggregate(t, element, depth + 1) :
+                                                      cfg_phi_leaf(t, element);
+      if (!value->elements[i])
+         return NULL;
+   }
+   return value;
+}
+
+/* Adds the edge from `pred` to each leaf PHI of the aggregate `target`:
+ * the leaf of `from` at its place, or undefined where `from` or one of its
+ * aggregates leaves it so. */
+static bool
+cfg_phi_aggregate_sources(struct translator *t, const struct value *target,
+                          const struct value *from, nir_block *pred)
+{
+   if (from && from->aggregate_count != target->aggregate_count)
+      return fail(t, STELA_AIR_TYPE, "aggregate PHI incoming shape mismatch");
+   for (unsigned i = 0; i < target->aggregate_count; i++) {
+      const struct value *leaf = target->elements[i];
+      const struct value *source = from ? from->elements[i] : NULL;
+      if (leaf->aggregate_count) {
+         if (!cfg_phi_aggregate_sources(t, leaf, source, pred))
+            return false;
+         continue;
+      }
+      if (source && source->aggregate_count)
+         return fail(t, STELA_AIR_TYPE, "aggregate PHI incoming shape mismatch");
+      nir_def *def = leaf->def;
+      /* An undefined incoming leaf may be any value, as NIR's undef is. */
+      nir_def *value = source ? whole_value(t, source) :
+                                nir_undef(&t->b, def->num_components, def->bit_size);
+      if (!value)
+         return fail(t, STELA_AIR_TYPE, "aggregate PHI incoming leaf has no value");
+      if (value->num_components != def->num_components || value->bit_size != def->bit_size)
+         return fail(t, STELA_AIR_TYPE, "PHI incoming leaf shape mismatch");
+      nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(def));
+      /* Leaves are already inserted; attach each late use as well. */
+      nir_phi_src *phi_source = nir_phi_instr_add_src(phi, pred, value);
+      list_addtail(&phi_source->src.use_link, &value->uses);
+   }
+   return true;
 }
 
 /* A PHI choosing a texture or null textures: that texture, with where the
@@ -8817,8 +8880,8 @@ static bool
 cfg_declare_phi(struct translator *t, LLVMValueRef inst)
 {
    LLVMTypeRef type = LLVMTypeOf(inst);
-   unsigned leaves;
-   if (!cfg_phi_shape(t, type, &leaves))
+   bool aggregate;
+   if (!cfg_phi_shape(t, type, &aggregate))
       return false;
    if (pointer_space(type)) {
       struct pointer_node *node = pointer_node(t, inst);
@@ -8827,22 +8890,9 @@ cfg_declare_phi(struct translator *t, LLVMValueRef inst)
       if (texture_choice_root(root))
          return texture_choice_phi(t, inst, root);
    }
-   struct value *value;
-   if (leaves) {
-      value = rzalloc(t->values, struct value);
-      if (!value || !(value->elements = rzalloc_array(t->values, struct value *, leaves)))
-         return fail(t, STELA_AIR_ALLOCATION, "aggregate PHI wrapper allocation failed");
-      value->aggregate_count = leaves;
-      for (unsigned i = 0; i < leaves; i++) {
-         value->elements[i] = cfg_phi_leaf(t, LLVMStructGetTypeAtIndex(type, i));
-         if (!value->elements[i])
-            return false;
-      }
-   } else {
-      value = cfg_phi_leaf(t, type);
-      if (!value)
-         return false;
-   }
+   struct value *value = aggregate ? cfg_phi_aggregate(t, type, 0) : cfg_phi_leaf(t, type);
+   if (!value)
+      return false;
    if (pointer_space(type)) {
       struct pointer_node *node = pointer_node(t, inst);
       if (node && node->choices) {
@@ -9442,27 +9492,27 @@ cfg_emit(struct translator *t)
             if (target->pointer_root && !LLVMIsUndef(incoming) &&
                 !joined_pointer(target, incoming, find_value(t, incoming)))
                return fail(t, STELA_AIR_MEMORY, "pointer PHI incoming authority differs from proof");
-            struct value *aggregate = target->aggregate_count ? aggregate_value(t, incoming) : NULL;
-            if (target->aggregate_count &&
-                (!aggregate || aggregate->aggregate_count != target->aggregate_count))
-               return fail(t, STELA_AIR_TYPE, "aggregate PHI incoming shape mismatch");
-            unsigned leaves = target->aggregate_count ? target->aggregate_count : 1;
-            for (unsigned leaf = 0; leaf < leaves; leaf++) {
-               nir_def *def = target->aggregate_count ? target->elements[leaf]->def : target->def;
-               /* An undefined incoming value may be any value, as NIR's undef is. */
-               const struct value *element = aggregate ? aggregate->elements[leaf] : NULL;
-               nir_def *value = element ? whole_value(t, element) :
-                  aggregate || LLVMIsUndef(incoming) ?
-                  nir_undef(&t->b, def->num_components, def->bit_size) : get_value(t, incoming);
-               if (!value)
+            if (target->aggregate_count) {
+               struct value *aggregate = aggregate_value(t, incoming);
+               if (!aggregate)
+                  return fail(t, STELA_AIR_TYPE, "aggregate PHI incoming shape mismatch");
+               if (!cfg_phi_aggregate_sources(t, target, aggregate, pred->end))
                   return false;
-               if (value->num_components != def->num_components || value->bit_size != def->bit_size)
-                  return fail(t, STELA_AIR_TYPE, "PHI incoming leaf shape mismatch");
-               nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(def));
-               /* Leaves are already inserted; attach each late use as well. */
-               nir_phi_src *source = nir_phi_instr_add_src(phi, pred->end, value);
-               list_addtail(&source->src.use_link, &value->uses);
+               sources++;
+               continue;
             }
+            nir_def *def = target->def;
+            /* An undefined incoming value may be any value, as NIR's undef is. */
+            nir_def *value = LLVMIsUndef(incoming) ?
+               nir_undef(&t->b, def->num_components, def->bit_size) : get_value(t, incoming);
+            if (!value)
+               return false;
+            if (value->num_components != def->num_components || value->bit_size != def->bit_size)
+               return fail(t, STELA_AIR_TYPE, "PHI incoming leaf shape mismatch");
+            nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(def));
+            /* The PHI is already inserted; attach each late use as well. */
+            nir_phi_src *source = nir_phi_instr_add_src(phi, pred->end, value);
+            list_addtail(&source->src.use_link, &value->uses);
             sources++;
          }
          if (sources != nir_block_num_preds(block->start))

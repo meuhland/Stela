@@ -70,6 +70,23 @@ fn forms_name_their_key_kind_operands_and_completion() {
     );
 }
 
+/// A thunk's service call ends as `--profile`'s host samples look for it
+/// before a return address; a block's call through the cell is checked in
+/// `inline`'s tests.
+#[test]
+fn thunk_service_calls_end_as_host_samples_look_for_them() {
+    const SERVICE: u64 = 0xffff_8000_1234_5678;
+    let [cell, address] = service_call_ends(0x48, SERVICE);
+    let form = Form::of(Operation::SignIbSp).unwrap();
+    let code = thunk(form, GuestAddress(0x1000), TAGS, SERVICE, None).code;
+    let contains = |code: &[u8], end: &[u8]| code.windows(end.len()).any(|bytes| bytes == end);
+    assert!(contains(&code, &address));
+    assert!(!contains(&code, &cell));
+    // Each ends with its call: `call rax`, `call [rdi + 0x48]`.
+    assert!(address.ends_with(&[0xff, 0xd0]));
+    assert!(cell.ends_with(&[0xff, 0x57, 0x48]));
+}
+
 #[test]
 fn tags_keep_generation_key_and_kind_apart() {
     assert_eq!(tag(1, 3, AUTHENTICATED), 0x132);
@@ -85,7 +102,54 @@ fn tags_keep_generation_key_and_kind_apart() {
         }
     }
     assert!(slot(u64::MAX, u64::MAX) < MEMO_ENTRIES);
-    assert_eq!(slot(1, 2), slot(2, 1));
+    assert_eq!(slot(0x1234, 0x5678) % MEMO_WAYS, 0);
+}
+
+/// Return addresses a few instructions apart signed with stack pointers a
+/// few frames apart (equal sums, which a call tree makes all the time)
+/// spread over the sets, and a set keeps its two most recent entries.
+#[test]
+fn memo_sets_spread_call_trees_and_keep_two_entries() {
+    use alloc::collections::BTreeSet;
+    let mut sets = BTreeSet::new();
+    let mut pairs = 0;
+    for site in 0..64u64 {
+        for depth in 0..16u64 {
+            let lr = 0x1_9a49_8000 + 0x10 * site;
+            let sp = 0x16f_dff0_0000 - 0x10 * (site + depth);
+            sets.insert(slot(lr, sp));
+            pairs += 1;
+        }
+    }
+    // Sums repeat across those pairs; the sets must not.
+    assert!(
+        sets.len() * 100 >= pairs * 97,
+        "{} sets for {pairs}",
+        sets.len()
+    );
+    let mut memo = alloc::vec![MemoEntry::default(); MEMO_ENTRIES];
+    let entry = |pointer: u64, value: u64| MemoEntry {
+        pointer,
+        modifier: 0x8000,
+        tag: tag(1, 0, SIGNED),
+        value,
+    };
+    // Three operand pairs in one set: the newest two stay.
+    let first = slot(0x4000, 0x8000);
+    let mut same = (0x4000..).step_by(4).filter(|&p| slot(p, 0x8000) == first);
+    let (a, b, c) = (
+        same.next().unwrap(),
+        same.next().unwrap(),
+        same.next().unwrap(),
+    );
+    insert(&mut memo, entry(a, 1));
+    insert(&mut memo, entry(b, 2));
+    assert_eq!(memo[first..first + 2], [entry(b, 2), entry(a, 1)]);
+    // Refilling an entry replaces it where it is.
+    insert(&mut memo, entry(a, 3));
+    assert_eq!(memo[first..first + 2], [entry(b, 2), entry(a, 3)]);
+    insert(&mut memo, entry(c, 4));
+    assert_eq!(memo[first..first + 2], [entry(c, 4), entry(b, 2)]);
 }
 
 /// Thunks run on the host: hits complete each form without the service,
@@ -171,8 +235,9 @@ fn thunks_complete_hits_and_computed_misses_natively() {
             assert_ne!(page as usize, usize::MAX);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(state);
             assert_eq!(munmap(page, PAGE), 0);
             exit
@@ -196,6 +261,7 @@ fn thunks_complete_hits_and_computed_misses_natively() {
             pc,
             TAGS,
             routine as usize as u64,
+            None,
         )
     };
     let mut state = GuestState::default();
@@ -340,7 +406,7 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
     use super::super::chain::{DIRECT_EXIT_BYTES, DYNAMIC_EXIT_BYTES};
     let pc = GuestAddress(0x4000);
     let form = Form::of(Operation::SignIbSp).unwrap();
-    let thunk = thunk(form, pc, TAGS, 0x4000);
+    let thunk = thunk(form, pc, TAGS, 0x4000, None);
     let end = thunk.code.len();
     assert_eq!(
         thunk.code[end - DIRECT_EXIT_BYTES..],
@@ -353,11 +419,13 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
         GuestAddress(0x4004),
         ExitKind::Fallthrough
     ));
-    // The refused service lands on the exit; the three memo misses on
-    // the service call, just after the completion, whose JMP back to the
-    // register write precedes the exit. No branch tests the tag word.
+    // The refused service lands on the exit; the second entry's three
+    // misses on the service call, just after the completion, whose JMP
+    // back to the register write precedes the exit; the first entry's two
+    // misses go to the second entry and its hit to the shared load, both
+    // before the completion. No branch tests the tag word.
     let complete = next - REGISTER_WRITE_BYTES;
-    let (mut exits, mut calls) = (0, 0);
+    let (mut exits, mut calls, mut within) = (0, 0, 0);
     for at in 0..end - 6 {
         if thunk.code[at] == 0x0f && [JZ, JNZ].contains(&thunk.code[at + 1]) {
             let relative =
@@ -365,11 +433,12 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
             match at + 6 + relative {
                 target if target == end - DIRECT_EXIT_BYTES => exits += 1,
                 target if target == next + DIRECT_EXIT_BYTES => calls += 1,
+                target if target > at && target < complete => within += 1,
                 target => panic!("a jump to {target}"),
             }
         }
     }
-    assert_eq!((exits, calls), (1, 3));
+    assert_eq!((exits, calls, within), (1, 3, 3));
     let back = end - DIRECT_EXIT_BYTES - 5;
     assert_eq!(thunk.code[back], 0xe9);
     let relative = i32::from_le_bytes(thunk.code[back + 1..back + 5].try_into().unwrap());
@@ -378,7 +447,7 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
     // A return completes at its exit to the target in RAX, which the
     // service path reaches too.
     let ret = Form::of(Operation::ReturnIaSp).unwrap();
-    let ret = super::thunk(ret, pc, TAGS, 0x4000);
+    let ret = super::thunk(ret, pc, TAGS, 0x4000, None);
     assert_eq!(ret.next, None);
     let returns = ret.dynamic.unwrap();
     // Padded for its patch point, wherever it lands.

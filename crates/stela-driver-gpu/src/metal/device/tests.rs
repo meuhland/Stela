@@ -26,7 +26,8 @@ use crate::metal::{
     },
     heap::{HeapDescriptor, PAGE, SizeAndAlign},
     indirect::{IndirectCommandBufferDescriptor, RecordLayout},
-    nvidia::{CHIPS, PcieLink},
+    nvidia::CHIPS,
+    open::PcieLink,
     pipeline::{
         ColorAttachmentDescriptor, MAX_COLOR_ATTACHMENTS, RenderTargets, StageThreads,
         TessellationDescriptor,
@@ -92,7 +93,7 @@ fn complete(device: &mut TestDevice, serial: u64) {
 fn devices_missing_a_required_feature_are_refused() {
     let mut backend = MockBackend::new();
     backend.physical.as_mut().unwrap().features.null_descriptor = false;
-    let platform = CHIPS[0].platform(crate::metal::nvidia::Attachment {
+    let platform = CHIPS[0].platform(crate::metal::open::Attachment {
         link: PcieLink {
             speed: 4,
             width: 16,
@@ -102,6 +103,21 @@ fn devices_missing_a_required_feature_are_refused() {
     });
     let device = Device::new(backend, MockCompiler::default(), &platform);
     assert!(matches!(device, Err(Error::Unsupported("nullDescriptor"))));
+}
+
+/// Images stay in `GENERAL`, which core Vulkan allows for every access, so
+/// a device whose driver does not promise that `GENERAL` costs nothing
+/// still serves Metal.
+#[test]
+fn devices_without_unified_image_layouts_are_served() {
+    let mut backend = MockBackend::new();
+    backend
+        .physical
+        .as_mut()
+        .unwrap()
+        .features
+        .unified_image_layouts = false;
+    device_on(backend);
 }
 
 /// A guest's poll takes the completion marker's serial as the timeline: no
@@ -1646,6 +1662,46 @@ fn binary_archives_hold_what_was_added_and_outlive_their_files() {
         device
             .new_compute_pipeline(&archived_compute(kernel, archives))
             .is_ok()
+    );
+}
+
+/// A lookup left to a job does not end the search: every archive is
+/// looked in by a job in the same turn, and nothing compiles or reaches an
+/// archive until the call runs again with their answers.
+#[test]
+fn a_deferred_archive_lookup_leaves_a_job_for_every_archive_and_compiles_nothing() {
+    let mut device = device();
+    let kernel = device.new_function(LIBRARY, "kernel", Some(&[])).unwrap();
+    let first = device.new_archive(&[]).unwrap();
+    let second = device.new_archive(&[]).unwrap();
+    // Required from them, it answers for its archives at creation.
+    let request = archived_compute(
+        kernel,
+        PipelineArchives {
+            searched: alloc::vec![first, second],
+            required: true,
+            added_to: None,
+        },
+    );
+    let lock = crate::metal::deferred::JobLock {
+        lock: Arc::new(crate::metal::compiler::CompileLock::new()),
+        relax: || {},
+    };
+    device.backend().deferred_lookups = 2;
+    device.backend().defer_pipelines(Some(&lock));
+    assert_eq!(
+        device.new_compute_pipeline(&request),
+        Err(crate::metal::compiler::DEFERRED)
+    );
+    let jobs = core::iter::from_fn(|| device.backend().take_job()).count();
+    assert_eq!(jobs, 2, "both archives are looked in by jobs");
+    assert!(device.backend().compute.is_empty(), "nothing compiled");
+    assert_eq!(device.archive_data(first), Ok(alloc::vec![0]));
+    device.backend().stop_deferring();
+    // Made again with the answers: both lack it, so the request fails.
+    assert_eq!(
+        device.new_compute_pipeline(&request),
+        Err(Error::NotArchived)
     );
 }
 
@@ -3226,7 +3282,13 @@ fn render_passes_resolve_cached_attachment_views() {
         .fill_buffer(&mut device.resolver(), buffer, 0, 4096, 7)
         .unwrap();
     commands.end_encoding(&mut device.resolver()).unwrap();
+    // The pass notes the textures bound for it, each once.
+    let sampled = device
+        .new_texture(&texture(PixelFormat::Bgra8Unorm, TextureUsage::SHADER_READ))
+        .unwrap();
     device.begin_render(&mut commands, &request).unwrap();
+    device.note_sampled(sampled);
+    device.note_sampled(sampled);
     commands.end_encoding(&mut device.resolver()).unwrap();
     let serial = device.commit(commands).unwrap();
     let segment = &device.backend().submissions.last().unwrap()[0];
@@ -3262,6 +3324,18 @@ fn render_passes_resolve_cached_attachment_views() {
             "render:-@128x128/Rgba8Unorm/optimal",
             "transfer:-"
         ]
+    );
+    let notes: Vec<_> = passes
+        .notes
+        .iter()
+        .map(|(key, (_, note))| (key.as_str(), note.as_str()))
+        .collect();
+    assert_eq!(
+        notes,
+        [(
+            "render:-@128x128/Rgba8Unorm/optimal",
+            "x1/layers=1/clear/store/textures=128x128/Bgra8Unorm/optimal"
+        )]
     );
     device.set_pass_profile(false);
     assert_eq!(device.take_pass_times(), None);
@@ -4487,7 +4561,7 @@ fn the_memory_book_names_freed_ranges_and_their_neighbours() {
     device.new_heap_buffer(heap, 4096, shared, None).unwrap();
     assert_eq!(
         device.memory_book_report(),
-        ["lost device memory: no whole allocation with a known address was freed"]
+        ["lost device memory: no whole allocation was freed"]
     );
     let serial = submit(&mut device);
     device.destroy_texture(texture).unwrap();
@@ -5205,4 +5279,219 @@ fn a_destroyed_events_late_completion_does_not_answer_for_its_handles_next_event
     device.commit(commands).unwrap();
     assert_eq!(device.signaled_value(b), Ok(0));
     assert_eq!(device.wait_event(b, 3, 0), Ok(false));
+}
+
+/// A waiter that took the completion timeline and left gets it again: the
+/// timeline is exported anew, never once the device is lost.
+#[test]
+fn the_completion_timeline_is_offered_again_until_the_device_is_lost() {
+    let mut backend = MockBackend::new();
+    backend.exported = Some(7);
+    let mut device = device_on(backend);
+    assert_eq!(device.take_completion(), Some(7));
+    assert_eq!(device.take_completion(), None);
+    assert!(device.rearm_completion());
+    assert!(device.rearm_completion(), "offered once until taken");
+    assert_eq!(device.take_completion(), Some(7));
+    device.mark_lost();
+    assert!(!device.rearm_completion());
+    assert_eq!(device.take_completion(), None);
+}
+
+/// A view others read, as a shared one is read by every connection that
+/// held it, keeps its parent for their command buffers too: before, the
+/// parent's release by its own connection freed its image while another
+/// connection's command buffer still sampled the view.
+#[test]
+fn a_parent_outlives_the_readers_of_its_views() {
+    let mut device = device_on(MockBackend::new());
+    let made = device.submitted_serial();
+    let descriptor = TextureDescriptor {
+        options: options(StorageMode::Managed),
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let parent = device.new_texture(&descriptor).unwrap();
+    let image = device.texture_image(parent).unwrap();
+    let view = device
+        .new_texture_view(
+            parent,
+            &crate::metal::resource::TextureViewDescriptor {
+                pixel_format: PixelFormat::Rgba8UnormSrgb,
+                texture_type: TextureType::D2,
+                levels: 0..1,
+                slices: 0..1,
+                swizzle: SwizzleChannels::IDENTITY,
+                min_lod: 0.0,
+            },
+        )
+        .unwrap();
+    let commands = device.new_command_buffer();
+    let other = device.commit_for(2, commands).unwrap();
+    let holders = pins::Scope {
+        created: 0,
+        reach: pins::Reach::Many([1, 2].into()),
+    };
+    device
+        .release_for(holders, |device| device.destroy_texture(view))
+        .unwrap();
+    release_as(&mut device, 1, made, |device| {
+        device.destroy_texture(parent)
+    })
+    .unwrap();
+    assert!(
+        !device.backend().destroyed.contains(&Object::Image(image)),
+        "the parent stays while connection 2's command buffer runs"
+    );
+    device.backend().finish();
+    assert_eq!(device.poll(), Ok(other));
+    assert!(device.backend().destroyed.contains(&Object::Image(image)));
+}
+
+/// The whole allocations the backend freed so far.
+fn memory_frees(device: &mut TestDevice) -> usize {
+    device
+        .backend()
+        .destroyed
+        .iter()
+        .filter(|object| matches!(object, Object::Memory(_)))
+        .count()
+}
+
+/// A resource placed in a heap that others read, as another connection's
+/// commit carries a CPU-copy upload into it or every commit refreshes an
+/// aligned copy from its rows, keeps the heap's memory for their command
+/// buffers too: before, the heap's release by its own connection freed the
+/// memory while another connection's held command buffer still had to read
+/// the resource.
+#[test]
+fn a_heap_outlives_the_readers_of_its_resources() {
+    let mut device = device_on(MockBackend::new());
+    let made = device.submitted_serial();
+    let private = options(StorageMode::Private);
+    let heap = device
+        .new_heap(&HeapDescriptor {
+            size: 1 << 20,
+            options: private,
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size64,
+        })
+        .unwrap();
+    let descriptor = TextureDescriptor {
+        options: private,
+        ..texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ)
+    };
+    let placed = device.new_heap_texture(heap, &descriptor, None).unwrap();
+    let (event, _) = hold_for_event(&mut device, 2);
+    let readers = pins::Scope {
+        created: 0,
+        reach: pins::Reach::Many([1, 2].into()),
+    };
+    device
+        .release_for(readers, |device| device.destroy_texture(placed))
+        .unwrap();
+    let before = memory_frees(&mut device);
+    release_as(&mut device, 1, made, |device| device.destroy_heap(heap)).unwrap();
+    device.poll().unwrap();
+    assert_eq!(
+        memory_frees(&mut device),
+        before,
+        "the heap's memory stays while connection 2's held work may read its texture"
+    );
+    device.set_signaled_value(event, 1).unwrap();
+    device.backend().finish();
+    device.poll().unwrap();
+    assert_eq!(memory_frees(&mut device), before + 1);
+    let memory = device.memory();
+    assert_eq!((memory.deferred, memory.pinned), (0, 0));
+}
+
+/// The lost device of run 20261116-171055: connection 45 made an automatic
+/// heap while serial 92379 ran, committed before the heap; serial 92380,
+/// another connection's, was committed while it lived; and its release by
+/// its own connection freed its memory "when serial 92378 completed", with
+/// both still running, as neither was a command buffer of its connection
+/// committed since it made the heap. The channel faulted in the freed range
+/// 11 ms later. Whole memory now goes only once every command buffer
+/// committed through its release that went to the GPU completes, whichever
+/// connection committed it, and the book says so.
+#[test]
+fn a_released_heap_waits_for_all_work_running_at_its_release() {
+    let mut device = device_on(MockBackend::new());
+    let timeline = device.timeline;
+    let earlier = device.commit_for(45, device.new_command_buffer()).unwrap();
+    let made = device.submitted_serial();
+    let private = options(StorageMode::Private);
+    let heap = device
+        .new_heap(&HeapDescriptor {
+            size: 458_752,
+            options: private,
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size64,
+        })
+        .unwrap();
+    device.book_holder(super::MemoryOwner::Heap(heap), 45);
+    let descriptor = TextureDescriptor {
+        options: private,
+        ..texture(PixelFormat::Rgba16Float, TextureUsage::SHADER_READ)
+    };
+    let placed = device.new_heap_texture(heap, &descriptor, None).unwrap();
+    let other = device.commit_for(1, device.new_command_buffer()).unwrap();
+    let before = memory_frees(&mut device);
+    release_as(&mut device, 45, made, |device| {
+        device.destroy_texture(placed)?;
+        device.destroy_heap(heap)
+    })
+    .unwrap();
+    device.poll().unwrap();
+    assert_eq!(
+        memory_frees(&mut device),
+        before,
+        "serials {earlier} and {other} still run"
+    );
+    device.backend().complete(timeline, earlier);
+    assert_eq!(device.poll(), Ok(earlier));
+    assert_eq!(
+        memory_frees(&mut device),
+        before,
+        "serial {other} of connection 1 still runs"
+    );
+    device.backend().complete(timeline, other);
+    assert_eq!(device.poll(), Ok(other));
+    assert_eq!(memory_frees(&mut device), before + 1);
+    let report = device.memory_book_report();
+    assert!(
+        report[0].contains(&alloc::format!(
+            "Automatic heap of 458752 bytes of connection 45, made at serial {made}, released \
+             at serial {other} when serial {other} completed"
+        )),
+        "{report:?}"
+    );
+}
+
+/// Another connection's held work keeps no memory, as before, until it is
+/// submitted: only work on the GPU keeps memory past its connection's
+/// readers.
+#[test]
+fn held_work_of_another_connection_keeps_no_memory() {
+    let mut device = device_on(MockBackend::new());
+    let (event, held) = hold_for_event(&mut device, 1);
+    let made = device.submitted_serial();
+    let heap = device
+        .new_heap(&HeapDescriptor {
+            size: 1 << 16,
+            options: options(StorageMode::Private),
+            heap_type: HeapType::Automatic,
+            sparse_page_size: SparsePageSize::Size64,
+        })
+        .unwrap();
+    let before = memory_frees(&mut device);
+    release_as(&mut device, 2, made, |device| device.destroy_heap(heap)).unwrap();
+    assert_eq!(
+        memory_frees(&mut device),
+        before + 1,
+        "serial {held} is held"
+    );
+    device.set_signaled_value(event, 1).unwrap();
+    device.backend().finish();
+    device.poll().unwrap();
 }

@@ -26,7 +26,8 @@
 //! polling and waiting submit held work as it becomes ready.
 use super::gpu_times::{GpuClock, GpuTimes};
 use super::pass_times::{
-    self, CommandBufferCounts, PROFILE_MARKS, PassTimes, SpanKind, SpanWork, TargetInfo,
+    self, CommandBufferCounts, PROFILE_MARKS, PassNote, PassTimes, SampledTexture, SpanKind,
+    SpanWork, TargetInfo,
 };
 use super::{
     BufferId, ComputePipelineId, CounterBufferId, Device, EventId, RenderPipelineId, Slab,
@@ -60,7 +61,8 @@ use crate::metal::{
     timing::{Detail, Phase},
     upload::{Chunk, ChunkSource},
     vulkan::{
-        BufferCreate, BufferUsage, MemoryProperties, PipelineStages, PipelineStatistics,
+        AttachmentLoadOp, AttachmentStoreOp, BufferCreate, BufferUsage, MemoryProperties,
+        PipelineStages, PipelineStatistics,
         backend::{Backend, BufferAllocation, Object, Requirements},
         command::Command,
         object::{
@@ -94,6 +96,9 @@ pub(super) const TIMES_KEPT: usize = 1024;
 
 /// Render pass targets the profile remembers by attachment view.
 const TARGETS_KEPT: usize = 1024;
+
+/// Notes of passes not yet submitted the profile keeps.
+const NOTES_KEPT: usize = 1024;
 
 /// A `MTLCounterSet` the device samples.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +186,8 @@ struct Marks {
     queries: u32,
     profiled: bool,
     counts: CommandBufferCounts,
+    /// The notes of its profiled passes, by their numbers.
+    notes: BTreeMap<u32, PassNote>,
 }
 
 impl Marks {
@@ -205,7 +212,7 @@ impl Marks {
 /// What one span between marks drew: the last pass's extent, its draws and
 /// dispatches, and the most vertices times instances of one direct draw;
 /// for the profile, its kind of work, the last pass's first attachment and
-/// the texels it copied or converted.
+/// the texels it copied or converted, and its pass's note.
 #[derive(Clone, Copy, Debug, Default)]
 struct SpanShape {
     extent: [u32; 2],
@@ -215,6 +222,8 @@ struct SpanShape {
     kind: SpanKind,
     target: Option<ImageView>,
     texels: u64,
+    /// The last pass's note, zero for none.
+    note: u32,
 }
 
 impl SpanShape {
@@ -230,6 +239,7 @@ impl SpanShape {
         match command {
             Command::BeginRendering(rendering) => {
                 self.extent = rendering.extent;
+                self.note = rendering.note;
                 self.target = rendering
                     .color
                     .iter()
@@ -373,6 +383,11 @@ pub(super) struct Queue {
     targets: BTreeMap<ImageView, (u64, TargetInfo)>,
     /// Targets noted so far, which orders them by age.
     noted: u64,
+    /// The profile's notes of render passes begun and not yet submitted,
+    /// by [`Rendering::note`](crate::metal::vulkan::command::Rendering::note);
+    /// textures bound go to the last's.
+    pass_notes: BTreeMap<u32, PassNote>,
+    last_note: u32,
 }
 
 impl Queue {
@@ -386,6 +401,17 @@ impl Queue {
         self.in_flight
             .iter()
             .any(|flight| release.read_by(flight.key, flight.serial))
+    }
+
+    /// Whether a command buffer in flight may reach the memory `release`
+    /// frees: one that may read it ([`Self::reads`]), or any of any
+    /// connection committed through the release that went to the GPU, held
+    /// ones only once submitted ([`super::pins`]).
+    pub(super) fn reaches_memory(&self, release: &super::pins::Release) -> bool {
+        self.in_flight.iter().any(|flight| {
+            release.read_by(flight.key, flight.serial)
+                || (flight.serial <= release.serial && flight.track != Track::Held)
+        })
     }
 
     /// The connections of unfinished command buffers that carry uploads or
@@ -472,6 +498,30 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // Copy the descriptors so the pass can borrow them while views are
         // created.
         let textures = self.pass_textures(request)?;
+        // A pass writes its attachments and resolve textures.
+        let written = request
+            .color_attachments
+            .iter()
+            .flatten()
+            .map(|color| (color.texture, color.resolve))
+            .chain(
+                request
+                    .depth_attachment
+                    .iter()
+                    .map(|depth| (depth.texture, depth.resolve)),
+            )
+            .chain(
+                request
+                    .stencil_attachment
+                    .iter()
+                    .map(|stencil| (stencil.texture, stencil.resolve)),
+            );
+        for (texture, resolve) in written {
+            self.note_texture_write(commands, texture);
+            if let Some((resolve, ..)) = resolve {
+                self.note_texture_write(commands, resolve);
+            }
+        }
         let lookup = |id: TextureId| {
             textures
                 .iter()
@@ -711,9 +761,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 .map(|attachment| attachment.view.texture)
         }
         let texture = first(&plan).filter(|_| self.passes_profiled());
-        let plan = self.resolve_views(plan)?;
+        let mut plan = self.resolve_views(plan)?;
         if let (Some(texture), Some(view)) = (texture, first(&plan)) {
             self.note_target(view, texture);
+        }
+        if self.passes_profiled() {
+            plan.note = self.open_note(&plan);
         }
         let visibility = request
             .visibility_result_buffer
@@ -810,6 +863,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             visibility_results: plan.visibility_results,
             sample_locations: plan.sample_locations,
             inputs: plan.inputs,
+            note: plan.note,
         })
     }
 
@@ -835,6 +889,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let finished = self
             .flush_indirect_writes()
             .and_then(|()| commands.finish(&mut self.resolver(), completion));
+        // Aligned copies are refreshed from their rows first, and those it
+        // wrote copied back into them last.
+        if finished.is_ok() {
+            let written = core::mem::take(&mut commands.aligned_writes);
+            let surfaces = core::mem::take(&mut commands.surfaces);
+            let writes = core::mem::take(&mut commands.written);
+            let (lead, tail) = self.aligned_copy_commands(&written, &surfaces, &writes);
+            commands.surround(lead, tail);
+        }
         // Applied once the recording reaches the queue.
         let planes = core::mem::take(&mut commands.planes);
         let recording = commands.into_recording();
@@ -1024,10 +1087,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     Command::Dispatch(_) | Command::DispatchIndirect { .. }
                 );
                 let pass_ends = matches!(command, Command::EndRendering);
-                match command {
-                    Command::BeginRendering(_) => {
+                match &command {
+                    Command::BeginRendering(rendering) => {
                         in_pass = true;
                         marks.counts.passes += 1;
+                        // A pass split into instances notes once.
+                        if let Some(note) = self.queue.pass_notes.remove(&rendering.note) {
+                            marks.notes.insert(rendering.note, note);
+                        }
                     }
                     Command::EndRendering => in_pass = false,
                     _ => {}
@@ -1647,6 +1714,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .map_or(self.submitted, |flight| flight.serial - 1)
     }
 
+    /// Whether command buffer `serial` was submitted and completed, after
+    /// a [`Self::poll`], whatever completed before it.
+    pub fn serial_complete(&self, serial: u64) -> bool {
+        serial <= self.submitted
+            && !self
+                .queue
+                .in_flight
+                .iter()
+                .any(|flight| flight.serial == serial && flight.track != Track::Done)
+    }
+
     /// Whether some connection's completion differs from the device's:
     /// work is held, or completes on the late timeline.
     pub fn holds(&self) -> bool {
@@ -2016,15 +2094,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                                     shape.extent,
                                     target.filter(|_| shape.kind == SpanKind::Render),
                                 );
+                                let span_ns = ns(pair[1]).saturating_sub(ns(pair[0]));
+                                let note = marks.notes.get(&shape.note);
+                                let noted = note.map(|_| key.clone());
                                 self.queue.passes.span(
                                     key,
                                     SpanWork {
-                                        ns: ns(pair[1]).saturating_sub(ns(pair[0])),
+                                        ns: span_ns,
                                         draws: shape.draws.into(),
                                         dispatches: shape.dispatches.into(),
                                         texels: shape.texels,
                                     },
                                 );
+                                if let (Some(key), Some(note)) = (noted, note) {
+                                    self.queue.passes.note(&key, span_ns, note);
+                                }
                             }
                         }
                         let spans = marks
@@ -2040,6 +2124,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                             });
                         self.queue.clock.retire(
                             flight.serial,
+                            flight.submits,
                             flight.committed,
                             seen,
                             [ns(times[0]), ns(times[1])],
@@ -2064,7 +2149,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // when `completed` passed it while it was held.
         self.completed = self.completed.max(completed);
         // Each release waits only for the command buffers that may read it
-        // (`pins`): another connection's held work does not keep it.
+        // (`pins`), and whole memory for any that went to the GPU before it
+        // too: another connection's held work does not keep it.
         // A bounded retirement (the boot processor's look, whose guest
         // waits meanwhile) stops destroying once its budget is spent and
         // leaves the rest, in order, for the next.
@@ -2073,7 +2159,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         self.destruction_left = false;
         let mut kept = VecDeque::with_capacity(self.deferred.len());
         for (release, object, allocated) in core::mem::take(&mut self.deferred) {
-            let frees = !self.queue.reads(&release);
+            let frees = self.frees_object(&release, object);
             let spent = budget != 0 && self.timing.now().wrapping_sub(began) >= budget;
             if frees && !spent {
                 self.destroy_now(object);
@@ -2143,6 +2229,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .then(|| self.queue.passes.take())
     }
 
+    /// Adds a committed command buffer's plane conversions to the
+    /// profile's report.
+    pub(super) fn note_plane_counts(&mut self, counts: pass_times::PlaneCounts) {
+        if self.passes_profiled() {
+            self.queue.passes.planes.add(counts);
+        }
+    }
+
     /// Notes what a pass attaching `view` of `texture` renders into, for
     /// the profile's report.
     fn note_target(&mut self, view: ImageView, texture: TextureId) {
@@ -2166,6 +2260,65 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             if let Some(oldest) = oldest {
                 queue.targets.remove(&oldest);
             }
+        }
+    }
+
+    /// Opens the profile's note of a pass beginning with `plan`, which the
+    /// textures bound next go to, and returns its number.
+    fn open_note(&mut self, plan: &RenderPassPlan<ImageView>) -> u32 {
+        let first = plan
+            .color
+            .iter()
+            .flatten()
+            .next()
+            .or(plan.depth.as_ref())
+            .or(plan.stencil.as_ref());
+        let resolves = plan
+            .color
+            .iter()
+            .flatten()
+            .chain(&plan.depth)
+            .chain(&plan.stencil)
+            .any(|attachment| attachment.resolve.is_some() || attachment.averaged);
+        let note = PassNote {
+            textures: Vec::new(),
+            more: 0,
+            samples: plan.sample_count,
+            layers: plan.layer_count,
+            load: first.map_or(AttachmentLoadOp::DontCare, |first| first.load_op),
+            store: first.map_or(AttachmentStoreOp::DontCare, |first| first.store_op),
+            resolves,
+        };
+        let queue = &mut self.queue;
+        queue.last_note = queue.last_note.wrapping_add(1).max(1);
+        queue.pass_notes.insert(queue.last_note, note);
+        if queue.pass_notes.len() > NOTES_KEPT {
+            // The oldest goes: its command buffer was likely dropped.
+            queue.pass_notes.pop_first();
+        }
+        queue.last_note
+    }
+
+    /// Notes texture `id` bound for the functions of the pass begun last,
+    /// for the profile's report of what its longest passes sample.
+    pub fn note_sampled(&mut self, id: TextureId) {
+        if !self.passes_profiled() {
+            return;
+        }
+        let Ok(descriptor) = self.texture_descriptor(id) else {
+            return;
+        };
+        let narrow = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        let texture = SampledTexture {
+            extent: [narrow(descriptor.width), narrow(descriptor.height)],
+            format: descriptor.pixel_format,
+            memory: self.target_memory(id),
+            levels: narrow(descriptor.mipmap_level_count),
+            samples: narrow(descriptor.sample_count),
+        };
+        let queue = &mut self.queue;
+        if let Some(note) = queue.pass_notes.get_mut(&queue.last_note) {
+            note.bind(texture);
         }
     }
 
@@ -2605,7 +2758,7 @@ impl<B: Backend, C: Compiler> Resolver for DeviceResolver<'_, B, C> {
         update: &mut dyn FnMut(&mut IndirectCommandBuffer) -> Result<()>,
     ) -> Result<()> {
         // A commit running again would apply the update twice.
-        self.device.stop_deferring();
+        self.device.stop_deferring()?;
         update(self.device.indirect_command_buffer_mut(id)?)
     }
 }

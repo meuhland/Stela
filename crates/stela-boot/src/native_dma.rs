@@ -16,6 +16,13 @@ pub(crate) struct FirmwareUnits {
     complete: bool,
 }
 
+impl FirmwareUnits {
+    /// The DMAR's flags, 0 without a DMAR (`Units::dmar_flags`).
+    pub(crate) fn dmar_flags(&self) -> u8 {
+        self.units.dmar_flags
+    }
+}
+
 /// The complete original IOMMU inventory at firmware exit, twice: `found`
 /// when every unit was observed inactive as the firmware left it, which
 /// the proof for requesters that start blocked needs, and `off` when every
@@ -98,7 +105,7 @@ pub(crate) fn firmware_units() -> Result<FirmwareUnits> {
     let mut complete = true;
     for signature in [b"DMAR", b"IVRS"] {
         // SAFETY: the firmware's RSDP; its tables stay mapped while boot
-        // services run, and `find` checks every checksum on the way.
+        // services run, and `find` checks each table's length.
         let added = match unsafe { acpi::find(rsdp, signature) } {
             Ok(table) if signature == b"DMAR" => units.add_dmar(table),
             Ok(table) => units.add_ivrs(table),

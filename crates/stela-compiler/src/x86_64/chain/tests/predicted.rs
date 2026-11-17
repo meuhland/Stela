@@ -305,20 +305,20 @@ impl Run {
 
     fn run(&mut self, state: &mut GuestState, control: &mut ChainControl) -> (u64, u64) {
         state.anchors[Anchor::Control] = control as *mut ChainControl as u64;
-        // A native entry, as the engine's: the jump cache starts over.
-        // SAFETY: the control's stamps are 0 or the live table's.
-        unsafe { next_jump_serial(control.stamps) };
+        // Each run starts with an empty jump cache, so the ways compare as
+        // the table probe serves them; the cache's own differences are the
+        // probes' and the jump cache's tests.
+        if control.stamps != 0 {
+            forget_all_jumps(&[control.stamps]);
+        }
         state.anchors[Anchor::Memo] = self.memo.as_ptr() as u64;
         state.anchors[Anchor::Pointer] = &raw mut *self.service as u64;
         // SAFETY: the region holds the entry, the thunk, its tails and the
         // probes with the block ABI; they touch the frame, the control, the
         // memo, the service, the tables and the blocks, which outlive the
         // call, and call `service`.
-        let result = unsafe {
-            let run: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                core::mem::transmute(self.region.0);
-            run(state)
-        };
+        let result =
+            unsafe { crate::x86_64::native::enter(self.region.0 as *const u8, state, 0, 0) };
         (result as u64, (result >> 64) as u64)
     }
 }
@@ -435,7 +435,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
         let form = pointer::Form::of(case.operation).unwrap();
         let tags = Place::new(Anchor::Pointer, core::mem::offset_of!(Service, tags));
         let routine: ServiceRoutine = service;
-        let thunk = pointer::thunk(form, GuestAddress(PC), tags, routine as usize as u64);
+        let thunk = pointer::thunk(form, GuestAddress(PC), tags, routine as usize as u64, None);
         let word = ExitWord::from(case.kind);
         // The predicted target: the first of a page in either half.
         let predicted = PCS[2 * (number % 2)];
@@ -464,7 +464,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
         let relink = |table: &mut LookupTable, key: u64| {
             let held = table.find(table.slot(predicted, key), predicted, key);
             let current = (held.pc == predicted && held.key == key).then_some(held);
-            table.link_cell(site, predicted, current);
+            table.link_hot_cell(site, predicted, current).unwrap();
             // As the engine links: a stamped tail only for a block that
             // accepts the BTYPE.
             current.filter(|entry| entry.targets & 1 << case.btype != 0)
@@ -601,28 +601,55 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 results[index] = run.run(&mut states[index], &mut controls[index]);
             }
             let [lookup, linked_way, unlinked, bare] = results;
+            // Only the cell probes count and sample their transfers.
+            for control in &mut controls {
+                (control.heat, control.sampled) = (0, 0);
+            }
             let stamped = hits_of() != stamped_hits;
             // The one difference the stamped tail may make, as in the
             // stamped tails' test: the cell probe misses a page this ITLB
             // put out for another (a capacity eviction, not a drop) and the
             // stamped tail enters the cell's block while the page tables
             // still map the page to the cell's key.
+            // A lower-half page is translated in the upper half's context
+            // too (`translate`), as in the stamped tails' test.
             let page = predicted & !0xfff;
-            let context = contexts[half(predicted)];
-            let resident = itlb.find(itlb.page_slot(predicted, context), page, context);
+            let candidates = match half(predicted) {
+                0 => &contexts[..],
+                _ => &contexts[1..],
+            };
+            let translated = candidates.iter().find_map(|&context| {
+                let resident = itlb.find(itlb.page_slot(predicted, context), page, context);
+                (resident.pc == page && resident.key == context).then_some(resident.entry)
+            });
             let cell = table.site_cell(site).unwrap();
+            // The stamp names the lower half's context alone, so for a
+            // lower-half page it outlives a change of the upper half's.
+            let stamped_in = match half(predicted) {
+                0 => &CONTEXTS[..],
+                _ => &contexts[1..],
+            };
+            let mapped = stamped_in
+                .iter()
+                .any(|&context| keys.get(&(page, context)) == Some(&cell.key));
+            // The lookup exits, or takes the other translation it holds.
             let evicted = stamped
-                && !(resident.pc == page && resident.key == context)
-                && keys.get(&(page, context)) == Some(&cell.key)
-                && lookup.0 == predicted
+                && translated != Some(cell.key)
+                && mapped
+                && (lookup.0 == predicted || translated.is_some())
                 && linked.is_some_and(|linked| linked.entry == cell.entry);
             // And the one difference a cell makes: the table put the
             // target's entry out of its set for another (a capacity
             // eviction, not a forget), and the cell, which keeps it,
             // enters its block where the table probe exits for a refill.
-            let resident_key = (resident.pc == page && resident.key == context)
-                .then_some(resident.entry)
-                .or_else(|| keys.get(&(page, context)).copied().filter(|_| stamped));
+            let resident_key = translated.or_else(|| {
+                stamped
+                    .then(|| match mapped {
+                        true => Some(cell.key),
+                        false => keys.get(&(page, candidates[0])).copied(),
+                    })
+                    .flatten()
+            });
             let held = resident_key
                 .map(|key| table.find(table.slot(predicted, key), predicted, key))
                 .unwrap_or_default();
@@ -768,11 +795,8 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             frame.anchors[Anchor::Control] = &raw mut control as u64;
             // SAFETY: the region holds the stub, its tail and the probes;
             // they touch the frame, the control, the tables and the blocks.
-            let result = unsafe {
-                let run: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                    core::mem::transmute(region.0);
-                run(&mut *frame)
-            };
+            let result =
+                unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, 0, 0) };
             let result = (result as u64, (result >> 64) as u64);
             if targets & 1 << btype != 0 {
                 assert_eq!(result, (0x7703, 99), "btype {btype} targets {targets:#b}");

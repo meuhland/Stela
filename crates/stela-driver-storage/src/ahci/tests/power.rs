@@ -21,7 +21,7 @@ fn link_power_policy_follows_port_and_device_features() {
         ..Lpm::new(host, 0, 0)
     };
     let link = Link::new(&[]);
-    fixture.disk.configure_lpm(&link, DEVICE_TRIES).unwrap();
+    block_on(fixture.disk.configure_lpm(&link, DEVICE_TRIES)).unwrap();
     // DIPM off and on around Partial and Slumber allowed with ALPE.
     assert_eq!(link.issued.get(), 2);
     assert_eq!(link.writes_to(PORT_SATA_CONTROL), [0x400]);
@@ -47,10 +47,10 @@ fn link_power_policy_follows_port_and_device_features() {
     // (The revalidation's IDENTIFY data reported no DIPM.)
     fixture.disk.lpm.dipm = true;
     let link = Link::new(&[Fault::Timeout]);
-    assert_eq!(
-        fixture.disk.set_lpm(&link, LPM_MAX_POWER, 2),
-        Err(BlockError::Timeout)
-    );
+    assert!(matches!(
+        block_on(fixture.disk.set_lpm(&link, LPM_MAX_POWER, 2)),
+        Err(BlockError::Expired(expired)) if expired.step.starts_with("ATA SET FEATURES (0xef)")
+    ));
     assert!(!fixture.disk.lpm.allowed);
     assert_eq!(fixture.disk.lpm.policy, LPM_MED_POWER_WITH_DIPM);
 }
@@ -67,7 +67,7 @@ fn devslp_uses_reported_timing_and_port_capabilities() {
     let log = &mut fixture.disk.table.bytes_mut()[LOG_DATA..LOG_DATA + 512];
     (log[8], log[9], log[2 * 0x30]) = (1, LOG_SATA_SETTINGS, 1);
     let link = Link::new(&[]);
-    fixture.disk.configure(&link, &found).unwrap();
+    block_on(fixture.disk.configure(&link, &found)).unwrap();
     assert!(fixture.disk.devslp);
     assert_eq!(link.issued.get(), 3);
 
@@ -75,7 +75,7 @@ fn devslp_uses_reported_timing_and_port_capabilities() {
     // max_power, before SControl lifts the restrictions.
     fixture.disk.lpm.capabilities_2 = CAP2_DEVICE_SLEEP | CAP2_AGGRESSIVE_DEVICE_SLEEP;
     link.registers.borrow_mut()[PORT_DEVICE_SLEEP / 4] = 0x3;
-    fixture.disk.apply_lpm(&link, LPM_MAX_POWER).unwrap();
+    block_on(fixture.disk.apply_lpm(&link, LPM_MAX_POWER)).unwrap();
     assert_eq!(link.writes_to(PORT_DEVICE_SLEEP), [DEVICE_SLEEP_PRESENT]);
     let table = fixture.disk.table.bytes();
     assert_eq!(
@@ -93,7 +93,7 @@ fn devslp_uses_reported_timing_and_port_capabilities() {
 
     // Without the IDENTIFY DEVICE data log the disk gets NO_ID_DEV_LOG.
     fixture.disk.table.bytes_mut()[LOG_DATA + 2 * 0x30] = 0;
-    fixture.disk.configure(&link, &found).unwrap();
+    block_on(fixture.disk.configure(&link, &found)).unwrap();
     assert!(!fixture.disk.devslp);
     assert_ne!(fixture.disk.quirks & quirks::NO_ID_DEV_LOG, 0);
 }

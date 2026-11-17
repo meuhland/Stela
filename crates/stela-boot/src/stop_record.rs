@@ -16,8 +16,8 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use stela_boot_core::stop_record::{
-    ATTRIBUTES, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR, carried_notice, fitting,
-    piece_name, pieces, read, stop_reason,
+    ATTRIBUTES, FirmwareCall, HEADER_NAME, Header, Kept, PIECES, Space, Tail, VENDOR,
+    carried_notice, fitting, piece_name, pieces, read, stop_reason,
 };
 use uefi::{
     CStr16, Guid,
@@ -52,6 +52,23 @@ impl Services {
     /// The firmware's, read while its boot services run. Firmware older
     /// than UEFI 2.0 has no `QueryVariableInfo`, and gets no record.
     pub(crate) fn capture() -> Self {
+        let services = Self::capture_without_heap();
+        if services.set_variable == 0 {
+            return services;
+        }
+        let entry = runtime::get_variable_boxed(
+            uefi::cstr16!("BootCurrent"),
+            &VariableVendor::GLOBAL_VARIABLE,
+        )
+        .ok()
+        .and_then(|(value, _)| <[u8; 2]>::try_from(&*value).ok())
+        .map_or(0, |value| u64::from(u16::from_le_bytes(value)) + 1);
+        Self { entry, ..services }
+    }
+
+    /// [`Self::capture`] without the firmware entry this start came from,
+    /// whose read needs the heap: for a stop before the heap exists.
+    pub(crate) fn capture_without_heap() -> Self {
         let Some(table) = uefi::table::system_table_raw() else {
             return Self::default();
         };
@@ -65,18 +82,11 @@ impl Services {
         if runtime.header.revision < Revision::EFI_2_00 {
             return Self::default();
         }
-        let entry = runtime::get_variable_boxed(
-            uefi::cstr16!("BootCurrent"),
-            &VariableVendor::GLOBAL_VARIABLE,
-        )
-        .ok()
-        .and_then(|(value, _)| <[u8; 2]>::try_from(&*value).ok())
-        .map_or(0, |value| u64::from(u16::from_le_bytes(value)) + 1);
         Self {
             set_variable: runtime.set_variable as usize as u64,
             query_variable_info: runtime.query_variable_info as usize as u64,
             boot: 0,
-            entry,
+            entry: 0,
         }
     }
 }
@@ -109,6 +119,50 @@ pub(crate) fn disarm() {
 /// This boot's number in the USB's log, once it is open.
 pub(crate) fn set_boot(boot: u64) {
     BOOT.store(boot, Ordering::Relaxed);
+}
+
+/// The firmware call a processor is in ([`in_firmware`]): its kind in the
+/// low byte and the processor's APIC ID above it; left set by a fault inside
+/// the call, which stops the boot.
+static CALL: AtomicU64 = AtomicU64::new(FirmwareCall::None as u64);
+
+/// This processor's APIC ID, as CPUID gives it: the x2APIC ID where leaf
+/// 0xb reports one, else the initial APIC ID.
+fn processor() -> u64 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    u64::from(
+        match __cpuid(0).eax >= 0xb && __cpuid_count(0xb, 0).ebx != 0 {
+            true => __cpuid_count(0xb, 0).edx,
+            false => __cpuid(1).ebx >> 24,
+        },
+    )
+}
+
+/// Run `call`, a call of the firmware's services, as `kind`, in the root
+/// the services were armed with.
+fn in_firmware<T>(kind: FirmwareCall, call: impl FnOnce() -> T) -> T {
+    CALL.store(processor() << 8 | kind as u64, Ordering::Release);
+    let result = match ROOT.load(Ordering::Relaxed) {
+        0 => call(),
+        // SAFETY: the loader's live root, which `arm` was given with the
+        // engine's handoff; a restart resumes nothing here.
+        root => unsafe { crate::engine::in_loader_root_at_stop(root, call) },
+    };
+    CALL.store(FirmwareCall::None as u64, Ordering::Release);
+    result
+}
+
+/// The firmware call this processor's x86 exception came from, taken once:
+/// a fault inside the firmware's services is the firmware's, not Stela's.
+/// Another processor's call is not this exception's.
+pub(crate) fn take_firmware_call() -> FirmwareCall {
+    let call = CALL.load(Ordering::Acquire);
+    let kind = FirmwareCall::from_u8(call as u8);
+    if kind == FirmwareCall::None || call >> 8 != processor() {
+        return FirmwareCall::None;
+    }
+    CALL.store(FirmwareCall::None as u64, Ordering::Release);
+    kind
 }
 
 /// What [`arm`] was given, with the boot's number, for the engine.
@@ -152,12 +206,7 @@ pub(crate) fn return_at_restart() -> Option<u16> {
             )
         }
     };
-    let status = match ROOT.load(Ordering::Relaxed) {
-        0 => store(),
-        // SAFETY: the loader's live root, which `arm` was given with the
-        // engine's handoff; the restart resumes nothing here.
-        root => unsafe { crate::engine::in_loader_root_at_stop(root, store) },
-    };
+    let status = in_firmware(FirmwareCall::BootNext, store);
     (status == SUCCESS).then_some(entry)
 }
 
@@ -274,12 +323,7 @@ fn write(fill: impl FnOnce(&mut Tail)) -> bool {
         };
         status == SUCCESS
     };
-    match ROOT.load(Ordering::Relaxed) {
-        0 => store(),
-        // SAFETY: the loader's live root, which `arm` was given with the
-        // engine's handoff.
-        root => unsafe { crate::engine::in_loader_root_at_stop(root, store) },
-    }
+    in_firmware(FirmwareCall::Record, store)
 }
 
 /// Copy the record an earlier start left on this PC into the log, between

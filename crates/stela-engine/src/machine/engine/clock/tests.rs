@@ -199,10 +199,12 @@ fn a_pe_stopped_in_the_kernel_holds_the_count_only_past_the_stall_limit() {
     assert!(!first.leave(|| 2000, 0, false), "stopped once");
     assert_eq!(second.read(|| 2500), 2500);
     first.resume(|| 2600, 0);
+    first.mark(|| 2600, 1, None);
     assert_eq!(second.read(|| 3000), 3000);
     assert_eq!(shared.take_stalled(), 0);
-    // A long one stops the count 1200 counts (50 ms) after it began; the
-    // rest becomes lag, and the count goes on from there.
+    // A long one stops the count 1200 counts (50 ms) after its last
+    // progress; the rest becomes lag, and the count goes on from there.
+    first.mark(|| 4000, 2, None);
     assert!(first.leave(|| 4000, 0, false));
     assert_eq!(second.read(|| 6000), 5200);
     assert_eq!(
@@ -210,7 +212,10 @@ fn a_pe_stopped_in_the_kernel_holds_the_count_only_past_the_stall_limit() {
         7200,
         "looks again a limit later"
     );
+    // Back in guest code it shows no progress until its next mark.
     first.resume(|| 10_000, 0);
+    assert_eq!(second.read(|| 10_000), 5200);
+    first.mark(|| 10_000, 3, None);
     assert_eq!(shared.take_stalled(), 4800);
     assert_eq!(second.read(|| 10_000), 5200);
     assert_eq!(second.read(|| 10_100), 5300);
@@ -265,6 +270,52 @@ fn a_pe_with_guest_work_that_retires_nothing_holds_the_count_only_past_the_limit
 }
 
 #[test]
+fn short_kernel_stops_with_no_progress_between_hold_the_count_as_one_long_stop() {
+    let (shared, mut first, mut second) = pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    second.busy(|| 1000, 0, None);
+    let limit = 1000 + FREQUENCY * STALL_MILLIS / 1000;
+    // For 200 ms the first PE stops in the kernel for 4 ms of host work at
+    // a time, as the boot PE does between slices, and runs a few blocks
+    // between, never the instructions of a progress mark; the second runs.
+    let mut retired = 0;
+    for host in (1000..1000 + LONG_STALL).step_by(120) {
+        assert!(first.leave(|| host, 0, false));
+        first.resume(|| host + 100, 0);
+        retired += 100;
+        second.mark(|| host + 110, retired, None);
+        assert_eq!(
+            second.read(|| host + 110),
+            (host + 110).min(limit),
+            "at {host}"
+        );
+    }
+    // Its next mark lifts the hold; only the excess became lag.
+    let end = 1000 + LONG_STALL;
+    first.mark(|| end, 1, None);
+    assert_eq!(shared.take_stalled(), end - limit);
+    assert_eq!(second.read(|| end + 100), limit + 100);
+    // Stops between progress marks cost the count nothing.
+    for host in (end..end + LONG_STALL).step_by(120) {
+        assert!(first.leave(|| host, 0, false));
+        first.resume(|| host + 100, 0);
+        first.mark(|| host + 110, host, None);
+        second.mark(|| host + 110, host, None);
+    }
+    assert_eq!(shared.take_stalled(), 0);
+    // Nor do stops at EL0, which hold nothing.
+    let later = end + LONG_STALL;
+    for host in (later..later + LONG_STALL).step_by(120) {
+        assert!(first.leave(|| host, 0, true));
+        first.resume(|| host + 100, 0);
+        second.mark(|| host + 110, host, None);
+    }
+    assert_eq!(shared.take_stalled(), 0);
+}
+
+#[test]
 fn a_waiting_pe_sets_the_limit_of_a_stalled_one() {
     let (shared, mut first, mut second) = pair();
     first.idle(|| 1000, 0, None);
@@ -277,6 +328,61 @@ fn a_waiting_pe_sets_the_limit_of_a_stalled_one() {
     assert_eq!(shared.count(|| 5000), 2200);
     first.mark(|| 5000, 1, None);
     assert_eq!(shared.take_stalled(), 2800);
+}
+
+/// A WFE that spins on its Exclusives monitor is a ticket waiter, the next
+/// owner once the holder hands it the turn: kept from its passes past the
+/// stall limit, it holds the count as a stopped holder does. Its passes
+/// retire nothing yet are its progress, so while it spins nothing holds.
+/// At EL0, where no lease starts, the stall limit alone applies; a kernel
+/// spin this long runs on a lease (`a_long_host_step_under_an_old_spin_*`).
+#[test]
+fn a_spinning_wfe_the_host_keeps_from_its_passes_holds_the_count() {
+    let (shared, mut first, mut second) = pair();
+    // It ran, then waited; its WFE now spins, though it retires nothing.
+    first.idle(|| 1000, 7, None);
+    assert!(!first.has_guest_work());
+    let limit_after = |host: u64| host + FREQUENCY * STALL_MILLIS / 1000;
+    // A pass every 100 counts publishes each time.
+    let mut retired = 0;
+    for host in (1000..1000 + LONG_STALL).step_by(100) {
+        first.spin(|| host, 7, None, true);
+        retired += 100;
+        second.mark(|| host, retired, None);
+        assert_eq!(
+            second.read(|| host),
+            host,
+            "spinning holds nothing at {host}"
+        );
+    }
+    assert!(first.has_guest_work());
+    assert_eq!(shared.take_stalled(), 0);
+    // The host keeps it from its passes for 200 ms: the count holds a stall
+    // limit after its last pass.
+    let last = 1000 + LONG_STALL - 100;
+    let end = last + LONG_STALL;
+    for host in (last + 100..end).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+        assert_eq!(
+            second.read(|| host),
+            host.min(limit_after(last)),
+            "at {host}"
+        );
+    }
+    // Its next pass lifts the hold; only the excess became lag.
+    first.spin(|| end, 7, None, true);
+    assert_eq!(shared.take_stalled(), end - limit_after(last));
+    assert_eq!(second.read(|| end + 100), limit_after(last) + 100);
+    // Waiting without the spin, it holds nothing again.
+    first.idle(|| end + 100, 7, None);
+    assert!(!first.has_guest_work());
+    for host in (end + 100..end + 100 + LONG_STALL).step_by(10) {
+        retired += 100;
+        second.mark(|| host, retired, None);
+    }
+    assert_eq!(shared.take_stalled(), 0);
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
 }
 
 #[test]
@@ -343,10 +449,12 @@ fn two_stops_hold_the_count_at_the_earlier_one_s_limit() {
     assert!(second.leave(|| 2500, 0, false));
     assert_eq!(shared.count(|| 9000), 3200);
     first.resume(|| 9000, 0);
+    first.mark(|| 9000, 1, None);
     // The second stop's limit, 3700, now holds the count from 3200.
     assert_eq!(shared.count(|| 9400), 3600);
     assert_eq!(shared.count(|| 9600), 3700);
     second.resume(|| 9600, 0);
+    second.mark(|| 9600, 1, None);
     assert_eq!(shared.count(|| 9700), 3800);
     assert_eq!(shared.take_stalled(), 5800 + 100);
 }
@@ -508,6 +616,7 @@ fn no_slew_runs_while_a_hold_is_in_force() {
     assert!(first.leave(|| 2000, 0, false));
     second.look(|| 8000);
     first.resume(|| 8000, 0);
+    first.mark(|| 8000, 1, None);
     let lag = shared.lag();
     assert_eq!(lag, 8000 - 3200);
     assert!(first.leave(|| 9000, 0, false));
@@ -516,6 +625,7 @@ fn no_slew_runs_while_a_hold_is_in_force() {
     }
     assert_eq!(shared.take_repaid(), 0);
     first.resume(|| 40_000, 0);
+    first.mark(|| 40_000, 2, None);
     assert!(shared.lag() > lag);
 }
 
@@ -547,4 +657,245 @@ fn a_look_reads_no_slot_until_one_could_look_stalled() {
     );
     assert_eq!(shared.count(|| 1000 + span), 1000 + span);
     assert_eq!(shared.take_stalled(), 0);
+}
+
+/// The guest time a ticket waiter, PE 0, sees from the start of its spin
+/// to its turn, behind PEs 1 to `ahead` in that order. At its turn each is
+/// kept from running for `stall` host counts by the host, or by a host
+/// step of ours in the kernel when `steps`, then runs a short section and
+/// hands the lock on; until then it spins too. Also the count at each
+/// hand-off.
+fn ticket_queue(ahead: usize, stall: u64, steps: bool) -> (u64, Vec<u64>) {
+    const SECTION: u64 = 5;
+    let (shared, mut clocks) = busy_clocks(ahead + 1, FREQUENCY);
+    let mut retired = alloc::vec![0u64; ahead + 1];
+    let mut host = 1000;
+    let mut handoffs = Vec::new();
+    for turn in 1..=ahead {
+        let start = host;
+        if steps {
+            assert!(clocks[turn].leave(|| host, 0, false));
+        }
+        while host < start + stall + SECTION {
+            let kept = host < start + stall;
+            if steps && host == start + stall {
+                clocks[turn].resume(|| host, 0);
+            }
+            for pe in (0..=ahead).filter(|&pe| pe == 0 || pe >= turn) {
+                if pe == turn && kept {
+                    continue;
+                }
+                if pe == turn {
+                    retired[pe] += 10;
+                    clocks[pe].mark(|| host, retired[pe], None);
+                } else {
+                    clocks[pe].spin(|| host, retired[pe], None, false);
+                }
+            }
+            host += 1;
+        }
+        // It releases the lock, and its guest waits.
+        clocks[turn].idle(|| host, retired[turn], None);
+        handoffs.push(clocks[0].read(|| host));
+    }
+    assert_eq!(clocks[0].spin_started(), Some(1000));
+    drop(shared);
+    (handoffs[ahead - 1] - 1000, handoffs)
+}
+
+/// A waiter's budget behind `ahead` PEs that each stall once: the spin
+/// age at which the lease starts, then a lease, a mark and the section
+/// for each.
+fn queue_budget(ahead: usize) -> u64 {
+    let lease = FREQUENCY * LEASE_MILLIS / 1000;
+    FREQUENCY * SPIN_MILLIS / 1000 + ahead as u64 * (lease + 2 + 5)
+}
+
+/// XNU's ticket spinlock timeout, 3,000,000 counts at 24 MHz.
+const TICKET_TIMEOUT: u64 = FREQUENCY * 125 / 1000;
+
+/// Each stall stays under the stall limit, so none holds the count on its
+/// own; added up along one queue they passed the ticket timeout. Once the
+/// waiter's spin is old, each costs it at most a lease.
+#[test]
+fn stalls_under_the_limit_along_one_ticket_queue_stay_within_the_spin_budget() {
+    let stall = FREQUENCY * (STALL_MILLIS - 1) / 1000;
+    for ahead in [2, 3] {
+        let (waited, handoffs) = ticket_queue(ahead, stall, false);
+        assert!(
+            waited <= queue_budget(ahead),
+            "{ahead} ahead: waited {waited} counts, budget {}",
+            queue_budget(ahead)
+        );
+        assert!(waited < TICKET_TIMEOUT / 2, "{ahead} ahead: {waited}");
+        // Every hand-off once the spin is old takes a lease and a section.
+        let lease = FREQUENCY * LEASE_MILLIS / 1000;
+        for pair in handoffs.windows(2) {
+            assert!(pair[1] - pair[0] <= lease + 2 + 5, "{handoffs:?}");
+        }
+    }
+}
+
+/// Our own host steps in the kernel are stalls like any other: three PEs
+/// each stopped just under the limit while holding the lock in turn.
+#[test]
+fn long_host_steps_along_one_ticket_queue_stay_within_the_spin_budget() {
+    let stall = FREQUENCY * (STALL_MILLIS - 1) / 1000;
+    let (waited, handoffs) = ticket_queue(3, stall, true);
+    assert!(waited <= queue_budget(3), "waited {waited}: {handoffs:?}");
+    // Without an old spin the same steps cost the count nothing.
+    let (shared, mut clocks) = busy_clocks(2, FREQUENCY);
+    let mut host = 1000;
+    for step in 0..3u64 {
+        assert!(clocks[1].leave(|| host, 0, false));
+        for _ in 0..stall {
+            clocks[0].mark(|| host, host, None);
+            assert_eq!(clocks[0].read(|| host), host);
+            host += 1;
+        }
+        clocks[1].resume(|| host, 0);
+        clocks[1].mark(|| host, step + 1, None);
+    }
+    assert_eq!(shared.take_stalled(), 0);
+}
+
+/// A host step of ours in the kernel, while a spin is old, holds the count
+/// a lease after its PE's last progress; the held time is reported as the
+/// lease's and repaid as lag.
+#[test]
+fn a_long_host_step_under_an_old_spin_holds_the_count_a_lease_after_its_progress() {
+    let (shared, mut clocks) = busy_clocks(3, FREQUENCY);
+    let (spin, lease) = (
+        FREQUENCY * SPIN_MILLIS / 1000,
+        FREQUENCY * LEASE_MILLIS / 1000,
+    );
+    let mut host = 1000;
+    // PE 0 spins on a lock PE 1 holds and runs; PE 2 runs.
+    while host < 1000 + spin + 100 {
+        clocks[0].spin(|| host, 0, None, false);
+        clocks[1].mark(|| host, host, None);
+        clocks[2].mark(|| host, host, None);
+        assert_eq!(
+            clocks[0].read(|| host),
+            host,
+            "a running queue holds nothing"
+        );
+        host += 1;
+    }
+    // PE 2 stops in the kernel for 10 ms of host work.
+    let step = FREQUENCY * 10 / 1000;
+    let last = host - 1;
+    assert!(clocks[2].leave(|| host, 0, false));
+    for _ in 0..step {
+        clocks[0].spin(|| host, 0, None, false);
+        clocks[1].mark(|| host, host, None);
+        assert!(clocks[0].read(|| host) <= last + lease + 1, "at {host}");
+        host += 1;
+    }
+    clocks[2].resume(|| host, 0);
+    clocks[2].mark(|| host, host, None);
+    let stalled = shared.take_stalled();
+    assert!(stalled + lease + 2 >= step, "{stalled} held");
+    assert_eq!(shared.take_leased(), stalled);
+    assert_eq!(clocks[1].read(|| host + 1), host + 1 - stalled);
+}
+
+/// Every PE kept from running at once, as by a firmware SMI or a paused
+/// VM: no PE is left to see the stall, and the lease set ahead holds.
+#[test]
+fn every_pe_stopped_at_once_under_an_old_spin_costs_at_most_a_lease() {
+    let (shared, mut clocks) = busy_clocks(2, FREQUENCY);
+    let (spin, lease) = (
+        FREQUENCY * SPIN_MILLIS / 1000,
+        FREQUENCY * LEASE_MILLIS / 1000,
+    );
+    let mut host = 1000;
+    while host < 1000 + spin + 100 {
+        clocks[0].spin(|| host, 0, None, false);
+        clocks[1].mark(|| host, host, None);
+        host += 1;
+    }
+    let last = host - 1;
+    host += FREQUENCY / 10;
+    assert!(clocks[0].read(|| host) <= last + lease, "100 ms later");
+    assert!(shared.count(|| host) <= last + lease);
+}
+
+/// On a healthy host the count is the host's at every read: short spins
+/// write nothing, and an old spin with every PE marking well within a
+/// lease holds nothing either.
+#[test]
+fn a_healthy_run_s_count_is_the_host_s_with_spins_short_and_long() {
+    let (shared, mut clocks) = busy_clocks(3, FREQUENCY);
+    let sequence = shared.state.sequence.load(Ordering::Relaxed);
+    let mut retired = [0u64; 3];
+    let mut host = 1000;
+    // Ten seconds of 2 ms kernel spins on PE 0, one every 5 ms, between
+    // which it runs 360,000 instructions or waits, in turn.
+    let end = 1000 + 10 * FREQUENCY;
+    while host < end {
+        let (round, phase) = ((host - 1000) / 120, (host - 1000) % 120);
+        if phase < 48 {
+            clocks[0].spin(|| host, retired[0], None, false);
+        } else if round % 2 == 0 && phase % 2 == 0 {
+            retired[0] += 10_000;
+            clocks[0].mark(|| host, retired[0], None);
+        } else if round % 2 == 1 && phase == 48 {
+            clocks[0].idle(|| host, retired[0], None);
+        }
+        for pe in 1..3 {
+            retired[pe] += 100;
+            clocks[pe].mark(|| host, retired[pe], None);
+        }
+        assert_eq!(clocks[1].read(|| host), host, "at {host}");
+        host += 1;
+    }
+    assert_eq!(shared.state.sequence.load(Ordering::Relaxed), sequence);
+    // A 60 ms spin behind a holder that runs, PE 2 marking only every
+    // 1.5 ms: past the spin age the count runs on its lease, never held.
+    let gap = FREQUENCY * 3 / 2000;
+    let start = host;
+    while host < start + FREQUENCY * 60 / 1000 {
+        clocks[0].spin(|| host, retired[0], None, false);
+        retired[1] += 100;
+        clocks[1].mark(|| host, retired[1], None);
+        if (host - start) % gap == 0 {
+            retired[2] += 100;
+            clocks[2].mark(|| host, retired[2], None);
+        }
+        assert_eq!(clocks[1].read(|| host), host, "at {host}");
+        host += 1;
+    }
+    assert!(
+        shared.state.ceiling.load(Ordering::Relaxed) != UNBOUNDED,
+        "on a lease"
+    );
+    assert_eq!(shared.take_stalled(), 0);
+    // It takes the lock and runs on: the spin ends, the lease with it.
+    for _ in 0..FREQUENCY / 10 {
+        retired[0] += SPIN_END_INSTRUCTIONS / 100;
+        for pe in 0..3 {
+            retired[pe] += 100;
+            clocks[pe].mark(|| host, retired[pe], None);
+        }
+        assert_eq!(clocks[1].read(|| host), host);
+        host += 1;
+    }
+    assert_eq!(clocks[0].spin_started(), None);
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
+    assert_eq!(shared.take_stalled(), 0);
+}
+
+/// A spin at EL0 is timed by nothing in the kernel: it keeps guest work
+/// but starts no lease.
+#[test]
+fn a_spin_at_el0_starts_no_lease() {
+    let (shared, mut clocks) = busy_clocks(2, FREQUENCY);
+    for host in 1000..1000 + 4 * FREQUENCY * SPIN_MILLIS / 1000 {
+        clocks[0].spin(|| host, 0, None, true);
+        clocks[1].mark(|| host, host, None);
+    }
+    assert!(clocks[0].has_guest_work());
+    assert_eq!(clocks[0].spin_started(), None);
+    assert_eq!(shared.state.ceiling.load(Ordering::Relaxed), UNBOUNDED);
 }

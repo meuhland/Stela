@@ -25,6 +25,8 @@ struct State {
     /// A bus reset is offered, and whether it fails.
     bus_reset: bool,
     fail_bus_reset: bool,
+    /// The Command register drops writes to its memory decoding bit.
+    memory_stuck: bool,
 }
 struct Config {
     words: Box<[u32; 128]>,
@@ -62,6 +64,11 @@ impl ConfigSpace for Config {
     }
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), ConfigError> {
         let before = self.words[usize::from(offset / 4)];
+        let value = if offset == 4 && self.state.borrow().memory_stuck {
+            value & !2 | before & 2
+        } else {
+            value
+        };
         self.words[usize::from(offset / 4)] = value;
         if offset == 0x84 && value & 3 == 3 {
             self.state.borrow_mut().events.push("d3hot");
@@ -180,9 +187,12 @@ unsafe impl Timer for PhysicalTimer {
     }
 }
 fn inputs() -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
+    inputs_for(0x1234_10de)
+}
+fn inputs_for(identity: u32) -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
     let state = Rc::new(RefCell::new(State::default()));
     let mut words = [0; 128];
-    words[0] = 0x1234_10de;
+    words[0] = identity;
     words[1] = 0x0010_0402;
     words[2] = 0x0300_0001;
     words[4] = 0xfe00_0000;
@@ -262,6 +272,29 @@ fn preflight_never_seals_or_resets_an_unsupported_or_foreign_source() {
         drop(failed);
         kept(&state.borrow());
     }
+}
+#[test]
+fn an_amd_gpu_binds_without_the_reset_its_driver_makes_itself() {
+    // An RX 9070 or 6800 XT, which offers no FLR, untranslated and with its
+    // bus reset offered: amdgpu resets it itself, so none happens here.
+    let (mut inputs, state) = inputs_for(0x7550_1002);
+    inputs.requester.function.config().words[0x44 / 4] = 0;
+    state.borrow_mut().bus_reset = true;
+    let candidate = check_candidate(
+        &mut inputs.requester.function,
+        &PhysicalTimer(state.clone()),
+        false,
+        true,
+    );
+    assert_eq!(candidate, Ok(Some(Reset::Driver)));
+    {
+        let ready = Cold::new(inputs)
+            .quiesce_and_bind()
+            .unwrap_or_else(|error| panic!("{:?}", error.error));
+        assert_eq!(ready.reset(), Some(Reset::Driver));
+        assert_eq!(state.borrow().events, ["views-seal", "root-drain", "bind"]);
+    }
+    kept(&state.borrow());
 }
 #[test]
 fn failed_original_cpu_view_retirement_cannot_reset_or_bind() {
@@ -458,36 +491,167 @@ fn without_a_function_reset_or_translation_the_bus_is_reset() {
     }
 }
 #[test]
-fn a_function_reset_or_translation_comes_before_the_bus_reset() {
+fn a_function_reset_comes_before_the_bus_reset() {
     for translated in [false, true] {
         let (mut inputs, state) = inputs();
         state.borrow_mut().bus_reset = true;
-        if translated {
-            let words = &mut inputs.requester.function.config().words;
-            words[0x44 / 4] = 0;
-            words[0x84 / 4] = 8;
-        }
         let candidate = check_candidate(
             &mut inputs.requester.function,
             &PhysicalTimer(state.clone()),
             translated,
             true,
         );
+        assert_eq!(
+            candidate,
+            Ok(Some(Reset::Function(ResetMethod::FunctionLevel)))
+        );
         let mut cold = Cold::new(inputs);
         if translated {
-            assert_eq!(candidate, Ok(None));
             // SAFETY: the symbolic domain stands for a translating one.
             cold = unsafe { cold.translated() };
-        } else {
-            assert_eq!(
-                candidate,
-                Ok(Some(Reset::Function(ResetMethod::FunctionLevel)))
-            );
         }
         let ready = cold
             .quiesce_and_bind()
             .unwrap_or_else(|error| panic!("{:?}", error.error));
-        assert_ne!(ready.reset(), Some(Reset::SecondaryBus));
+        assert_eq!(
+            ready.reset(),
+            Some(Reset::Function(ResetMethod::FunctionLevel))
+        );
         assert!(!state.borrow().events.contains(&"bus-reset"));
     }
+}
+
+/// A GPU an earlier run left holding its secure region needs a reset even
+/// when its DMA is translated, so an available bus reset is not skipped.
+#[test]
+fn a_translated_function_without_a_function_reset_still_gets_the_bus_reset() {
+    let (mut inputs, state) = inputs();
+    {
+        let words = &mut inputs.requester.function.config().words;
+        words[0x44 / 4] = 0;
+        words[0x84 / 4] = 8;
+    }
+    state.borrow_mut().bus_reset = true;
+    let candidate = check_candidate(
+        &mut inputs.requester.function,
+        &PhysicalTimer(state.clone()),
+        true,
+        true,
+    );
+    assert_eq!(candidate, Ok(Some(Reset::SecondaryBus)));
+    // SAFETY: the symbolic domain stands for a translating one.
+    let cold = unsafe { Cold::new(inputs).translated() };
+    let ready = cold
+        .quiesce_and_bind()
+        .unwrap_or_else(|error| panic!("{:?}", error.error));
+    assert_eq!(ready.reset(), Some(Reset::SecondaryBus));
+    assert_eq!(
+        state.borrow().events,
+        ["views-seal", "bus-reset", "root-drain", "bind"]
+    );
+}
+
+#[test]
+fn register_bar_names_each_window_nouveau_cannot_map() {
+    let memory = |address, size, prefetchable| {
+        Some(Bar::Memory {
+            address,
+            size,
+            prefetchable,
+            wide: false,
+        })
+    };
+    assert_eq!(
+        register_bar(memory(0xfe00_0000, 1 << 24, false), 4096),
+        Ok(())
+    );
+    assert_eq!(register_bar(None, 4096), Err(RegisterBar::Absent));
+    assert_eq!(
+        register_bar(
+            Some(Bar::Io {
+                port: 0x1000,
+                size: 128
+            }),
+            4096
+        ),
+        Err(RegisterBar::Io)
+    );
+    assert_eq!(
+        register_bar(memory(0xfe00_0000, 1 << 24, true), 4096),
+        Err(RegisterBar::Prefetchable)
+    );
+    assert_eq!(
+        register_bar(memory(0xfe00_0000, 2048, false), 4096),
+        Err(RegisterBar::Small)
+    );
+    assert_eq!(
+        register_bar(memory(0, 1 << 24, false), 4096),
+        Err(RegisterBar::Unassigned)
+    );
+}
+
+/// A hybrid laptop's firmware leaves the discrete GPU's memory decoding off;
+/// Linux `pci_enable_device` turns it on, and so does the claim, leaving bus
+/// mastering and INTx as they were.
+#[test]
+fn decode_firmware_left_off_is_turned_on_alone() {
+    let (mut inputs, state) = inputs();
+    let function = &mut inputs.requester.function;
+    function.config().words[1] = 0x0010_0400;
+    let timer = PhysicalTimer(state.clone());
+    assert_eq!(
+        enable_decode(function, &timer),
+        Ok(Decode {
+            power_state: 0,
+            memory_was_off: true,
+        })
+    );
+    assert_eq!(function.config().words[1] & 0xffff, 0x0402);
+    assert_eq!(state.borrow().minimum_waited_us, 0);
+    // Already on: nothing changes.
+    assert_eq!(
+        enable_decode(function, &timer),
+        Ok(Decode {
+            power_state: 0,
+            memory_was_off: false,
+        })
+    );
+    assert_eq!(function.config().words[1] & 0xffff, 0x0402);
+    assert!(state.borrow().events.is_empty());
+}
+
+/// A function in D3hot comes to D0 first, its BARs restored after the soft
+/// reset, then decodes.
+#[test]
+fn decode_brings_a_d3hot_function_to_d0_first() {
+    let (mut inputs, state) = inputs();
+    let function = &mut inputs.requester.function;
+    function.config().words[1] = 0x0010_0400;
+    function.config().words[0x84 / 4] = 3;
+    let timer = PhysicalTimer(state.clone());
+    assert_eq!(
+        enable_decode(function, &timer),
+        Ok(Decode {
+            power_state: 3,
+            memory_was_off: true,
+        })
+    );
+    assert_eq!(state.borrow().events, ["d0"]);
+    assert!(state.borrow().minimum_waited_us >= 10_000);
+    assert_eq!(function.config().words[0x84 / 4] & 3, 0);
+    assert_eq!(function.config().words[4], 0xfe00_0000);
+    assert_eq!(function.config().words[1] & 0xffff, 0x0402);
+}
+
+#[test]
+fn decode_that_does_not_stick_is_refused() {
+    let (mut inputs, state) = inputs();
+    let function = &mut inputs.requester.function;
+    function.config().words[1] = 0x0010_0400;
+    state.borrow_mut().memory_stuck = true;
+    let timer = PhysicalTimer(state.clone());
+    assert_eq!(
+        enable_decode(function, &timer),
+        Err(DecodeError::Readback { command: 0x0400 })
+    );
 }

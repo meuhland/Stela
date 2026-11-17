@@ -1,9 +1,13 @@
-//! NVK, NIR and NAK, linked into `stela.efi` for its Metal device.
+//! NVK, NIR and NAK, linked into `stela.efi` for its Metal device, with ANV
+//! and BRW and RADV and ACO when the build host had the tools their builds
+//! run.
 //!
 //! The C is the archive `cargo xtask gpu nvk` builds; the Rust is NAK and NIL
 //! as dependencies of this crate. Nothing but the drivers' loader entries and
 //! the start of the C is called from here: Mesa reaches its host through
-//! `compat/libc`, and the Metal compiler is `metal::compiler`'s.
+//! `compat/libc`, and the Metal compiler is `metal::compiler`'s. ANV's entry
+//! is `stela_driver_gpu::metal::intel::DRIVER`'s, RADV's
+//! `stela_driver_gpu::metal::amd::DRIVER`'s.
 #![no_std]
 
 extern crate nak;

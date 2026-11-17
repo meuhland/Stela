@@ -106,9 +106,22 @@ pub(crate) fn connection(descriptors: &[Descriptor]) -> Result<Connection, Platf
             _ => None,
         });
     let Some((serial, address, ten_bit)) = serial else {
-        return Err(PlatformError::Refused(
-            "I2C device without an I2cSerialBus connection",
-        ));
+        // Which of these a report shows tells a firmware that built its
+        // `_CRS` for another OS (an interrupt alone) from one with nothing.
+        let interrupts = descriptors
+            .iter()
+            .all(|descriptor| match &descriptor.resource {
+                Resource::Interrupt(_) => true,
+                Resource::Gpio(gpio) => matches!(gpio.kind, GpioKind::Interrupt { .. }),
+                _ => false,
+            });
+        return Err(PlatformError::Refused(if descriptors.is_empty() {
+            "I2C device whose _CRS is empty"
+        } else if interrupts {
+            "I2C device whose _CRS has its interrupt and no I2cSerialBus connection"
+        } else {
+            "I2C device without an I2cSerialBus connection"
+        }));
     };
     let apic = descriptors
         .iter()
@@ -1007,6 +1020,23 @@ mod tests {
                 Err(PlatformError::Refused(_))
             ));
         }
+    }
+
+    #[test]
+    fn a_crs_without_a_serial_bus_says_what_it_held() {
+        let refusal = |descriptors: &[Descriptor]| match connection(descriptors) {
+            Err(PlatformError::Refused(text)) => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refusal(&[]), "I2C device whose _CRS is empty");
+        assert_eq!(
+            refusal(&[descriptor(apic_interrupt())]),
+            "I2C device whose _CRS has its interrupt and no I2cSerialBus connection"
+        );
+        assert_eq!(
+            refusal(&[descriptor(gpio_interrupt(Polarity::Low))]),
+            "I2C device whose _CRS has its interrupt and no I2cSerialBus connection"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 extern crate std;
 
 use super::{Memory, MockBackend, MockCompiler, Stream, commit, connect, service};
-use crate::metal::service::shared::UPKEEP_PIECES;
+use crate::metal::service::shared::{LIBRARY_PIECE_BYTES, UPKEEP_PIECES};
 use crate::metal::{
     capabilities::block::Block,
     service::{
@@ -22,8 +22,12 @@ impl CallerMemory for Memory {
             address,
             length: buffer.len() as u64,
         };
-        let bytes = GuestMemory::read(self, span).map_err(|_| CallerFault::Denied { address })?;
-        buffer.copy_from_slice(&bytes);
+        // Copied in place: a read allocates nothing of its length.
+        let range = self
+            .range(span)
+            .map_err(|_| CallerFault::Denied { address })?;
+        self.longest = self.longest.max(span.length);
+        buffer.copy_from_slice(&self.bytes[range]);
         Ok(())
     }
 
@@ -206,6 +210,7 @@ const HOST: ServiceHost = ServiceHost {
     served: |_| {},
     wake: || panic!("no turn kept an interrupt from looking"),
     bundle: |_| panic!("no kext reports"),
+    job_waiting: || {},
 };
 
 /// The GPU finishes what was committed.
@@ -1105,7 +1110,8 @@ fn a_library_is_read_a_piece_at_each_run_and_its_turn_reads_none() {
     shared.set_library_piece(PIECE);
     let connection = connect(&mut shared.try_turn().unwrap());
     let mut memory = Memory::default();
-    let bytes = crate::metal::library::tests::fixture(false);
+    // Not the fixture's library, which the device holds from its start.
+    let bytes = crate::metal::library::tests::padded(256, 0x11);
     let data = memory.put(&bytes);
     let record = library_call(&mut memory, data);
     memory.longest = 0;
@@ -1120,6 +1126,17 @@ fn a_library_is_read_a_piece_at_each_run_and_its_turn_reads_none() {
         );
     }
     drop(held);
+    // The device holds no library of these bytes: they are read again, kept.
+    GateService::serve(&shared, connection, record, &mut memory).unwrap();
+    let call = completed(&mut memory, record);
+    assert_eq!(
+        (call.status, call.reason_length),
+        (Status::Pending.raw(), 0)
+    );
+    for _ in 1..bytes.len().div_ceil(PIECE) {
+        GateService::serve(&shared, connection, record, &mut memory).unwrap();
+        assert_eq!(completed(&mut memory, record).status, Status::Pending.raw());
+    }
     GateService::serve(&shared, connection, record, &mut memory).unwrap();
     let call = completed(&mut memory, record);
     assert_eq!(call.status, Status::Ok.raw());
@@ -1154,4 +1171,180 @@ fn a_library_is_read_a_piece_at_each_run_and_its_turn_reads_none() {
         (call.status, call.reason_length),
         (Status::Unmapped.raw(), 0)
     );
+}
+
+/// Serves the `NewLibrary` call at `record` until it is answered other than
+/// `Pending`, with at most `runs` runs.
+fn serve_library(
+    shared: &SharedService<MockBackend, MockCompiler>,
+    connection: NonZeroU64,
+    record: u64,
+    memory: &mut Memory,
+    runs: usize,
+) -> GateCall {
+    for _ in 0..runs {
+        GateService::serve(shared, connection, record, memory).unwrap();
+        let call = completed(memory, record);
+        if call.status != Status::Pending.raw() {
+            return call;
+        }
+    }
+    panic!("the library call still pending after {runs} runs");
+}
+
+/// A library another process holds is shared by its digest with no
+/// allocation of its size: a heap whose largest free block is far smaller
+/// than the library still serves it. A library the device does not hold
+/// needs one block of its size for the kept copy; without one the call is
+/// answered out of memory.
+#[test]
+fn a_held_library_is_shared_without_a_block_of_its_size() {
+    const LIBRARY: usize = 8 << 20;
+    const LARGEST_BLOCK: usize = 2 << 20;
+    let shared = SharedService::new(service(), HOST);
+    let first = connect(&mut shared.try_turn().unwrap());
+    let mut memory = Memory::default();
+    let bytes = crate::metal::library::tests::padded(LIBRARY, 0x5a);
+    let data = memory.put(&bytes);
+    let record = library_call(&mut memory, data);
+    let runs = 2 * bytes.len().div_ceil(LIBRARY_PIECE_BYTES) + 4;
+    assert_eq!(
+        serve_library(&shared, first, record, &mut memory, runs).status,
+        Status::Ok.raw()
+    );
+
+    let second = connect(&mut shared.try_turn().unwrap());
+    let again = library_call(&mut memory, data);
+    let (call, refused) = super::heap::without_blocks_of(LARGEST_BLOCK, || {
+        serve_library(&shared, second, again, &mut memory, runs)
+    });
+    assert_eq!(call.status, Status::Ok.raw());
+    assert_eq!(refused, 0, "no allocation of a large block was asked for");
+
+    let other = crate::metal::library::tests::padded(LIBRARY, 0xa5);
+    let data = memory.put(&other);
+    let new = library_call(&mut memory, data);
+    let (call, refused) = super::heap::without_blocks_of(LARGEST_BLOCK, || {
+        serve_library(&shared, second, new, &mut memory, runs)
+    });
+    assert_eq!(call.status, Status::OutOfMemory.raw());
+    assert_ne!(refused, 0);
+}
+
+/// A texture only host image copies reach is read by a GPU copy into host
+/// memory: the call's turn starts each band's copy and answers `Pending`,
+/// and the call made again copies the band to its caller from the published
+/// completion, holding no turn, while another call holds the service.
+#[test]
+fn a_texture_read_waits_for_its_gpu_copy_and_copies_out_holding_no_turn() {
+    use crate::metal::{
+        abi::StorageMode,
+        device::resources::CPU_BAND_BYTES,
+        service::wire::{Empty, RegionRecord, TextureBytesRequest, TextureResponse},
+        vulkan::backend::Object,
+    };
+    let shared = SharedService::new(service(), HOST);
+    let connection = connect(&mut shared.try_turn().unwrap());
+    let mut memory = Memory::default();
+    let texture: TextureResponse = super::call(
+        &mut shared.try_turn().unwrap(),
+        connection,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Shared),
+        &mut memory,
+    )
+    .unwrap();
+    // Two rows of eight texels, written whole. The test's GPU copies an
+    // image from its start, so the rows are alike; each band's copy names
+    // its own row.
+    let written: alloc::vec::Vec<u8> = (0..64).map(|byte| byte % 32).collect();
+    let region = RegionRecord {
+        slice: 0,
+        level: 0,
+        origin: [0; 3],
+        size: [8, 2, 1],
+    };
+    let replace = TextureBytesRequest {
+        texture: texture.handle,
+        region,
+        bytes: memory.put(&written),
+        bytes_per_row: 32,
+        bytes_per_image: 0,
+    };
+    let _: Empty = super::call(
+        &mut shared.try_turn().unwrap(),
+        connection,
+        Operation::ReplaceRegion,
+        &replace,
+        &mut memory,
+    )
+    .unwrap();
+    // Rows a band apart: each is a band of its own.
+    let apart = CPU_BAND_BYTES as usize;
+    let read = TextureBytesRequest {
+        bytes: memory.put(&alloc::vec![0xee; apart + 32]),
+        bytes_per_row: CPU_BAND_BYTES,
+        ..replace
+    };
+    let record = gate_call(&mut memory, Operation::GetBytes, wire::bytes(&read), 0);
+    let serve = |memory: &mut Memory| {
+        GateService::serve(&shared, connection, record, memory).unwrap();
+        completed(memory, record).status
+    };
+    // `HOST.relax` panics: a call that waited for the holder would fail.
+    let serve_held = |memory: &mut Memory| {
+        let held = shared.try_turn().unwrap();
+        let status = serve(memory);
+        drop(held);
+        status
+    };
+    let finish = || {
+        shared.try_turn().unwrap().device().backend().finish();
+        shared.interrupted();
+    };
+    // The first band's turn starts its copy.
+    assert_eq!(serve(&mut memory), Status::Pending.raw());
+    assert_eq!(serve_held(&mut memory), Status::Pending.raw(), "copy runs");
+    finish();
+    // Copied out, and the next band's copy starts in the call's turn.
+    assert_eq!(serve(&mut memory), Status::Pending.raw());
+    let bytes = GuestMemory::read(&mut memory, read.bytes).unwrap();
+    assert_eq!(bytes[..32], written[..32]);
+    assert_eq!(serve_held(&mut memory), Status::Pending.raw(), "copy runs");
+    finish();
+    // The last band is copied out holding no turn.
+    assert_eq!(serve_held(&mut memory), Status::Ok.raw());
+    let rows: alloc::vec::Vec<(i32, [u32; 3])> = shared
+        .try_turn()
+        .unwrap()
+        .device()
+        .backend()
+        .submissions
+        .iter()
+        .flatten()
+        .flat_map(|segment| &segment.commands)
+        .filter_map(|command| match command {
+            crate::metal::vulkan::command::Command::CopyImageToBuffer { region, .. } => {
+                Some((region.offset[1], region.extent))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, [(0, [8, 1, 1]), (1, [8, 1, 1])]);
+    let bytes = GuestMemory::read(&mut memory, read.bytes).unwrap();
+    assert_eq!(bytes[..32], written[..32]);
+    assert_eq!(bytes[32..apart], alloc::vec![0xee; apart - 32][..]);
+    assert_eq!(bytes[apart..], written[32..]);
+    // The memory copied out of is freed by the next turn.
+    GateService::disconnect(&shared, connection);
+    let freed = shared
+        .try_turn()
+        .unwrap()
+        .device()
+        .backend()
+        .destroyed
+        .iter()
+        .filter(|object| matches!(object, Object::Buffer(_)))
+        .count();
+    assert_eq!(freed, 2, "both bands' host memory");
 }

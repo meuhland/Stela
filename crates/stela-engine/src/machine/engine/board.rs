@@ -187,6 +187,10 @@ pub(super) struct Code {
     /// Units of work a retirement step takes under the lock
     /// ([`super::code_cache::STEP_VISITS`]; tests take fewer).
     pub(super) step_visits: u64,
+    /// PEs waiting for the lock now ([`Self::cache_at`]): a retirement
+    /// step ends early while one does ([`Self::wanted`]). On a line of its
+    /// own, as only waiters write it.
+    pub(super) waiting: Padded<AtomicU32>,
     /// The fetch pages its PEs compile in the tagged variant.
     pub(super) tagged: super::page_sets::PageSet,
     /// The fetch pages its PEs compile with the two-sided range check at
@@ -653,6 +657,7 @@ impl Code {
             retiring: Mutex::new(None),
             retire_pending: AtomicBool::new(false),
             step_visits: super::code_cache::STEP_VISITS,
+            waiting: Padded(AtomicU32::new(0)),
             tagged: Default::default(),
             two_sided: Default::default(),
             rebases: super::rebase::Rebases::new(super::rebase::BOUND),
@@ -679,7 +684,9 @@ impl Code {
             };
         }
         let start = timestamp();
+        self.waiting.fetch_add(1, Ordering::Relaxed);
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
         let since = timestamp();
         let waited = since.wrapping_sub(start);
         let lock = &mut cache.lock;
@@ -694,6 +701,12 @@ impl Code {
             site,
             since,
         }
+    }
+
+    /// Whether a PE waits for the code lock now: a holder doing work that
+    /// can stop at any of its bounds (a retirement step) lets it in first.
+    pub(super) fn wanted(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) != 0
     }
 
     /// The indexed block at `pc`, `physical` and `variant`: from the
@@ -1009,7 +1022,18 @@ pub(super) struct Blocks {
     records: Records<Record>,
     /// Slots holding an installed block.
     live: AtomicUsize,
+    /// Advanced by every step that retires published blocks
+    /// ([`Self::advance_epoch`]): a paired frame holds it from its push,
+    /// and a return takes its continuation only while it is unchanged
+    /// (`chain::ChainControl::retire_epoch`), as the continuation may lie
+    /// in a block retired since. A line of its own: every PE's paired
+    /// returns read it.
+    epoch: RetireEpoch,
 }
+
+/// [`Blocks::epoch`].
+#[repr(align(64))]
+struct RetireEpoch(AtomicU64);
 
 impl Blocks {
     pub(super) fn new(capacity: u32) -> Self {
@@ -1017,7 +1041,27 @@ impl Blocks {
             slots: Slots::new(capacity),
             records: Records::new(capacity),
             live: AtomicUsize::new(0),
+            epoch: RetireEpoch(AtomicU64::new(1)),
         }
+    }
+
+    /// The host address of the retire epoch, which native code reads while
+    /// the board lives.
+    pub(super) fn epoch_address(&self) -> u64 {
+        self.epoch.0.as_ptr() as u64
+    }
+
+    /// The retire epoch now.
+    #[cfg(test)]
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch.0.load(Ordering::Relaxed)
+    }
+
+    /// Fail every paired frame pushed before now: before blocks that a
+    /// native run may have reached retire ([`Self::retire`]), so that a PE
+    /// whose frame names one sees the epoch moved at its return.
+    pub(super) fn advance_epoch(&self) {
+        self.epoch.0.fetch_add(1, Ordering::Release);
     }
 
     /// One more than the highest slot given so far.
@@ -1130,8 +1174,12 @@ impl Blocks {
     /// gives the records' memory back.
     pub(super) fn clear(&mut self, free: bool) {
         let capacity = self.slots.capacity;
+        // Every block goes: no frame of before may match.
+        self.advance_epoch();
         if free {
+            let epoch = self.epoch.0.load(Ordering::Relaxed);
             *self = Self::new(capacity);
+            *self.epoch.0.get_mut() = epoch;
         } else {
             self.slots = Slots::new(capacity);
             self.records.reset();

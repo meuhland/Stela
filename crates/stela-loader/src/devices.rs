@@ -98,6 +98,20 @@ const ROLE: &str = "role";
 const GFX_ROLE: &[u8] = b"GFX\0";
 const DEFAULTS: &str = "/defaults";
 const SERIAL_DEVICE: &str = "serial-device";
+/// Claims that Image4 nonces are entangled with the AES engine's UID-derived
+/// key 2212 (0x8a4; AppleS8000AES `gSpecialKeySeeds`, derived from UID1,
+/// handle 2000). 26B123 AppleImage4 sets its expert's entangle flag from it
+/// (`_darwin_el2_boot` +0x204) and `_darwin_el2_entangle_nonce` then
+/// encrypts every proposed seed with that key before hashing it
+/// (`odometer_derive_nonce_hash`). The Image4 kext checks a restore-info
+/// nonce (`_antiReplayEnforceRestoreInfoNonce`) with the same key only when
+/// `/chosen` `gid-aes-key` is nonzero (`_encryptInit`), and hashes the plain
+/// seed otherwise. The AES model has no UID1 key (stela-runtime
+/// `machine::mount` provisions none), so no entanglement can be honest and
+/// `gid-aes-key` stays 0: without the claim both sides hash the plain seed,
+/// where a personalized cryptex's `cnch` from the first never matched the
+/// second's digest ("'cnch' mismatch" at every mobileassetd graft).
+const ENTANGLE_NONCE: &str = "entangle-nonce";
 const PHANDLE: &str = "AAPL,phandle";
 const SECURE_ROOT_PREFIX: &str = "secure-root-prefix";
 const DEVICE_TYPE: &str = "device_type";
@@ -377,6 +391,11 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
         tree.root.remove_property(SECURE_ROOT_PREFIX);
         hidden.push(format!("/ {SECURE_ROOT_PREFIX}"));
     }
+    if let Some(defaults) = tree.node_mut(DEFAULTS)
+        && defaults.remove_property(ENTANGLE_NONCE).is_some()
+    {
+        hidden.push(format!("{DEFAULTS} {ENTANGLE_NONCE}"));
+    }
     if !visible(&tree.root, &|node| {
         compatibles(node).any(|name| name.starts_with("pmu,"))
     }) {
@@ -428,7 +447,9 @@ fn retire_hidden_capabilities(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
 
 /// Hides the AGX model (`sgx`, its `gfx-asc` coprocessor and firmware mapper)
 /// from a boot whose guest has a real GPU, so that StelaGPU is its only Metal
-/// device: the model refuses all GPU work, and macOS could choose it. Returns
+/// device, and from an installed macOS's console boot without one, which then
+/// has no Metal device: the model refuses all GPU work, and macOS could
+/// choose it. Returns
 /// their paths for the admission ledger. The properties stay, as they do on
 /// every hidden node.
 pub fn hide_agx(tree: &mut DeviceTree) -> Vec<String> {

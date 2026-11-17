@@ -1,4 +1,4 @@
-//! The install medium: the full IPSW on the USB's FAT32 data partition, as
+//! The install medium: the full IPSW on the stick's FAT32 data partition, as
 //! `stela.efi`'s `--install` reads it.
 //!
 //! ```text
@@ -51,7 +51,7 @@ const BUFFER: usize = 64 * HASH_BLOCK_BYTES as usize;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Medium {
     pub(super) build: String,
-    /// The mounted FAT32 data partition of the USB that holds it.
+    /// The mounted FAT32 data partition of the stick that holds it.
     pub(super) volume: PathBuf,
     /// That partition's GPT unique GUID, by which `stela.efi` finds it.
     pub(super) partition_guid: String,
@@ -196,8 +196,7 @@ impl Medium {
             return Ok(Vec::new());
         };
         let total = pieces.iter().map(|piece| piece.bytes).sum();
-        let progress =
-            crate::progress::Phase::bytes("Checking every piece of the install medium", total);
+        let progress = crate::progress::Phase::bytes("Checking macOS on the stick", total);
         let mut damaged = Vec::new();
         for (index, piece) in pieces.iter().enumerate() {
             let path = directory.join(piece_name(index));
@@ -212,7 +211,7 @@ impl Medium {
     }
 }
 
-/// The pieces of the install medium the USB's boot log says failed their
+/// The pieces of the install medium the stick's boot log says failed their
 /// block check during an install (`DAMAGED_LOG_LINE`, `ipsw.003 block 12`),
 /// in lines written after byte `after` of the log's stream: the log's head
 /// when a repair last checked the medium ([`log_head`]). Each piece once.
@@ -248,7 +247,7 @@ pub(super) fn reported_damage(esp: &Path, after: u64) -> Vec<String> {
     found
 }
 
-/// The end of the USB's boot log stream: what a check of the medium now
+/// The end of the stick's boot log stream: what a check of the medium now
 /// has seen ([`reported_damage`]). Zero without a log.
 pub(super) fn log_head(esp: &Path) -> u64 {
     fs::read(esp.join(efi::BOOT_LOG))
@@ -263,14 +262,67 @@ pub(super) fn directory(volume: &Path, build: &str) -> PathBuf {
 }
 
 /// The USB's FAT32 data partition, which holds the boot bundles, the install
-/// medium and the translation store: `explicit`, or the first mounted FAT
-/// partition of the ESP's disk that is not the ESP. Returns its mount and
+/// medium and the translation store: `explicit`, or the first FAT partition
+/// of the ESP's disk that is not the ESP ([`search`]). Returns its mount and
 /// GPT unique GUID.
 pub(super) fn locate(
     host: &dyn Host,
     esp: &Path,
     explicit: Option<&Path>,
 ) -> Result<(PathBuf, String)> {
+    let (usb, reasons) = match search(host, esp, explicit)? {
+        Search::Found(volume, guid) => return Ok((volume, guid)),
+        Search::Missing { usb, reasons } => (usb, reasons),
+    };
+    if let Some(explicit) = explicit {
+        bail!(
+            "{} is not a FAT32 data partition of the stick that holds {}:\n{reasons}",
+            explicit.display(),
+            esp.display()
+        );
+    }
+    bail!(
+        "macOS and its boot files go on a FAT32 partition of the stick, and {usb} has none \
+         stela can use:\n{reasons}stela does not repartition the stick: add a FAT32 partition of \
+         at least 30 GB with a disk utility, mount it, and run stela again. Or erase the stick \
+         with `stela create` on its whole disk."
+    )
+}
+
+/// The mount of the data partition of a setup the stick holds, whose EFI
+/// partition is at `esp`: as [`locate`] finds it, or an error that says the
+/// partition is out of reach, never that it needs writing again.
+pub(super) fn reach(host: &dyn Host, esp: &Path) -> Result<PathBuf> {
+    match search(host, esp, None)? {
+        Search::Found(volume, _) => Ok(volume),
+        Search::Missing { usb, reasons } if reasons.is_empty() => bail!(
+            "the stick's {} volume, which holds macOS and its boot files, is missing from {usb}",
+            super::create::USB_VOLUME
+        ),
+        Search::Missing { reasons, .. } => bail!(
+            "the stick's {} volume, which holds macOS and its boot files, is not mounted, and \
+             stela could not mount it:\n{reasons}Mount it, or plug the stick in again, and run \
+             stela again",
+            super::create::USB_VOLUME
+        ),
+    }
+}
+
+/// What [`search`] found.
+enum Search {
+    /// The data partition's mount and GPT unique GUID.
+    Found(PathBuf, String),
+    /// No data partition on the disk `usb`: why each partition is not it,
+    /// one line each.
+    Missing { usb: String, reasons: String },
+}
+
+/// The data partition of the ESP's disk: `explicit`, or the first mounted
+/// FAT partition that is not the ESP. Hosts leave a stick's partitions
+/// unmounted as often as they mount them, so without `explicit` and a
+/// mounted one, each unmounted partition beside the ESP is mounted for
+/// this run, as the ESP is ([`super::mount_for_run`]), until one is FAT.
+fn search(host: &dyn Host, esp: &Path, explicit: Option<&Path>) -> Result<Search> {
     let usb = host.volume(esp)?.disk.with_context(|| {
         format!(
             "this computer does not say which disk {} is on",
@@ -297,34 +349,55 @@ pub(super) fn locate(
             ));
             continue;
         }
-        let filesystem = host.volume(mount)?.filesystem;
-        if filesystem != FileSystem::Fat {
-            reasons.push_str(&format!(
-                "  {} is {filesystem}, not FAT32\n",
-                mount.display()
-            ));
-            continue;
+        if let Some(guid) = data_partition(host, &partition.identifier, mount, &mut reasons)? {
+            return Ok(Search::Found(mount.clone(), guid));
         }
-        let guid = host.partition(&partition.identifier)?.guid;
-        ensure!(
-            !guid.is_empty(),
-            "{} has no GPT partition GUID, by which stela.efi would find it",
-            partition.identifier
-        );
-        return Ok((mount.clone(), guid));
     }
-    if let Some(explicit) = explicit {
-        bail!(
-            "{} is not a FAT32 data partition of the USB that holds {}:\n{reasons}",
-            explicit.display(),
-            esp.display()
-        );
+    if explicit.is_none() {
+        for partition in &disk.partitions {
+            if partition.mount.is_some() || partition.content == "EFI" {
+                continue;
+            }
+            let found = super::mount_for_run(host, &partition.identifier).and_then(|mount| {
+                let guid = data_partition(host, &partition.identifier, &mount, &mut reasons)?;
+                Ok(guid.map(|guid| (mount, guid)))
+            });
+            match found {
+                Ok(Some((mount, guid))) => return Ok(Search::Found(mount, guid)),
+                Ok(None) => {}
+                Err(error) => reasons.push_str(&format!(
+                    "  {} could not be mounted: {error:#}\n",
+                    partition.identifier
+                )),
+            }
+        }
     }
-    bail!(
-        "The boot bundles and the install medium go on a FAT32 data partition of the USB beside \
-         its EFI partition, and {usb} has none mounted:\n{reasons}Setup does not repartition the USB: add a FAT32 \
-         partition of at least 30 GB with a disk utility, mount it, and run setup again."
-    )
+    Ok(Search::Missing { usb, reasons })
+}
+
+/// The GPT unique GUID of the partition `identifier` mounted at `mount`
+/// when it is FAT, the data partition's file system; else why not, added to
+/// `reasons`.
+fn data_partition(
+    host: &dyn Host,
+    identifier: &str,
+    mount: &Path,
+    reasons: &mut String,
+) -> Result<Option<String>> {
+    let filesystem = host.volume(mount)?.filesystem;
+    if filesystem != FileSystem::Fat {
+        reasons.push_str(&format!(
+            "  {} is {filesystem}, not FAT32\n",
+            mount.display()
+        ));
+        return Ok(None);
+    }
+    let guid = host.partition(identifier)?.guid;
+    ensure!(
+        !guid.is_empty(),
+        "{identifier} has no GPT partition GUID, by which stela.efi would find it"
+    );
+    Ok(Some(guid))
 }
 
 /// What writing the medium needs: the IPSW's pieces not already on
@@ -387,11 +460,12 @@ pub(super) fn check_space(host: &dyn Host, options: SpaceOptions<'_>) -> Result<
     let free = host.volume(volume)?.free_bytes;
     ensure!(
         free >= need,
-        "{} has {:.1} GB free; the install medium needs {:.1} GB more (the macOS {build} IPSW is \
-         {:.1} GB). Free space on it, or use a larger USB.",
+        "{} has {:.1} GB free; macOS needs {:.1} GB more (macOS {} is {:.1} GB). Free space on \
+         it, or use a larger stick.",
         volume.display(),
         free as f64 / 1e9,
         need as f64 / 1e9,
+        super::home::macos_name(build),
         ipsw_bytes as f64 / 1e9
     );
     Ok(need)
@@ -573,7 +647,7 @@ pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
     let mut piece_blocks = Vec::new();
     let mut written = Written::default();
     let mut offset = 0;
-    let progress = crate::progress::Phase::bytes("Writing and verifying the USB image", total * 2);
+    let progress = crate::progress::Phase::bytes("Copying macOS to the stick", total * 2);
     for (index, &size) in sizes.iter().enumerate() {
         let name = piece_name(index);
         let path = directory.join(&name);
@@ -618,7 +692,7 @@ pub(super) fn write(options: WriteOptions<'_>) -> Result<Written> {
             // Read back, so a USB that loses writes is found now.
             ensure!(
                 hash_file(&partial, size, &progress)? == digest,
-                "{} does not read back as written; the USB may be failing",
+                "{} does not read back as written; the stick may be failing",
                 partial.display()
             );
             fs::rename(&partial, &path)?;

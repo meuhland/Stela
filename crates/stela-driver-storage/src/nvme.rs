@@ -16,8 +16,8 @@ use crate::bytes::le32;
 use crate::{
     Clock, Handoff,
     block::{
-        BlockDevice, BlockError, Command, DiscardLimits, Features, Finished, Identity, Transport,
-        WriteZeroes, ascii,
+        BlockDevice, BlockError, Command, DiscardLimits, Features, Finished, Identity, Rotation,
+        Transport, WriteZeroes, ascii,
     },
     bus::{dma::DmaAllocator, pci::Function},
     registers,
@@ -29,6 +29,7 @@ mod features;
 mod io;
 pub mod owned;
 pub mod parts;
+mod quirks;
 mod recovery;
 pub mod vmd;
 use core::{
@@ -36,6 +37,8 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 use owned::{Buffer, RegisterIo};
+pub use quirks::Quirks;
+use stela_driver_core::firmware::smbios::SystemIdentity;
 
 pub const CLASS: [u8; 3] = [0x01, 0x08, 0x02];
 
@@ -96,6 +99,9 @@ const ADMIN_IDENTIFY: u8 = 0x06;
 const ADMIN_ABORT: u8 = 0x08;
 const ADMIN_SET_FEATURES: u8 = 0x09;
 const ADMIN_ASYNC_EVENT: u8 = 0x0c;
+/// Create I/O Submission Queue CDW11 QPRIO: medium (Linux
+/// `NVME_SQ_PRIO_MEDIUM`).
+const SUBMISSION_PRIORITY_MEDIUM: u32 = 2 << 1;
 /// One MSI-X table entry: message address, data and vector control.
 const MSIX_ENTRY_BYTES: u64 = 16;
 /// Autonomous Power State Transition (NVMe Base 2.1 5.27.1.6).
@@ -339,6 +345,15 @@ impl Ids {
         ids
     }
 
+    /// Under `NVME_QUIRK_BOGUS_NID` the descriptors' EUI64, NGUID and UUID
+    /// are skipped; the command set stays.
+    fn without_identifiers(self) -> Self {
+        Self {
+            csi: self.csi,
+            ..Self::default()
+        }
+    }
+
     /// Linux `nvme_ns_info_from_identify`: EUI64 and NGUID from Identify
     /// Namespace when the descriptors gave none.
     fn fill(&mut self, version: u32, data: &[u8]) {
@@ -349,6 +364,16 @@ impl Ids {
             self.nguid.copy_from_slice(&data[NAMESPACE_NGUID]);
         }
     }
+}
+
+/// What Linux `nvme_scan_ns` learns of a namespace before Identify
+/// Namespace ([`Controller::namespace_ids`]).
+enum Scan {
+    /// Its identifiers, and whether the command-set-independent Identify
+    /// Namespace described it.
+    Found(Ids, bool),
+    /// Passed over, and why.
+    Passed(BlockError),
 }
 
 /// How an admin command was lost, when it produced no completion to report.
@@ -367,8 +392,6 @@ struct Queue {
     tail: u16,
     head: u16,
     phase: bool,
-    /// The submission head the controller last reported.
-    consumed: u16,
 }
 
 impl Queue {
@@ -381,7 +404,6 @@ impl Queue {
             tail: 0,
             head: 0,
             phase: true,
-            consumed: 0,
         })
     }
 
@@ -390,37 +412,12 @@ impl Queue {
         self.tail = 0;
         self.head = 0;
         self.phase = true;
-        self.consumed = 0;
     }
 
     /// The next position after an already validated index.
     fn next(&self, slot: u16) -> u16 {
         let next = slot + 1;
         if next == self.entries { 0 } else { next }
-    }
-
-    /// Whether a reported submission head lies no earlier than the last
-    /// one and no further than the tail, in ring order: commands fetched
-    /// together may complete reporting the same head.
-    fn consumes(&self, head: u16) -> bool {
-        head < self.entries
-            && self.ahead(self.consumed, head) <= self.ahead(self.consumed, self.tail)
-    }
-
-    /// Whether `head` shows the command at submission `slot` fetched: past
-    /// it, and no further than the tail.
-    fn fetched(&self, slot: u16, head: u16) -> bool {
-        let past = self.ahead(slot, head);
-        past != 0 && past <= self.ahead(slot, self.tail)
-    }
-
-    /// How many entries `to` lies after `from`, in ring order.
-    fn ahead(&self, from: u16, to: u16) -> u16 {
-        if to >= from {
-            to - from
-        } else {
-            self.entries - (from - to)
-        }
     }
 }
 
@@ -489,10 +486,6 @@ enum Tag {
     Free,
     Running {
         id: u16,
-        /// Its submission queue entry.
-        slot: u16,
-        /// An accepted submission head has passed this command.
-        fetched: bool,
         namespace: u32,
         block: usize,
         command: Command,
@@ -563,8 +556,10 @@ enum Recovery {
         id: u16,
         deadline: crate::Deadline,
     },
-    /// CC.EN cleared; waiting for CSTS.RDY to clear.
-    Disabling(crate::Deadline),
+    /// CC.EN cleared; waiting for CSTS.RDY to clear by the first deadline,
+    /// and under `NVME_QUIRK_DELAY_BEFORE_CHK_RDY` reading CSTS only once
+    /// the second passed.
+    Disabling(crate::Deadline, Option<crate::Deadline>),
     /// CC.EN set; waiting for CSTS.RDY.
     Enabling(crate::Deadline),
     /// A bring-up command, its identifier, and the Identify Controller data
@@ -577,6 +572,43 @@ enum Recovery {
     },
 }
 
+/// An admin command the driver sends of its own between I/O commands, for
+/// an asynchronous event or a namespace rescan, as Linux's event and scan
+/// work items do: published without waiting and looked for at later calls,
+/// until its deadline, as a reset's bring-up commands are. A processor that
+/// starts a guest's command never waits out an admin command, which a
+/// controller may take its whole timeout to answer.
+struct Errand {
+    purpose: Purpose,
+    id: u16,
+    /// Whether it moves data through the admin page.
+    data: bool,
+    deadline: crate::Deadline,
+    /// Its opcode and Identify CNS or feature, for a report.
+    name: &'static str,
+    /// Its result and status once its completion was taken.
+    completed: Option<(u32, u32)>,
+}
+
+/// What an [`Errand`] is for: the Get Log Page that acts on an event, or a
+/// rescan's Identify of `cns` for a namespace, at scan count `scans`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    Log(u32),
+    Identify {
+        namespace: u32,
+        cns: u32,
+        scans: u64,
+    },
+}
+
+/// An Identify's page, or the controller's refusal as its bare status.
+type Answer = Result<Vec<u8>, BlockError>;
+
+/// How a scan asks for the Identify of a CNS: the answer, or `None` while
+/// the command is out ([`Controller::scan_ids`]).
+type AskIdentify<'a> = dyn FnMut(&mut Controller, u32) -> Result<Option<Answer>, BlockError> + 'a;
+
 /// Linux's asynchronous events: what Identify Controller enables, the
 /// outstanding Asynchronous Event Request and a completion not yet acted on.
 #[derive(Default)]
@@ -586,6 +618,9 @@ struct Events {
     activation_us: u64,
     request: Option<u16>,
     completed: Option<(u32, u32)>,
+    /// While a firmware activation pauses processing: when the wait for it
+    /// ends ([`Controller::service_events`]).
+    activation: Option<crate::Deadline>,
 }
 
 impl Events {
@@ -710,7 +745,12 @@ struct Controller {
     events: Events,
     /// The Abort commands sent and not yet completed.
     aborts: Vec<u16>,
+    /// The admin command of an event or a rescan that is out
+    /// ([`Controller::errand`]).
+    errand: Option<Errand>,
     limits: Limits,
+    /// What Linux's quirk tables say of this controller ([`Quirks`]).
+    quirks: Quirks,
 }
 
 /// `nvme_init_non_mdts_limits`: the NVM command set's Write Zeroes and
@@ -889,40 +929,40 @@ pub struct Namespace {
     scanned: u64,
     /// Set once a rescan removed the namespace.
     removed: Option<BlockError>,
+    /// The rescan in progress: the scan count it answers and the Identify
+    /// answers it has, by CNS ([`Namespace::rescan`]).
+    rescanning: Option<(u64, Vec<(u32, Answer)>)>,
 }
 
 /// Reset `function`'s controller, bring up its queues and return its usable
-/// namespaces.
+/// namespaces. `platform` names the board for Linux's board quirks.
 pub fn attach(
     function: &mut Function,
     handoff: &Handoff,
     dma: &mut dyn DmaAllocator,
     minimum: &(impl crate::bus::pci::power::Timer + ?Sized),
+    platform: &SystemIdentity<'_>,
 ) -> Result<Attached, BlockError> {
     minimum.check().map_err(BlockError::PciPower)?;
     validate_clock(handoff.clock)?;
     function.power_up(minimum)?;
     let bars = function.bars()?;
     let registers = RegisterIo::Legacy(registers(handoff, bars[0], 0, 0x2000)?);
-    function.enable_polled()?;
-    let signalled = match (handoff.completion, function.interrupts()?.msix) {
-        (Some(message), Some(msix)) => {
-            let table = crate::registers(
+    // Memory decode only: bus mastering stays off, as the device start left
+    // it, until the controller stopped ([`start_after_stop`]).
+    function.enable_polled_decode()?;
+    let msix = match (handoff.completion, function.interrupts()?.msix) {
+        (Some(message), Some(msix)) => Some((
+            message,
+            msix,
+            crate::registers(
                 handoff,
                 bars[usize::from(msix.table_bar)],
                 u64::from(msix.table_offset),
                 MSIX_ENTRY_BYTES,
-            )?;
-            function.enable_msix(msix, || {
-                table.write32(0, message.address as u32);
-                table.write32(4, (message.address >> 32) as u32);
-                table.write32(8, message.data);
-                table.write32(12, 0);
-                Ok(())
-            })?;
-            true
-        }
-        _ => false,
+            )?,
+        )),
+        _ => None,
     };
     let mut controller = Controller {
         registers,
@@ -934,7 +974,7 @@ pub fn attach(
         held: (0..DEPTH).map(|_| Vec::new()).collect(),
         tags: (0..DEPTH).map(|_| Tag::Free).collect(),
         recovery: None,
-        signalled,
+        signalled: false,
         owed: false,
         max_transfer: BOUNCE_BYTES,
         max_command_bytes: MAX_COMMAND_BYTES,
@@ -959,10 +999,42 @@ pub fn attach(
         host_memory_enabled: false,
         events: Events::default(),
         aborts: Vec::new(),
+        errand: None,
         limits: Limits::default(),
+        quirks: Quirks::for_device(function.vendor, function.device)
+            | Quirks::for_platform(function.vendor, function.device, platform),
     };
-    controller.initialize()?;
+    start_after_stop(&mut controller, |_| {
+        function.enable_bus_master()?;
+        let Some((message, msix, table)) = msix else {
+            return Ok(false);
+        };
+        function.enable_msix(msix, || {
+            table.write32(0, message.address as u32);
+            table.write32(4, (message.address >> 32) as u32);
+            table.write32(8, message.data);
+            table.write32(12, 0);
+            Ok(())
+        })?;
+        Ok(true)
+    })?;
     discover(controller, format!("{}", function.address), &mut { dma })
+}
+
+/// Stop the controller, then `enable_dma`, then start it with its admin
+/// queue: a controller the firmware left enabled may still post to the
+/// firmware's queues or host memory buffer, pages Stela owns after the
+/// firmware exits, until CSTS.RDY clears, so bus mastering (and the MSI-X
+/// message, whose answer says whether completions are signalled) comes
+/// only after. Linux enables bus mastering first; the owned path's
+/// lifecycle orders it the same way as this.
+fn start_after_stop(
+    controller: &mut Controller,
+    enable_dma: impl FnOnce(&Controller) -> Result<bool, BlockError>,
+) -> Result<(), BlockError> {
+    controller.stop()?;
+    controller.signalled = enable_dma(controller)?;
+    controller.start_admin()
 }
 
 /// Linux `nvme_wait_ready`'s bound for a ready timeout in 500 ms units:
@@ -1002,6 +1074,9 @@ fn discover(
     // Linux `nvme_init_identify` takes a present cache as one to flush and
     // leaves the controller's Volatile Write Cache feature as it is.
     let write_cache = identify[CONTROLLER_VOLATILE_CACHE] & 1 != 0;
+    // Linux `nvme_init_identify` adds `core_quirks` once, from the first
+    // Identify Controller.
+    controller.quirks = controller.quirks | Quirks::for_controller(&identify);
     controller.shutdown_timeout_us = shutdown_timeout_us(rtd3_entry_us);
     controller.identified(&identify);
     controller.allocate_host_memory(request, host_memory);
@@ -1013,42 +1088,73 @@ fn discover(
     controller.settle()?;
 
     // Linux `nvme_scan_work`: the active list from NVMe 1.1, otherwise (or
-    // when the controller refuses it) every namespace ID in turn.
+    // when the controller refuses it) every namespace ID in turn. A list
+    // out of order, or naming an ID past NN, is garbage, which the
+    // sequential scan replaces too: its IDs could name one namespace twice.
     let listed = if version >= VERSION_1_1 {
-        controller
-            .identify(IDENTIFY_ACTIVE_NAMESPACES, 0)
-            .map(|list| {
-                list.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|word| u32::from_le_bytes(*word))
-                    .take_while(|namespace| *namespace != 0)
-                    .collect::<Vec<u32>>()
-            })
-            .ok()
+        Some(
+            controller
+                .identify(IDENTIFY_ACTIVE_NAMESPACES, 0)
+                .map(|list| {
+                    list.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_le_bytes(*word))
+                        .take_while(|namespace| *namespace != 0)
+                        .collect::<Vec<u32>>()
+                })
+                .map_err(|error| match error {
+                    BlockError::Device { status } => ActiveList::Refused(status),
+                    _ => ActiveList::Lost,
+                }),
+        )
     } else {
         None
     };
     controller.ready()?;
-    let (candidates, sequential) = match listed {
-        Some(active) => (active, false),
-        None => ((1..=namespaces.min(SEQUENTIAL_SCAN_LIMIT)).collect(), true),
-    };
     let mut attached = Attached {
         namespaces: Vec::new(),
         failures: Vec::new(),
+        quirks: controller.quirks,
+        sequential: None,
+    };
+    let scanned = namespaces.min(SEQUENTIAL_SCAN_LIMIT);
+    let (candidates, sequential) = match listed {
+        Some(Ok(active)) if active_list_valid(&active, namespaces) => (active, false),
+        listed => {
+            let why = match listed {
+                Some(Ok(active)) => Some(ActiveList::Invalid(active.len())),
+                Some(Err(why)) => Some(why),
+                None => None,
+            };
+            attached.sequential = why.map(|why| SequentialScan {
+                why,
+                namespaces,
+                scanned,
+            });
+            ((1..=scanned).collect(), true)
+        }
     };
     let mut found = Vec::new();
-    let (max_transfer, max_command_bytes, commands, scans, limits) = (
+    let (max_transfer, max_command_bytes, commands, scans, limits, quirks) = (
         controller.max_transfer,
         controller.max_command_bytes,
         controller.commands,
         controller.scans,
         controller.limits,
+        controller.quirks,
     );
     for namespace in candidates {
-        let Some((mut ids, independent)) = controller.namespace_ids(namespace)? else {
-            continue;
+        // A sequential scan meets IDs of no namespace, which refuse; a
+        // listed namespace passed over is reported with why.
+        let (mut ids, independent) = match controller.namespace_ids(namespace)? {
+            Scan::Found(ids, independent) => (ids, independent),
+            Scan::Passed(error) => {
+                if !sequential {
+                    attached.failures.push((namespace, error));
+                }
+                continue;
+            }
         };
         // Zoned and other command sets need drivers Stela does not have.
         if ids.csi != CSI_NVM {
@@ -1071,7 +1177,7 @@ fn discover(
             }
             Err(error) => return Err(error),
         };
-        if !independent {
+        if !independent && !quirks.contains(Quirks::BOGUS_IDS) {
             ids.fill(version, data);
         }
         match plain_format(data, max_transfer) {
@@ -1094,6 +1200,7 @@ fn discover(
             ids,
             scanned: scans,
             removed: None,
+            rescanning: None,
             identity: Identity {
                 transport: Transport::Nvme,
                 location: format!("{location} namespace {namespace}"),
@@ -1111,6 +1218,7 @@ fn discover(
                         data: max_transfer,
                         command: max_command_bytes,
                     },
+                    quirks,
                 ),
             },
         })
@@ -1119,19 +1227,29 @@ fn discover(
 }
 
 /// The APST table Linux `nvme_configure_apst` gives a controller that
-/// supports it, or `None`: from the deepest power state up, each state goes
-/// to the deepest usable non-operational state below it once idle for its
-/// timeout, at most one state per latency tolerance.
-fn apst_table(identify: &[u8]) -> Option<[u64; 32]> {
+/// supports it, and whether APST is enabled with it, or `None`: from the
+/// deepest power state up, each state goes to the deepest usable
+/// non-operational state below it once idle for its timeout, at most one
+/// state per latency tolerance. A state whose exit latency exceeds
+/// `default_ps_max_latency_us` is never a target, nor the deepest state
+/// under `NVME_QUIRK_NO_DEEPEST_PS`; `NVME_QUIRK_NO_APST` turns APST off
+/// with an empty table.
+fn apst_table(identify: &[u8], quirks: Quirks) -> Option<([u64; 32], bool)> {
     let deepest = usize::from(identify[CONTROLLER_POWER_STATES]);
     if identify[CONTROLLER_APST] & 1 == 0 || deepest > 31 {
         return None;
     }
     let mut table = [0; 32];
+    if quirks.contains(Quirks::NO_APST) {
+        return Some((table, false));
+    }
     let mut target = 0;
     let mut tolerance = u32::MAX;
     for state in (0..=deepest).rev() {
         table[state] = target;
+        if state == deepest && quirks.contains(Quirks::NO_DEEPEST_POWER_STATE) {
+            continue;
+        }
         let descriptor = &identify[CONTROLLER_POWER_DESCRIPTORS + 32 * state..][..32];
         if descriptor[3] & POWER_NON_OPERATIONAL == 0 {
             continue;
@@ -1155,7 +1273,7 @@ fn apst_table(identify: &[u8]) -> Option<[u64; 32]> {
         };
         target = (state as u64) << 3 | idle << 8;
     }
-    Some(table)
+    Some((table, true))
 }
 
 /// Payload storage and logical command-range limits are separate: a no-data
@@ -1174,12 +1292,15 @@ struct TransferLimits {
 /// (`nvme_init_non_mdts_limits`), which may deallocate where the namespace
 /// reads deallocated blocks as zeros and says Write Zeroes deallocates
 /// (`NVME_NS_DEAC`). A Write Zeroes command takes at most 2^16 blocks.
+/// `NVME_QUIRK_NO_FUA` leaves FUA out, and `NVME_QUIRK_DISABLE_WRITE_ZEROES`
+/// Write Zeroes.
 fn features(
     write_cache: bool,
     commands: u16,
     limits: Limits,
     format: &Format,
     transfer: TransferLimits,
+    quirks: Quirks,
 ) -> Features {
     let block_shift = format.block_size.trailing_zeros();
     let sectors = u64::from(u32::MAX) >> (block_shift - 9);
@@ -1194,7 +1315,7 @@ fn features(
     };
     Features {
         write_cache,
-        fua: write_cache,
+        fua: write_cache && !quirks.contains(Quirks::NO_FUA),
         max_transfer: transfer.data,
         max_read_transfer: None,
         discard: (commands & COMMANDS_DATASET_MANAGEMENT != 0).then_some(DiscardLimits {
@@ -1208,17 +1329,73 @@ fn features(
                 ranges => usize::from(ranges).min(MAX_DEALLOCATE_RANGES),
             },
         }),
-        write_zeroes: (commands & COMMANDS_WRITE_ZEROES != 0).then_some(WriteZeroes {
+        write_zeroes: (commands & COMMANDS_WRITE_ZEROES != 0
+            && !quirks.contains(Quirks::NO_WRITE_ZEROES))
+        .then_some(WriteZeroes {
             blocks: (zeroes >> block_shift).min(1 << 16),
             unmap: format.deallocate & 0x7 == 1 && format.deallocate & 1 << 3 != 0,
         }),
+        // The namespace's rotational media bit (NVMe 2.0's I/O Command Set
+        // Independent Identify Namespace) is not read.
+        rotation: Rotation::Unreported,
     }
 }
 
-/// The namespaces of one controller, and those it cannot serve.
+/// Whether an Identify Active Namespace List is one: in increasing order
+/// (NVMe Base 2.1 5.1.13.2.2), each ID within NN, which bounds valid IDs.
+fn active_list_valid(active: &[u32], namespaces: u32) -> bool {
+    active.windows(2).all(|pair| pair[0] < pair[1])
+        && active.last().is_none_or(|last| *last <= namespaces)
+}
+
+/// Why a controller from NVMe 1.1 was scanned one namespace ID at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveList {
+    /// It refused the Identify Active Namespace List with this status.
+    Refused(u32),
+    /// The list got no answer, and the controller was reset.
+    Lost,
+    /// Its list of this many IDs was out of order or named one past NN.
+    Invalid(usize),
+}
+
+/// A sequential namespace scan in place of the active list: why, NN, and
+/// the IDs scanned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequentialScan {
+    pub why: ActiveList,
+    pub namespaces: u32,
+    pub scanned: u32,
+}
+
+impl core::fmt::Display for SequentialScan {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = identify_name(IDENTIFY_ACTIVE_NAMESPACES);
+        match self.why {
+            ActiveList::Refused(status) => write!(f, "{name} refused, status {status:#x}")?,
+            ActiveList::Lost => write!(f, "{name} got no answer")?,
+            ActiveList::Invalid(listed) => write!(
+                f,
+                "{name} of {listed} IDs out of order or past NN {}",
+                self.namespaces
+            )?,
+        }
+        write!(
+            f,
+            ": NVMe namespace IDs 1 to {} scanned one by one",
+            self.scanned
+        )
+    }
+}
+
+/// The namespaces of one controller, those it cannot serve, the quirks it
+/// runs with and the sequential scan that replaced a refused or garbage
+/// active namespace list.
 pub struct Attached {
     pub namespaces: Vec<Namespace>,
     pub failures: Vec<(u32, BlockError)>,
+    pub quirks: Quirks,
+    pub sequential: Option<SequentialScan>,
 }
 
 /// A namespace's size and its in-use LBA format.
@@ -1275,42 +1452,81 @@ impl Namespace {
     /// or namespace-change notice, once asynchronous events are acted on:
     /// a namespace no longer allocated, or whose identifiers changed, is
     /// removed; otherwise its size and format are updated. A refused
-    /// Identify leaves the namespace as it was. Admin commands of its own:
-    /// only while no command runs.
-    fn rescan(&mut self, controller: &mut Controller) -> Result<(), BlockError> {
+    /// Identify leaves the namespace as it was. Whether the namespace is
+    /// scanned at the controller's count. Its admin commands are errands
+    /// ([`Controller::errand`]), sent only while no command runs and looked
+    /// for at later calls, as Linux's scan work runs beside its requests:
+    /// this never waits for one, and commands go on meanwhile.
+    fn rescan(&mut self, controller: &mut Controller) -> Result<bool, BlockError> {
         controller.ready()?;
         if let Some(error) = &self.removed {
             return Err(error.clone());
         }
-        controller.service_events()?;
-        if self.scanned == controller.scans {
-            return Ok(());
+        if !controller.service_events()? {
+            return Ok(false);
         }
-        let scans = controller.scans;
-        let Some((mut ids, independent)) = controller.namespace_ids(self.namespace)? else {
-            self.scanned = scans;
-            return Ok(());
+        if self.scanned == controller.scans {
+            self.rescanning = None;
+            return Ok(true);
+        }
+        let (scans, namespace) = (controller.scans, self.namespace);
+        let mut answers = match self.rescanning.take() {
+            Some((at, answers)) if at == scans => answers,
+            _ => Vec::new(),
         };
+        let mut ask =
+            |controller: &mut Controller, cns: u32| -> Result<Option<Answer>, BlockError> {
+                if let Some((_, answer)) = answers.iter().find(|(asked, _)| *asked == cns) {
+                    return Ok(Some(answer.clone()));
+                }
+                let purpose = Purpose::Identify {
+                    namespace,
+                    cns,
+                    scans,
+                };
+                let command = |controller: &Controller| controller.identify_command(cns, namespace);
+                let Some((_, status)) = controller.errand(purpose, true, command)? else {
+                    return Ok(None);
+                };
+                let answer = match status {
+                    0 => Ok(controller.admin_data.bytes()[..PAGE].to_vec()),
+                    status => Err(BlockError::Device { status }),
+                };
+                answers.push((cns, answer.clone()));
+                Ok(Some(answer))
+            };
+        let (mut ids, independent) = match controller.scan_ids(&mut ask)? {
+            None => {
+                self.rescanning = Some((scans, answers));
+                return Ok(false);
+            }
+            Some(Scan::Passed(_)) => {
+                self.scanned = scans;
+                return Ok(true);
+            }
+            Some(Scan::Found(ids, independent)) => (ids, independent),
+        };
+        let Some(data) = ask(controller, IDENTIFY_NAMESPACE)? else {
+            self.rescanning = Some((scans, answers));
+            return Ok(false);
+        };
+        self.scanned = scans;
         let (version, max_transfer, max_command_bytes) = (
             controller.version,
             controller.max_transfer,
             controller.max_command_bytes,
         );
-        let (commands, limits) = (controller.commands, controller.limits);
-        let data = match controller.identify(IDENTIFY_NAMESPACE, self.namespace) {
+        let (commands, limits, quirks) =
+            (controller.commands, controller.limits, controller.quirks);
+        let data = match data {
             Ok(data) => data,
-            Err(BlockError::Device { .. }) => {
-                self.scanned = scans;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
+            Err(_) => return Ok(true),
         };
-        if !independent {
-            ids.fill(version, data);
+        if !independent && !quirks.contains(Quirks::BOGUS_IDS) {
+            ids.fill(version, &data);
         }
         let allocated = data[NAMESPACE_CAPACITY] != [0; 8];
-        let format = plain_format(data, max_transfer);
-        self.scanned = scans;
+        let format = plain_format(&data, max_transfer);
         match format {
             Ok(Some(format)) if allocated && ids == self.ids => {
                 self.identity.blocks = format.blocks;
@@ -1326,8 +1542,9 @@ impl Namespace {
                         data: max_transfer,
                         command: max_command_bytes,
                     },
+                    quirks,
                 );
-                Ok(())
+                Ok(true)
             }
             Err(error) if allocated && ids == self.ids => {
                 // nvme_update_ns_info hides a namespace it cannot use.
@@ -1349,7 +1566,14 @@ impl Namespace {
     fn command_to(&mut self, command: Command, destination: Option<&mut [u8]>) -> Finished {
         let controller = self.controller.clone();
         let mut controller = controller.borrow_mut();
-        self.rescan(&mut controller)?;
+        // A caller that waits sees the rescan to its end: its errands go
+        // once every queued command ended.
+        controller.settle()?;
+        while !self.rescan(&mut controller)? {
+            controller.advance();
+            crate::waiting();
+            core::hint::spin_loop();
+        }
         let command = command.within(&self.identity, 0)?;
         let block = self.identity.block_size as usize;
         controller.run(self.namespace, block, command, destination)
@@ -1430,8 +1654,8 @@ impl BlockDevice for Namespace {
         self.removed.is_some() || self.controller.borrow().room()
     }
 
-    /// Asynchronous events and rescans run admin commands, which wait: only
-    /// while no command runs, as Linux's work items run between requests.
+    /// Asynchronous events and rescans move on first, never waiting
+    /// ([`Self::rescan`]).
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
         self.start_with(command, true)
     }
@@ -1477,17 +1701,14 @@ impl BlockDevice for Namespace {
 }
 
 impl Namespace {
-    /// Asynchronous events and rescans run admin commands, which wait: only
-    /// while no command runs, as Linux's work items run between requests.
-    /// The doorbell rings at once when `ring`.
+    /// Asynchronous events and rescans move on first, never waiting
+    /// ([`Self::rescan`]): their admin commands go only while no command
+    /// runs, as Linux's work items run between requests, and are looked
+    /// for at later starts. The doorbell rings at once when `ring`.
     fn start_with(&mut self, command: Command, ring: bool) -> Result<u32, BlockError> {
         let controller = self.controller.clone();
         let mut controller = controller.borrow_mut();
-        if !controller.busy() {
-            parts::timed(parts::Part::Rescan, || self.rescan(&mut controller))?;
-        } else if let Some(error) = &self.removed {
-            return Err(error.clone());
-        }
+        parts::timed(parts::Part::Rescan, || self.rescan(&mut controller))?;
         let command = command.within(&self.identity, 0)?;
         let block = self.identity.block_size as usize;
         parts::timed(parts::Part::Start, || {

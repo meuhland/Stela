@@ -82,6 +82,25 @@ kernel void surface_two_plane_wide(texture2d<float, access::sample> t [[texture(
     sampled[i] = t.sample(linear, (float2(p) + 0.5f) / float2(n));
 }
 
+/* A compositor's frame over a video surface: the whole surface sampled
+ * into a target of the same size. */
+kernel void surface_frame(texture2d<float, access::sample> t [[texture(0)]],
+                          texture2d<half, access::write> target [[texture(1)]],
+                          uint2 p [[thread_position_in_grid]], uint2 n [[threads_per_grid]])
+{
+    constexpr sampler linear(filter::linear, address::clamp_to_edge);
+    target.write(half4(t.sample(linear, (float2(p) + 0.5f) / float2(n))), p);
+}
+
+/* 16 texels of a frame's surface, spread over it, from `first` on. */
+kernel void surface_probe(texture2d<float, access::sample> t [[texture(0)]],
+                          device float4 *probes [[buffer(0)]], constant uint &first [[buffer(1)]],
+                          uint i [[thread_position_in_grid]])
+{
+    uint2 at = uint2((i * 241u + 17u) % t.get_width(), (i * 137u + 5u) % t.get_height());
+    probes[first + i] = t.read(at);
+}
+
 kernel void archived(device uint *data [[buffer(0)]], constant uint &unused [[buffer(1)]], uint i [[thread_position_in_grid]])
 {
     data[i] = data[i] * 3u + 1u;

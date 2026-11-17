@@ -224,7 +224,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             zero_block: system::native_zero_block(&self.cpu, &self.profile_missing),
             cache_clean: system::native_cache_clean(&self.cpu),
             exclusive: self.parallel.is_some(),
-            pointer: Some(super::pointer::CELLS),
+            pointer: Some(super::pointer::cells(self.target)),
             mirrored: inline_mirrored_reads(),
             amx: self.cpu.amx.generation().is_some(),
             self_loops: self.self_loops,

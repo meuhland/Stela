@@ -35,6 +35,7 @@ pub(crate) use kernel_work::FirmwareContext;
 mod network;
 pub(crate) mod nor;
 mod parallel;
+mod pci_power;
 #[cfg(feature = "nvk")]
 pub(crate) mod pipelines;
 pub(crate) mod power;
@@ -45,6 +46,8 @@ mod restore;
 mod service;
 mod services;
 mod speculation;
+mod step_watchdog;
+pub(crate) use step_watchdog::alone_idle_stage;
 pub(crate) mod storage;
 mod store_file;
 mod topology;
@@ -68,6 +71,7 @@ use stela_boot_core::{
     console_lines,
     options::{Base, System},
     ram,
+    screen::Exclusive,
 };
 use stela_compiler::TargetCpu;
 use stela_contracts::Chip;
@@ -541,11 +545,13 @@ pub(crate) fn feed_console_input() {
 
 /// The guest's console UART, shown line by line as `GUEST| ...`. In the
 /// automatic Metal plugin repair's boot it also types the repair's commands
-/// (`bundle_repair`), ahead of the host's own input.
+/// (`bundle_repair`), and the host's own input waits until it is done.
 #[derive(Default)]
 struct GuestConsole {
     lines: console_lines::Lines,
     repair: ConsoleRepair,
+    /// Host input was dropped while the repair typed; reported once.
+    dropped: bool,
 }
 
 #[derive(Default)]
@@ -554,6 +560,8 @@ enum ConsoleRepair {
     #[default]
     Unknown,
     Driving(stela_boot_core::bundle_repair::Driver),
+    /// Keep host input isolated until reset after an automatic repair ends.
+    Closed,
     Off,
 }
 
@@ -575,17 +583,25 @@ impl GuestConsole {
         }
     }
 
-    /// Log what the driver did. A repair whose shell stopped answering, or
-    /// whose guest did not restart, restarts the PC, once: the next normal
-    /// boot tries the kext, and NVRAM's record makes a still missing plugin
-    /// stop there with the manual remedy instead of repairing again. A
-    /// failed step the shell answered restarts the guest itself.
+    /// Log what the driver did. A repair whose shell stopped answering or
+    /// left, or whose guest did not restart, restarts the PC, once: the
+    /// next normal boot tries the kext, and NVRAM's record makes a still
+    /// missing plugin stop there with the manual remedy instead of
+    /// repairing again. A shell that never took input asks for one more
+    /// repair boot instead (`bundle_repair::unanswered`). A failed step the
+    /// shell answered restarts the guest itself.
     fn report_repair(&mut self) {
         let Some(driver) = self.repair() else {
             return;
         };
         let events = driver.take_events();
+        if let Some(outcome) = driver.outcome() {
+            bundle_repair::outcome(outcome);
+        }
         let restart = driver.failed();
+        let unanswered = driver
+            .failure()
+            .is_some_and(stela_boot_core::bundle_repair::Failure::unanswered);
         for event in &events {
             output::arguments(format_args!(
                 "{}\n",
@@ -593,10 +609,16 @@ impl GuestConsole {
             ));
         }
         if restart {
-            self.repair = ConsoleRepair::Off;
-            output::arguments(format_args!(
-                "BUNDLE REPAIR restarting the PC; the next boot tries the kext once\n"
-            ));
+            self.repair = ConsoleRepair::Closed;
+            if unanswered && bundle_repair::unanswered() {
+                output::arguments(format_args!(
+                    "BUNDLE REPAIR nothing ran; restarting the PC into one more repair boot\n"
+                ));
+            } else {
+                output::arguments(format_args!(
+                    "BUNDLE REPAIR restarting the PC; the next boot tries the kext once\n"
+                ));
+            }
             service::request_restart();
         }
     }
@@ -614,7 +636,22 @@ impl ConsoleSink for GuestConsole {
         }
         let input = &CONSOLE_INPUT;
         let taken = input.taken.load(Ordering::Relaxed);
-        if taken == input.put.load(Ordering::Acquire) {
+        let put = input.put.load(Ordering::Acquire);
+        if taken == put {
+            return None;
+        }
+        if matches!(self.repair, ConsoleRepair::Closed) {
+            return None;
+        }
+        if matches!(self.repair, ConsoleRepair::Driving(_)) {
+            // Bytes between the repair's would break into its commands, and
+            // a break or ^C would stop the shell.
+            input.taken.store(put, Ordering::Release);
+            if !core::mem::replace(&mut self.dropped, true) {
+                output::arguments(format_args!(
+                    "BUNDLE REPAIR host console input dropped while the repair types\n"
+                ));
+            }
             return None;
         }
         let byte = input.bytes[taken % CONSOLE_INPUT_BYTES].load(Ordering::Relaxed);
@@ -623,17 +660,24 @@ impl ConsoleSink for GuestConsole {
     }
 
     fn transmit(&mut self, byte: u8) -> Result<(), ConsoleBusy> {
+        // Each byte, for the shell's prompt, which ends no line.
+        if let Some(driver) = self.repair() {
+            driver.output(byte, Self::millis());
+            self.report_repair();
+        }
         if let Some(fragment) = self.lines.push(byte) {
             if let Ok(mut panic) = GUEST_PANIC.0.try_borrow_mut() {
                 panic.observe(&fragment);
             }
-            let line = fragment.text;
-            output::arguments(format_args!("GUEST| {line}\n"));
-            if !fragment.complete {
-                output::arguments(format_args!(
-                    "GUEST-FRAGMENT bytes={} continues=1\n",
-                    fragment.bytes
-                ));
+            let line = fragment.text.clone();
+            // The log and the serial port take it outside the board's lock
+            // ([`write_guest_output`]), in order.
+            if GUEST_OUTPUT
+                .try_with(|queued| queued.push(fragment, GUEST_OUTPUT_LINES))
+                .is_none()
+            {
+                // A stop writes the queue now ([`write_guest_output_at_stop`]).
+                GUEST_SKIPPED.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(driver) = self.repair() {
                 let now = Self::millis();
@@ -891,6 +935,118 @@ fn stop_here(text: &str, code: u32) -> ! {
 /// `status::STREAM_LINES` at most, reached under the board's lock.
 static GUEST_LINES: output::Global<Vec<String>> = output::Global(RefCell::new(Vec::new()));
 
+/// The guest's console lines and fragments for the log since the home PE
+/// last took them ([`Drained::take`]), in order, made under the board's
+/// lock. A stop on any processor writes them too, without that lock
+/// ([`write_guest_output_at_stop`]), so the queue is a processor-safe cell
+/// rather than a `RefCell`.
+static GUEST_OUTPUT: Exclusive<console_lines::Queued> =
+    Exclusive::new(console_lines::Queued::new());
+
+/// The most guest lines kept for the log between two takes: far more than
+/// a slice's worth, so that only a home PE kept from its reports drops any.
+const GUEST_OUTPUT_LINES: usize = 4096;
+
+/// The guest lines the home PE took and has not written yet, which only it
+/// and a stop reach.
+static GUEST_WRITING: Exclusive<console_lines::Queued> =
+    Exclusive::new(console_lines::Queued::new());
+
+/// Guest lines a UART write ended while a stop held [`GUEST_OUTPUT`].
+static GUEST_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How long a stop waits for another processor to put down a guest line
+/// queue: longer than the home PE's bounded write between slices
+/// ([`run::report_drained`]); a holder that keeps it longer is this
+/// processor further up its stack, or stuck.
+const GUEST_STOP_WAIT_MILLIS: u64 = 250;
+/// How long a stop writes guest lines for, the rest counted as dropped:
+/// the queue holds up to [`GUEST_OUTPUT_LINES`], and after the serial
+/// port's queue ends each line waits for the port itself.
+const GUEST_STOP_WRITE_MILLIS: u64 = 1000;
+/// Tries to take a queue before the counter's rate is known.
+const GUEST_STOP_WAIT_SPINS: u64 = 1 << 22;
+
+/// Take the guest's console output for the log, under the board's lock.
+pub(super) fn take_guest_output() -> console_lines::Queued {
+    GUEST_OUTPUT
+        .try_with(|queued| queued.take())
+        .unwrap_or_default()
+}
+
+fn guest_dropped(dropped: u64) {
+    output::arguments(format_args!("GUEST-DROPPED lines={dropped}\n"));
+}
+
+fn guest_line(fragment: &console_lines::Line) {
+    output::arguments(format_args!("GUEST| {}\n", fragment.text));
+    if !fragment.complete {
+        output::arguments(format_args!(
+            "GUEST-FRAGMENT bytes={} continues=1\n",
+            fragment.bytes
+        ));
+    }
+}
+
+/// Write the guest console lines taken so far (those left before, then
+/// `taken`) as `GUEST|` lines, in order, while `more` allows, keeping the
+/// rest for the next call: the home PE's reports write them between slices,
+/// not the PE whose UART write ended the line under the board's lock. With
+/// `more` always true, everything left.
+pub(super) fn write_guest_output(taken: console_lines::Queued, more: impl FnMut() -> bool) {
+    GUEST_WRITING.try_with(|writing| {
+        writing.append(taken);
+        let skipped = GUEST_SKIPPED.swap(0, Ordering::Relaxed);
+        if skipped != 0 {
+            guest_dropped(skipped);
+        }
+        writing.write(guest_dropped, more, guest_line);
+    });
+}
+
+/// At a stop, on any processor and before its reason, record and screen:
+/// write every guest console line the log does not have yet, the home PE's
+/// taken ones first, then those still queued, which only the home PE wrote
+/// before and which explain the stop. Takes no board lock, allocates and
+/// frees nothing, waits at most [`GUEST_STOP_WAIT_MILLIS`] for each queue
+/// and writes for at most [`GUEST_STOP_WRITE_MILLIS`]; what it leaves is
+/// counted as dropped. Safe before the engine runs: the queues are empty.
+pub(crate) fn write_guest_output_at_stop() {
+    let bounded = |millis: u64| {
+        let started = output::now();
+        let mut spins = 0u64;
+        move || {
+            spins += 1;
+            match output::counter_hz() {
+                0 => spins >= GUEST_STOP_WAIT_SPINS,
+                _ => output::millis_since(started) >= millis,
+            }
+        }
+    };
+    let mut writing = bounded(GUEST_STOP_WRITE_MILLIS);
+    let mut more = move || !writing();
+    let mut held = 0;
+    for queue in [&GUEST_WRITING, &GUEST_OUTPUT] {
+        if queue
+            .with_until(bounded(GUEST_STOP_WAIT_MILLIS), |queued| {
+                queued.write_at_stop(guest_dropped, &mut more, guest_line);
+            })
+            .is_none()
+        {
+            held += 1;
+        }
+    }
+    let skipped = GUEST_SKIPPED.swap(0, Ordering::Relaxed);
+    if skipped != 0 {
+        guest_dropped(skipped);
+    }
+    if held != 0 {
+        output::arguments(format_args!(
+            "GUEST-HELD queues={held}: guest lines another processor holds are not in this stop's log\n"
+        ));
+    }
+}
+
 /// The restore step `line` begins, by name, as the running step's detail.
 fn installer_step(line: &str) -> Option<String> {
     // `[08:34:20.0721-GMT]{5>7} CHECKPOINT BEGIN: RESTORED:[0x067C] fdr_create`
@@ -981,10 +1137,18 @@ fn panic_region_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
 }
 
 /// How the guest went down: the first panic, else `otherwise`.
+/// A check-in stall on a disk too slow for it names that disk first
+/// (`storage::slow_disk_note`).
 fn guest_down(otherwise: String) -> String {
-    match guest_panic() {
-        Some(message) => format!("macOS crashed: {message}"),
-        None => otherwise,
+    let Some(message) = guest_panic() else {
+        return otherwise;
+    };
+    match storage::slow_disk_note(&message) {
+        Some(note) => {
+            output::arguments(format_args!("STOP SLOW DISK {note}\n"));
+            format!("macOS could not start in time: {note}. macOS crashed: {message}")
+        }
+        None => format!("macOS crashed: {message}"),
     }
 }
 
@@ -1149,6 +1313,7 @@ fn finish<H: Host>(
     parallel::report_source_observations(machine);
     survey_report(machine);
     let drained = machine.devices.with(Drained::take);
+    write_guest_output(drained.guest, || true);
     unmodeled_report(machine, drained.unmodeled);
     // Machine answers are counted per access; coprocessor requests are
     // counted among the distinct reports only.
@@ -1261,8 +1426,14 @@ fn finish<H: Host>(
                     show_reset("macOS turned the Mac off", "Turning the PC off", hold);
                     host_power.power_off()
                 }
+                // A model's refusal is the machine's stop, not a halt macOS
+                // asked for; a panic macOS printed still names it first.
                 Transition::Halt => stop_here(
-                    &guest_down(format!("macOS halted the Mac: {}", reset.reason)),
+                    &guest_down(if stela_soc::machine::model_refused(&reset.reason) {
+                        format!("Stela stopped the Mac: {}", reset.reason)
+                    } else {
+                        format!("macOS halted the Mac: {}", reset.reason)
+                    }),
                     power::RESTART_CODE,
                 ),
             }

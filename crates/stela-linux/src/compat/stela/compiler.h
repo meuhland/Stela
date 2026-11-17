@@ -25,3 +25,10 @@ _Static_assert(sizeof(*L"") == 2, "Linux compiler requires 16-bit wide literals"
 #endif
 /* Client calls cannot bypass the single boot-owned namespace authority. */
 #include <stela/acpi_client.h>
+
+/* Linux's sscanf and vsscanf (lib/vsscanf.c) parse kernel text: no floating
+ * point, no ranges in a set. The image also holds the C library's, which
+ * Mesa's code calls with C's rules, so Linux's go by their own names in
+ * every Linux unit. */
+#define sscanf stela_linux_sscanf
+#define vsscanf stela_linux_vsscanf

@@ -43,7 +43,8 @@ pub struct Failure {
     pub code: u8,
 }
 
-/// Where the PAC field sits in one pointer.
+/// Where the PAC field sits in one pointer ([`Layout::new`]), with its
+/// masks worked out once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
     /// The bottom PAC bit: 64 - TnSZ.
@@ -53,16 +54,26 @@ pub struct Layout {
     /// The bit `AddPAC` extends and keeps at bit 55: 55 when either range
     /// ignores the top byte, 63 otherwise (`selbit`).
     pub select_shift: u32,
+    /// The bits from `address_bits` to `top_shift`.
+    extension: u64,
 }
 
 impl Layout {
-    pub(super) const fn extension_mask(self) -> u64 {
-        let below_top = if self.top_shift == 63 {
+    pub const fn new(address_bits: u32, top_shift: u32, select_shift: u32) -> Self {
+        let below_top = if top_shift == 63 {
             u64::MAX
         } else {
-            (1 << (self.top_shift + 1)) - 1
+            (1 << (top_shift + 1)) - 1
         };
-        below_top & !((1 << self.address_bits) - 1)
+        Self {
+            address_bits,
+            top_shift,
+            select_shift,
+            extension: below_top & !((1 << address_bits) - 1),
+        }
+    }
+    pub(super) const fn extension_mask(self) -> u64 {
+        self.extension
     }
     const fn pac_mask(self) -> u64 {
         self.extension_mask() & !REGION_BIT
@@ -79,11 +90,7 @@ impl Domain {
             Self::Instruction => INSTRUCTION_TOP_SHIFT,
             Self::Data => DATA_TOP_SHIFT,
         };
-        Layout {
-            address_bits: ADDRESS_BITS,
-            top_shift,
-            select_shift: top_shift,
-        }
+        Layout::new(ADDRESS_BITS, top_shift, top_shift)
     }
     #[cfg(test)]
     const fn extension_mask(self) -> u64 {
@@ -95,6 +102,7 @@ impl Domain {
     }
 }
 
+#[inline]
 pub fn signing_input(layout: Layout, pointer: u64) -> u64 {
     let extension = if pointer & (1 << layout.select_shift) != 0 {
         layout.extension_mask()
@@ -104,6 +112,7 @@ pub fn signing_input(layout: Layout, pointer: u64) -> u64 {
     (pointer & !layout.extension_mask()) | extension
 }
 
+#[inline]
 pub fn authentication_input(layout: Layout, pointer: u64) -> u64 {
     (pointer & !layout.extension_mask())
         | if pointer & REGION_BIT != 0 {
@@ -114,6 +123,7 @@ pub fn authentication_input(layout: Layout, pointer: u64) -> u64 {
 }
 
 /// `pac` is ComputePAC(signing_input(layout,pointer),modifier,key).
+#[inline]
 pub fn sign(version: Version, layout: Layout, pointer: u64, mut pac: u64) -> u64 {
     let extension = signing_input(layout, pointer) & layout.extension_mask();
     if version == Version::Classic {
@@ -129,6 +139,7 @@ pub fn sign(version: Version, layout: Layout, pointer: u64, mut pac: u64) -> u64
 
 /// `pac` is ComputePAC(authentication_input(layout,pointer),modifier,key).
 /// FPAC faults standalone AUT; FPACCOMBINE additionally faults LDRA and transfers.
+#[inline]
 pub fn authenticate(
     version: Version,
     domain: Domain,
@@ -177,11 +188,7 @@ mod tests {
     #[test]
     fn regime_layouts_follow_tnsz_and_tbi() {
         // A 39-bit TTBR1 kernel pointer without TBI: PAC in bits 63:56 and 54:39.
-        let kernel = Layout {
-            address_bits: 39,
-            top_shift: 63,
-            select_shift: 63,
-        };
+        let kernel = Layout::new(39, 63, 63);
         assert_eq!(kernel.pac_mask(), 0xff7f_ff80_0000_0000);
         assert_eq!(kernel.poison_shift(), 61);
         let pointer = 0xffff_ff80_1234_5678_u64;
@@ -204,11 +211,7 @@ mod tests {
             }
         );
         // TBI keeps the top byte and moves the poison to bits 54:53.
-        let tagged = Layout {
-            address_bits: 39,
-            top_shift: 55,
-            select_shift: 55,
-        };
+        let tagged = Layout::new(39, 55, 55);
         assert_eq!(tagged.pac_mask(), 0x007f_ff80_0000_0000);
         assert_eq!(tagged.poison_shift(), 53);
         assert_eq!(Domain::Data.layout().pac_mask(), 0x007f_8000_0000_0000);

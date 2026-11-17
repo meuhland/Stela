@@ -14,10 +14,10 @@
 //! with the same delay standing in for the reset interrupt.
 //! Raw HID reports and the exact report descriptor pass to a shared HID consumer;
 //! no keyboard, touchpad or touchscreen descriptor is substituted here.
-use super::Input;
+use super::{Input, ptp};
 use crate::bus::i2c::{self, Address, Bus, Operation, Timer};
 use crate::bus::pci::power::{self, Timer as Minimum};
-use crate::usb::hid::{ParseError, Translator};
+use crate::usb::hid::{ParseError, Translated, Translator};
 use alloc::{rc::Rc, string::String, vec::Vec};
 use core::mem::ManuallyDrop;
 mod refusal;
@@ -320,6 +320,10 @@ impl<B: Bus, I: Interrupt, T: Timer> Device<B, I, T> {
     }
     pub fn descriptor(&self) -> Option<&Descriptor> {
         self.descriptor.as_ref()
+    }
+    /// The device's clock now, in microseconds.
+    pub fn now_us(&self) -> u64 {
+        self.timer.now_us()
     }
     pub fn report_descriptor(&self) -> &[u8] {
         &self.report_descriptor
@@ -780,6 +784,8 @@ const POLL_REPORTS: usize = 16;
 pub struct HidInput<B, I, T> {
     device: ManuallyDrop<Device<B, I, T>>,
     translator: Translator,
+    /// A precision touchpad switched to report its fingers.
+    ptp: Option<ptp::Ptp>,
     pub name: String,
 }
 
@@ -791,15 +797,40 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
         reason = "a device whose descriptor does not parse goes back to its owner"
     )]
     pub fn new(device: Device<B, I, T>, name: String) -> Result<Self, Refusal<B, I, T>> {
-        let device = ManuallyDrop::new(device);
+        let mut device = ManuallyDrop::new(device);
         match Translator::describe(device.report_descriptor()) {
-            Ok(translator) => Ok(Self {
-                device,
-                translator,
-                name,
-            }),
+            Ok(translator) => {
+                // A precision touchpad goes to touchpad mode, as Linux
+                // hid-multitouch's `mt_set_modes` sets it; a failed switch
+                // leaves it in its firmware's mouse mode, read as a mouse,
+                // and the failure is the device's, reported by its poll.
+                let ptp = translator
+                    .descriptor()
+                    .and_then(ptp::Profile::select)
+                    .filter(|profile| {
+                        profile.mode_reports().iter().all(|(id, payload)| {
+                            device.set_report(ReportType::Feature, *id, payload).is_ok()
+                        })
+                    })
+                    .map(ptp::Ptp::new);
+                let mut name = name;
+                if ptp.is_some() {
+                    name.push_str(" precision touchpad");
+                }
+                Ok(Self {
+                    device,
+                    translator,
+                    ptp,
+                    name,
+                })
+            }
             Err(error) => Err(Refusal::descriptor(device, error)),
         }
+    }
+
+    /// Whether the device is a precision touchpad reporting its fingers.
+    pub fn is_precision_touchpad(&self) -> bool {
+        self.ptp.is_some()
     }
 
     pub fn device(&self) -> &Device<B, I, T> {
@@ -816,7 +847,19 @@ impl<B: Bus, I: Interrupt, T: Timer> HidInput<B, I, T> {
                 Some(
                     InputReport::Data(report) | InputReport::CorrectedLength { data: report, .. },
                 ) => {
-                    self.translator.translate(&report, &mut events, inputs);
+                    let at = events.len();
+                    let translated = self.translator.translate(&report, &mut events, inputs);
+                    if let (Some(ptp), Translated::Data(frame), Some(descriptor)) =
+                        (&mut self.ptp, &translated, self.translator.descriptor())
+                    {
+                        ptp.report(
+                            descriptor,
+                            frame,
+                            &events[at..],
+                            self.device.now_us(),
+                            inputs,
+                        );
+                    }
                 }
                 Some(InputReport::Empty | InputReport::SpuriousInterrupt) => {}
             }

@@ -50,8 +50,13 @@ pub fn upstream_warnings(build: &mut cc::Build) {
         // Linux's top-level Makefile builds every file with -Wno-pointer-sign:
         // mutex.c passes its unsigned owner word to the long atomic helpers.
         .flag("-Wno-pointer-sign");
-    // The rest of scripts/Makefile.warn's default (no W=) clang profile.
+    // The rest of scripts/Makefile.warn's default (no W=) clang profile, and
+    // the top-level Makefile's `-Wno-gnu` for clang: Linux is written in GNU C,
+    // and its `-Wno-microsoft-anon-tag` for the tagged anonymous members
+    // `-fms-extensions` gives it (mm/slab.h).
     for warning in [
+        "gnu",
+        "microsoft-anon-tag",
         "format-security",
         "trigraphs",
         "frame-address",
@@ -70,11 +75,23 @@ pub fn upstream_warnings(build: &mut cc::Build) {
     ] {
         build.flag(format!("-Wno-{warning}"));
     }
+    // Linux formats with GNU printf's length modifiers (`%Lx` for a long
+    // long, amdgpu_vm.c), which clang accepts only for a GNU target. The
+    // host build of the same units checks their formats under that
+    // dialect; for the UEFI target, whose dialect lacks them, the check is
+    // off rather than wrong.
+    if std::env::var("TARGET").is_ok_and(|target| target.ends_with("-uefi")) {
+        build.flag("-Wno-format");
+    }
     // SYSCALL_DEFINE aliases each entry point to a wrapper of another type.
     // Linux silences this with __diag pragmas keyed to the compiler's
     // version, which a compiler numbered apart from LLVM (Apple's) misses.
     // Compilers without the warning reject its name, so it is probed.
     build.flag_if_supported("-Wno-attribute-alias");
+    // scripts/Makefile.warn passes this where the compiler has it (Clang 21
+    // and later): typecheck() declares an uninitialized object of its
+    // argument's type, which may be const.
+    build.flag_if_supported("-Wno-default-const-init-unsafe");
 }
 
 /// Clang reports nothing from system headers, not even a call to a service no

@@ -263,19 +263,13 @@ fn put(pages: &Pages, offset: usize, bytes: &[u8]) {
 /// Run the stub at `region` (`mov rax, rsi`, then the tail) with `control`:
 /// what it returned.
 fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
-    // A native entry, as the engine's: the jump cache starts over.
-    // SAFETY: the control's stamps are 0 or the live table's.
-    unsafe { next_jump_serial(control.stamps) };
     let mut frame = Box::new(GuestState::default());
     frame.anchors[Anchor::Control] = control as *mut ChainControl as u64;
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result = unsafe {
-        let run: unsafe extern "sysv64" fn(*mut GuestState, u64) -> u128 =
-            core::mem::transmute(region.0);
-        run(&mut *frame, target)
-    };
+    let result =
+        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
     (result as u64, (result >> 64) as u64)
 }
 
@@ -303,7 +297,15 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
     let stamps = table.new_stamps();
     let mut itlb = LookupTable::itlb();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-    let (mut entered, mut exited) = (0u32, 0u32);
+    let (mut entered, mut exited, mut cached) = (0u32, 0u32, 0u32);
+    // What the page tables map each page to in each context: a key changes
+    // only after a drop of the page, as a TLBI precedes a remap.
+    let mut keys = alloc::collections::BTreeMap::new();
+    for &pc in &pcs {
+        for context in CONTEXTS {
+            keys.insert((pc & !0xfff, context), KEYS[0]);
+        }
+    }
     for (block, &pc) in pcs.iter().enumerate() {
         itlb.insert(
             itlb.page_slot(pc, CONTEXTS[half(pc)]),
@@ -335,10 +337,15 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
                     0 => CONTEXTS[rng.below(3) as usize],
                     _ => CONTEXTS[half(pc)],
                 };
-                let key = KEYS[usize::from(rng.below(4) == 0)];
+                let page = pc & !0xfff;
+                let held = keys.get_mut(&(page, context)).unwrap();
+                if rng.below(4) == 0 {
+                    itlb.forget_range_where(page..=page, |entry| entry.key == context);
+                    *held = KEYS[usize::from(rng.below(4) == 0)];
+                }
                 itlb.insert(
                     itlb.page_slot(pc, context),
-                    LookupEntry::page(pc & !0xfff, context, key),
+                    LookupEntry::page(page, context, *held),
                 );
             }
             3..=5 => {
@@ -411,9 +418,15 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
             )
             .unwrap()
             .to_vec(),
-            false => lookup_tail(new.0 as u64 + 3, kind, ran, new.0 as u64 + probe as u64, 0)
-                .unwrap()
-                .to_vec(),
+            false => lookup_tail(
+                new.0 as u64 + 3,
+                kind,
+                ran,
+                new.0 as u64 + probe as u64,
+                btype,
+            )
+            .unwrap()
+            .to_vec(),
         };
         let before = legacy_tail(
             old.0 as u64 + 3,
@@ -448,14 +461,55 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         let mut base = base;
         base.salts = base.contexts.map(|context| itlb.salt(context));
         let (mut a, mut b) = (base, base);
+        // The one difference the jump cache makes, as a stamp does: its
+        // entry holds in the half's context and ITLB drop epoch while the
+        // probe misses a page this ITLB put out for another (a capacity
+        // eviction, not a drop), or finds it in another upper context than
+        // the lower-half page's entry was filled in, and the entry enters
+        // the block of the key the page tables still map the page to.
+        let page = target & !0xfff;
+        let candidates = match half(target) {
+            0 => &base.contexts[..],
+            _ => &base.contexts[1..],
+        };
+        let translated = candidates.iter().find_map(|&context| {
+            let resident = itlb.find(itlb.page_slot(target, context), page, context);
+            (resident.pc == page && resident.key == context).then_some(resident.entry)
+        });
+        let at = jump_entry(stamps, target);
+        // SAFETY: an entry of the stamps' jump cache and a drop epoch of
+        // the ITLB, which live; no native code runs meanwhile.
+        let field = |offset: i32| unsafe { ((at as i64 + i64::from(offset)) as *const u64).read() };
+        let drops = itlb.address() as i64 + i64::from(ITLB_DROPS) + 8 * half(target) as i64;
+        // SAFETY: as above.
+        let drops = unsafe { (drops as *const u64).read() };
+        let cached_block = field(JUMP_BLOCK) as u32;
+        let held = !through_cell
+            && field(JUMP_PC) == target
+            && field(JUMP_CONTEXT) == base.contexts[half(target)]
+            && field(JUMP_EPOCH) == drops
+            && KEYS.into_iter().any(|key| {
+                let entry = table.find(table.slot(target, key), target, key);
+                entry.pc == target
+                    && entry.key == key
+                    && entry.block == cached_block
+                    && translated != Some(key)
+                    && CONTEXTS
+                        .into_iter()
+                        .any(|context| keys.get(&(page, context)) == Some(&key))
+            });
         let ra = run(&new, &mut a, target);
         let rb = run(&old, &mut b, target);
+        // Only today's cell probes count and sample their transfers.
+        (a.heat, a.sampled) = (0, 0);
+        if held && (ra != rb || a != b) {
+            cached += 1;
+            continue;
+        }
         assert_eq!(
             ra, rb,
             "trial {trial}: target {target:#x} cell {through_cell} btype {btype}"
         );
-        // Only today's cell probes count heat.
-        a.heat = 0;
         assert_eq!(a, b, "trial {trial}: the controls differ");
         if ra.1 == 99 {
             entered += 1;
@@ -465,4 +519,99 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         }
     }
     assert!(entered > 8000 && exited > 8000, "{entered} {exited}");
+    assert!(cached < 1200, "{cached}");
+}
+
+/// A lower-half page the ITLB lacks in the lower half's context is
+/// translated through the upper half's, where the engine keeps the pages
+/// whose walk ended in a global leaf; the lower half's own entry comes
+/// first; an upper-half page is never translated through the lower half's
+/// context, nor any page through a context the control does not name.
+#[test]
+fn a_lower_page_absent_from_its_context_is_translated_through_the_upper_one() {
+    let blocks = pages(PAGE);
+    let region = pages(REGION);
+    let mut code = vec![0x48, 0xb8];
+    code.extend(marker(0).to_le_bytes());
+    code.extend([0xba, 99, 0, 0, 0, 0xc3]);
+    put(&blocks, 0, &code);
+    let dispatcher = dispatcher_with_policy(0, Interruption::Epoch).unwrap();
+    assert!(dispatcher.len() <= DISPATCHER_BYTES);
+    put(&region, PROBES, &dispatcher);
+    let tail = lookup_tail(
+        region.0 as u64 + 3,
+        ExitWord::from(ExitKind::Direct),
+        1,
+        region.0 as u64 + (PROBES + PROBE_ENTRY) as u64,
+        0,
+    )
+    .unwrap();
+    put(&region, 0, &[0x48, 0x89, 0xf0]); // mov rax,rsi
+    put(&region, 3, &tail);
+    let [lower, upper] = [pcs()[0], pcs()[4]];
+    let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+    // Each check takes fresh stamps: one page's global and non-global
+    // entries together are a TLB conflict, which a jump cache entry filled
+    // from either serves until the TLBI that ends it drops the page.
+    let fresh: Vec<u64> = (0..8).map(|_| table.new_stamps()).collect();
+    let next = std::cell::Cell::new(0);
+    for pc in [lower, upper] {
+        let entry = LookupEntry {
+            pc,
+            key: KEYS[0],
+            entry: blocks.0 as u64,
+            block: 0,
+            targets: 0b1111,
+        };
+        table.insert(table.slot(pc, KEYS[0]), entry);
+    }
+    let control = |itlb: &LookupTable| {
+        let stamps = fresh[next.get()];
+        next.set(next.get() + 1);
+        let mut control = ChainControl {
+            budget: 5,
+            contexts: [CONTEXTS[0], CONTEXTS[1]],
+            table: table.address(),
+            itlb: itlb.address(),
+            masks: [table.mask(), itlb.mask()],
+            stamps,
+            ..ChainControl::default()
+        };
+        control.salts = control.contexts.map(|context| itlb.salt(context));
+        control
+    };
+    let put_page = |itlb: &mut LookupTable, pc: u64, context: u64, key: u64| {
+        let entry = LookupEntry::global_page(pc & !0xfff, context, key);
+        itlb.insert(itlb.page_slot(pc, context), entry);
+    };
+    let entered = |itlb: &LookupTable, pc: u64| run(&region, &mut control(itlb), pc).1 == 99;
+    // Only in the upper half's context: entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, lower, CONTEXTS[1], KEYS[0]);
+    assert!(entered(&itlb, lower));
+    // Its own context's entry comes first, here of a key the table lacks.
+    put_page(&mut itlb, lower, CONTEXTS[0], KEYS[1]);
+    assert!(!entered(&itlb, lower));
+    // Of a context the control does not name: not entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, lower, CONTEXTS[2], KEYS[0]);
+    assert!(!entered(&itlb, lower));
+    // An upper-half page in the lower half's context: not entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, upper, CONTEXTS[0], KEYS[0]);
+    assert!(!entered(&itlb, upper));
+    put_page(&mut itlb, upper, CONTEXTS[1], KEYS[0]);
+    assert!(entered(&itlb, upper));
+    // No upper context (0, as no engine names one): not entered.
+    let mut itlb = LookupTable::itlb();
+    put_page(&mut itlb, lower, CONTEXTS[1], KEYS[0]);
+    let mut none = control(&itlb);
+    none.contexts[1] = 0;
+    assert_eq!(
+        run(&region, &mut none, lower),
+        (
+            lower,
+            u64::from(ExitWord::from(ExitKind::Direct).encoded() | 1 << ExitWord::RAN_SHIFT)
+        )
+    );
 }

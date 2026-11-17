@@ -3,6 +3,15 @@
 //! The host supplies the clock ([`super::Host::profile_ticks`]); while off,
 //! each phase boundary costs one branch.
 
+mod regions;
+pub use regions::{CodeRegion, block_regions, pointer_service_calls};
+
+/// Words of a PE's PAC census (`Statistics` `pac_census`): cipher runs by
+/// key (IA, IB, DA, DB, GA) and operation (signing, authentication,
+/// PACGA), then by cause (new, here, other), then those of native code,
+/// then new key generations.
+pub const PAC_CENSUS_WORDS: usize = super::pointer::census::WORDS;
+
 /// A phase of the step loop ([`super::Machine::run_blocks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -1354,6 +1363,164 @@ pub struct HotBlocks {
     /// most [`DYNAMIC_SAMPLES`]; those past them are in `dynamic_other`.
     pub dynamic: alloc::vec::Vec<DynamicSample>,
     pub dynamic_other: u64,
+    /// The same samples by guest address space ([`AsidSamples`]).
+    pub asids: AsidSamples,
+}
+
+/// [`HotBlocks`]' samples by the ASID the PE's translations were tagged with
+/// at each one (`Machine::current_space_asid`), at any level: a user thread's system calls and faults count with
+/// its process, as the guest's own CPU time does, and kernel threads with
+/// the kernel's address space. Each address space's samples by [`Level`],
+/// and its EL0 blocks apart, so the PCs name the process (its frameworks)
+/// for an ASID the host cannot map to a process name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsidSamples {
+    /// Open-addressed address spaces, [`ASID_SLOTS`] once the first sample
+    /// is added; samples past them are in `other`.
+    pub spaces: alloc::vec::Vec<AsidSpace>,
+    /// Open-addressed EL0 blocks keyed by ASID and PC ([`AsidBlock`]),
+    /// [`ASID_BLOCKS`] of them; samples past them count only by space.
+    pub blocks: alloc::vec::Vec<AsidBlock>,
+    pub other: u64,
+}
+
+/// One address space's samples ([`AsidSamples`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsidSpace {
+    pub asid: u16,
+    pub samples: [u64; Level::COUNT],
+}
+
+impl AsidSpace {
+    pub fn total(&self) -> u64 {
+        self.samples.iter().sum()
+    }
+}
+
+/// One EL0 block's samples in one address space ([`AsidSamples`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsidBlock {
+    pub asid: u16,
+    pub pc: u64,
+    pub count: u64,
+}
+
+/// The address spaces [`AsidSamples`] holds apart.
+pub const ASID_SLOTS: usize = 512;
+/// The EL0 blocks by address space [`AsidSamples`] holds apart.
+pub const ASID_BLOCKS: usize = 4096;
+
+/// A slot of an open-addressed table of `slots` (a power of two) for `key`:
+/// where its probe starts.
+fn probe_start(key: u64, slots: usize) -> usize {
+    (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - slots.ilog2())) as usize
+}
+
+impl AsidSamples {
+    /// Count `count` samples at `level` in address space `asid`, and an EL0
+    /// sample's block at `pc` apart.
+    pub fn add(&mut self, asid: u16, pc: u64, level: Level, count: u64) {
+        self.allocate();
+        let start = probe_start(u64::from(asid), ASID_SLOTS);
+        let space = (0..ASID_SLOTS / 8)
+            .map(|probe| (start + probe) % ASID_SLOTS)
+            .find(|&slot| self.spaces[slot].total() == 0 || self.spaces[slot].asid == asid);
+        let Some(slot) = space else {
+            self.other += count;
+            return;
+        };
+        self.spaces[slot].asid = asid;
+        self.spaces[slot].samples[level as usize] += count;
+        if level != Level::User {
+            return;
+        }
+        let start = probe_start(pc ^ u64::from(asid) << 48, ASID_BLOCKS);
+        for probe in 0..ASID_BLOCKS / 8 {
+            let block = &mut self.blocks[(start + probe) % ASID_BLOCKS];
+            if block.count == 0 {
+                *block = AsidBlock { asid, pc, count: 0 };
+            }
+            if block.asid == asid && block.pc == pc {
+                block.count += count;
+                return;
+            }
+        }
+    }
+
+    /// Add every sample `other` holds.
+    pub fn merge(&mut self, other: &Self) {
+        // EL0 samples by block first, each address space's held ones
+        // counted, then the rest of every space's samples.
+        let mut held = alloc::collections::BTreeMap::<u16, u64>::new();
+        for block in other.blocks.iter().filter(|block| block.count != 0) {
+            self.add(block.asid, block.pc, Level::User, block.count);
+            *held.entry(block.asid).or_default() += block.count;
+        }
+        for space in other.spaces.iter().filter(|space| space.total() != 0) {
+            for level in [Level::Kernel, Level::Guarded] {
+                let count = space.samples[level as usize];
+                if count != 0 {
+                    self.add(space.asid, 0, level, count);
+                }
+            }
+            let user = space.samples[Level::User as usize];
+            let rest = user.saturating_sub(held.get(&space.asid).copied().unwrap_or(0));
+            if rest != 0 {
+                self.add_space_only(space.asid, rest);
+            }
+        }
+        self.other += other.other;
+    }
+
+    /// The tables, once the first sample comes.
+    fn allocate(&mut self) {
+        if self.spaces.is_empty() {
+            self.spaces = alloc::vec![AsidSpace::default(); ASID_SLOTS];
+            self.blocks = alloc::vec![AsidBlock::default(); ASID_BLOCKS];
+        }
+    }
+
+    /// EL0 samples of `asid` whose block no table held.
+    fn add_space_only(&mut self, asid: u16, count: u64) {
+        self.allocate();
+        let start = probe_start(u64::from(asid), ASID_SLOTS);
+        match (0..ASID_SLOTS / 8)
+            .map(|probe| (start + probe) % ASID_SLOTS)
+            .find(|&slot| self.spaces[slot].total() == 0 || self.spaces[slot].asid == asid)
+        {
+            Some(slot) => {
+                self.spaces[slot].asid = asid;
+                self.spaces[slot].samples[Level::User as usize] += count;
+            }
+            None => self.other += count,
+        }
+    }
+
+    /// The `shown` address spaces with the most samples, most first.
+    pub fn top(&self, shown: usize) -> alloc::vec::Vec<AsidSpace> {
+        let mut spaces: alloc::vec::Vec<AsidSpace> = self
+            .spaces
+            .iter()
+            .filter(|space| space.total() != 0)
+            .copied()
+            .collect();
+        spaces.sort_unstable_by(|a, b| b.total().cmp(&a.total()).then(a.asid.cmp(&b.asid)));
+        spaces.truncate(shown);
+        spaces
+    }
+
+    /// The `shown` EL0 blocks of `asid` with the most samples, most first.
+    pub fn top_blocks(&self, asid: u16, shown: usize) -> alloc::vec::Vec<AsidBlock> {
+        let mut blocks: alloc::vec::Vec<AsidBlock> = self
+            .blocks
+            .iter()
+            .filter(|block| block.count != 0 && block.asid == asid)
+            .copied()
+            .collect();
+        blocks.sort_unstable_by(|a, b| b.count.cmp(&a.count).then(a.pc.cmp(&b.pc)));
+        blocks.truncate(shown);
+        blocks
+    }
 }
 
 /// A sampled transfer of a block's RET, BLR or BR form ([`HotBlocks`]):
@@ -1525,6 +1692,7 @@ impl HotBlocks {
         }
         self.add_dynamic(&hot.dynamic);
         self.dynamic_other += hot.dynamic_other;
+        self.asids.merge(&hot.asids);
     }
 
     /// Keep `samples` of dynamic transfers, as many as fit.
@@ -1602,6 +1770,11 @@ impl Levels {
     #[inline]
     pub(super) fn charge(&mut self, level: Level, spent: u64) {
         self.ticks[level as usize] += spent;
+        // No handler runs at EL0: back there, the one taken has returned,
+        // whether native code or the engine made its exception return.
+        if level == Level::User {
+            self.in_interrupt = false;
+        }
         if self.in_interrupt {
             self.interrupt_ticks += spent;
         }
@@ -1615,6 +1788,14 @@ impl Levels {
     pub(super) fn interrupt_taken(&mut self) {
         self.interrupts += 1;
         self.in_interrupt = true;
+    }
+
+    /// Native code made an exception return: the handler taken has ended,
+    /// and the run's ticks charged after are not its. What the run spent in
+    /// the handler before its return is charged outside it, so
+    /// `interrupt_ticks` is a lower bound.
+    pub(super) fn exception_returned(&mut self) {
+        self.in_interrupt = false;
     }
 
     /// A WFI, which completed at once if `at_once`.
@@ -1825,6 +2006,22 @@ mod tests {
             } else {
                 (base + 12).wrapping_sub(VBAR)
             };
+        // Each regime's TTBR0 holds an ASID of its own (8 bits: TCR.AS is
+        // clear); the sample names the one its regime tags translations
+        // with, never a constant.
+        use crate::machine::system::Register;
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL1, 0, 0x11 << 48);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL2, 0, 0x22 << 48);
+        let asid = machine.current_space_asid();
+        let in_el20 =
+            machine.cpu.pstate.el == 2 || machine.cpu.pstate.el == 0 && machine.cpu.in_host();
+        assert_eq!(asid, if in_el20 { 0x22 } else { 0x11 });
         machine.set_step_timing(true);
         run(&mut machine, 2 * HOT_SAMPLE_EVERY);
         let mut hot = HotBlocks::default();
@@ -1833,6 +2030,13 @@ mod tests {
         assert_eq!(total, 2);
         let pcs: alloc::vec::Vec<u64> = hot.counted().map(|block| block.pc).collect();
         assert_eq!(pcs, [expected]);
+        let spaces: alloc::vec::Vec<(u16, u64)> = hot
+            .asids
+            .top(8)
+            .iter()
+            .map(|space| (space.asid, space.total()))
+            .collect();
+        assert_eq!(spaces, [(asid, 2)]);
         assert!(!machine.has_hot_samples());
         // Draws stay within the span and below the run's own budget.
         for _ in 0..1000 {
@@ -1840,6 +2044,53 @@ mod tests {
             assert!((1..=HOT_SAMPLE_SPAN + 1).contains(&budget));
             assert_eq!(sampled, budget <= HOT_SAMPLE_SPAN);
         }
+    }
+
+    /// A sample's address space is the ASID its regime tags translations
+    /// with: under VHE with HCR_EL2.TGE (XNU on an M2, kernel at EL2) EL0
+    /// and EL2 take TTBR0_EL2's, where the kernel's TTBR0_EL1 writes land,
+    /// and TTBR0_EL1 stays 0; in EL1&0 TTBR0_EL1's; TCR.A1 picks TTBR1.
+    #[test]
+    fn a_samples_address_space_is_its_regimes_asid() {
+        use crate::machine::system::Register;
+        const HCR_TGE: u64 = 1 << 27;
+        const HCR_E2H: u64 = 1 << 34;
+        const TCR_A1: u64 = 1 << 22;
+        const TCR_AS: u64 = 1 << 36;
+        let mut machine = super::super::tests::machine(&[0x9100_0400]);
+        machine.cpu.registers.set(Register::TTBR0_EL1, 0, 0);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL2, 0, 0x1234 << 48);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR1_EL2, 0, 0x5678 << 48);
+        machine.cpu.registers.set(Register::TCR_EL2, 0, TCR_AS);
+        machine
+            .cpu
+            .registers
+            .set(Register::HCR_EL2, 0, HCR_TGE | HCR_E2H);
+        for el in [0, 2] {
+            machine.cpu.pstate.el = el;
+            assert_eq!(machine.current_space_asid(), 0x1234, "EL{el} under TGE");
+        }
+        machine
+            .cpu
+            .registers
+            .set(Register::TCR_EL2, 0, TCR_AS | TCR_A1);
+        assert_eq!(machine.current_space_asid(), 0x5678, "TCR.A1");
+        // EL1&0: TTBR0_EL1's, 8 bits without TCR_EL1.AS.
+        machine.cpu.registers.set(Register::HCR_EL2, 0, 0);
+        machine
+            .cpu
+            .registers
+            .set(Register::TTBR0_EL1, 0, 0x1abc << 48);
+        machine.cpu.pstate.el = 1;
+        assert_eq!(machine.current_space_asid(), 0xbc);
+        machine.cpu.pstate.el = 0;
+        assert_eq!(machine.current_space_asid(), 0xbc);
     }
 
     /// Sites sampled once are not judged; a site whose samples all named
@@ -1884,6 +2135,60 @@ mod tests {
         assert_eq!(
             (full.dynamic.len(), full.dynamic_other),
             (DYNAMIC_SAMPLES, 1)
+        );
+    }
+
+    /// Samples count by address space at every level, EL0 blocks apart per
+    /// address space, and a merge keeps both, those no block held included.
+    #[test]
+    fn asid_samples_rank_address_spaces_and_their_user_blocks_and_merge() {
+        let mut asids = AsidSamples::default();
+        asids.add(7, 0x1000, Level::User, 5);
+        asids.add(7, 0x2000, Level::User, 2);
+        asids.add(7, 0x10, Level::Kernel, 4);
+        asids.add(0, 0x20, Level::Kernel, 9);
+        // The same PC in another address space is another block.
+        asids.add(9, 0x1000, Level::User, 1);
+        let top = asids.top(8);
+        assert_eq!(
+            top.iter()
+                .map(|s| (s.asid, s.samples))
+                .collect::<alloc::vec::Vec<_>>(),
+            [(7, [7, 4, 0]), (0, [0, 9, 0]), (9, [1, 0, 0])]
+        );
+        assert_eq!(
+            asids
+                .top_blocks(7, 8)
+                .iter()
+                .map(|b| (b.pc, b.count))
+                .collect::<alloc::vec::Vec<_>>(),
+            [(0x1000, 5), (0x2000, 2)]
+        );
+        // Kernel samples name no block.
+        assert!(asids.top_blocks(0, 8).is_empty());
+        let mut merged = AsidSamples::default();
+        merged.add(7, 0x1000, Level::User, 1);
+        merged.merge(&asids);
+        assert_eq!(merged.top(1)[0].samples, [8, 4, 0]);
+        assert_eq!(merged.top_blocks(7, 1)[0].count, 6);
+        // HotBlocks carries them through its own merge.
+        let hot = HotBlocks {
+            asids: asids.clone(),
+            ..HotBlocks::default()
+        };
+        let mut total = HotBlocks::default();
+        total.merge(&hot);
+        assert_eq!(total.asids.top(8), asids.top(8));
+        // EL0 samples whose blocks did not fit still count by space.
+        let mut full = AsidSamples::default();
+        for pc in 0..(ASID_BLOCKS as u64 + 50) {
+            full.add(3, pc * 4, Level::User, 1);
+        }
+        let mut again = AsidSamples::default();
+        again.merge(&full);
+        assert_eq!(
+            again.top(1)[0].samples[Level::User as usize],
+            ASID_BLOCKS as u64 + 50
         );
     }
 
@@ -2406,6 +2711,29 @@ mod tests {
         let later_delta = now.since(&now);
         assert_eq!(later_delta.phases, [0; Phase::COUNT]);
         assert_eq!(later_delta.lifetime_maxima, now.lifetime_maxima);
+    }
+
+    /// Native code makes most exception returns (`PES TRANSITIONS eret`):
+    /// one ends the handler the engine saw taken, and so does reaching EL0,
+    /// where no handler runs. Before, only a return the engine handled did,
+    /// and `irq%` counted the user time after native returns.
+    #[test]
+    fn a_native_exception_return_or_el0_time_ends_the_interrupt() {
+        let mut levels = Levels::default();
+        levels.interrupt_taken();
+        levels.charge(Level::Kernel, 5);
+        levels.exception_returned();
+        levels.charge(Level::Kernel, 7);
+        assert_eq!((levels.interrupts, levels.interrupt_ticks), (1, 5));
+        levels.interrupt_taken();
+        levels.charge(Level::Guarded, 2);
+        levels.charge(Level::User, 30);
+        levels.charge(Level::Kernel, 4);
+        assert_eq!((levels.interrupts, levels.interrupt_ticks), (2, 7));
+        assert!(!levels.in_interrupt);
+        // In-interrupt time never exceeds kernel and guarded time.
+        let handlers = levels.ticks[Level::Kernel as usize] + levels.ticks[Level::Guarded as usize];
+        assert!(levels.interrupt_ticks <= handlers);
     }
 
     #[test]

@@ -30,9 +30,13 @@ impl Controller {
         self.registers.write32(INTERRUPT_MASK_SET, u32::MAX)
     }
 
-    /// Linux `nvme_enable_ctrl`: set CC.EN, returning how long CSTS.RDY may
-    /// take, CAP.TO or a longer CRTO.CRWMT. CRIME stays clear, as in Linux.
+    /// Linux `nvme_enable_ctrl`: write CC with EN clear, read CAP again, as
+    /// CAP may change once CC is written, then set CC.EN, returning how long
+    /// CSTS.RDY may take, CAP.TO or a longer CRTO.CRWMT. CRIME stays clear,
+    /// as in Linux. The controller is stopped here.
     pub(super) fn enable(&mut self) -> Result<u64, BlockError> {
+        self.registers
+            .write32(CONFIGURATION, self.configuration & !ENABLE)?;
         let capabilities = self.registers.read64(CAPABILITIES)?;
         let mut timeout = capabilities >> 24 & 0xff;
         if capabilities & CAPABILITY_READY_WITH_MEDIA != 0 {
@@ -45,7 +49,17 @@ impl Controller {
         Ok(ready_wait_us(timeout))
     }
 
+    /// Stop the controller, then start it ([`Self::stop`],
+    /// [`Self::start_admin`]).
     pub(super) fn initialize(&mut self) -> Result<(), BlockError> {
+        self.stop()?;
+        self.start_admin()
+    }
+
+    /// Take the controller's capabilities and stop it, as Linux's
+    /// `nvme_pci_configure_admin_queue` does before it sets up the admin
+    /// queue: CC cleared, CSTS.RDY clear.
+    pub(super) fn stop(&mut self) -> Result<(), BlockError> {
         if let Some(owner) = self.owned.as_mut() {
             // An attempted prepare may have effects without establishing D0.
             // Only success authorizes NVMe MMIO; uncertain failure quarantines.
@@ -68,8 +82,17 @@ impl Controller {
         }
         // CAP.MQES, zero-based, bounds the I/O queues alone; AQA sizes the
         // admin queue. Linux shortens its I/O queues to it, refusing none
-        // (the value 0, one entry, is reserved).
-        let longest = (capabilities & 0xffff) + 1;
+        // (the value 0, one entry, is reserved). `nvme_pci_enable` gives a
+        // quirked controller two entries, one command, and the PM1725's
+        // MQES 0 64 entries.
+        let mqes = capabilities & 0xffff;
+        let longest = if self.quirks.contains(Quirks::QUEUE_DEPTH_ONE) {
+            2
+        } else if mqes == 0 && self.quirks.contains(Quirks::QUEUE_DEPTH_64) {
+            64
+        } else {
+            mqes + 1
+        };
         if longest < 2 {
             return Err(BlockError::Unsupported(
                 "NVMe controller reports one-entry queues (CAP.MQES 0)",
@@ -88,15 +111,30 @@ impl Controller {
         if capabilities & CAPABILITY_COMMAND_SETS != 0 {
             self.configuration |= COMMAND_SETS_ALL;
         }
-        self.registers.write32(CONFIGURATION, 0)?;
-        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
-            .map_err(|error| error.at(DISABLE_WAIT))?;
+        self.stop_and_wait().map_err(|error| error.at(DISABLE_WAIT))
+    }
+
+    /// Point the stopped controller at the admin queue, give it DMA where
+    /// its owner holds it, and enable it.
+    pub(super) fn start_admin(&mut self) -> Result<(), BlockError> {
         self.configure_admin()?;
         if let Some(owner) = self.owned.as_mut() {
             owner.lifecycle.enable_dma()?;
         }
         let timeout = self.enable()?;
         self.wait_enabled(timeout)
+    }
+
+    /// Linux `nvme_disable_ctrl`: clear CC, then wait for CSTS.RDY to clear,
+    /// first sleeping Linux's delay for a quirked controller. Waits: only at
+    /// attach and teardown, outside any service turn; a passed device start
+    /// budget ends the delay early.
+    pub(super) fn stop_and_wait(&mut self) -> Result<(), BlockError> {
+        self.registers.write32(CONFIGURATION, 0)?;
+        if self.quirks.contains(Quirks::READY_DELAY) {
+            self.clock.wait(quirks::READY_CHECK_DELAY_US, || false);
+        }
+        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
     }
 
     /// Linux `nvme_wait_ready` after CC.EN is set: CSTS.RDY alone ends the
@@ -129,7 +167,12 @@ impl Controller {
         let mut command = [0u32; 16];
         let address = if submission {
             command[0] = u32::from(ADMIN_CREATE_SUBMISSION);
-            command[11] = 1 << 16 | 1; // completion queue 1, contiguous
+            // Completion queue 1, contiguous; medium priority for a
+            // controller that otherwise enables weighted round robin.
+            command[11] = 1 << 16 | 1;
+            if self.quirks.contains(Quirks::MEDIUM_PRIORITY_QUEUE) {
+                command[11] |= SUBMISSION_PRIORITY_MEDIUM;
+            }
             self.io.submissions.address()?
         } else {
             command[0] = u32::from(ADMIN_CREATE_COMPLETION);
@@ -171,6 +214,7 @@ impl Controller {
     /// CSTS, not a completion, reported the failure.
     pub(super) fn admin(&mut self, command: [u32; 16]) -> Result<u32, BlockError> {
         self.ready()?;
+        self.settle_errand();
         self.settle()?;
         match self.admin_wait(command, true) {
             Ok((result, 0)) => Ok(result),
@@ -246,18 +290,27 @@ impl Controller {
     /// each: an Asynchronous Event Request's is kept for
     /// [`Self::service_events`] and an Abort's ends it. Command `id`'s result
     /// and status once posted, giving the admin page back to the CPU when
-    /// it holds `data`; any other completion breaks the protocol.
+    /// it holds `data`. A completion that names no outstanding command is
+    /// passed over ([`Self::stray_completion`]).
     pub(super) fn admin_completion(
         &mut self,
         expected: Option<(u16, bool)>,
     ) -> Result<Option<(u32, u32)>, BlockError> {
-        while let Some((id, result, status, _)) = self.posted(false)? {
+        while let Some((id, result, status)) = self.posted(false)? {
             self.ring_completion(false)?;
             if self.events.request == Some(id) {
                 self.events.request = None;
                 self.events.completed = Some((result, status));
             } else if let Some(at) = self.aborts.iter().position(|abort| *abort == id) {
                 self.aborts.swap_remove(at);
+            } else if let Some(errand) = self.errand.as_mut().filter(|errand| errand.id == id) {
+                errand.completed = Some((result, status));
+                if errand.data {
+                    self.trust_completion()?;
+                    // SAFETY: the controller completed this exact command;
+                    // no other command reaches the admin page meanwhile.
+                    unsafe { self.admin_data.take()? };
+                }
             } else if let Some((_, data)) = expected.filter(|(expected, _)| *expected == id) {
                 if data {
                     self.trust_completion()?;
@@ -267,7 +320,7 @@ impl Controller {
                 }
                 return Ok(Some((result, status)));
             } else {
-                return Err(BlockError::Device { status: 0xffff });
+                self.stray_completion()?;
             }
         }
         Ok(None)
@@ -280,9 +333,8 @@ impl Controller {
         Ok(&self.admin_data.bytes()[..PAGE])
     }
 
-    /// Linux `nvme_get_log` for every namespace into the admin page. A
-    /// failure is only logged.
-    pub(super) fn read_log(&mut self, log: u32, bytes: usize) -> Result<(), BlockError> {
+    /// Linux `nvme_get_log` for every namespace into the admin page.
+    pub(super) fn log_command(&self, log: u32, bytes: usize) -> Result<[u32; 16], BlockError> {
         let page = self.admin_data.address()?;
         let mut command = [0u32; 16];
         command[0] = u32::from(ADMIN_GET_LOG_PAGE);
@@ -290,51 +342,198 @@ impl Controller {
         command[6] = page as u32;
         command[7] = (page >> 32) as u32;
         command[10] = ((bytes / 4 - 1) as u32) << 16 | log;
-        let _ = self.admin(command);
-        self.ready()
+        Ok(command)
+    }
+
+    /// Errand `purpose`'s result and status once its completion came,
+    /// publishing `command`, which moves the admin page when `data`, if no
+    /// errand is out ([`Errand`]). `None` while it or another errand is
+    /// out, and while an I/O command runs or the controller resets: an
+    /// errand is sent only between them, as Linux's work items run. One
+    /// answered for an earlier scan, which no rescan asks for again, is
+    /// dropped. Never waits.
+    ///
+    /// As [`Self::admin`]: a refusal is the bare status; a failed
+    /// controller is reset before the errand is sent, and an errand past
+    /// its deadline resets it, which later calls move on, and is the error,
+    /// named.
+    pub(super) fn errand(
+        &mut self,
+        purpose: Purpose,
+        data: bool,
+        command: impl FnOnce(&Self) -> Result<[u32; 16], BlockError>,
+    ) -> Result<Option<(u32, u32)>, BlockError> {
+        self.ready()?;
+        if let Some(errand) = &self.errand
+            && errand.purpose != purpose
+            && errand.completed.is_some()
+            && let Purpose::Identify { scans, .. } = errand.purpose
+            && scans != self.scans
+        {
+            self.errand = None;
+        }
+        let Some(errand) = &self.errand else {
+            if self.busy() {
+                return Ok(None);
+            }
+            let command = command(self)?;
+            let name = admin_name(command[0] as u8, command[10]);
+            match self.registers.read32(STATUS)? {
+                REMOVED => return Err(self.poison(removed())),
+                status if self.fails(status) => {
+                    self.reset_with(false);
+                    return Err(within(name, fatal_status(BlockError::Device { status })));
+                }
+                _ => {}
+            }
+            let memory = if data { Data::Admin } else { Data::None };
+            let id = self.publish(false, command, memory)?;
+            let deadline = self.deadline(self.admin_timeout_us)?;
+            self.errand = Some(Errand {
+                purpose,
+                id,
+                data,
+                deadline,
+                name,
+                completed: None,
+            });
+            return Ok(None);
+        };
+        if errand.purpose != purpose {
+            return Ok(None);
+        }
+        if errand.completed.is_none()
+            && let Err(error) = self.admin_completion(None)
+        {
+            self.errand = None;
+            return Err(self.poison(error));
+        }
+        let Some(errand) = self
+            .errand
+            .take_if(|errand| errand.completed.is_some() || errand.deadline.passed())
+        else {
+            return Ok(None);
+        };
+        match errand.completed {
+            Some(answer) => Ok(Some(answer)),
+            None => {
+                // As `nvme_timeout` for the admin queue: the lost command
+                // leaves no admin queue to delete with.
+                let status = self.registers.read32(STATUS)?;
+                if status == REMOVED {
+                    return Err(self.poison(removed()));
+                }
+                self.reset_with(false);
+                let error = if self.fails(status) {
+                    fatal_status(BlockError::Device { status })
+                } else {
+                    BlockError::Timeout
+                };
+                Err(within(errand.name, error))
+            }
+        }
+    }
+
+    /// Wait for the errand that is out, if any, for a caller that runs an
+    /// admin command of its own through the admin page: its answer is
+    /// dropped, and its owner sends it again. One past its deadline resets
+    /// the controller, as [`Self::admin`] does.
+    pub(super) fn settle_errand(&mut self) {
+        while let Some(errand) = &self.errand {
+            if errand.completed.is_some() {
+                self.errand = None;
+                return;
+            }
+            if errand.deadline.passed() {
+                self.errand = None;
+                self.reset_with(false);
+                let _ = self.settle();
+                return;
+            }
+            if let Err(error) = self.admin_completion(None) {
+                self.errand = None;
+                self.poison(error);
+                return;
+            }
+            crate::waiting();
+            core::hint::spin_loop();
+        }
     }
 
     /// Linux `nvme_scan_ns` before it adds or validates a namespace: its
     /// identifiers and whether the command-set-independent Identify
-    /// Namespace described it, or `None` when Linux passes it over for
-    /// refused descriptors, a command set the controller does not run, or a
+    /// Namespace described it, or why Linux passes it over: refused
+    /// descriptors, a command set the controller does not run, or a
     /// namespace that is not ready.
-    pub(super) fn namespace_ids(
+    pub(super) fn namespace_ids(&mut self, namespace: u32) -> Result<Scan, BlockError> {
+        let mut wait = |controller: &mut Self, cns: u32| -> Result<Option<Answer>, BlockError> {
+            match controller.identify(cns, namespace) {
+                Ok(page) => Ok(Some(Ok(page.to_vec()))),
+                Err(error @ BlockError::Device { .. }) => Ok(Some(Err(error))),
+                Err(error) => Err(error),
+            }
+        };
+        Ok(self
+            .scan_ids(&mut wait)?
+            .expect("an Identify the caller waits for answers"))
+    }
+
+    /// [`Self::namespace_ids`], each Identify asked of `identify` by CNS:
+    /// it answers the page or the refusal, or `None` while the command is
+    /// out, when this answers `None` too and a later call asks again.
+    pub(super) fn scan_ids(
         &mut self,
-        namespace: u32,
-    ) -> Result<Option<(Ids, bool)>, BlockError> {
-        let Some(ids) = self.descriptors(namespace)? else {
-            return Ok(None);
+        identify: &mut AskIdentify<'_>,
+    ) -> Result<Option<Scan>, BlockError> {
+        let ids = match self.descriptors(identify)? {
+            None => return Ok(None),
+            Some(Ok(ids)) => ids,
+            Some(Err(error)) => return Ok(Some(Scan::Passed(error))),
         };
         if ids.csi != CSI_NVM && self.configuration & COMMAND_SETS_ALL == 0 {
-            return Ok(None);
+            return Ok(Some(Scan::Passed(BlockError::Unsupported(
+                "NVMe namespace of a command set the controller does not run",
+            ))));
         }
         if self.independent_identify
             || (ids.csi != CSI_NVM && ids.csi != CSI_ZONED)
             || self.version >= VERSION_2_0
         {
-            match self.identify(IDENTIFY_INDEPENDENT_NAMESPACE, namespace) {
-                Ok(data) => {
-                    let ready = data[INDEPENDENT_STATUS] & NAMESPACE_READY != 0;
-                    return Ok(ready.then_some((ids, true)));
+            match identify(self, IDENTIFY_INDEPENDENT_NAMESPACE)? {
+                None => return Ok(None),
+                Some(Ok(data)) => {
+                    return Ok(Some(if data[INDEPENDENT_STATUS] & NAMESPACE_READY != 0 {
+                        Scan::Found(ids, true)
+                    } else {
+                        Scan::Passed(BlockError::Unsupported(
+                            "NVMe namespace not ready (NSTAT.NRDY clear)",
+                        ))
+                    }));
                 }
-                Err(BlockError::Device { .. }) => {}
-                Err(error) => return Err(error),
+                Some(Err(_)) => {}
             }
         }
-        Ok(Some((ids, false)))
+        Ok(Some(Scan::Found(ids, false)))
     }
 
-    /// Linux `nvme_identify_ns_descs`: none before NVMe 1.3. `None` when the
-    /// controller refused the list; the scan then skips the namespace.
-    pub(super) fn descriptors(&mut self, namespace: u32) -> Result<Option<Ids>, BlockError> {
-        if self.version < VERSION_1_3 {
-            return Ok(Some(Ids::default()));
+    /// Linux `nvme_identify_ns_descs`: none before NVMe 1.3 or under
+    /// `NVME_QUIRK_NO_NS_DESC_LIST`, and only the command set under
+    /// `NVME_QUIRK_BOGUS_NID`. The controller's refusal, named, when it
+    /// refused the list; the scan then skips the namespace.
+    pub(super) fn descriptors(
+        &mut self,
+        identify: &mut AskIdentify<'_>,
+    ) -> Result<Option<Result<Ids, BlockError>>, BlockError> {
+        if self.version < VERSION_1_3 || self.quirks.contains(Quirks::NO_DESCRIPTOR_LIST) {
+            return Ok(Some(Ok(Ids::default())));
         }
-        match self.identify(IDENTIFY_DESCRIPTORS, namespace) {
-            Ok(data) => Ok(Some(Ids::from_descriptors(data))),
-            Err(BlockError::Device { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
+        let bogus = self.quirks.contains(Quirks::BOGUS_IDS);
+        Ok(
+            identify(self, IDENTIFY_DESCRIPTORS)?.map(|answer| match answer {
+                Ok(data) if bogus => Ok(Ids::from_descriptors(&data).without_identifiers()),
+                Ok(data) => Ok(Ids::from_descriptors(&data)),
+                Err(error) => Err(error.at(identify_name(IDENTIFY_DESCRIPTORS))),
+            }),
+        )
     }
 }

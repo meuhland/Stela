@@ -90,14 +90,15 @@ impl TranslatedSeen {
 /// The host's shadow counters at the last heartbeat.
 #[derive(Default)]
 pub(super) struct ShadowSeen {
-    pub(super) counts: [u64; 12],
+    pub(super) counts: [u64; 14],
     pub(super) causes: [u64; 7],
     pub(super) fields: [u64; 9],
 }
 
 impl ShadowSeen {
     /// Since the last heartbeat: the shadow faults filled and the pages
-    /// mapped beside them; the resets of the whole shadow, and of those
+    /// mapped beside them from the same leaves (`prefills`) and from the
+    /// window's other leaves (`around`); the resets of the whole shadow, and of those
     /// the ones each cause led to (a half running out of frames, SPRR,
     /// TTBR0 or other controls, tag checks, invalidations and TLBIs of
     /// everything, and for other controls the fields that differed); the
@@ -121,6 +122,8 @@ impl ShadowSeen {
             host.bank_misses,
             host.scoped,
             host.view_switches,
+            host.fill_ns,
+            host.around,
         ];
         let [
             fills,
@@ -135,8 +138,11 @@ impl ShadowSeen {
             bank_misses,
             scoped,
             view_switches,
+            fill_ns,
+            around,
         ] = core::array::from_fn(|index| counts[index] - self.counts[index]);
         self.counts = counts;
+        let fill_ns_each = fill_ns / fills.max(1);
         let [_, sprr, table, controls, tags, invalidated, maintained] =
             core::array::from_fn(|index| host.reset_causes[index] - self.causes[index]);
         self.causes = host.reset_causes;
@@ -161,7 +167,7 @@ impl ShadowSeen {
              lower_resets={lower_resets} lower_switches={lower_switches} \
              lower_found={lower_found} kept_dropped={kept_dropped} \
              bank_switches={bank_switches} bank_misses={bank_misses} scoped={scoped} \
-             view_switches={view_switches}\n"
+             view_switches={view_switches} fill_ns_each={fill_ns_each} around={around}\n"
         ));
         if let Some((from, to)) = host.last_controls
             && controls > 0
@@ -597,6 +603,8 @@ pub(super) fn text_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
 /// request and may end at the host timeout) and their logs.
 pub(super) struct Drained {
     pub(super) lines: Vec<String>,
+    /// The guest's console output for the log ([`super::write_guest_output`]).
+    pub(super) guest: stela_boot_core::console_lines::Queued,
     pub(super) unmodeled: Vec<String>,
     pub(super) sep: Vec<String>,
     pub(super) usb: Vec<stela_soc::machine::UsbLog>,
@@ -630,6 +638,7 @@ impl Drained {
                 .try_borrow_mut()
                 .map(|mut lines| core::mem::take(&mut *lines))
                 .unwrap_or_default(),
+            guest: super::take_guest_output(),
             unmodeled: devices.take_unmodeled(),
             sep: devices.sep_observations(),
             usb_transfers: if mux_error {

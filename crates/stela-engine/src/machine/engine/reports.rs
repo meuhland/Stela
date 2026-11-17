@@ -495,7 +495,11 @@ const _: () = assert!(ItlbMiss::Cold as usize + 1 == ItlbMiss::COUNT);
 ///   predecessor of the same key had taken (`Machine::refill_pages`);
 /// - of the entries dropped in every context: those of the upper half,
 ///   those a TLBI without an ASID dropped in the lower half, and those of
-///   a global page a TLBI with an ASID dropped there.
+///   a global page a TLBI with an ASID dropped there;
+/// - pages taken with another page of their leaf, by its walk
+///   (`Machine::take_leaf_pages`);
+/// - lower-half pages taken in the context every address space shares, as
+///   their walk ended in a global leaf (`Machine::itlb_context`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ItlbSource {
     FillsLower,
@@ -513,13 +517,15 @@ pub(super) enum ItlbSource {
     DropUpper,
     DropNoAsid,
     DropGlobal,
+    LeafFills,
+    SharedFills,
 }
 
 impl ItlbSource {
-    pub(super) const COUNT: usize = 15;
+    pub(super) const COUNT: usize = 17;
 }
 
-const _: () = assert!(ItlbSource::DropGlobal as usize + 1 == ItlbSource::COUNT);
+const _: () = assert!(ItlbSource::SharedFills as usize + 1 == ItlbSource::COUNT);
 // A fill counts at `FillsLower` plus its half.
 const _: () = assert!(ItlbSource::FillsUpper as usize == ItlbSource::FillsLower as usize + 1);
 
@@ -546,6 +552,23 @@ pub struct Statistics {
     /// How many exits had a stamped tail when this PE last looked (every
     /// promotion step): a level, which adding keeps the larger of.
     pub stamped_in_use: u64,
+    /// Transfers this PE's cell probes made (`ChainControl::heat`).
+    pub cell_probes: u64,
+    /// Hot exits a promotion step found whose cell held no entry yet, left
+    /// for a later step.
+    pub promotions_waiting: u64,
+    /// The cells this PE's cell probes named (`ChainControl::sampled`) that
+    /// its promotion steps read.
+    pub cell_samples: u64,
+    /// Hot exits a promotion step found while every stamped cell was held,
+    /// which kept their cell tails.
+    pub promotions_full: u64,
+    /// The cells exits held, those past the stamped ones and those holding
+    /// no entry, when this PE last looked (every promotion step): levels,
+    /// as `stamped_in_use`.
+    pub cells_live: u64,
+    pub cells_past: u64,
+    pub cells_empty: u64,
     /// Links undone, as the blocks they chained into went.
     pub unlinks: u64,
     /// Exits redirected through a lookup of their target (returns and
@@ -765,6 +788,13 @@ impl core::ops::AddAssign for Statistics {
             stamped_tails,
             predicted_tails,
             stamped_in_use,
+            cell_probes,
+            promotions_waiting,
+            cell_samples,
+            promotions_full,
+            cells_live,
+            cells_past,
+            cells_empty,
             unlinks,
             lookups,
             lookup_hits,
@@ -922,6 +952,9 @@ impl core::ops::AddAssign for Statistics {
             *total += count;
         }
         self.stamped_in_use = self.stamped_in_use.max(stamped_in_use);
+        self.cells_live = self.cells_live.max(cells_live);
+        self.cells_past = self.cells_past.max(cells_past);
+        self.cells_empty = self.cells_empty.max(cells_empty);
         for (total, count) in self
             .store_sources
             .as_flattened_mut()
@@ -936,6 +969,10 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.links, links),
             (&mut self.stamped_tails, stamped_tails),
             (&mut self.predicted_tails, predicted_tails),
+            (&mut self.cell_probes, cell_probes),
+            (&mut self.promotions_waiting, promotions_waiting),
+            (&mut self.cell_samples, cell_samples),
+            (&mut self.promotions_full, promotions_full),
             (&mut self.unlinks, unlinks),
             (&mut self.lookups, lookups),
             (&mut self.lookup_hits, lookup_hits),

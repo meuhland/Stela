@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Linux's sorts, with the interfaces of Linux
  * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 lib/sort.c and lib/list_sort.c: an
- * in-place, unstable heapsort of arrays and a stable merge sort of lists. */
+ * in-place, unstable heapsort of arrays, with or without a private pointer
+ * for its functions, and a stable merge sort of lists. */
 #include <linux/list.h>
 #include <linux/list_sort.h>
 #include <linux/sort.h>
@@ -19,37 +20,66 @@ static void swap_bytes(void *a, void *b, int size)
 	}
 }
 
-static void swap_elements(void *a, void *b, size_t size, swap_func_t swap_func)
+/* One sort's functions: sort_r()'s, which take its private pointer, or
+ * sort()'s, which do not. */
+struct order {
+	cmp_r_func_t compare_r;
+	swap_r_func_t swap_r;
+	cmp_func_t compare;
+	swap_func_t swap;
+	const void *priv;
+};
+
+static int compare_elements(const struct order *order, const void *a, const void *b)
 {
-	if (swap_func)
-		swap_func(a, b, (int)size);
+	return order->compare_r ? order->compare_r(a, b, order->priv) : order->compare(a, b);
+}
+
+static void swap_elements(const struct order *order, void *a, void *b, size_t size)
+{
+	if (order->swap_r)
+		order->swap_r(a, b, (int)size, order->priv);
+	else if (order->swap)
+		order->swap(a, b, (int)size);
 	else
 		swap_bytes(a, b, (int)size);
 }
 
 /* Lets the element at root sink below its larger children in a heap of count
  * elements. */
-static void sift_down(char *base, size_t root, size_t count, size_t size, cmp_func_t cmp_func,
-		      swap_func_t swap_func)
+static void sift_down(const struct order *order, char *base, size_t root, size_t count,
+		      size_t size)
 {
 	for (size_t child; (child = 2 * root + 1) < count; root = child) {
 		if (child + 1 < count &&
-		    cmp_func(base + child * size, base + (child + 1) * size) < 0)
+		    compare_elements(order, base + child * size, base + (child + 1) * size) < 0)
 			child++;
-		if (cmp_func(base + root * size, base + child * size) >= 0)
+		if (compare_elements(order, base + root * size, base + child * size) >= 0)
 			break;
-		swap_elements(base + root * size, base + child * size, size, swap_func);
+		swap_elements(order, base + root * size, base + child * size, size);
+	}
+}
+
+static void heapsort(const struct order *order, void *base, size_t num, size_t size)
+{
+	for (size_t root = num / 2; root--;)
+		sift_down(order, base, root, num, size);
+	for (size_t end = num; end > 1; end--) {
+		swap_elements(order, base, (char *)base + (end - 1) * size, size);
+		sift_down(order, base, 0, end - 1, size);
 	}
 }
 
 void sort(void *base, size_t num, size_t size, cmp_func_t cmp_func, swap_func_t swap_func)
 {
-	for (size_t root = num / 2; root--;)
-		sift_down(base, root, num, size, cmp_func, swap_func);
-	for (size_t end = num; end > 1; end--) {
-		swap_elements(base, (char *)base + (end - 1) * size, size, swap_func);
-		sift_down(base, 0, end - 1, size, cmp_func, swap_func);
-	}
+	heapsort(&(struct order){.compare = cmp_func, .swap = swap_func}, base, num, size);
+}
+
+void sort_r(void *base, size_t num, size_t size, cmp_r_func_t cmp_func, swap_r_func_t swap_func,
+	    const void *priv)
+{
+	heapsort(&(struct order){.compare_r = cmp_func, .swap_r = swap_func, .priv = priv}, base,
+		 num, size);
 }
 
 /* Merges two sorted null-terminated chains linked by next, earlier a first. */
@@ -103,6 +133,7 @@ void list_sort(void *priv, struct list_head *head, list_cmp_func_t cmp)
 }
 
 #ifdef STELA_LINUX_SORT_TEST
+#include <linux/minmax.h>
 #include <stela/test.h>
 
 struct item {
@@ -114,6 +145,23 @@ struct item {
 static int compare_ints(const void *a, const void *b)
 {
 	return *(const int *)a - *(const int *)b;
+}
+
+/* Descending when the private pointer says so. */
+static int compare_ints_r(const void *a, const void *b, const void *priv)
+{
+	int order = *(const int *)a - *(const int *)b;
+
+	return *(const bool *)priv ? -order : order;
+}
+
+static unsigned int swaps;
+
+static void swap_ints_r(void *a, void *b, int size, const void *priv)
+{
+	assert(size == sizeof(int) && priv);
+	swap(*(int *)a, *(int *)b);
+	swaps++;
 }
 
 static int compare_items(void *priv, const struct list_head *a, const struct list_head *b)
@@ -130,6 +178,18 @@ int main(void)
 	for (size_t i = 1; i < ARRAY_SIZE(values); i++)
 		assert(values[i - 1] <= values[i]);
 	sort(values, 0, sizeof(*values), compare_ints, NULL);
+
+	bool descending = true;
+
+	sort_r(values, ARRAY_SIZE(values), sizeof(*values), compare_ints_r, NULL, &descending);
+	for (size_t i = 1; i < ARRAY_SIZE(values); i++)
+		assert(values[i - 1] >= values[i]);
+	descending = false;
+	sort_r(values, ARRAY_SIZE(values), sizeof(*values), compare_ints_r, swap_ints_r,
+	       &descending);
+	for (size_t i = 1; i < ARRAY_SIZE(values); i++)
+		assert(values[i - 1] <= values[i]);
+	assert(swaps);
 
 	struct item items[11];
 	LIST_HEAD(list);

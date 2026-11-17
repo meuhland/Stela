@@ -2220,6 +2220,8 @@ fn surface_plane_conversions_cover_what_the_pass_drew() {
         decodes_whole: false,
         mirror: 0,
         stamp: 0,
+        refreshes: [None; 2],
+        staging: None,
     };
     let record = |draws: &[(ScissorRect, Option<Viewport>, PrimitiveType)]| {
         let mut resolver = MockResolver::default();
@@ -2357,6 +2359,8 @@ fn marked_passes_encode_their_dirty_tiles() {
         decodes_whole: true,
         mirror: crate::metal::binding::TexelArguments::MIRROR_COMPARE,
         stamp: 7,
+        refreshes: [None; 2],
+        staging: None,
     };
     let record = |scissor: ScissorRect, attached: ResourceId| {
         let mut resolver = MockResolver::default();
@@ -2401,10 +2405,10 @@ fn marked_passes_encode_their_dirty_tiles() {
         width: 200,
         height: 70,
     };
-    // 4 x 2 tiles of 64, a workgroup of 64 threads each.
+    // 4 x 2 tiles of 64, a thread for each of their texels.
     assert_eq!(
         record(whole, ResourceId(0x55)),
-        [(4 * 2 * 64, 7, [200, 70])]
+        [(4 * 2 * 64 * 64, 7, [200, 70])]
     );
     let part = ScissorRect {
         x: 8,
@@ -2414,6 +2418,232 @@ fn marked_passes_encode_their_dirty_tiles() {
     };
     assert_eq!(record(part, ResourceId(0x55)), [(16 * 8, 0, [16, 8])]);
     assert_eq!(record(whole, ResourceId(0x66)), [(200 * 70, 0, [200, 70])]);
+}
+
+/// An encode of [`PlaneStaging::MIN_TEXELS`] or more of an IOSurface's
+/// planes converts every texel of its rectangle into the staging memory,
+/// writing the mirror with it, and once the pass's encodes are done a
+/// barrier and copies move each rectangle's codes and alpha into the
+/// planes; smaller rectangles, dirty tiles and planes the GPU reaches
+/// through aligned copies write the planes in place, comparing with the
+/// mirror. The commit reports which way each went.
+///
+/// [`PlaneStaging::MIN_TEXELS`]: crate::metal::pass::PlaneStaging::MIN_TEXELS
+#[test]
+fn large_surface_encodes_copy_through_staging_memory() {
+    use crate::metal::{binding::TexelArguments, pass::PlaneStaging};
+    let mut color = texture(PixelFormat::Rgba8Unorm);
+    color.width = 512;
+    color.height = 512;
+    let staging = PlaneStaging {
+        buffer: Buffer(77),
+        address: 3 << 40,
+        color_bytes_per_row: 2048,
+        alpha_offset: 1 << 20,
+        alpha_bytes_per_row: 512,
+        planes: [Image(11), Image(12)],
+    };
+    let planes = crate::metal::pass::ExtendedPlanes {
+        storage: ResourceId(0x55),
+        encoding: 9,
+        extent: [512, 512],
+        layers: 1,
+        color: 1 << 40,
+        color_bytes_per_row: 4096,
+        alpha: 2 << 40,
+        alpha_bytes_per_row: 1024,
+        loads: true,
+        stores: true,
+        narrows: true,
+        decodes_whole: true,
+        mirror: TexelArguments::MIRROR_COMPARE,
+        stamp: 0,
+        refreshes: [None; 2],
+        staging: Some(staging),
+    };
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Encode(u32, u64, u32, u64, u32, u32),
+        Barrier,
+        Copy(Buffer, Image, u64, u32, [i32; 3], [u32; 3]),
+    }
+    let record = |planes: crate::metal::pass::ExtendedPlanes, scissors: &[ScissorRect]| {
+        let mut resolver = MockResolver::default();
+        let mut commands = CommandBuffer::new(FEATURES);
+        let mut plan = pass(&color, StoreAction::Store, false);
+        plan.inputs.extended_planes[0] = Some(planes);
+        // The attachment's raw texels are the working image.
+        plan.inputs.textures[0] = planes.storage;
+        commands
+            .begin_render(&mut resolver, plan, None, Vec::new())
+            .unwrap();
+        let mut state = render_state(1);
+        state.plan.topology_class = crate::metal::abi::PrimitiveTopologyClass::Unspecified;
+        commands.set_render_pipeline_state(&state).unwrap();
+        commands
+            .set_render_buffer(Stage::Vertex, Some(buffer(3, 256)), 0, 2)
+            .unwrap();
+        for &scissor in scissors {
+            commands.set_scissor_rects(&[scissor]).unwrap();
+            commands
+                .draw_primitives(&mut resolver, PrimitiveType::Triangle, 0, 3, 1, 0)
+                .unwrap();
+        }
+        commands.end_encoding(&mut resolver).unwrap();
+        let counts = commands.planes.counts;
+        let recording = commit(commands, &mut resolver, (Semaphore(1), 1));
+        let commands = &recording.segments[0].commands;
+        let after = commands
+            .iter()
+            .position(|command| matches!(command, Command::EndRendering))
+            .unwrap();
+        let seen = commands[after..]
+            .iter()
+            .filter_map(|command| match *command {
+                Command::LoadTexels { arguments, count } => {
+                    let encoded = uploaded(&recording, arguments);
+                    Some(Seen::Encode(
+                        count,
+                        double(encoded, 0),
+                        word(encoded, 32),
+                        double(encoded, 56),
+                        word(encoded, 64),
+                        word(encoded, 68),
+                    ))
+                }
+                Command::Barrier(_) => Some(Seen::Barrier),
+                Command::CopyBufferToImage { src, dst, region } => Some(Seen::Copy(
+                    src,
+                    dst,
+                    region.buffer_offset,
+                    region.buffer_row_length,
+                    region.offset,
+                    region.extent,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        (seen, counts)
+    };
+    let rect = |x, y, width, height| ScissorRect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let (compare, write) = (TexelArguments::MIRROR_COMPARE, TexelArguments::MIRROR_WRITE);
+    // A 300 x 300 rectangle at (100, 50) and a 16 x 8 one apart: the large
+    // one encodes into the staging memory, the small one into the planes.
+    let (seen, counts) = record(planes, &[rect(100, 50, 300, 300), rect(8, 400, 16, 8)]);
+    let staged = |x: u64, y: u64| (3 << 40) + y * 2048 + x * 4;
+    let staged_alpha = |x: u64, y: u64| (3 << 40) + (1 << 20) + y * 512 + x;
+    assert_eq!(
+        seen,
+        [
+            Seen::Barrier,
+            Seen::Encode(
+                300 * 300,
+                staged(100, 50),
+                2048,
+                staged_alpha(100, 50),
+                512,
+                write
+            ),
+            Seen::Encode(
+                16 * 8,
+                (1 << 40) + 400 * 4096 + 8 * 4,
+                4096,
+                (2 << 40) + 400 * 1024 + 8,
+                1024,
+                compare
+            ),
+            Seen::Barrier,
+            Seen::Copy(
+                Buffer(77),
+                Image(11),
+                50 * 2048 + 100 * 4,
+                512,
+                [100, 50, 0],
+                [300, 300, 1]
+            ),
+            Seen::Copy(
+                Buffer(77),
+                Image(12),
+                (1 << 20) + 50 * 512 + 100,
+                512,
+                [100, 50, 0],
+                [300, 300, 1]
+            ),
+        ]
+    );
+    assert_eq!(
+        (
+            counts.copied,
+            counts.copied_texels,
+            counts.direct,
+            counts.direct_texels
+        ),
+        (1, 300 * 300, 1, 16 * 8)
+    );
+    // Planes without alpha copy only the codes; planes without a mirror
+    // keep none.
+    let bare = crate::metal::pass::ExtendedPlanes {
+        alpha: 0,
+        mirror: 0,
+        ..planes
+    };
+    let (seen, _) = record(bare, &[rect(0, 0, 512, 512)]);
+    assert_eq!(
+        seen,
+        [
+            Seen::Barrier,
+            Seen::Encode(512 * 512, staged(0, 0), 2048, 0, 512, 0),
+            Seen::Barrier,
+            Seen::Copy(Buffer(77), Image(11), 0, 512, [0, 0, 0], [512, 512, 1]),
+        ]
+    );
+    // Dirty tiles, and planes the GPU reaches through aligned copies, write
+    // the planes in place.
+    let stamped = crate::metal::pass::ExtendedPlanes { stamp: 7, ..planes };
+    let (seen, counts) = record(stamped, &[rect(0, 0, 512, 512)]);
+    assert!(!seen.iter().any(|seen| matches!(seen, Seen::Copy(..))));
+    assert_eq!(
+        (counts.stamped, counts.stamped_tiles, counts.copied),
+        (1, 64, 0)
+    );
+    let aligned = crate::metal::pass::ExtendedPlanes {
+        refreshes: [
+            Some(crate::metal::device::resources::RowCopy {
+                buffer: Buffer(5),
+                image: Image(11),
+                region: crate::metal::vulkan::command::BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length: 512,
+                    buffer_image_height: 0,
+                    subresource: crate::metal::vulkan::command::Subresource {
+                        aspects: crate::metal::vulkan::ImageAspects::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    offset: [0; 3],
+                    extent: [512, 512, 1],
+                },
+            }),
+            None,
+        ],
+        ..planes
+    };
+    let (seen, counts) = record(aligned, &[rect(100, 50, 300, 300)]);
+    assert!(seen.contains(&Seen::Encode(
+        300 * 300,
+        (1 << 40) + 50 * 4096 + 100 * 4,
+        4096,
+        (2 << 40) + 50 * 1024 + 100,
+        1024,
+        compare
+    )));
+    assert_eq!((counts.direct, counts.copied), (1, 0));
 }
 
 #[test]

@@ -1,8 +1,8 @@
 //! The jump cache of [`lookup_tail`]s: a target the table probe entered is
-//! entered from the tail while the cache's serial holds, and every change
-//! the probe would see between native runs (a TLBI of the page, a block's
-//! release, a context switch, a native transition's new contexts) goes
-//! with the serial's move. Random runs against the plain tail.
+//! entered from the tail across native runs, and every change the probe
+//! would see (a TLBI of the page, a rekeyed page, a block's release or
+//! replacement, a context switch, a native transition's new contexts) takes
+//! the entry with it. Random runs against the plain tail.
 use super::super::*;
 use crate::GuestState;
 use alloc::{boxed::Box, vec::Vec};
@@ -101,11 +101,8 @@ fn run(region: &Pages, stub: usize, control: &mut ChainControl, target: u64) -> 
     // SAFETY: the region holds the stubs, tails and probes with the block
     // ABI; they touch the frame's control, the tables, the stamps and the
     // blocks, which outlive the call.
-    let result = unsafe {
-        let run: unsafe extern "sysv64" fn(*mut GuestState, u64) -> u128 =
-            core::mem::transmute(region.0.add(stub));
-        run(&mut *frame, target)
-    };
+    let result =
+        unsafe { crate::x86_64::native::enter(region.0.add(stub), &mut *frame, target, 0) };
     (result as u64, (result >> 64) as u64)
 }
 
@@ -161,12 +158,6 @@ impl World {
         );
     }
 
-    /// What the engine does at every native entry.
-    fn enter(&mut self) {
-        // SAFETY: the table's stamps, which live; nothing runs.
-        unsafe { next_jump_serial(self.control.stamps) };
-    }
-
     fn run(&mut self, stub: usize, target: u64) -> (u64, u64) {
         run(&self.region, stub, &mut self.control, target)
     }
@@ -177,10 +168,11 @@ const fn exit(target: u64, kind: ExitKind) -> (u64, u64) {
 }
 
 /// A probe's transfer fills the entry, counted as a fill, which the next
-/// transfer takes from the tail without the ITLB or the table: until the
-/// serial moves, after which the forgotten page exits as the probe would.
+/// transfer takes from the tail without the ITLB or the table, in later
+/// native runs too: until a TLBI of the page grows the epoch of its half,
+/// after which the forgotten page exits as the probe would.
 #[test]
-fn a_filled_entry_holds_until_the_serial_moves() {
+fn a_filled_entry_holds_until_its_page_goes() {
     const PC: u64 = 0x1_0000_0100;
     let filled = |world: &World| {
         // SAFETY: the world's stamps, whose table lives.
@@ -189,7 +181,6 @@ fn a_filled_entry_holds_until_the_serial_moves() {
     };
     let mut world = World::new();
     world.map(PC, block_key(0x4000_0000, 1), 3, 0b1111);
-    world.enter();
     assert_eq!(world.run(0, PC), (0x7703, 99));
     assert_eq!(
         (
@@ -200,57 +191,59 @@ fn a_filled_entry_holds_until_the_serial_moves() {
         (1, u64::from(RAN), 3)
     );
     assert_eq!(filled(&world), 1);
-    // A TLBI of the page: the probe would exit, the cached entry still
-    // holds in this serial (as a direct link would, until the run ends).
+    // Later runs take it from the tail.
+    for hits in 2..5 {
+        assert_eq!(world.run(0, PC), (0x7703, 99));
+        assert_eq!(world.control.hits, hits);
+    }
+    assert_eq!(filled(&world), 1, "the cache's hit fills nothing");
+    // A TLBI of the page: the probe and the cached tail both exit.
     let page = PC & !0xfff;
     assert!(world.itlb.forget_range(page..=page | 0xfff, u64::MAX));
-    assert_eq!(world.run(0, PC), (0x7703, 99));
-    assert_eq!(world.control.hits, 2);
-    assert_eq!(filled(&world), 1, "the cache's hit fills nothing");
     assert_eq!(world.run(16, PC), exit(PC, ExitKind::Return));
-    // The next native entry moves the serial: the tail misses, and the
-    // probe exits.
-    world.enter();
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    assert_eq!(world.control.hits, 2);
+    assert_eq!(world.control.hits, 4);
+    // The page back, the probe fills again.
+    world.map(PC, block_key(0x4000_0000, 1), 3, 0b1111);
+    assert_eq!(world.run(0, PC), (0x7703, 99));
+    assert_eq!(filled(&world), 2);
 }
 
-/// Each event that changes what the probe finds, between runs, then the
-/// entry at the next native entry: a block's release, a context switch, a
-/// rekeyed page; and a native transition's new contexts within a run.
+/// Each event that changes what the probe finds takes the entry with it:
+/// a block's release, its replacement by another block, a context switch,
+/// a rekeyed page; and the old context back finds the entry again.
 #[test]
-fn every_lookup_change_takes_the_serial_with_it() {
+fn every_lookup_change_takes_the_entry() {
     const PC: u64 = 0xffff_fe00_0020_0040;
     let key = block_key(0x5000_0000, 1);
     let mut world = World::new();
-    // A released block: its table entry goes.
+    // A released block: its table entry goes, and the cache's with it.
     world.map(PC, key, 1, 0b1111);
-    world.enter();
+    assert_eq!(world.run(0, PC), (0x7701, 99));
     assert_eq!(world.run(0, PC), (0x7701, 99));
     world.table.forget_block(PC, key, 1);
     let held = world.table.find(world.table.slot(PC, key), PC, key);
     assert!(!(held.pc == PC && held.key == key));
-    world.enter();
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
+    // Another block of the PC in its place.
+    world.map(PC, key, 2, 0b1111);
+    assert_eq!(world.run(0, PC), (0x7702, 99));
+    world.map(PC, key, 5, 0b1111);
+    assert_eq!(world.run(0, PC), (0x7705, 99));
     // A context switch of the upper half: the page translates in the new
     // context to another frame.
-    world.map(PC, key, 2, 0b1111);
-    world.enter();
-    assert_eq!(world.run(0, PC), (0x7702, 99));
     world.control.contexts[1] += 1 << LOOKUP_SALT_BITS;
     world.control.salts[1] = world.itlb.salt(world.control.contexts[1]);
     world.map(PC, block_key(0x6000_0000, 1), 4, 0b1111);
-    world.enter();
     assert_eq!(world.run(0, PC), (0x7704, 99));
-    // A native transition writes new contexts and moves the serial itself
-    // ([`super::super::super::transition`]); back in the old context, the
-    // old frame's block.
+    // A native transition writes the old contexts back: the old frame's
+    // block, which the probe enters again.
     world.control.contexts[1] -= 1 << LOOKUP_SALT_BITS;
     world.control.salts[1] = world.itlb.salt(world.control.contexts[1]);
-    let serial = (world.control.stamps as i64 + i64::from(JUMP_SERIAL)) as *mut u64;
-    // SAFETY: the stamps' serial, which only this test writes.
-    unsafe { *serial += 1 };
-    assert_eq!(world.run(0, PC), (0x7702, 99));
+    assert_eq!(world.run(0, PC), (0x7705, 99));
+    // The page rekeyed in that context: a drop, and the new frame's block.
+    world.map(PC, block_key(0x6000_0000, 1), 6, 0b1111);
+    assert_eq!(world.run(0, PC), (0x7706, 99));
 }
 
 /// An entry enters a branch that sets a BTYPE only when its block accepts
@@ -263,7 +256,6 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
     let mut world = World::new();
     world.map(PC, block_key(0x4000_0000, 1), 5, 0b0101);
     world.map(REFUSING, block_key(0x4000_0000, 1), 6, 0b0011);
-    world.enter();
     // Filled by the BTYPE 0 probe, taken by a BTYPE 2 tail.
     assert_eq!(world.run(0, PC), (0x7705, 99));
     assert_eq!(world.run(0, REFUSING), (0x7706, 99));
@@ -285,9 +277,9 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
 }
 
 /// Random runs: targets that share entries, pages put in, rekeyed and
-/// forgotten, blocks released and contexts switched between runs, each
-/// followed by a native entry. The cached tail takes the transfer or the
-/// exit the plain tail takes, and leaves the control the same.
+/// forgotten, blocks released and contexts switched between runs. The
+/// cached tail takes the transfer or the exit the plain tail takes, and
+/// leaves the control the same.
 #[test]
 fn cached_tails_run_as_plain_tails() {
     let mut world = World::new();
@@ -331,7 +323,7 @@ fn cached_tails_run_as_plain_tails() {
                 world.control.salts[half] = world.itlb.salt(world.control.contexts[half]);
             }
             _ => {
-                // The cached tail first: an entry of an earlier serial
+                // The cached tail first: an entry of an earlier change
                 // must miss.
                 let mut plain = ChainControl { ..*world.control };
                 let got = world.run(0, pc);
@@ -348,27 +340,33 @@ fn cached_tails_run_as_plain_tails() {
                     "{pc:#x}"
                 );
                 compared += 1;
-                continue;
             }
         }
-        world.enter();
     }
     assert!(compared > 10_000);
 }
 
-/// The serial moves by one and never to 0, which no entry holds.
+/// An empty entry holds in no context (none is 0), so a branch to PC 0
+/// takes the probe; the table's writer and a fill each take a stale entry
+/// out of the cache.
 #[test]
-fn the_serial_starts_at_one_and_skips_zero() {
+fn empty_and_replaced_entries_take_the_probe() {
     let mut world = World::new();
-    let serial = (world.control.stamps as i64 + i64::from(JUMP_SERIAL)) as *mut u64;
-    // SAFETY: the stamps' serial, which only this test touches.
-    unsafe {
-        assert_eq!(*serial, 1);
-        world.enter();
-        assert_eq!(*serial, 2);
-        *serial = u64::MAX;
-        world.enter();
-        assert_eq!(*serial, 1);
-        next_jump_serial(0);
-    }
+    assert_eq!(world.run(0, 0), exit(0, ExitKind::Return));
+    assert_eq!(world.control.hits, 0);
+    const PC: u64 = 0x3_0000_0040;
+    let key = block_key(0x4000_0000, 1);
+    world.map(PC, key, 2, 0b1111);
+    assert_eq!(world.run(0, PC), (0x7702, 99));
+    let entry = jump_entry(world.control.stamps, PC);
+    // SAFETY: the entry's PC word, in the world's live stamps.
+    let held = || unsafe { *(entry as *const u64) };
+    assert_eq!(held(), PC);
+    // The writer's change of the table entry takes the cache's.
+    world.map(PC, key, 3, 0b1111);
+    assert_eq!(held(), 0);
+    assert_eq!(world.run(0, PC), (0x7703, 99));
+    assert_eq!(held(), PC);
+    world.table.clear();
+    assert_eq!(held(), 0);
 }

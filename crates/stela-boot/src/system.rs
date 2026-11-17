@@ -29,7 +29,7 @@ use stela_runtime::pc::gpt::Guid;
 use uefi::{
     boot::{self, AllocateType, MemoryType},
     fs::FileSystem,
-    mem::memory_map::{MemoryMap, MemoryMapOwned},
+    mem::memory_map::{MemoryMap, MemoryMapRef},
     proto::loaded_image::LoadedImage,
 };
 
@@ -50,12 +50,12 @@ pub(crate) struct EbsOwnership {
 
 /// Keeps the final memory map and its receipt together on the loader side.
 pub(crate) struct SuccessfulExit {
-    map: core::mem::ManuallyDrop<MemoryMapOwned>,
+    map: MemoryMapRef<'static>,
     ownership: Option<EbsOwnership>,
 }
 
 impl SuccessfulExit {
-    pub(crate) fn map(&self) -> &MemoryMapOwned {
+    pub(crate) fn map(&self) -> &MemoryMapRef<'static> {
         &self.map
     }
 
@@ -816,6 +816,7 @@ fn load(
         trampoline,
         root,
         loader_tables,
+        sipi_taken,
     } = memory;
     let loader_tables = loader_tables
         .retain()
@@ -874,12 +875,19 @@ fn load(
         ));
     }
     crate::status::begin("Taking control of the other processors");
+    // Named before the buffer's allocation, the last one: the firmware's
+    // exit can take long, and the screen keeps this detail through it. The
+    // next detail logs its time (`status::progress`).
+    crate::status::progress("the firmware ends its boot services");
+    // The last allocation Stela makes before the exit: from here to the
+    // exit's own map read only the firmware's timer and logs close.
+    let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; every page
     // Stela keeps is LOADER_DATA or LOADER_CODE.
-    let map = unsafe { boot::exit_boot_services(None) };
+    let map = unsafe { crate::boot_exit::exit(final_map) };
     let mut exit = SuccessfulExit {
-        map: core::mem::ManuallyDrop::new(map),
+        map,
         ownership: Some(EbsOwnership { _private: () }),
     };
     // The firmware's exception handlers ended with its boot services. Until
@@ -901,6 +909,7 @@ fn load(
     // identity map is loaded and no Stela driver has started.
     unsafe { usb_legacy.take(tsc_hz) };
     crate::status::progress("the firmware's DMA remapping");
+    let dmar_flags = remapping.dmar_flags();
     // SAFETY: the firmware's identity map is still loaded, the APs idle in
     // firmware code, and no Stela driver or memory reuse has started.
     let inactive_firmware_units =
@@ -920,20 +929,28 @@ fn load(
     // guest RAM, including workers that will later receive their owned SIPI.
     // The BSP alone sends ICR commands, with firmware IRQ handlers excluded.
     unsafe { asm!("cli", options(nomem, nostack)) };
-    // x2APIC whenever CPUID offers it, from here on: the firmware no longer
-    // runs on this processor, and every later APIC handle is made from the
-    // base returned here (the handoff's) or read afresh. The APs take the
-    // same mode as they enter Stela (`native_smp::executor`).
+    // x2APIC whenever CPUID offers it and the firmware's DMAR does not opt
+    // out, from here on: the firmware no longer runs on this processor, and
+    // every later APIC handle is made from the base returned here (the
+    // handoff's) or read afresh. The APs take the same mode as they enter
+    // Stela (`native_smp::executor`).
     crate::status::progress("the local APIC");
+    let keep_xapic = crate::apic::honours_x2apic_opt_out(
+        dmar_flags,
+        capture.processors[..capture.processor_count as usize]
+            .iter()
+            .filter(|processor| processor.flags & stela_boot_core::topology::ENABLED != 0)
+            .map(|processor| processor.apic_id),
+    );
     // SAFETY: CPL0, interrupts masked, no APIC handle of this processor made.
-    let apic_base = unsafe { crate::apic::prefer_x2apic() };
+    let apic_base = unsafe { crate::apic::choose_mode(keep_xapic) };
     let sender = crate::apic::Apic::new(apic_base, apic_base & crate::apic::BASE_ADDRESS);
     output::arguments(format_args!(
         "HOST APIC {}\n",
-        if sender.is_x2apic() {
-            "x2APIC"
-        } else {
-            "xAPIC (no x2APIC offered)"
+        match (sender.is_x2apic(), keep_xapic) {
+            (true, _) => "x2APIC",
+            (false, true) => "xAPIC (the firmware's DMAR opts out of x2APIC)",
+            (false, false) => "xAPIC (no x2APIC offered)",
         }
     ));
     crate::status::progress("stopping the firmware's processors");
@@ -944,8 +961,9 @@ fn load(
     } {
         Ok(deliveries) => deliveries,
         Err(error) => {
-            output::arguments(format_args!("NATIVE FIRMWARE INIT refused: {error:?}\n"));
-            output::fatal("firmware processor handoff refused before memory reuse");
+            output::fatal(format_args!(
+                "firmware processor handoff refused before memory reuse: {error:?}"
+            ));
         }
     };
     output::arguments(format_args!(
@@ -962,6 +980,41 @@ fn load(
         count,
         installed,
     } = handoff_phase::guest_memory(exit.map());
+    // The other cores' startup page must still be Stela's in the final map:
+    // a boot services page taken from an earlier map that something
+    // allocated since would be overwritten by the engine.
+    let sipi = native_resources.sipi;
+    if sipi != 0
+        && !stela_boot_core::startup_page::kept(
+            exit.map()
+                .entries()
+                .map(|entry| (entry.ty.0, entry.phys_start, entry.page_count)),
+            sipi,
+            sipi_taken,
+        )
+    {
+        output::fatal(format_args!(
+            "the page below 1 MiB the other cores start from ({sipi:#x}) was allocated to \
+             something else before the firmware exited"
+        ));
+    }
+    // The lines since the firmware's log closed, which no log stored, for
+    // the engine's record: the USB's log takes them when it resumes.
+    let loader_lines = {
+        let physical = handoff_page.physical + size_of::<Handoff>() as u64;
+        // SAFETY: the handoff allocation's tail, sized for these lines and
+        // used by nothing else; the firmware's identity map is loaded.
+        let into = unsafe {
+            core::slice::from_raw_parts_mut(
+                physical as *mut u8,
+                stela_boot_core::loader_lines::BYTES,
+            )
+        };
+        Region {
+            physical,
+            bytes: output::unkept_lines(into) as u64,
+        }
+    };
     // SAFETY: fresh LOADER_DATA pages sized for the handoff.
     unsafe {
         handoff.write(Handoff {
@@ -982,6 +1035,7 @@ fn load(
             screen,
             history,
             history_bytes,
+            loader_lines,
             host,
             host_bytes,
             log_partition: log.map(|guid| guid.0),
@@ -1016,6 +1070,7 @@ fn load(
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),
+            serial_present: crate::serial::present(),
         });
     }
     // SAFETY: boot services ended; the completed root maps this code and

@@ -26,7 +26,7 @@ use alloc::{boxed::Box, collections::VecDeque, format, rc::Rc, string::String, v
 use core::{cell::RefCell, task::Poll};
 use stela_contracts::Refusal;
 use stela_contracts::refuse;
-use stela_drivers::block::{Ahead, BlockDevice, ReadAhead};
+use stela_drivers::block::{Ahead, BlockDevice, Bounded, ReadAhead, ReadBound};
 use {
     stela_formats::payload::PayloadManifest, stela_formats::payload::Purpose,
     stela_formats::payload::ReadAt, stela_runtime::net::Transfer,
@@ -79,6 +79,8 @@ pub struct Source {
     remote: Option<Rc<RefCell<Remote>>>,
     /// The partition's read-ahead ([`Source::extent`]).
     ahead: Option<Ahead>,
+    /// The bound of a partition's reads ([`Source::bound`]).
+    local: Option<ReadBound>,
 }
 
 struct Described<R>(R);
@@ -114,6 +116,16 @@ impl Source {
             reader: Box::new(Described(reader)),
             remote: None,
             ahead: None,
+            local: None,
+        }
+    }
+
+    /// A source read from a partition whose reads `bound` bounds
+    /// ([`Bounded`]), as the install medium's are.
+    pub fn bounded<R: ReadAt + 'static>(reader: R, bound: ReadBound) -> Self {
+        Self {
+            local: Some(bound),
+            ..Self::new(reader)
         }
     }
 
@@ -123,6 +135,7 @@ impl Source {
             reader: Box::new(Described(Borrowed(Rc::clone(&remote)))),
             remote: Some(remote),
             ahead: None,
+            local: None,
         }
     }
 
@@ -139,14 +152,16 @@ impl Source {
     /// The study's raw source: the IPSW from the partition's first byte,
     /// read ahead in the host storage's largest commands.
     pub fn extent(partition: Box<dyn BlockDevice>, bytes: u64) -> Result<Self> {
+        let partition = Bounded::new(partition);
+        let bound = partition.bound();
         let ahead = Ahead::new(ReadAhead::new(
-            partition,
+            Box::new(partition),
             READ_AHEAD_BYTES,
             READ_AHEAD_DEPTH,
         ));
         let extent = Extent::new(Bytes::new(ahead.clone()), bytes)
             .map_err(|error| refuse!("restore source extent: {error}", %error))?;
-        let mut source = Self::new(extent);
+        let mut source = Self::bounded(extent, bound);
         source.ahead = Some(ahead);
         Ok(source)
     }
@@ -161,18 +176,27 @@ impl ReadAt for Source {
         self.reader.read_at(offset, buffer)
     }
     fn blocked(&mut self) -> bool {
-        self.remote
+        let remote = self
+            .remote
             .as_ref()
-            .is_some_and(|remote| remote.borrow_mut().blocked())
+            .is_some_and(|remote| remote.borrow_mut().blocked());
+        let local = self.local.as_ref().is_some_and(ReadBound::blocked);
+        remote || local
     }
 }
 
 impl Source {
-    /// Bound every later read of a remote image ([`Remote::bound`]): the
-    /// service reads it on a PE whose guest CPU waits meanwhile.
-    fn bound(&mut self) {
+    /// Bound every later read, of a remote image ([`Remote::bound`]) or of
+    /// a partition, whose time-stamp counter runs at `tsc_hz`: the service
+    /// reads it on a PE whose guest CPU waits meanwhile, and a USB stick may
+    /// hold a read behind one write for seconds. A read past its bound is
+    /// pending, and the next service goes on from what arrived.
+    fn bound(&mut self, tsc_hz: u64) {
         if let Some(remote) = &self.remote {
             remote.borrow_mut().bound();
+        }
+        if let Some(local) = &self.local {
+            local.set(tsc_hz / 1_000_000 * READ_WAIT_MICROS);
         }
     }
 }
@@ -308,6 +332,10 @@ pub struct Experiment {
     backpressure: MuxBackpressure,
     /// The counter's rate, for [`PREFETCH_MICROS`].
     tsc_hz: u64,
+    /// The answer that waits for its reads ([`Self::report_waiting`]): its
+    /// serial, the counter when it began waiting, and when the log names
+    /// it next, in milliseconds after that.
+    waiting: Option<(u64, u64, u64)>,
 }
 
 /// How long the guest runs on after its restore fails. A failure is often
@@ -320,6 +348,10 @@ const FAILURE_GRACE_MS: u64 = 10_000;
 const READ_AHEAD_BYTES: usize = 1 << 20;
 const READ_AHEAD_DEPTH: usize = 4;
 
+/// How long a bounded read of a partition waits for the disk, as a remote
+/// read waits for the network (`ranges::BUDGET_MS`).
+const READ_WAIT_MICROS: u64 = 20_000;
+
 /// Chunks of the image each service reads ahead, in one read the size of
 /// the store's largest, which the host's storage moves in its largest
 /// commands.
@@ -329,6 +361,11 @@ const PREFETCH_CHUNKS: usize = 8;
 /// read waits for the network (`ranges::BUDGET_MS`): its PE's guest waits
 /// meanwhile, and one job's read moves 1 MiB at most.
 const PREFETCH_MICROS: u64 = 20_000;
+
+/// How long an answer waits for its reads before the log names it, and
+/// how often the log names it again while it waits.
+const WAITING_REPORT_MS: u64 = 30_000;
+const WAITING_REPEAT_MS: u64 = 300_000;
 
 /// Native services kept for the whole restore session.
 pub struct Services {
@@ -894,6 +931,7 @@ impl Experiment {
             installed_macos,
             backpressure: MuxBackpressure::default(),
             tsc_hz: handoff.tsc_hz,
+            waiting: None,
         })
     }
     /// Read ahead from the host's storage, without the guest's devices.
@@ -917,7 +955,7 @@ impl Experiment {
     /// at the next service.
     pub fn prefetch(&mut self) {
         if !self.terminal {
-            self.driver.answers.store.reader_mut().bound();
+            self.driver.answers.store.reader_mut().bound(self.tsc_hz);
             let started = super::host::rdtsc();
             let budget = self.tsc_hz / 1_000_000 * PREFETCH_MICROS;
             self.driver.prefetch(PREFETCH_CHUNKS, || {
@@ -931,9 +969,46 @@ impl Experiment {
     /// which every PE's device access would otherwise wait out.
     pub fn work(&mut self) {
         if !self.terminal {
-            self.driver.answers.store.reader_mut().bound();
+            self.driver.answers.store.reader_mut().bound(self.tsc_hz);
             self.driver.work();
+            self.report_waiting();
         }
+    }
+
+    /// Name in the log an answer that has waited for its reads for
+    /// [`WAITING_REPORT_MS`], and again every [`WAITING_REPEAT_MS`]: its
+    /// request's type and the bytes it read and keeps, which grow while it
+    /// moves on, however slow the source.
+    fn report_waiting(&mut self) {
+        let Some(progress) = self.driver.answers.store.answer_progress() else {
+            self.waiting = None;
+            return;
+        };
+        let (serial, since, next) = match self.waiting {
+            Some(waiting) if waiting.0 == progress.serial => waiting,
+            _ => (progress.serial, output::now(), WAITING_REPORT_MS),
+        };
+        let waited = output::millis_since(since);
+        let next = match waited >= next {
+            true => {
+                output::arguments(format_args!(
+                    "{} ANSWER WAITING {} for {} s over {} turns: read {} KiB, kept {} KiB{}\n",
+                    self.mode.label(),
+                    progress.data_type,
+                    waited / 1000,
+                    progress.turns,
+                    progress.read >> 10,
+                    progress.kept >> 10,
+                    match progress.full {
+                        true => ", a result too large to keep is read again",
+                        false => "",
+                    }
+                ));
+                next + WAITING_REPEAT_MS
+            }
+            false => next,
+        };
+        self.waiting = Some((serial, since, next));
     }
 
     /// The image sent so far and the share of polls the host was behind

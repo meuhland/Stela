@@ -20,7 +20,23 @@ unsafe fn input(port: u16) -> u8 {
     value
 }
 pub fn initialize() {
-    // SAFETY: configured development PC UART, exclusive BSP I/O ownership.
+    let answers = stela_boot_core::uart::answers(
+        UART,
+        &mut |port| {
+            // SAFETY: a COM1 register, with exclusive BSP I/O ownership.
+            unsafe { input(port) }
+        },
+        &mut |port, value| {
+            // SAFETY: as above; a port nothing answers ignores the write,
+            // and a UART's interrupt enables are put back.
+            unsafe { out(port, value) }
+        },
+    );
+    ABSENT.store(!answers, Ordering::Relaxed);
+    if !answers {
+        return;
+    }
+    // SAFETY: the UART just found at COM1, exclusive BSP I/O ownership.
     unsafe {
         out(UART + 1, 0);
         out(UART + 3, 0x80);
@@ -29,28 +45,29 @@ pub fn initialize() {
         out(UART + 3, 3);
         out(UART + 2, 0xc7);
         out(UART + 4, 0x0b);
-        // A PC with no COM1 answers every read of its ports with 0xff: a
-        // line status no UART gives after its FIFOs were cleared, and a
-        // scratch register that keeps nothing. Linux's 8250 probe refuses
-        // such a port the same way.
-        let kept = |pattern: u8| {
-            out(UART + 7, pattern);
-            input(UART + 7) == pattern
-        };
-        let absent = input(UART + 5) == 0xff && !(kept(0x5a) && kept(0xa5));
-        ABSENT.store(absent, Ordering::Relaxed);
     }
 }
 
-/// Whether [`initialize`] found no UART at COM1. Its line status then
-/// always reads as data ready and transmitter empty: without this, the
-/// guest's console was fed 0xff bytes without end and every log byte was
-/// written to a port nothing answers.
+/// Whether [`initialize`] found no UART at COM1 ([`stela_boot_core::uart::
+/// answers`]), or one stopped taking bytes ([`send`]). A port nothing
+/// answers reads the same whatever is written: as 0xff its line status
+/// reads as data ready and transmitter empty, and without this the guest's
+/// console was fed 0xff bytes without end. XNU's console takes each such
+/// byte as a break (`cons_cinput` sign-extends it into `TTY_BI`), which
+/// with `BRKINT` sends SIGINT to the console's foreground process group:
+/// the single-user shell, as soon as it starts. As 0 it never shows the
+/// transmitter empty, and each byte waited out its poll.
 static ABSENT: AtomicBool = AtomicBool::new(false);
 
 /// Whether COM1 has a UART.
 pub fn present() -> bool {
     !ABSENT.load(Ordering::Relaxed)
+}
+
+/// Take the loader's [`initialize`] result in the engine, whose image copy
+/// was taken before it ran and so starts with a UART assumed present.
+pub fn adopt(present: bool) {
+    ABSENT.store(!present, Ordering::Relaxed);
 }
 /// One input byte for the guest console's device owner, when available.
 pub fn read() -> Option<u8> {
@@ -110,14 +127,17 @@ fn send(byte: u8) {
     for _ in 0..100_000 {
         // SAFETY: the line status register is a COM1 register, read at CPL0.
         if unsafe { input(UART + 5) } & 0x20 != 0 {
-            break;
+            // SAFETY: the transmit holding register is a COM1 register,
+            // written at CPL0.
+            unsafe { out(UART, byte) };
+            return;
         }
         core::hint::spin_loop();
     }
-    // SAFETY: the transmit holding register is a COM1 register, written at CPL0.
-    unsafe {
-        out(UART, byte);
-    }
+    // A transmitter that does not empty in the whole poll, far longer than
+    // a 16-byte FIFO takes at any rate the port runs at, takes no more bytes
+    // this boot: each would wait out the poll again.
+    ABSENT.store(true, Ordering::Relaxed);
 }
 pub struct Serial;
 impl Serial {

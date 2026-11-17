@@ -22,6 +22,14 @@ static void poweroff(struct work_struct *work)
 }
 static DECLARE_WORK(poweroff_work, poweroff);
 
+/* Linux's emergency_restart resets the machine at once, without syncing or
+ * stopping anything. The owner has no restart service, so the request is
+ * reported and the caller goes on, as after a restart that did not happen. */
+void emergency_restart(void)
+{
+	stela_linux_unsupported("an emergency restart");
+}
+
 void orderly_poweroff(bool force)
 {
 	if (force)

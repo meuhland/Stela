@@ -5,7 +5,7 @@
 
 use super::*;
 
-impl AhciDisk {
+impl Disk {
     /// The commands the port runs at once: a slot each while NCQ is on.
     pub(super) fn queue_depth(&self) -> usize {
         if self.ncq.enabled() {
@@ -196,25 +196,53 @@ impl AhciDisk {
 
     /// Move `issues`, each in its own slot, on without waiting: launch
     /// those that may run, take one look at the port, and recover it from a
-    /// failure, after which each failed command is retried as
+    /// failure in place, after which each failed command is retried as
     /// `ata_eh_finish` decides and completes by its fetched or generated
-    /// sense data, as sd does. Each issue's result once it has one.
-    ///
-    /// Linux `ata_std_qc_defer`: in turn, a queued command launches beside
-    /// queued ones, any other alone. A failure reaches every launched
-    /// command, as `ata_link_abort` does; one the NCQ Command Error log does
-    /// not blame runs again uncharged (`ata_eh_qc_retry` without an error).
+    /// sense data, as sd does ([`Self::settle`]). Each issue's result once
+    /// it has one.
     pub(super) fn advance(
         &mut self,
         port: &impl CommandPort,
         issues: &mut [&mut Issue],
     ) -> Vec<Option<Result<(), BlockError>>> {
+        let (mut results, failed) = self.launch_and_look(port, issues);
+        if let Some(Failed {
+            mut failure,
+            blamed,
+            io,
+        }) = failed
+        {
+            let recovered = block_on(self.recover(port, &mut failure, io));
+            let settled = self.settle(issues, blamed, &failure, recovered);
+            for (result, settled) in results.iter_mut().zip(settled) {
+                if settled.is_some() {
+                    *result = settled;
+                }
+            }
+        }
+        results
+    }
+
+    /// The part of [`Self::advance`] before error handling: launch the
+    /// issues that may run and take one look at the port. Each issue's
+    /// result once it has one, and the failure the look found, which the
+    /// launched commands wait on until the port is recovered.
+    ///
+    /// Linux `ata_std_qc_defer`: in turn, a queued command launches beside
+    /// queued ones, any other alone. A failure reaches every launched
+    /// command, as `ata_link_abort` does; one the NCQ Command Error log does
+    /// not blame runs again uncharged (`ata_eh_qc_retry` without an error).
+    pub(super) fn launch_and_look(
+        &mut self,
+        port: &impl CommandPort,
+        issues: &mut [&mut Issue],
+    ) -> (Vec<Option<Result<(), BlockError>>>, Option<Failed>) {
         let mut results: Vec<_> = issues.iter().map(|_| None).collect();
         if let Err(error) = self.minimum.ready() {
             for result in &mut results {
                 *result = Some(Err(error.clone()));
             }
-            return results;
+            return (results, None);
         }
         let mut launched = issues
             .iter()
@@ -253,6 +281,7 @@ impl AhciDisk {
                     write: issue.write,
                     buffer: None,
                 },
+                self.command_timeout_us,
             ) {
                 Ok(started) => {
                     issue.launched = Some(started);
@@ -268,11 +297,11 @@ impl AhciDisk {
                 .filter_map(|issue| issue.launched.as_ref())
                 .collect();
             if launched.is_empty() {
-                return results;
+                return (results, None);
             }
             match self.look(port, &launched) {
                 Some(seen) => seen,
-                None => return results,
+                None => return (results, None),
             }
         };
         for (index, issue) in issues.iter_mut().enumerate() {
@@ -289,13 +318,36 @@ impl AhciDisk {
                 results[index] = Some(Ok(()));
             }
         }
-        let Some(mut failure) = seen.failure else {
-            return results;
+        let Some(failure) = seen.failure else {
+            return (results, None);
         };
         let io = issues
             .iter()
             .any(|issue| issue.launched.is_some() && issue.io);
-        if let Err(error) = self.recover(port, &mut failure, io) {
+        let failed = Failed {
+            failure,
+            blamed: seen.blamed,
+            io,
+        };
+        (results, Some(failed))
+    }
+
+    /// What error handling's end, `recovered`, means for the launched
+    /// `issues` a failure reached: once the port is recovered each command
+    /// it charged, the one the NCQ Command Error log names in `failure` or
+    /// those in `blamed`, is disposed of ([`Self::dispose`]) and the others
+    /// run again uncharged; a disk it could not recover is disabled and
+    /// every launched command fails with its error. Each issue's result
+    /// once it has one.
+    pub(super) fn settle(
+        &mut self,
+        issues: &mut [&mut Issue],
+        blamed: u32,
+        failure: &Failure,
+        recovered: Result<(), BlockError>,
+    ) -> Vec<Option<Result<(), BlockError>>> {
+        let mut results: Vec<_> = issues.iter().map(|_| None).collect();
+        if let Err(error) = recovered {
             self.fault = Some(error.clone());
             for (index, issue) in issues.iter_mut().enumerate() {
                 if issue.launched.take().is_some() {
@@ -308,11 +360,11 @@ impl AhciDisk {
             let Some(launched) = issue.launched.take() else {
                 continue;
             };
-            let blamed = match failure.named {
+            let charged = match failure.named {
                 Some(slot) => slot == launched.slot,
-                None => seen.blamed >> launched.slot & 1 != 0,
+                None => blamed >> launched.slot & 1 != 0,
             };
-            if blamed {
+            if charged {
                 results[index] = self.dispose(issue, failure.clone());
             }
         }
@@ -329,12 +381,13 @@ impl AhciDisk {
     }
 
     /// An internal command (`ata_exec_internal`): a failure kicks the engine
-    /// so it forgets the command, and is returned as is.
+    /// so it forgets the command, and is returned as is, also when the
+    /// engine does not stop, as `ahci_post_internal_cmd` ignores that.
     #[expect(
         clippy::result_large_err,
         reason = "Return complete typed command failure and recovery context without allocation on the failure path."
     )]
-    pub(super) fn internal(
+    pub(super) async fn internal(
         &mut self,
         port: &impl CommandPort,
         command: u8,
@@ -344,50 +397,85 @@ impl AhciDisk {
         buffer: u64,
     ) -> Result<(), Failure> {
         self.ready().map_err(Failure::new)?;
-        let Err(failure) = self.attempt(
-            port,
-            AtaRequest {
-                command,
-                feature: u16::from(feature),
-                lba: 0,
-                count,
-                bytes,
-                write: false,
-                buffer: Some(buffer),
-            },
-        ) else {
+        let Err(failure) = self
+            .attempt(
+                port,
+                AtaRequest {
+                    command,
+                    feature: u16::from(feature),
+                    lba: 0,
+                    count,
+                    bytes,
+                    write: false,
+                    buffer: Some(buffer),
+                },
+            )
+            .await
+        else {
             return Ok(());
         };
         self.minimum.ready().map_err(Failure::new)?;
-        stop_engine(port, self.clock).map_err(Failure::new)?;
-        start_engine(port);
+        if stop_engine(port, self.clock).await.is_ok() {
+            start_engine(port);
+        }
         Err(failure)
     }
 
-    /// Issue the command once in slot 0, the port running nothing else, and
-    /// wait for its completion or error.
+    /// Linux `ata_internal_cmd_timeout`: an internal command's timeout in
+    /// this error handling run, never longer than a block command's.
+    pub(super) fn internal_timeout_us(&self, command: u8) -> u64 {
+        let timeout = match internal_class(command) {
+            Some(class) => INTERNAL_TIMEOUTS_US[class].1[usize::from(self.timeout_steps[class])],
+            None => INTERNAL_DEFAULT_TIMEOUT_US,
+        };
+        timeout.min(self.command_timeout_us)
+    }
+
+    /// Linux `ata_internal_cmd_timed_out`: the class's next command waits
+    /// for the next timeout, the last one staying.
+    pub(super) fn internal_timed_out(&mut self, command: u8) {
+        if let Some(class) = internal_class(command) {
+            let step = &mut self.timeout_steps[class];
+            if usize::from(*step) + 1 < INTERNAL_TIMEOUTS_US[class].1.len() {
+                *step += 1;
+            }
+        }
+    }
+
+    /// Issue the internal command once in slot 0, the port running nothing
+    /// else, and wait for its completion or error, at most its
+    /// [`Self::internal_timeout_us`]: each look that finds neither ends the
+    /// step.
     #[expect(
         clippy::result_large_err,
         reason = "Return complete typed command failure and recovery context without allocation on the failure path."
     )]
-    pub(super) fn attempt(
+    pub(super) async fn attempt(
         &mut self,
         port: &impl CommandPort,
         request: AtaRequest,
     ) -> Result<(), Failure> {
-        let launched = self.launch(port, 0, true, request)?;
+        let command = request.command;
+        let timeout_us = self.internal_timeout_us(command);
+        let launched = self.launch(port, 0, true, request, timeout_us)?;
         loop {
             self.minimum.ready().map_err(Failure::new)?;
             if let Some(seen) = self.look(port, &[&launched]) {
-                return seen.failure.map_or(Ok(()), Err);
+                let Some(failure) = seen.failure else {
+                    return Ok(());
+                };
+                if failure.mask & ERR_TIMEOUT != 0 {
+                    self.internal_timed_out(command);
+                }
+                return Err(failure);
             }
-            crate::waiting();
-            core::hint::spin_loop();
+            yield_now().await;
         }
     }
 
-    /// Issue the command once in `slot`; `alone` when the port runs no
-    /// other command, whose interrupts and ending FIS marks it may clear.
+    /// Issue the command once in `slot`, to complete within `timeout_us`;
+    /// `alone` when the port runs no other command, whose interrupts and
+    /// ending FIS marks it may clear.
     #[expect(
         clippy::result_large_err,
         reason = "Return complete typed command failure and recovery context without allocation on the failure path."
@@ -398,6 +486,7 @@ impl AhciDisk {
         slot: usize,
         alone: bool,
         request: AtaRequest,
+        timeout_us: u64,
     ) -> Result<Launched, Failure> {
         self.ready().map_err(Failure::new)?;
         let AtaRequest {
@@ -479,7 +568,7 @@ impl AhciDisk {
         fence(Ordering::SeqCst);
         let deadline = self
             .clock
-            .try_deadline(self.command_timeout_us)
+            .try_deadline(timeout_us)
             .map_err(|_| Failure::new(BlockError::Timeout))?;
         // ahci_qc_issue: a queued command is active in PxSACT until the
         // disk's Set Device Bits FIS clears it.
@@ -490,6 +579,7 @@ impl AhciDisk {
         Ok(Launched {
             slot,
             queued,
+            command,
             deadline,
         })
     }
@@ -571,6 +661,28 @@ impl AhciDisk {
         let lpm = self.lpm.policy > LPM_MAX_POWER;
         let task_file = port.read32(PORT_TASK_FILE);
         let mut failure = classify(interrupts, serror, task_file, timed_out, lpm);
+        // The first expired command, named with what the port showed.
+        if let Some(launched) = launched
+            .iter()
+            .find(|launched| expired >> launched.slot & 1 != 0)
+        {
+            failure.error = BlockError::Expired(Box::new(Expired {
+                step: command_wait(launched.command),
+                waited_us: self
+                    .clock
+                    .try_elapsed_us(launched.deadline.started())
+                    .unwrap_or(0),
+                registers: alloc::vec![
+                    ("PxCI", port.read32(PORT_ISSUE)),
+                    ("PxSACT", port.read32(PORT_SATA_ACTIVE)),
+                    ("PxTFD", task_file),
+                    ("PxSSTS", port.read32(PORT_SATA_STATUS)),
+                    ("PxIS", status),
+                    ("PxSERR", serror),
+                    ("PxCMD", port.read32(PORT_COMMAND)),
+                ],
+            }));
+        }
         // ahci_qc_fill_rtf, before error handling issues anything else: the
         // Set Device Bits FIS for a queued command, else the last D2H FIS.
         let fis = if queued { RECEIVED_SDB } else { RECEIVED_D2H };
@@ -633,10 +745,28 @@ impl AhciDisk {
         Ok(tag)
     }
 
-    /// Move the started block commands on as far as they go without
-    /// waiting.
+    /// Move the started block commands on as far as they go, recovering
+    /// the port in place from each failure, the caller waiting: error
+    /// handling run to its end, as for a caller that waits anyway.
+    /// [`AhciDisk`] runs it a step at a time instead.
     pub(super) fn run(&mut self, port: &impl CommandPort) {
+        while let Some(Failed {
+            mut failure,
+            blamed,
+            io,
+        }) = self.run_stepped(port)
+        {
+            let recovered = block_on(self.recover(port, &mut failure, io));
+            self.settle_running(blamed, &failure, recovered);
+        }
+    }
+
+    /// Move the started block commands on as far as they go without
+    /// waiting, up to a failure: the launched commands it reached wait for
+    /// error handling, whose end [`Self::settle_running`] takes.
+    pub(super) fn run_stepped(&mut self, port: &impl CommandPort) -> Option<Failed> {
         let mut running = core::mem::take(&mut self.running);
+        let mut failed = None;
         loop {
             for command in running
                 .iter_mut()
@@ -659,35 +789,72 @@ impl AhciDisk {
             if issues.is_empty() {
                 break;
             }
-            let results = self.advance(port, &mut issues);
-            let mut progressed = false;
-            for (command, result) in running
-                .iter_mut()
-                .filter(|command| command.issue.is_some())
-                .zip(results)
-            {
-                let Some(result) = result else {
-                    continue;
-                };
-                progressed = true;
-                let Some(issue) = command.issue.take() else {
-                    continue;
-                };
-                match result {
-                    Err(error) => command.result = Some(Err(error)),
-                    Ok(()) => {
-                        if let Command::Read { .. } = command.command {
-                            self.gather(command.slot, issue.bytes, &mut command.data);
-                        }
-                        command.done += issue.bytes.max(1);
-                    }
-                }
+            let (results, failure) = self.launch_and_look(port, &mut issues);
+            let progressed = self.take_results(&mut running, results);
+            if failure.is_some() {
+                failed = failure;
+                break;
             }
             if !progressed {
                 break;
             }
         }
         self.running = running;
+        failed
+    }
+
+    /// The end of the error handling a [`Self::run_stepped`] failure
+    /// started, for the started commands it reached ([`Self::settle`]).
+    pub(super) fn settle_running(
+        &mut self,
+        blamed: u32,
+        failure: &Failure,
+        recovered: Result<(), BlockError>,
+    ) {
+        let mut running = core::mem::take(&mut self.running);
+        let results = {
+            let mut issues: Vec<&mut Issue> = running
+                .iter_mut()
+                .filter_map(|command| command.issue.as_mut())
+                .collect();
+            self.settle(&mut issues, blamed, failure, recovered)
+        };
+        self.take_results(&mut running, results);
+        self.running = running;
+    }
+
+    /// Give the started commands with an issue their issues' `results`, in
+    /// order: a failed part fails its command, a completed one adds its
+    /// data. Whether any had one.
+    fn take_results(
+        &mut self,
+        running: &mut [Running],
+        results: Vec<Option<Result<(), BlockError>>>,
+    ) -> bool {
+        let mut progressed = false;
+        for (command, result) in running
+            .iter_mut()
+            .filter(|command| command.issue.is_some())
+            .zip(results)
+        {
+            let Some(result) = result else {
+                continue;
+            };
+            progressed = true;
+            let Some(issue) = command.issue.take() else {
+                continue;
+            };
+            match result {
+                Err(error) => command.result = Some(Err(error)),
+                Ok(()) => {
+                    if let Command::Read { .. } = command.command {
+                        self.gather(command.slot, issue.bytes, &mut command.data);
+                    }
+                    command.done += issue.bytes.max(1);
+                }
+            }
+        }
+        progressed
     }
 
     /// The next part of `running`'s command, its data staged in its slot's
@@ -768,5 +935,53 @@ impl AhciDisk {
             ATA_SECTOR_BYTES as usize,
             true,
         )
+    }
+}
+
+/// The [`INTERNAL_TIMEOUTS_US`] class of an internal command.
+fn internal_class(command: u8) -> Option<usize> {
+    INTERNAL_TIMEOUTS_US
+        .iter()
+        .position(|(commands, _)| commands.contains(&command))
+}
+
+/// What a command's expired wait is reported as: the command, and the
+/// slot's bit it waited to see cleared.
+fn command_wait(command: u8) -> &'static str {
+    macro_rules! wait {
+        ($name:literal, $code:literal) => {
+            concat!(
+                "ATA ",
+                $name,
+                " (",
+                $code,
+                "), waiting for its PxCI bit to clear"
+            )
+        };
+        ($name:literal, $code:literal, queued) => {
+            concat!(
+                "ATA ",
+                $name,
+                " (",
+                $code,
+                "), waiting for its PxSACT bit to clear"
+            )
+        };
+    }
+    match command {
+        ATA_IDENTIFY => wait!("IDENTIFY DEVICE", "0xec"),
+        ATA_SET_FEATURES => wait!("SET FEATURES", "0xef"),
+        ATA_READ_LOG_EXT => wait!("READ LOG EXT", "0x2f"),
+        ATA_READ_LOG_DMA_EXT => wait!("READ LOG DMA EXT", "0x47"),
+        ATA_REQUEST_SENSE_DATA_EXT => wait!("REQUEST SENSE DATA EXT", "0x0b"),
+        ATA_STANDBY_IMMEDIATE => wait!("STANDBY IMMEDIATE", "0xe0"),
+        ATA_READ_DMA_EXT => wait!("READ DMA EXT", "0x25"),
+        ATA_WRITE_DMA_EXT => wait!("WRITE DMA EXT", "0x35"),
+        ATA_READ_FPDMA_QUEUED => wait!("READ FPDMA QUEUED", "0x60", queued),
+        ATA_WRITE_FPDMA_QUEUED => wait!("WRITE FPDMA QUEUED", "0x61", queued),
+        ATA_FLUSH_CACHE => wait!("FLUSH CACHE", "0xe7"),
+        ATA_FLUSH_CACHE_EXT => wait!("FLUSH CACHE EXT", "0xea"),
+        ATA_DATA_SET_MANAGEMENT => wait!("DATA SET MANAGEMENT", "0x06"),
+        _ => "ATA command, waiting for its PxCI bit to clear",
     }
 }

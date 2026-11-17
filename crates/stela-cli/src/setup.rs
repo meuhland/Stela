@@ -3,8 +3,8 @@
 //! system's life.
 //!
 //! Setup writes the install medium (`setup::medium`) of the installer the
-//! user chooses ([`InstallImage`]): Offline, the whole IPSW on the USB's
-//! FAT32 data partition, which needs a USB of 32 GB or more; or Online,
+//! user chooses ([`InstallImage`]): Offline, the whole IPSW on the stick's
+//! FAT32 data partition, which needs a stick of 32 GB or more; or Online,
 //! the IPSW's inventory, from which `stela.efi` streams the IPSW from
 //! Apple's servers during the install. Offline is the default where it
 //! fits ([`offline_unavailable`]). It prepares each machine's restore bundle (`stela
@@ -17,15 +17,15 @@
 //! boots the installed system afterwards. The restore personalizes its root
 //! tickets, its Cryptex1 ticket and the recoveryOS LocalPolicy with Apple's
 //! signing server (TSS); setup asks for them while it prepares the bundle
-//! (`boot::ticket::staged`), so an install with macOS on the USB needs no
+//! (`boot::ticket::staged`), so an install with macOS on the stick needs no
 //! network.
 //!
-//! One command checks the USB and the restore image without writing
+//! One command checks the stick and the restore image without writing
 //! anything, prepares the restore bundle on this computer, then copies it
-//! to the USB's FAT32 data partition, which the PC's firmware can read and
+//! to the stick's FAT32 data partition, which the PC's firmware can read and
 //! which also holds the install medium and the translation store
 //! (`stela/boot`, `stela/install` and `stela/store`), installs `stela.efi`
-//! as the USB's boot loader (`efi`) with a `stela.cfg` that boots the
+//! as the stick's boot loader (`efi`) with a `stela.cfg` that boots the
 //! installed macOS, and records what it wrote in `EFI/stela/setup.json` on
 //! the EFI partition. `--dry-run` stops after the checks; `uninstall`
 //! removes everything the record names.
@@ -33,7 +33,7 @@
 //! Each Stela machine has its own ECID (`setup::ecid`), drawn once, kept in
 //! the record and given to every bundle prepared for it. Without `--target`,
 //! Install macOS asks for a disk of the PC in `stela.efi`, or a raw
-//! partition of the USB is the Mac's internal SSD. With `--target`, setup
+//! partition of the stick is the Mac's internal SSD. With `--target`, setup
 //! runs on the PC itself and names the PC's own disk (`setup::installed`):
 //! one empty partition becomes the Mac's internal SSD and keeps the machine
 //! state (NVRAM, the SEP's state, the boot log) in its last bytes, outside
@@ -42,7 +42,7 @@
 //! disk's own recoveryOS when NVRAM asks for it or the disk holds no system,
 //! as a Mac does. Further disks become further installs of the same setup
 //! (`setup::machines`), each its own machine, chosen at boot from
-//! `stela.efi`'s startup choices. Setup writes no disk but the USB, except
+//! `stela.efi`'s startup choices. Setup writes no disk but the stick, except
 //! fresh machine state with `--initialize-nor` and NVRAM with
 //! `nvram next-boot`.
 //!
@@ -78,6 +78,7 @@ mod prepare;
 mod record;
 mod release;
 mod settings;
+mod signatures;
 mod sources;
 mod state;
 mod translations;
@@ -163,6 +164,61 @@ thread_local! {
     /// repeat: never the volume path it was resolved to, which may hold
     /// the user's name.
     static NAMED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The stick partitions this run mounted, with where: [`Mounted`]
+    /// unmounts them when the run ends.
+    static MOUNTED: std::cell::RefCell<Vec<(String, PathBuf)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Mount the stick's partition `identifier`, its EFI or data partition,
+/// which hosts often leave unmounted, for this run: [`Mounted`] unmounts it
+/// when the run ends.
+fn mount_for_run(host: &dyn Host, identifier: &str) -> Result<PathBuf> {
+    let mount = host.mount(identifier)?;
+    MOUNTED.with_borrow_mut(|mounted| {
+        if !mounted.iter().any(|(done, _)| done == identifier) {
+            mounted.push((identifier.into(), mount.clone()));
+        }
+    });
+    Ok(mount)
+}
+
+/// Held for a run: when it ends, on every path, it unmounts what the run
+/// mounted ([`mount_for_run`]), so a run leaves no stick partition mounted (a
+/// lasting drive letter on Windows, a read-write mount on Linux) that was
+/// not mounted before it.
+struct Mounted<'a> {
+    host: &'a dyn Host,
+}
+
+impl<'a> Mounted<'a> {
+    fn hold(host: &'a dyn Host) -> Self {
+        Self { host }
+    }
+}
+
+impl Drop for Mounted<'_> {
+    fn drop(&mut self) {
+        for (identifier, mount) in MOUNTED.take().into_iter().rev() {
+            let partition = match self.host.partition(&identifier) {
+                // Unmounted already, as an erase does.
+                Ok(info) if info.mount.is_none() => continue,
+                Ok(info) => info,
+                Err(_) => host::PartitionInfo {
+                    identifier: identifier.clone(),
+                    disk: String::new(),
+                    guid: String::new(),
+                    bytes: 0,
+                    content: "EFI".into(),
+                    mount: Some(mount),
+                    container: None,
+                },
+            };
+            if let Err(error) = self.host.unmount(&partition) {
+                eprintln!("Note: {identifier} stays mounted: {error:#}");
+            }
+        }
+    }
 }
 
 /// `stela {words}` in backticks, as a user types it, with the stick at
@@ -195,11 +251,10 @@ fn quoted(word: &str) -> String {
 }
 
 /// What to do about an interrupted first setup on `usb`.
-fn interrupted_text(record: &Record, usb: &Path) -> String {
+fn interrupted_text(usb: &Path) -> String {
     format!(
-        "the first setup on {} was interrupted: {} finishes it (add --ipsw FILE to use a local \
-         image). To start over, make a new installer on the stick with `stela create`",
-        record.esp.display(),
+        "the create on this stick stopped part way: {} finishes it. To start over, make a new \
+         installer on the stick with `stela create`",
         fix(usb, "repair")
     )
 }
@@ -267,8 +322,35 @@ fn consent(environment: &Environment<'_>, yes: bool, question: &str, refusal: &s
         Err(error) if ui::cancelled(&error) => false,
         answer => answer?,
     };
-    ensure!(accepted, "nothing was changed");
-    Ok(())
+    match accepted {
+        true => Ok(()),
+        false => Err(Declined.into()),
+    }
+}
+
+/// A question declined at a terminal: the person chose no, so the run
+/// stops there, having changed nothing. It is an answer, not a failure:
+/// the run closes with "Nothing was changed." and exits 0, as Quit in plain
+/// `stela` does. Without a terminal a question is refused instead, naming
+/// `--yes`, and the run fails.
+#[derive(Debug)]
+pub(super) struct Declined;
+
+impl std::fmt::Display for Declined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing was changed")
+    }
+}
+
+impl std::error::Error for Declined {}
+
+/// How a run on `ui` ends: a [`Declined`] question closes with "Nothing was
+/// changed." and succeeds; anything else is the run's result.
+fn closed(ui: &dyn ui::Ui, result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.is::<Declined>() => ui.cancel("Nothing was changed."),
+        result => result,
+    }
 }
 
 /// A command that found problems: its whole report, which goes to standard
@@ -328,10 +410,10 @@ fn restore_choice_name(kind: Kind) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum InstallImage {
-    // The whole IPSW on the USB; with the signing answers setup fetched,
+    // The whole IPSW on the stick; with the signing answers setup fetched,
     // the install needs no network. Records name it `full`, and those
     // written before that name `offline`. The doc line is `--help`'s.
-    /// macOS is copied to the USB (32 GB or more); the install needs no internet
+    /// macOS is copied to the stick (32 GB or more); the install needs no internet
     #[serde(alias = "offline")]
     #[value(name = "offline")]
     Full,
@@ -385,8 +467,8 @@ fn image_is_remote(ipsw: &Path, choice: InstallImage) -> Result<bool> {
         InstallImage::Full => {
             ensure!(
                 restore::payload::holds_system_image(ipsw)?,
-                "{} holds only boot files, without the macOS system image this USB's \
-                 install reads from it; pass the whole IPSW with --ipsw",
+                "{} holds only part of macOS; an Offline installer needs the whole IPSW file \
+                 (--ipsw)",
                 ipsw.display()
             );
             Ok(false)
@@ -438,6 +520,10 @@ pub(crate) struct Request {
     /// `--yes`: without a terminal, accept what a terminal run asks about,
     /// erasing aside.
     pub(crate) yes: bool,
+    /// The bytes of a download plain `stela`'s choice named and the person
+    /// chose: a download of that size is not asked about again, any other
+    /// is.
+    accepted_download: Option<u64>,
     target: Option<String>,
     nor: Option<String>,
     disk_serial: Option<String>,
@@ -457,7 +543,7 @@ pub(crate) struct Request {
     chooser_timeout: Option<command::Wait>,
     translation_store_bytes: Option<u64>,
     confirm_disk: Option<String>,
-    /// The person running setup confirmed erasing the USB, as the wizard
+    /// The person running setup confirmed erasing the stick, as the wizard
     /// asks; otherwise a scripted erase at a terminal asks.
     confirmed: bool,
     wifi: Option<String>,
@@ -564,7 +650,7 @@ type InventoryOf = dyn Fn(&Path, &str) -> Result<restore::payload::Inventory>;
 type ImageSizeOf<'a> = dyn Fn(&str, &str) -> Result<(u64, u64)> + 'a;
 /// Fetch what a command needs of a build's image for a model into a
 /// directory: the boot files (`prepare::fetch_inputs`), or the boot files
-/// of a whole image that is written onto the USB as it downloads
+/// of a whole image that is written onto the stick as it downloads
 /// (`medium::download::Download`).
 /// The members of an image `boot prepare` reads for a model's restore
 /// bundle (`boot::restore_inputs_in`), from the image's directory and
@@ -647,18 +733,33 @@ fn read_efi(environment: &Environment<'_>, path: &Path) -> Result<Vec<u8>> {
     Ok(image)
 }
 
+/// Whether `record`'s stela.efi is missing, is not the version the record
+/// names, or reads another interface than this `stela` writes, or its boot
+/// bundles are of an older revision than this `stela` prepares: the damage
+/// `status` names `update` for, which `repair` then does first.
+fn needs_update(environment: &Environment<'_>, record: &Record) -> bool {
+    if record.bundle_revision < environment.bundle_revision {
+        return true;
+    }
+    match fs::read(record.esp.join(LOADER_PATH)) {
+        Err(_) => true,
+        Ok(image) => {
+            record.stela_version.as_deref() != Some(update::version_id(&image).as_str())
+                || mount_interface::mismatch(environment.interface, mount_interface::find(&image))
+                    .is_some()
+        }
+    }
+}
+
 /// Refuse to change a setup whose installed `stela.efi` reads another
 /// interface than this `stela` writes; `update` replaces it first.
 fn check_installed_efi(environment: &Environment<'_>, record: &Record) -> Result<()> {
     let tool = record.esp.join(LOADER_PATH);
     let image = fs::read(&tool).with_context(|| format!("cannot read {}", tool.display()))?;
-    if let Some(reason) =
-        mount_interface::mismatch(environment.interface, mount_interface::find(&image))
-    {
+    if mount_interface::mismatch(environment.interface, mount_interface::find(&image)).is_some() {
         bail!(
-            "the stela.efi on {} does not read what this stela writes ({reason}); install this \
-             stela's stela.efi first with {}, or use the stela that installed it",
-            record.esp.display(),
+            "Stela on this stick does not match this stela: update it first with {}, or use the \
+             stela that made it",
             fix(&record.esp, "update")
         );
     }
@@ -684,15 +785,11 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
     }
     Some(if theirs < ours {
         format!(
-            "this setup's boot bundles are revision {theirs}, and this stela prepares revision \
-             {ours}: prepare them again with {}",
+            "this stick's boot files were prepared by an older stela: prepare them again with {}",
             fix(&record.esp, "update")
         )
     } else {
-        format!(
-            "this setup's boot bundles are revision {theirs}, newer than the revision {ours} \
-             this stela prepares: use the stela that prepared them"
-        )
+        "this stick's boot files were prepared by a newer stela: use that stela".into()
     })
 }
 
@@ -735,6 +832,22 @@ fn setup_volume(disk: &host::Disk) -> Option<PathBuf> {
         .find(|mount| mount.join(RECORD).is_file())
         .or_else(|| mounts().find(|mount| mount.join("stela/boot").is_dir()))
         .cloned()
+}
+
+/// Whether the EFI partition of the stick whose volume is `usb` has no
+/// mount, so reading it means mounting it: on Windows, giving it a drive
+/// letter, which only an administrator can.
+fn esp_unmounted(host: &dyn Host, usb: &Path) -> bool {
+    let Ok(volume) = host.volume(usb) else {
+        return false;
+    };
+    host.disks()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter(|disk| volume.disk.as_deref() == Some(disk.identifier.as_str()))
+        .flat_map(|disk| disk.partitions)
+        .any(|partition| partition.content == "EFI" && partition.mount.is_none())
 }
 
 /// The mounted volume that holds the setup of the whole disk `stick`
@@ -810,7 +923,7 @@ fn create_installer(environment: &Environment<'_>, request: Request) -> Result<(
     }
     if dry_run {
         print!("{report}");
-        return Ok(());
+        return ui.outro("Done.");
     }
     let profile = match profile {
         true => "\nProfiling is on. Keep EFI/stela/boot.log after your run.",
@@ -823,7 +936,7 @@ fn create_installer(environment: &Environment<'_>, request: Request) -> Result<(
             create::network_next_step(&report)
         ),
     )?;
-    ui.outro("Your installer stick is ready")
+    ui.outro("Your installer stick is ready.")
 }
 
 impl Request {
@@ -859,15 +972,23 @@ impl Request {
         }
         // The rights to write disks, before anything is downloaded or
         // changed. A Windows relaunch opens its own window, which only the
-        // wizard and `log`, whose raw disk reads need administrator
-        // rights, want.
+        // wizard, `log`, whose raw disk reads need administrator rights,
+        // and a `status` that must mount the stick's EFI partition want,
+        // and only at a terminal.
         let boot_log = matches!(self.action, Action::BootLog);
+        let administrator = elevation::is_administrator();
+        let status_mounts = cfg!(windows)
+            && !administrator
+            && matches!(self.action, Action::Status)
+            && esp_unmounted(&host::System, &self.usb);
         let rights = elevation::rights(elevation::Situation {
             windows: cfg!(windows),
-            administrator: elevation::is_administrator(),
+            administrator,
             dry_run: self.dry_run,
-            own_window: self.usb.as_os_str().is_empty() || boot_log,
+            own_window: self.usb.as_os_str().is_empty() || boot_log || status_mounts,
+            interactive: ui::attached(),
             writes_disks: writes_disks(&self.action),
+            admin_reads: boot_log || status_mounts,
         });
         match rights {
             elevation::Rights::Enough => {}
@@ -881,7 +1002,7 @@ impl Request {
                 }
                 return Ok(());
             }
-            elevation::Rights::Refuse => bail!(elevation::REFUSED),
+            elevation::Rights::Refuse => bail!(elevation::refused(writes_disks(&self.action))),
         }
         // Said once, by the run that has the rights.
         if let Some(disk) = found {
@@ -972,16 +1093,22 @@ impl Request {
             builds: builds::SUPPORTED,
             models: SUPPORTED_MODELS,
         };
+        let _mounted = Mounted::hold(environment.host);
+        closed(environment.ui, self.act(&environment))
+    }
+
+    /// Run this request in `environment`, once it has the rights it needs.
+    fn act(mut self, environment: &Environment<'_>) -> Result<()> {
         let asks = environment.ui.interactive();
         let wizard = matches!(self.action, Action::Create) && self.usb.as_os_str().is_empty();
         // A stela without its stela.efi says so before anything is asked.
         if (wizard || matches!(self.action, Action::Home)) && self.efi.is_none() {
             let path = assets::resolve()?;
-            read_efi(&environment, &path)?;
+            read_efi(environment, &path)?;
             self.efi = Some(path);
         }
         match self.action {
-            Action::Home => return home::run(&environment, self),
+            Action::Home => return home::run(environment, self),
             Action::Create if wizard => {
                 ensure!(
                     asks,
@@ -989,9 +1116,9 @@ impl Request {
                      SIZE",
                     host::DISK_EXAMPLE
                 );
-                let sticks: Vec<_> = home::sticks(&environment)?
+                let sticks: Vec<_> = home::sticks(environment)?
                     .into_iter()
-                    .filter(|stick| stick.disk.bytes == 0 || stick.disk.bytes >= home::NETWORK_MIN)
+                    .filter(|stick| stick.disk.bytes >= home::NETWORK_MIN)
                     .collect();
                 ensure!(
                     !sticks.is_empty(),
@@ -1004,22 +1131,22 @@ impl Request {
                 let Some(stick) = stick else {
                     return environment.ui.cancel("Nothing was changed.");
                 };
-                if !wizard::configure(&environment, &mut self, &stick)? {
+                if !wizard::configure(environment, &mut self, &stick)? {
                     return Ok(());
                 }
-                return create_installer(&environment, self);
+                return create_installer(environment, self);
             }
             // Plain `stela settings` on a terminal asks for each setting.
             Action::Configure if asks && !settings::named(&self) => {
-                let record = read_record(&environment, &self.usb)?;
-                if !settings::ask(&environment, &mut self, Some(&record))? {
+                let record = read_record(environment, &self.usb)?;
+                if !settings::ask(environment, &mut self, Some(&record))? {
                     return Ok(());
                 }
             }
             _ => {}
         }
         let output = self.output.take();
-        let (report, result) = split_report(self.dispatch(&environment));
+        let (report, result) = split_report(self.dispatch(environment));
         if let Err(error) = result {
             print!("{report}");
             return Err(error);
@@ -1036,8 +1163,47 @@ impl Request {
         self.model.as_deref().unwrap_or(PINNED_MODEL)
     }
 
-    /// Bring the stick of `record` to the request's build of macOS.
-    fn update_os(&self, environment: &Environment<'_>, mut record: Record) -> Result<String> {
+    /// Put this stela's stela.efi on the stick of `record`, preparing its
+    /// boot files again when they are of another generation; `allowed`
+    /// when this run already asked to change a newer Stela's stick, and
+    /// `skips` when it reports and ends the device skips.
+    fn update_stela(
+        &self,
+        environment: &Environment<'_>,
+        record: Record,
+        (allowed, skips): (bool, bool),
+    ) -> Result<String> {
+        let image = match &self.efi {
+            Some(path) => path.clone(),
+            None => assets::resolve()?,
+        };
+        // The update finds the restore image itself when it needs one,
+        // downloading only its boot files, never the whole image. A local
+        // image named for a macOS change is that build's, not the active
+        // one's.
+        update::update_stela(
+            environment,
+            record,
+            update::UpdateOptions {
+                usb: &self.usb,
+                image_path: &image,
+                ipsw: self.ipsw.as_deref().filter(|_| self.macos.is_none()),
+                download_dir: self.download_dir.as_deref(),
+                dry_run: self.dry_run,
+                yes: self.yes || allowed,
+                skips,
+            },
+        )
+    }
+
+    /// Bring the stick of `record` to the request's build of macOS; `named`
+    /// when the command named that build, as `update --macos` does.
+    fn update_os(
+        &self,
+        environment: &Environment<'_>,
+        mut record: Record,
+        named: bool,
+    ) -> Result<String> {
         check_installed_efi(environment, &record)?;
         record.install_image = self.install_image.or(record.install_image);
         update::update_os(
@@ -1050,12 +1216,16 @@ impl Request {
                 download_dir: self.download_dir.as_deref(),
                 dry_run: self.dry_run,
                 yes: self.yes,
+                named,
+                accepted: self.accepted_download,
             },
         )
     }
 
     fn dispatch(mut self, environment: &Environment<'_>) -> Result<String> {
         let action = std::mem::take(&mut self.action);
+        #[cfg(test)]
+        tests::DISPATCHED.with_borrow_mut(|done| done.push(tests::command_of(&action)));
         match action {
             Action::Create => return self.create(environment),
             Action::Status => return doctor::status(environment, &self.usb, self.full),
@@ -1102,41 +1272,58 @@ impl Request {
         match action {
             // An interrupted first setup is finished as it began.
             Action::Repair if !record.complete => self.finish_create(environment, &record),
-            // A macOS switch that removed the old copy for room goes on.
-            Action::Repair if record.replacing.is_some() => Request {
-                action: Action::UpdateOs,
-                build: record.replacing.clone().unwrap_or_default(),
-                // The old copy is gone already: nothing is left to ask about.
-                yes: true,
-                ..self
+            // A macOS switch that removed the old copy for room goes on,
+            // after what `status` names `update` for: the switch prepares
+            // bundles of this stela's revision. The repair names no
+            // download: a large one is asked about, unless the menu's
+            // choice named its size.
+            Action::Repair if record.replacing.is_some() => {
+                let build = record.replacing.clone().unwrap_or_default();
+                let mut text = String::new();
+                let record = match needs_update(environment, &record) {
+                    false => record,
+                    true => {
+                        // The question above asked to change a newer stick.
+                        // Finishing a switch leaves the device skips.
+                        text = self.update_stela(environment, record, (true, false))?;
+                        if self.dry_run {
+                            text.push_str(&format!(
+                                "  then          the switch to macOS {} goes on once Stela is \
+                                 updated\n",
+                                home::macos_name(&build)
+                            ));
+                            return Ok(text);
+                        }
+                        read_record(environment, &self.usb)?
+                    }
+                };
+                text.push_str(&Request { build, ..self }.update_os(environment, record, false)?);
+                Ok(text)
             }
-            .dispatch(environment),
+            // What `status` names `update` for (`needs_update`) is put
+            // right as `update` does it, and the repair goes on with the
+            // rest.
+            // The repair reports and ends the device skips; a dry run does
+            // not reach it.
+            Action::Repair if needs_update(environment, &record) => {
+                let mut text = self.update_stela(environment, record, (false, self.dry_run))?;
+                match self.dry_run {
+                    true => text.push_str(
+                        "  then          the repair checks the rest once Stela is updated\n",
+                    ),
+                    false => text.push_str(&doctor::repair(environment, &self)?),
+                }
+                Ok(text)
+            }
             Action::Repair => doctor::repair(environment, &self),
             Action::ResetNvram => state::reset_nvram(environment, &record, &self),
             Action::BackupState(path) => state::backup(environment, &record, &self, &path),
             Action::RestoreState(path) => state::restore(environment, &record, &self, &path),
             Action::BootLog => state::boot_log(environment, &record, &self),
+            // The device skips end once the whole update is done.
             Action::UpdateStela => {
-                let image = match &self.efi {
-                    Some(path) => path.clone(),
-                    None => assets::resolve()?,
-                };
-                // The update finds the restore image itself when it needs
-                // one, downloading only its boot files, never the whole
-                // image. A local image named for a macOS change is that
-                // build's, not the active one's.
-                let mut text = update::update_stela(
-                    environment,
-                    record,
-                    update::UpdateOptions {
-                        usb: &self.usb,
-                        image_path: &image,
-                        ipsw: self.ipsw.as_deref().filter(|_| self.macos.is_none()),
-                        download_dir: self.download_dir.as_deref(),
-                        dry_run: self.dry_run,
-                        yes: self.yes,
-                    },
-                )?;
+                let (esp, dry_run) = (record.esp.clone(), self.dry_run);
+                let mut text = self.update_stela(environment, record, (false, true))?;
                 if let Some(build) = self.macos.take() {
                     let next = Request {
                         action: Action::UpdateOs,
@@ -1145,9 +1332,12 @@ impl Request {
                     };
                     text.push_str(&next.dispatch(environment)?);
                 }
+                if !dry_run {
+                    doctor::end_device_skips(&esp, "stela update")?;
+                }
                 Ok(text)
             }
-            Action::UpdateOs => self.update_os(environment, record),
+            Action::UpdateOs => self.update_os(environment, record, true),
             Action::NextBoot(next) => self.next_boot(environment, &record, next),
             Action::Configure => {
                 // Without a terminal nothing is asked, so a run that names
@@ -1199,21 +1389,31 @@ impl Request {
         if self.wifi.is_some() && self.wifi_passphrase_file.is_none() && key.is_file() {
             self.wifi_passphrase = Some(wifi::read_passphrase(&key)?);
         }
-        if !self.dry_run
-            && let Some(bytes) = resume_bytes(
+        if !self.dry_run {
+            let what = format!("the rest of macOS {}", home::macos_name(&record.build));
+            match resume_bytes(
                 environment,
                 record,
                 self.ipsw.as_deref(),
                 self.download_dir.as_deref(),
-            )
-        {
-            consent_download(
-                environment,
-                self.yes,
-                false,
-                bytes,
-                &format!("the rest of macOS {}", record.build),
-            )?;
+            ) {
+                Some(bytes) => consent_download(
+                    environment,
+                    self.yes || self.accepted_download == Some(bytes),
+                    false,
+                    bytes,
+                    &what,
+                )?,
+                // Apple's server did not say its size: asked without one.
+                None => consent(
+                    environment,
+                    self.yes,
+                    &format!(
+                        "This downloads {what} from Apple; its size is not known yet. Download it?"
+                    ),
+                    &format!("this downloads {what} from Apple, of a size not known yet"),
+                )?,
+            }
         }
         self.action = Action::Create;
         self.create(environment)
@@ -1380,7 +1580,7 @@ fn locate_esp(host: &dyn Host, usb: &Path) -> Result<PathBuf> {
         Some(partition) => match &partition.mount {
             Some(mount) => mount.clone(),
             // Hosts leave a USB's EFI partition unmounted.
-            None => host.mount(&partition.identifier).with_context(|| {
+            None => mount_for_run(host, &partition.identifier).with_context(|| {
                 format!(
                     "{} is on the same disk as EFI partition {}, which could not be mounted \
                      (setup needs {})",

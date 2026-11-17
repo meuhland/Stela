@@ -4,6 +4,7 @@
  * through its owner's callbacks, as an x86 host bridge's pci_ops and IOMMU's
  * dma_map_ops would. x86 caches snoop DMA, so no operation syncs. */
 #include <linux/dma-map-ops.h>
+#include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -17,7 +18,57 @@ struct host_function {
 	struct pci_bus bus;
 	struct pci_dev dev;
 	struct host_function *quarantined_next;
+	/* The copy of the function's platform ROM, and the next attached
+	 * function's with one. */
+	struct page *rom;
+	struct host_function *rom_next;
 };
+
+/* The functions with a platform ROM copy. Only the serialized owner attaches
+ * and releases. */
+static struct host_function *rom_hosts;
+
+/* x86 Linux keeps the video BIOS EFI hands over in memory the firmware
+ * reserved, and amdgpu maps pci_dev::rom with ioremap. The copy here is
+ * pages of the layer's own, which the owner's device mappings do not hold,
+ * so ioremap answers it from this list. */
+void __iomem *stela_linux_pci_rom_map(phys_addr_t start, size_t size)
+{
+	for (struct host_function *host = rom_hosts; host; host = host->rom_next) {
+		phys_addr_t rom = host->dev.rom;
+
+		if (start >= rom && size <= host->dev.romlen && start - rom <= host->dev.romlen - size)
+			return (void __iomem __force *)((u8 *)page_address(host->rom) + (start - rom));
+	}
+	return NULL;
+}
+
+bool stela_linux_pci_rom_mapped(const volatile void __iomem *address)
+{
+	unsigned long at = (unsigned long)address;
+
+	for (struct host_function *host = rom_hosts; host; host = host->rom_next) {
+		unsigned long copy = (unsigned long)page_address(host->rom);
+
+		if (at >= copy && at - copy < host->dev.romlen)
+			return true;
+	}
+	return false;
+}
+
+static void release_rom(struct host_function *host)
+{
+	if (!host->rom)
+		return;
+	for (struct host_function **link = &rom_hosts; *link; link = &(*link)->rom_next) {
+		if (*link == host) {
+			*link = host->rom_next;
+			break;
+		}
+	}
+	__free_pages(host->rom, (unsigned int)get_order(host->dev.romlen));
+	host->rom = NULL;
+}
 
 static u64 quarantined_functions;
 static struct host_function *quarantined_hosts;
@@ -192,6 +243,56 @@ void pci_disable_msi(struct pci_dev *dev)
 	dev->msi_enabled = 0;
 }
 
+/* drivers/pci/msi/msi.c writes a function's message back after a reset
+ * cleared it. The owner holds the message, so the owner routes it again. */
+void pci_restore_msi_state(struct pci_dev *dev)
+{
+	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+
+	if (dev->msi_enabled && function->enable_msi(function->context)) {
+		pci_err(dev, "the owner could not route the message again after a reset\n");
+		dev->msi_enabled = 0;
+	}
+}
+
+/* Interrupt vectors, following drivers/pci/msi/api.c: MSI-X, MSI and INTx
+ * in that order, each only where the caller allows it. A function's owner
+ * routes one message and no MSI-X table, so one vector is what there is, and
+ * MSI-X alone is refused. */
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs,
+			  unsigned int flags)
+{
+	int error = -ENOSPC;
+
+	if (!min_vecs || max_vecs < min_vecs)
+		return -ERANGE;
+	if (min_vecs > 1) {
+		stela_linux_unsupported("more than one PCI interrupt vector");
+		return -ENOSPC;
+	}
+	if (flags & PCI_IRQ_MSI) {
+		error = pci_enable_msi(dev);
+		if (!error)
+			return 1;
+	}
+	if ((flags & PCI_IRQ_INTX) && dev->irq)
+		return 1;
+	if (!(flags & (PCI_IRQ_MSI | PCI_IRQ_INTX)))
+		stela_linux_unsupported("PCI MSI-X vectors");
+	return error;
+}
+
+void pci_free_irq_vectors(struct pci_dev *dev)
+{
+	pci_disable_msi(dev);
+}
+
+/* The Linux interrupt of vector nr: the function's one line or message. */
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	return nr ? -EINVAL : (int)dev->irq;
+}
+
 static void release(struct device *dev)
 {
 	struct host_function *host = container_of(to_pci_dev(dev), struct host_function, dev);
@@ -206,6 +307,7 @@ static void release(struct device *dev)
 			__atomic_store_n(&quarantined_functions, count + 1, __ATOMIC_RELAXED);
 		return;
 	}
+	release_rom(host);
 	if (host->function.release_context)
 		host->function.release_context(host->function.context);
 	kfree(host);
@@ -251,6 +353,8 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
         error = pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_revision);
     if (!error)
         error = stela_linux_pci_find_capability(dev, PCI_CAP_ID_EXP, &dev->pcie_cap);
+    if (!error)
+        error = stela_linux_pci_express_probe(dev);
     if (error) {
         /* No original device_initialize/publication or context transfer has
          * occurred. Rust retains exact State/Host/authority on this refusal. */
@@ -269,6 +373,22 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 		dev->resource[i].start = region->start;
 		dev->resource[i].end = region->start + region->size - 1;
 		dev->resource[i].flags = region->flags;
+	}
+	/* The caller's image lasts only for the attach. */
+	host->function.rom = NULL;
+	if (function->rom_length) {
+		host->rom = alloc_pages(GFP_KERNEL, (unsigned int)get_order(function->rom_length));
+		if (!host->rom) {
+			if (status)
+				*status = -ENOMEM;
+			kfree(host);
+			return NULL;
+		}
+		memcpy(page_address(host->rom), function->rom, function->rom_length);
+		dev->rom = page_to_phys(host->rom);
+		dev->romlen = function->rom_length;
+		host->rom_next = rom_hosts;
+		rom_hosts = host;
 	}
 	dev->dev.dma_mask = &dev->dma_mask;
 	dev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
@@ -292,6 +412,68 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 	}
 	if (status)
 		*status = 0;
+	return dev;
+}
+
+static int read_identity_config(struct pci_bus *bus, unsigned int devfn, int where, int size,
+				u32 *value)
+{
+	(void)bus, (void)devfn, (void)where, (void)size;
+	*value = ~(u32)0;
+	return PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+static int write_identity_config(struct pci_bus *bus, unsigned int devfn, int where, int size,
+				 u32 value)
+{
+	(void)bus, (void)devfn, (void)where, (void)size, (void)value;
+	stela_linux_unsupported("a PCI configuration write to a function published for searches only");
+	return PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+static struct pci_ops identity_ops = {.read = read_identity_config,
+				      .write = write_identity_config};
+
+struct pci_dev *stela_linux_pci_publish_identity(const struct stela_linux_pci_identity *identity,
+						 int *status)
+{
+	int error = stela_linux_kernel_hosted() ? -EPERM : -ENOMEM;
+	struct host_function *host = error == -EPERM ? NULL : kzalloc_obj(*host);
+
+	if (status)
+		*status = error;
+	if (!host)
+		return NULL;
+	/* No callback and no context: the release frees the host alone. */
+	host->function.bus = identity->bus;
+	host->function.devfn = identity->devfn;
+	host->owner = stela_linux_owner();
+	host->bus.sysdata = &host->function;
+	host->bus.ops = &identity_ops;
+	host->bus.number = (unsigned char)identity->bus;
+	struct pci_dev *dev = &host->dev;
+
+	dev->bus = &host->bus;
+	dev->devfn = identity->devfn;
+	dev->vendor = identity->vendor;
+	dev->device = identity->device;
+	dev->subsystem_vendor = identity->subsystem_vendor;
+	dev->subsystem_device = identity->subsystem_device;
+	dev->revision = (u8)identity->class_revision;
+	dev->class = identity->class_revision >> 8;
+	dev->current_state = PCI_D0;
+	dev->dev.release = release;
+	device_initialize(&dev->dev);
+	error = dev_set_name(&dev->dev, "%04x:%02x:%02x.%d", 0, identity->bus,
+			     PCI_SLOT(identity->devfn), PCI_FUNC(identity->devfn));
+	if (!error)
+		error = stela_linux_pci_publish_for_searches(dev);
+	if (status)
+		*status = error;
+	if (error) {
+		put_device(&dev->dev);
+		return NULL;
+	}
 	return dev;
 }
 
@@ -370,9 +552,91 @@ static void test_disable_msi(void *context)
 	on_message = false;
 }
 
+static unsigned int refusals;
+
+static void test_unsupported(void *context, const char *operation)
+{
+	(void)context;
+	assert(strstr(operation, "PCI"));
+	refusals++;
+}
+
+static unsigned int probes;
+
+static int test_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+	(void)dev, (void)id;
+	probes++;
+	return 0;
+}
+
+/* A function published for searches is found by class, table and address,
+ * says who it is, and is offered to no driver, registered before or after. */
+static void test_identity(void)
+{
+	static const struct pci_device_id bridges[] = {
+		{.vendor = PCI_VENDOR_ID_INTEL, .device = 0x5182,
+		 .subvendor = (u32)PCI_ANY_ID, .subdevice = (u32)PCI_ANY_ID}, {}};
+	static struct pci_driver early = {.name = "early", .id_table = bridges,
+					  .probe = test_probe};
+	static struct pci_driver late = {.name = "late", .id_table = bridges,
+					 .probe = test_probe};
+	const struct stela_linux_pci_identity identity = {
+		.bus = 0, .devfn = PCI_DEVFN(0x1f, 0),
+		.vendor = PCI_VENDOR_ID_INTEL, .device = 0x5182,
+		.subsystem_vendor = 0x17aa, .subsystem_device = 0x22e7,
+		.class_revision = PCI_CLASS_BRIDGE_ISA << 16 | 0x01,
+	};
+	int status = 1;
+	u64 quarantined = stela_linux_pci_quarantined_functions();
+
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL));
+	assert(!pci_register_driver(&early));
+	struct pci_dev *bridge = stela_linux_pci_publish_identity(&identity, &status);
+
+	assert(bridge && !status);
+	assert(!pci_register_driver(&late));
+	assert(!probes && !stela_linux_pci_bound(bridge));
+	assert(pci_dev_present(bridges));
+	struct pci_dev *found = pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL);
+
+	assert(found == bridge);
+	assert(found->vendor == PCI_VENDOR_ID_INTEL && found->device == 0x5182);
+	assert(found->subsystem_vendor == 0x17aa && found->subsystem_device == 0x22e7);
+	assert(found->class == PCI_CLASS_BRIDGE_ISA << 8 && found->revision == 0x01);
+	assert(!pci_resource_len(found, 0) && !found->irq);
+	assert(!strcmp(dev_name(&found->dev), "0000:00:1f.0"));
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, found));
+	found = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0x1f, 0));
+	assert(found == bridge);
+	pci_dev_put(found);
+
+	/* Its configuration is its owner's: reads fail as for an absent
+	 * function, and a write is refused and reported. */
+	u32 value = 0;
+	unsigned int before = refusals;
+
+	assert(pci_read_config_dword(bridge, PCI_VENDOR_ID, &value) == PCIBIOS_DEVICE_NOT_FOUND);
+	assert(value == ~(u32)0);
+	assert(pci_write_config_word(bridge, PCI_COMMAND, PCI_COMMAND_MASTER) ==
+	       PCIBIOS_DEVICE_NOT_FOUND);
+	assert(refusals == before + 1);
+	/* The cases after this one count their own refusals from here. */
+	refusals = before;
+
+	stela_linux_pci_remove_device(bridge);
+	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL) && !pci_dev_present(bridges));
+	assert(stela_linux_pci_quarantined_functions() == quarantined);
+	pci_unregister_driver(&early);
+	pci_unregister_driver(&late);
+}
+
+static const struct stela_linux_services test_services = {.unsupported = test_unsupported};
+static const struct stela_linux_owner test_owner = {.services = &test_services};
+
 int main(void)
 {
-	stela_linux_enter(&stela_linux_bare);
+	stela_linux_enter(&test_owner);
 	stela_test_register_pages();
 	memcpy(&config[PCI_VENDOR_ID], "\xde\x10\x07\x2d", 4);
 	memcpy(&config[PCI_CLASS_REVISION], "\xa1\x00\x00\x03", 4);
@@ -393,6 +657,7 @@ int main(void)
 	struct pci_dev *dev = stela_linux_pci_attach(&function, NULL);
 
 	assert(dev && !stela_linux_pci_bound(dev));
+	test_identity();
 
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);
@@ -462,6 +727,23 @@ int main(void)
 	pci_disable_msi(dev);
 	assert(!on_message && !dev->msi_enabled);
 
+	/* One vector: the message where MSI is allowed and granted, else the
+	 * line where INTx is allowed. MSI-X alone and two vectors are refused. */
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI) == 1 && on_message);
+	assert(pci_irq_vector(dev, 0) == 9 && pci_irq_vector(dev, 1) == -EINVAL);
+	pci_free_irq_vectors(dev);
+	assert(!on_message && !dev->msi_enabled);
+	msi_error = -ENOSPC;
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI) == -ENOSPC);
+	assert(pci_alloc_irq_vectors(dev, 1, 4, PCI_IRQ_MSI | PCI_IRQ_INTX) == 1 && !on_message);
+	msi_error = 0;
+	assert(!refusals);
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSIX) == -ENOSPC && !on_message);
+	assert(pci_alloc_irq_vectors(dev, 2, 2, PCI_IRQ_ALL_TYPES) == -ENOSPC && !on_message);
+	assert(refusals == 2);
+	assert(pci_alloc_irq_vectors(dev, 0, 1, PCI_IRQ_MSI) == -ERANGE);
+	assert(pci_alloc_irq_vectors(dev, 2, 1, PCI_IRQ_MSI) == -ERANGE);
+
 	/* Removal owns only registration's reference. An escaped pci_dev keeps
 	 * the copied callback table and its original context until its last put. */
 	assert(pci_dev_get(dev) == dev);
@@ -475,9 +757,32 @@ int main(void)
 	/* A legacy caller can still retain ownership without a release callback. */
 	function.release_context = NULL;
 	dev = stela_linux_pci_attach(&function, NULL);
-	assert(dev);
+	assert(dev && !dev->rom && !dev->romlen);
 	stela_linux_pci_remove_device(dev);
 	assert(context_releases == 1);
+	/* A platform ROM is copied at the attach: Linux finds it at pci_dev::rom
+	 * through ioremap, whole or in part, and iounmap leaves the copy, which
+	 * lasts until the function is released. */
+	static u8 rom_image[5000];
+	for (size_t i = 0; i < sizeof(rom_image); i++)
+		rom_image[i] = (u8)(i * 7);
+	function.rom = rom_image;
+	function.rom_length = sizeof(rom_image);
+	dev = stela_linux_pci_attach(&function, NULL);
+	rom_image[0] = 0xff;
+	assert(dev && dev->rom && dev->romlen == sizeof(rom_image));
+	u8 __iomem *rom = ioremap(dev->rom, dev->romlen);
+	assert(rom && readb(rom) == 0 && readb(rom + 4999) == (u8)(4999 * 7));
+	assert(ioremap(dev->rom + 4096, 904) == rom + 4096);
+	assert(!stela_linux_pci_rom_map(dev->rom + 4096, 905));
+	assert(!stela_linux_pci_rom_map(dev->rom - 1, 2));
+	iounmap(rom);
+	assert(readb(rom + 1) == 7);
+	phys_addr_t copy = dev->rom;
+	stela_linux_pci_remove_device(dev);
+	assert(!stela_linux_pci_rom_map(copy, 1) && !stela_linux_pci_rom_mapped(rom));
+	function.rom = NULL;
+	function.rom_length = 0;
 	/* An atomic final put cannot destroy the host or callback context. */
 	function.release_context = test_release_context;
 	dev = stela_linux_pci_attach(&function, NULL);

@@ -131,9 +131,20 @@ pub enum Log {
     /// Cumulative presentation progress in the bounded log.
     PresentSummary { total: u64, last_swap: u32 },
     /// How swaps reached the scanout over a window of the counter.
-    Pacing(iomfb::Pacing),
+    Pacing(Box<iomfb::Pacing>),
     /// A named refusal, with the call's interface row.
     Refused(String),
+    /// The monitor was published to macOS: its native size, its image size
+    /// in centimetres and the identity macOS keeps its settings under,
+    /// derived from the real monitor's EDID with the size or from the size
+    /// alone (none of the EDID's fields is logged).
+    Published {
+        width: u32,
+        height: u32,
+        image_cm: (u8, u8),
+        uuid: String,
+        from_monitor: bool,
+    },
     /// A swap shown before `io_fence_notify` named every surface it waited
     /// for: those layers may still have been drawing.
     FenceTimeout {
@@ -262,6 +273,24 @@ impl core::fmt::Display for Log {
             }
             Log::Pacing(pacing) => write!(f, "{pacing}"),
             Log::Refused(text) => write!(f, "DCP refused {text}"),
+            Log::Published {
+                width,
+                height,
+                image_cm,
+                uuid,
+                from_monitor,
+            } => write!(
+                f,
+                "DCP display published at {width}x{height}, image {}x{} cm, as display {uuid} \
+                 (identity from {})",
+                image_cm.0,
+                image_cm.1,
+                if *from_monitor {
+                    "the monitor's EDID and the size"
+                } else {
+                    "the size: no monitor EDID"
+                }
+            ),
             Log::FenceTimeout {
                 swap_id,
                 fenced,

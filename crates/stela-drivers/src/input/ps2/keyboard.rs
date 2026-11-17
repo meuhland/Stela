@@ -25,7 +25,7 @@ impl Keyboard {
     pub(super) fn drain_observed(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.observed)
     }
-    fn reset_prefix(&mut self) {
+    pub(super) fn reset_prefix(&mut self) {
         self.extended = false;
         self.released = false;
         self.pause = None;
@@ -67,9 +67,10 @@ impl Keyboard {
         if observe {
             self.observed.push(data);
         }
+        // A prefix that expired before this byte is dropped, and the byte
+        // starts a sequence of its own.
         if self.prefix() && now.wrapping_sub(self.prefix_at) >= timeout {
             self.reset_prefix();
-            return Err(ErrorKind::PacketTimeout(Port::Keyboard));
         }
         if let Some(position) = self.pause {
             if data != PAUSE_TAIL[position] {

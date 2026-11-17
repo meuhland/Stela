@@ -181,6 +181,14 @@ long stela_libc_drm_rdev(int fd)
 	return -ENODEV;
 }
 
+long long stela_libc_drm_seek(int fd, long long offset, int whence)
+{
+	(void)fd;
+	(void)offset;
+	(void)whence;
+	return -ENODEV;
+}
+
 int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument)
 {
 	(void)fd;

@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:15:08 +0000
+Subject: [PATCH] feat(nouveau): boot GB20x on GSP-RM 570.211.01 with LibOS3
+ logs, CrashCat queue, and R570.211 system info
+
+---
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  4 +
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/gb202.c   | 12 +--
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/gh100.c   | 13 +++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 81 ++++++++++++++-----
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c | 60 ++++++++++++++
+ .../nvkm/subdev/gsp/rm/r570/nvrm/gsp.h        | 56 +++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r570/rm.c  | 24 +++++-
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |  1 +
+ 8 files changed, 223 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index 5a52f502d3da84e665e195d139a1afd3333ca893..a0eb3a391307064df7114d9d5583fd5da4bd4c34 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -146,7 +146,11 @@ struct nvkm_gsp {
+ 	struct nvkm_gsp_mem loginit;
+ 	struct nvkm_gsp_mem logintr;
+ 	struct nvkm_gsp_mem logrm;
++	struct nvkm_gsp_mem logmnoc;
++	struct nvkm_gsp_mem logkrnl;
+ 	struct nvkm_gsp_mem rmargs;
++	struct nvkm_gsp_mem notify_op;
++	struct nvkm_gsp_mem crashcat;
+ 
+ 	struct nvkm_gsp_mem wpr_meta;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gb202.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gb202.c
+index 51384c63148ceaa4f5eead2b1e6c08829e53c56a..836fea2b1cf0314003ae6d4a55835711e5d0f9e2 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gb202.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gb202.c
+@@ -20,7 +20,7 @@ gb202_gsp = {
+ 
+ static struct nvkm_gsp_fwif
+ gb202_gsps[] = {
+-	{ 0, gh100_gsp_load, &gb202_gsp, &r570_rm_gb20x, "570.144" },
++	{ 0, gh100_gsp_load, &gb202_gsp, &r570_rm_gb20x, "570.211.01" },
+ 	{}
+ };
+ 
+@@ -31,8 +31,8 @@ gb202_gsp_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst,
+ 	return nvkm_gsp_new_(gb202_gsps, device, type, inst, pgsp);
+ }
+ 
+-NVKM_GSP_FIRMWARE_FMC(gb202, 570.144);
+-NVKM_GSP_FIRMWARE_FMC(gb203, 570.144);
+-NVKM_GSP_FIRMWARE_FMC(gb205, 570.144);
+-NVKM_GSP_FIRMWARE_FMC(gb206, 570.144);
+-NVKM_GSP_FIRMWARE_FMC(gb207, 570.144);
++NVKM_GSP_FIRMWARE_FMC(gb202, 570.211.01);
++NVKM_GSP_FIRMWARE_FMC(gb203, 570.211.01);
++NVKM_GSP_FIRMWARE_FMC(gb205, 570.211.01);
++NVKM_GSP_FIRMWARE_FMC(gb206, 570.211.01);
++NVKM_GSP_FIRMWARE_FMC(gb207, 570.211.01);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gh100.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gh100.c
+index 93fe3a6798ead4f2aea5aa638365df088ff8f3e8..833561a55deedb7318eddd88e59de440754c0edb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gh100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/gh100.c
+@@ -169,6 +169,19 @@ gh100_gsp_wpr_meta_init(struct nvkm_gsp *gsp)
+ 	meta->frtsSize = 0x100000;
+ 	meta->vgaWorkspaceSize = gsp->fb.bios.vga_workspace.size;
+ 	meta->pmuReservedSize = gsp->rm->wpr->rsvd_size_pmu;
++
++	/*
++	 * GB20x GSP-FMC and GSP-RM require a 4 KiB CrashCat report queue in
++	 * system memory (OpenRM kgspGetCrashcatSysmemBufferSize_GB202).
++	 */
++	if (gsp->subdev.device->card_type >= GB20x) {
++		ret = nvkm_gsp_mem_ctor(gsp, GSP_PAGE_SIZE, &gsp->crashcat);
++		if (ret)
++			return ret;
++
++		meta->sysmemAddrOfCrashReportQueue = gsp->crashcat.addr;
++		meta->sizeOfCrashReportQueue = gsp->crashcat.size;
++	}
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index d4bb3c3bceefd0e1d8e838dadf152a0729affb70..d2b72b6e4fd643b2fa817c9b8c9e08f8450abf87 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -1618,6 +1618,7 @@ static int
+ r535_gsp_libos_init(struct nvkm_gsp *gsp)
+ {
+ 	LibosMemoryRegionInitArgument *args;
++	int idx = 0;
+ 	int ret;
+ 
+ 	ret = nvkm_gsp_mem_ctor(gsp, 0x1000, &gsp->libos);
+@@ -1630,44 +1631,75 @@ r535_gsp_libos_init(struct nvkm_gsp *gsp)
+ 	if (ret)
+ 		return ret;
+ 
+-	args[0].id8  = r535_gsp_libos_id8("LOGINIT");
+-	args[0].pa   = gsp->loginit.addr;
+-	args[0].size = gsp->loginit.size;
+-	args[0].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
+-	args[0].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
++	args[idx].id8  = r535_gsp_libos_id8("LOGINIT");
++	args[idx].pa   = gsp->loginit.addr;
++	args[idx].size = gsp->loginit.size;
++	args[idx].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
++	args[idx].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
+ 	create_pte_array(gsp->loginit.data + sizeof(u64), gsp->loginit.addr, gsp->loginit.size);
++	idx++;
+ 
+ 	ret = nvkm_gsp_mem_ctor(gsp, 0x10000, &gsp->logintr);
+ 	if (ret)
+ 		return ret;
+ 
+-	args[1].id8  = r535_gsp_libos_id8("LOGINTR");
+-	args[1].pa   = gsp->logintr.addr;
+-	args[1].size = gsp->logintr.size;
+-	args[1].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
+-	args[1].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
++	args[idx].id8  = r535_gsp_libos_id8("LOGINTR");
++	args[idx].pa   = gsp->logintr.addr;
++	args[idx].size = gsp->logintr.size;
++	args[idx].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
++	args[idx].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
+ 	create_pte_array(gsp->logintr.data + sizeof(u64), gsp->logintr.addr, gsp->logintr.size);
++	idx++;
+ 
+ 	ret = nvkm_gsp_mem_ctor(gsp, 0x10000, &gsp->logrm);
+ 	if (ret)
+ 		return ret;
+ 
+-	args[2].id8  = r535_gsp_libos_id8("LOGRM");
+-	args[2].pa   = gsp->logrm.addr;
+-	args[2].size = gsp->logrm.size;
+-	args[2].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
+-	args[2].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
++	args[idx].id8  = r535_gsp_libos_id8("LOGRM");
++	args[idx].pa   = gsp->logrm.addr;
++	args[idx].size = gsp->logrm.size;
++	args[idx].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
++	args[idx].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
+ 	create_pte_array(gsp->logrm.data + sizeof(u64), gsp->logrm.addr, gsp->logrm.size);
++	idx++;
++
++	if (gsp->rm->wpr->os_carveout_size) {
++		ret = nvkm_gsp_mem_ctor(gsp, 0x10000, &gsp->logmnoc);
++		if (ret)
++			return ret;
++
++		args[idx].id8  = r535_gsp_libos_id8("LOGMNOC");
++		args[idx].pa   = gsp->logmnoc.addr;
++		args[idx].size = gsp->logmnoc.size;
++		args[idx].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
++		args[idx].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
++		create_pte_array(gsp->logmnoc.data + sizeof(u64),
++				 gsp->logmnoc.addr, gsp->logmnoc.size);
++		idx++;
++
++		ret = nvkm_gsp_mem_ctor(gsp, 0x10000, &gsp->logkrnl);
++		if (ret)
++			return ret;
++
++		args[idx].id8  = r535_gsp_libos_id8("LOGKRNL");
++		args[idx].pa   = gsp->logkrnl.addr;
++		args[idx].size = gsp->logkrnl.size;
++		args[idx].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
++		args[idx].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
++		create_pte_array(gsp->logkrnl.data + sizeof(u64),
++				 gsp->logkrnl.addr, gsp->logkrnl.size);
++		idx++;
++	}
+ 
+ 	ret = r535_gsp_rmargs_init(gsp, false);
+ 	if (ret)
+ 		return ret;
+ 
+-	args[3].id8  = r535_gsp_libos_id8("RMARGS");
+-	args[3].pa   = gsp->rmargs.addr;
+-	args[3].size = gsp->rmargs.size;
+-	args[3].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
+-	args[3].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
++	args[idx].id8  = r535_gsp_libos_id8("RMARGS");
++	args[idx].pa   = gsp->rmargs.addr;
++	args[idx].size = gsp->rmargs.size;
++	args[idx].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
++	args[idx].loc  = LIBOS_MEMORY_REGION_LOC_SYSMEM;
+ 
+ #ifdef CONFIG_DEBUG_FS
+ 	r535_gsp_libos_debugfs_init(gsp);
+@@ -2340,6 +2372,9 @@ r535_gsp_dtor(struct nvkm_gsp *gsp)
+ 	nvkm_gsp_dtor_fws(gsp);
+ 	nvkm_gsp_fwsec_sb_dtor(gsp);
+ 
++	nvkm_gsp_mem_dtor(&gsp->libos);
++	nvkm_gsp_mem_dtor(&gsp->crashcat);
++	nvkm_gsp_mem_dtor(&gsp->notify_op);
+ 	nvkm_gsp_mem_dtor(&gsp->rmargs);
+ 	nvkm_gsp_mem_dtor(&gsp->wpr_meta);
+ 	nvkm_gsp_mem_dtor(&gsp->shm.mem);
+@@ -2349,6 +2384,8 @@ r535_gsp_dtor(struct nvkm_gsp *gsp)
+ 	nvkm_gsp_mem_dtor(&gsp->loginit);
+ 	nvkm_gsp_mem_dtor(&gsp->logintr);
+ 	nvkm_gsp_mem_dtor(&gsp->logrm);
++	nvkm_gsp_mem_dtor(&gsp->logmnoc);
++	nvkm_gsp_mem_dtor(&gsp->logkrnl);
+ }
+ 
+ static void
+@@ -2430,6 +2467,10 @@ r535_gsp_oneinit(struct nvkm_gsp *gsp)
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
++	ret = nvkm_gsp_mem_ctor(gsp, GSP_PAGE_SIZE, &gsp->notify_op);
++	if (WARN_ON(ret))
++		return ret;
++
+ 	ret = rmapi->gsp->set_system_info(gsp);
+ 	if (WARN_ON(ret))
+ 		return ret;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
+index b45781cd0dfdcead13d983983d6174c55988552b..a6dbdbb8e008aacd5b3535559332b762d96955bb 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
+@@ -188,6 +188,56 @@ r570_gsp_set_system_info(struct nvkm_gsp *gsp)
+ 	return nvkm_gsp_rpc_wr(gsp, info, NVKM_GSP_RPC_REPLY_NOSEQ);
+ }
+ 
++static int
++r570_211_gsp_set_system_info(struct nvkm_gsp *gsp)
++{
++	struct nvkm_device *device = gsp->subdev.device;
++	struct pci_dev *pdev = container_of(device, struct nvkm_device_pci, device)->pdev;
++	GspSystemInfo_r570_211 *info;
++	u32 lnk_cap = 0;
++
++	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, hostPageSize) != 920);
++	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, bGspNocatEnabled) != 928);
++	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, virtualConfigBits) != 930);
++
++	if (WARN_ON(device->type == NVKM_DEVICE_TEGRA))
++		return -ENOSYS;
++
++	info = nvkm_gsp_rpc_get(gsp, NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, sizeof(*info));
++	if (IS_ERR(info))
++		return PTR_ERR(info);
++
++	info->gpuPhysAddr = device->func->resource_addr(device, NVKM_BAR0_PRI);
++	info->gpuPhysFbAddr = device->func->resource_addr(device, NVKM_BAR1_FB);
++	info->gpuPhysInstAddr = device->func->resource_addr(device, NVKM_BAR2_INST);
++	if (pci_resource_flags(pdev, 5) & IORESOURCE_IO)
++		info->gpuPhysIoAddr = pci_resource_start(pdev, 5);
++	info->nvDomainBusDeviceFunc = pci_dev_id(pdev);
++	info->notifyOpSharedSurfacePhysAddr = gsp->notify_op.addr;
++	info->maxUserVa = TASK_SIZE;
++	info->pciConfigMirrorBase = device->pci->func->cfg.addr;
++	info->pciConfigMirrorSize = device->pci->func->cfg.size;
++	info->PCIDeviceID = (pdev->device << 16) | pdev->vendor;
++	info->PCISubDeviceID = (pdev->subsystem_device << 16) | pdev->subsystem_vendor;
++	info->PCIRevisionID = pdev->revision;
++	info->bGpuBehindBridge = pdev->bus && pdev->bus->number != 0;
++	info->b64bBar0Supported = !!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM_64);
++	r570_gsp_acpi_info(gsp, &info->acpiMethodData);
++	info->bIsPrimary = video_is_primary_device(device->dev);
++	if (pdev->pcie_cap) {
++		u32 dev_cap = 0;
++
++		if (pci_read_config_dword(pdev, pdev->pcie_cap + PCI_EXP_DEVCAP, &dev_cap) == 0)
++			info->bFlrSupported = !!(dev_cap & PCI_EXP_DEVCAP_FLR);
++		if (pci_read_config_dword(pdev, pdev->pcie_cap + PCI_EXP_LNKCAP, &lnk_cap) == 0)
++			info->pcieConfigReg.linkCap = lnk_cap;
++	}
++	info->bPreserveVideoMemoryAllocations = false;
++	info->hostPageSize = PAGE_SIZE;
++
++	return nvkm_gsp_rpc_wr(gsp, info, NVKM_GSP_RPC_REPLY_NOSEQ);
++}
++
+ static void
+ r570_gsp_set_rmargs(struct nvkm_gsp *gsp, bool resume)
+ {
+@@ -224,3 +274,13 @@ r570_gsp = {
+ 	.drop_post_nocat_record = r570_gsp_drop_post_nocat_record,
+ 	.sr_data_size = r570_gsp_sr_data_size,
+ };
++
++const struct nvkm_rm_api_gsp
++r570_211_gsp = {
++	.set_rmargs = r570_gsp_set_rmargs,
++	.set_system_info = r570_211_gsp_set_system_info,
++	.get_static_info = r570_gsp_get_static_info,
++	.xlat_mc_engine_idx = r570_gsp_xlat_mc_engine_idx,
++	.drop_post_nocat_record = r570_gsp_drop_post_nocat_record,
++	.sr_data_size = r570_gsp_sr_data_size,
++};
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h
+index c458569af9d72042b7d71625518c9c72dc6a81ed..8bbfca4836431aed1ceef3b01e929ac327bc0f31 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h
+@@ -331,6 +331,62 @@ typedef struct GspSystemInfo
+     NvU64  hostPageSize;
+ } GspSystemInfo;
+ 
++/* Excerpt of RM GspSystemInfo from https://github.com/NVIDIA/open-gpu-kernel-modules/tree/570.211.01 */
++typedef struct GspSystemInfo_r570_211
++{
++    NvU64 gpuPhysAddr;
++    NvU64 gpuPhysFbAddr;
++    NvU64 gpuPhysInstAddr;
++    NvU64 gpuPhysIoAddr;
++    NvU64 nvDomainBusDeviceFunc;
++    NvU64 simAccessBufPhysAddr;
++    NvU64 notifyOpSharedSurfacePhysAddr;
++    NvU64 pcieAtomicsOpMask;
++    NvU64 consoleMemSize;
++    NvU64 maxUserVa;
++    NvU32 pciConfigMirrorBase;
++    NvU32 pciConfigMirrorSize;
++    NvU32 PCIDeviceID;
++    NvU32 PCISubDeviceID;
++    NvU32 PCIRevisionID;
++    NvU32 pcieAtomicsCplDeviceCapMask;
++    NvU8 oorArch;
++    NvU64 clPdbProperties;
++    NvU32 Chipset;
++    NvBool bGpuBehindBridge;
++    NvBool bFlrSupported;
++    NvBool b64bBar0Supported;
++    NvBool bMnocAvailable;
++    NvU32  chipsetL1ssEnable;
++    NvBool bUpstreamL0sUnsupported;
++    NvBool bUpstreamL1Unsupported;
++    NvBool bUpstreamL1PorSupported;
++    NvBool bUpstreamL1PorMobileOnly;
++    NvBool bSystemHasMux;
++    NvU8   upstreamAddressValid;
++    BUSINFO FHBBusInfo;
++    BUSINFO chipsetIDInfo;
++    ACPI_METHOD_DATA acpiMethodData;
++    NvU32 hypervisorType;
++    NvBool bIsPassthru;
++    NvU64 sysTimerOffsetNs;
++    GSP_VF_INFO gspVFInfo;
++    NvBool bIsPrimary;
++    NvBool isGridBuild;
++    GSP_PCIE_CONFIG_REG pcieConfigReg;
++    NvU32 gridBuildCsp;
++    NvBool bPreserveVideoMemoryAllocations;
++    NvBool bTdrEventSupported;
++    NvBool bFeatureStretchVblankCapable;
++    NvBool bEnableDynamicGranularityPageArrays;
++    NvBool bClockBoostSupported;
++    NvBool bRouteDispIntrsToCPU;
++    NvU64  hostPageSize;
++    NvBool bGspNocatEnabled;
++    NvBool bS0ixSupport;
++    NvU16  virtualConfigBits;
++} GspSystemInfo_r570_211;
++
+ typedef struct rpc_os_error_log_v17_00
+ {
+     NvU32      exceptType;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/rm.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/rm.c
+index 498658d0c60c879005e043778ce4252f5f78cbef..4ee20ec1a1c41be3213a0205aa5b1e1ea5e5a697 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/rm.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/rm.c
+@@ -44,7 +44,8 @@ r570_wpr_libos3_gb20x = {
+ 	.os_carveout_size = GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3_BAREMETAL,
+ 	.base_size = GSP_FW_HEAP_PARAM_BASE_RM_SIZE_GH100,
+ 	.heap_size_min = GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MIN_MB,
+-	.heap_size_non_wpr = 0x220000,
++	/* OpenRM 570.211.01 kgspGetNonWprHeapSize_GB202 raises non-WPR heap to 0x230000. */
++	.heap_size_non_wpr = 0x230000,
+ 	.rsvd_size_pmu = ALIGN(0x0800000 + 0x1000000 + 0x0001000, 0x20000),
+ 	.offset_set_by_acr = true,
+ };
+@@ -92,8 +93,27 @@ r570_rm_gb10x = {
+ 	.api = &r570_api,
+ };
+ 
++static const struct nvkm_rm_api
++r570_211_api = {
++	.gsp = &r570_211_gsp,
++	.rpc = &r535_rpc,
++	.ctrl = &r535_ctrl,
++	.alloc = &r535_alloc,
++	.client = &r570_client,
++	.device = &r535_device,
++	.fbsr = &r570_fbsr,
++	.disp = &r570_disp,
++	.fifo = &r570_fifo,
++	.ce = &r535_ce,
++	.gr = &r570_gr,
++	.nvdec = &r535_nvdec,
++	.nvenc = &r535_nvenc,
++	.nvjpg = &r535_nvjpg,
++	.ofa = &r570_ofa,
++};
++
+ const struct nvkm_rm_impl
+ r570_rm_gb20x = {
+ 	.wpr = &r570_wpr_libos3_gb20x,
+-	.api = &r570_api,
++	.api = &r570_211_api,
+ };
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index cefe2d4e1b768f49e325b0ca90e8c5a96e381240..f8111b7be89ff54fd15a35e0ec709c7821d33405 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -187,6 +187,7 @@ extern const struct nvkm_rm_impl r570_rm_gh100;
+ extern const struct nvkm_rm_impl r570_rm_gb10x;
+ extern const struct nvkm_rm_impl r570_rm_gb20x;
+ extern const struct nvkm_rm_api_gsp r570_gsp;
++extern const struct nvkm_rm_api_gsp r570_211_gsp;
+ extern const struct nvkm_rm_api_client r570_client;
+ extern const struct nvkm_rm_api_fbsr r570_fbsr;
+ extern const struct nvkm_rm_api_disp r570_disp;

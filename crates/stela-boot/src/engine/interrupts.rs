@@ -12,14 +12,27 @@ mod saved_state;
 pub(crate) use saved_state::SavedState;
 pub(crate) type Handler = for<'image> extern "sysv64" fn(&mut Frame, &SavedState<'image>);
 
-pub const TIMER_VECTOR: u8 = 0x40;
-/// Native worker doorbell; host-device IRQs own 0x50..=0x5f.
-pub(crate) const NATIVE_WAKE_VECTOR: u8 = 0x60;
-/// The MMIO aperture's TLB shootdown (`native_mmio::shootdown`).
-pub(crate) const SHOOTDOWN_VECTOR: u8 = 0x61;
+/// The engine's local APIC timer, in a priority class above every device
+/// and completion vector, as Linux's `LOCAL_TIMER_VECTOR` (0xec,
+/// arch/x86/include/asm/irq_vectors.h): a device vector left in service, or
+/// one that keeps coming, cannot hold it off. Below it the timer waited
+/// behind any of them, and one left in service stopped it for good.
+pub const TIMER_VECTOR: u8 = 0xec;
+/// Native worker doorbell, above the timer as Linux's reschedule IPI
+/// (0xfd); host-device IRQs own 0x50..=0x5f.
+pub(crate) const NATIVE_WAKE_VECTOR: u8 = 0xfd;
+/// The MMIO aperture's TLB shootdown (`native_mmio::shootdown`), above the
+/// timer as Linux's function-call IPI (0xfb) that its TLB shootdowns use.
+pub(crate) const SHOOTDOWN_VECTOR: u8 = 0xfb;
 /// A host device's completion signal (`host::completion_signal`): a
 /// doorbell that also counts the signals apart from other cores' doorbells.
 pub(crate) const SIGNAL_VECTOR: u8 = 0x62;
+/// A host network adapter's frames arrived (`host::network_signal`): a
+/// doorbell that also makes the host's service due
+/// (`host::take_network_signal`).
+/// Apart from [`SIGNAL_VECTOR`], so a disk does not look for completions
+/// each time a frame comes.
+pub(crate) const NETWORK_VECTOR: u8 = 0x63;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 const CODE_SELECTOR: u16 = 0x08;
 const DATA_SELECTOR: u16 = 0x10;
@@ -29,8 +42,8 @@ const IST_BYTES: usize = 64 * 1024;
 // handler. Runtime/disassembly stack-budget validation remains a required gate.
 const HANDLER_STACK_BYTES: usize = 32 * 1024;
 
-use stela_boot_core::interrupt_image::Backing;
 pub use stela_boot_core::interrupt_image::Frame;
+use stela_boot_core::interrupt_image::{self, Backing};
 
 #[repr(C, packed)]
 struct TaskState {
@@ -54,8 +67,22 @@ pub(crate) struct Tables {
     gdt: [u64; 5],
     idt: [[u64; 2]; 256],
     fault_stack: Stack,
-    fatal_stack: Stack,
+    /// The terminal vectors' stacks: #DF, #MC and NMI each its own
+    /// ([`interrupt_image::ist`]), in [`interrupt_image::TERMINAL_VECTORS`]'
+    /// order of their IST indexes ([`terminal_index`]).
+    terminal_stacks: [Stack; 3],
 }
+
+/// The index in [`Tables::terminal_stacks`] of a terminal IST.
+const fn terminal_index(ist: u8) -> usize {
+    (ist - interrupt_image::DOUBLE_FAULT_IST) as usize
+}
+const _: () = assert!(
+    terminal_index(interrupt_image::DOUBLE_FAULT_IST) == 0
+        && terminal_index(interrupt_image::MACHINE_CHECK_IST) == 1
+        && terminal_index(interrupt_image::NMI_IST) == 2
+        && interrupt_image::ORDINARY_IST == 1
+);
 
 impl Tables {
     pub(crate) const fn new() -> Self {
@@ -74,7 +101,7 @@ impl Tables {
             gdt: [0, 0x00af_9a00_0000_ffff, 0x00cf_9200_0000_ffff, 0, 0],
             idt: [[0; 2]; 256],
             fault_stack: Stack::new(),
-            fatal_stack: Stack::new(),
+            terminal_stacks: [Stack::new(), Stack::new(), Stack::new()],
         }
     }
 }
@@ -307,6 +334,63 @@ extern "sysv64" fn terminal_interrupt(frame: *mut Frame, image: *const u8) -> ! 
     saved_state::terminal(frame, image)
 }
 
+// The NMI gate: an NMI a `--profile` counter overflow (`host::sampling`) or
+// a TLB shootdown sent (`native_mmio::shootdown`) is answered and returns;
+// any other goes on to vector 2's terminal stub with
+// the stack as the processor left it. The answer runs soft-float Rust that
+// takes no lock and touches no extended state, on the NMI's own stack, so it
+// saves only the registers the call may clobber. The processor's frame
+// leaves RSP 8 bytes past a 16-byte boundary and nine pushes realign it.
+global_asm!(
+    r#"
+.global stela_nmi_gate
+stela_nmi_gate:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    mov rdi, [rsp + 72]
+    mov rsi, [rsp + 96]
+    call {answer}
+    test al, al
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jz stela_vector_2
+    iretq
+"#,
+    answer = sym nmi_answer,
+);
+
+/// Whether the NMI at `rip`, the interrupted stack at `rsp`, was owed by a
+/// `--profile` counter overflow ([`host::sampling::overflow`]), now
+/// sampled, or by a retirement's NMI, now answered
+/// (`native_mmio::shootdown::gate`): the gate then returns. The step
+/// watchdog's keeps its stop. On a processor already in a terminal handler,
+/// which no retirement sends one to, an NMI (a platform's, or the step
+/// watchdog's for the step the handler interrupted) returns too: that
+/// handler's stop goes on and keeps its reason, where the NMI's terminal
+/// stub would find the terminal entry slot in use and halt.
+extern "sysv64" fn nmi_answer(rip: u64, rsp: u64) -> bool {
+    let fired = host::sampling::overflow(rip, rsp);
+    if crate::native_mmio::shootdown::terminal_here() {
+        return true;
+    }
+    crate::native_mmio::shootdown::gate(fired, rip, super::step_watchdog::nmi_is_watchdog)
+}
+
 // One stub per vector: push a zero error code when the CPU pushes none,
 // then the vector, and join the common path. The table lists them in order.
 macro_rules! vectors {
@@ -344,7 +428,7 @@ vectors!(
     64 none,
     80 none, 81 none, 82 none, 83 none, 84 none, 85 none, 86 none, 87 none,
     88 none, 89 none, 90 none, 91 none, 92 none, 93 none, 94 none, 95 none,
-    96 none, 97 none, 98 none, 255 none,
+    96 none, 97 none, 98 none, 99 none, 236 none, 251 none, 253 none, 255 none,
 );
 
 /// Whether the table gives `vector` a stub, and so a gate: an interrupt on
@@ -364,11 +448,46 @@ const _: () = assert!(
         && has_stub(NATIVE_WAKE_VECTOR)
         && has_stub(SHOOTDOWN_VECTOR)
         && has_stub(SIGNAL_VECTOR)
+        && has_stub(NETWORK_VECTOR)
         && has_stub(SPURIOUS_VECTOR)
 );
+// The timer's class is above every device and completion vector's, so none
+// of them in service holds it off; the doorbell's and the shootdown's are
+// above the timer's, so a compile job's task priority can block the timer
+// and still take them (`native_mmio::shootdown::JOB_PRIORITY`).
+const _: () = assert!(
+    TIMER_VECTOR >> 4 > 0x5f >> 4
+        && TIMER_VECTOR >> 4 > SIGNAL_VECTOR >> 4
+        && TIMER_VECTOR >> 4 > NETWORK_VECTOR >> 4
+        && NATIVE_WAKE_VECTOR >> 4 > TIMER_VECTOR >> 4
+        && SHOOTDOWN_VECTOR >> 4 > TIMER_VECTOR >> 4
+        && TIMER_VECTOR < SPURIOUS_VECTOR
+);
+
+/// The timer and every device and completion vector are ordinary: they run
+/// on the ordinary interrupt stack and share its one entry slot, which the
+/// entry stub refuses to enter while it is in use. So no handler of theirs
+/// runs under another's, which the timer's ending of vectors left in
+/// service relies on (`host::timer_interrupt`).
+pub(crate) const ORDINARY_ENTRIES: () = {
+    let mut vector = 0x50;
+    while vector <= 0x5f {
+        assert!(interrupt_image::ist(vector) == interrupt_image::ORDINARY_IST);
+        vector += 1;
+    }
+    assert!(
+        interrupt_image::ist(TIMER_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(SIGNAL_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(NETWORK_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(SHOOTDOWN_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(NATIVE_WAKE_VECTOR) == interrupt_image::ORDINARY_IST
+    );
+};
+const _: () = ORDINARY_ENTRIES;
 
 unsafe extern "C" {
     static stela_vector_table: [usize; VECTOR_NUMBERS.len()];
+    fn stela_nmi_gate();
 }
 
 fn gate(handler: usize, ist: u8) -> [u64; 2] {
@@ -394,22 +513,40 @@ pub(crate) unsafe fn install(handler: Handler) {
 
 /// Turn AVX on where this CPU has it, which firmware leaves off, so host
 /// code that detects AVX or F16C through XCR0 finds it usable, and so that
-/// translated blocks may use FMA3, F16C and AVX2. The entry stubs save the
-/// enabled state whatever it is.
+/// translated blocks may use FMA3, F16C and AVX2; and the AVX-512 state
+/// (opmask, ZMM_Hi256, Hi16_ZMM) where the CPU has AVX-512F and XSAVE
+/// manages that state ([`super::xstate::wanted_xcr0`]), as Linux enables
+/// it. Every processor Stela starts, parked ones included, runs this from
+/// [`install_on`] before its extended state is captured, so each gets the
+/// XCR0 its own CPUID gives; the entry stubs save the enabled state
+/// whatever it is, into images sized for every component XSAVE manages
+/// (CPUID.(EAX=0DH,ECX=0):ECX).
 ///
 /// # Safety
 /// Ring 0 with interrupts masked, on a CPU whose extended state nothing has
 /// captured yet.
 pub(crate) unsafe fn enable_avx() {
-    use core::arch::x86_64::{__cpuid, _xgetbv, _xsetbv};
-    const XSAVE_AND_AVX: u32 = 1 << 26 | 1 << 28;
+    use core::arch::x86_64::{__cpuid, __cpuid_count, _xgetbv, _xsetbv};
     const CR4_OSXSAVE: u64 = 1 << 18;
-    const XCR0_AVX: u64 = 0x7;
-    if __cpuid(1).ecx & XSAVE_AND_AVX != XSAVE_AND_AVX {
+    let maximum = __cpuid(0).eax;
+    let leaf = |leaf: u32, register: fn(core::arch::x86_64::CpuidResult) -> u32| {
+        if maximum >= leaf {
+            register(__cpuid_count(leaf, 0))
+        } else {
+            0
+        }
+    };
+    let Some(wanted) = super::xstate::wanted_xcr0(
+        maximum,
+        __cpuid(1).ecx,
+        leaf(7, |result| result.ebx),
+        leaf(0xd, |result| result.eax),
+    ) else {
         return;
-    }
-    // SAFETY: CPUID enumerates XSAVE and AVX, so CR4.OSXSAVE and these XCR0
-    // bits are defined; the caller holds this CPU in ring 0.
+    };
+    // SAFETY: CPUID enumerates XSAVE and AVX, and XSAVE manages the AVX-512
+    // bits where they are wanted, so CR4.OSXSAVE and these XCR0 bits are
+    // defined; the caller holds this CPU in ring 0.
     unsafe {
         let cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
@@ -421,8 +558,8 @@ pub(crate) unsafe fn enable_avx() {
             );
         }
         let xcr0 = _xgetbv(0);
-        if xcr0 & XCR0_AVX != XCR0_AVX {
-            _xsetbv(0, xcr0 | XCR0_AVX);
+        if xcr0 & wanted != wanted {
+            _xsetbv(0, xcr0 | wanted);
         }
     }
 }
@@ -441,12 +578,13 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
     // captured and before anything on it saves extended state.
     unsafe { enable_avx() };
     // SAFETY: install_on owns this CPU and permanently pinned Tables,
-    // including both distinct IST arrays, before HostOwner or AP READY.
+    // including every distinct IST array, before HostOwner or AP READY.
     let owner = unsafe { super::xstate::XstateOwner::capture() }.unwrap_or_else(|error| {
-        output::arguments(format_args!("native xstate entry refused: {error:?}\n"));
-        output::fatal("native IRQ state contract unavailable")
+        output::fatal(format_args!(
+            "native IRQ state contract unavailable: {error:?}"
+        ))
     });
-    for stack in [&tables.fault_stack, &tables.fatal_stack] {
+    for stack in core::iter::once(&tables.fault_stack).chain(&tables.terminal_stacks) {
         let bottom = stack.as_mut_ptr().addr();
         let top = bottom + IST_BYTES;
         let frame = top - size_of::<Frame>();
@@ -465,8 +603,12 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
     // SAFETY: all data here is private to this physical processor.
     unsafe {
         let tss = &raw mut tables.tss;
-        (*tss).ist[0] = (tables.fault_stack.as_mut_ptr() as u64) + IST_BYTES as u64;
-        (*tss).ist[1] = (tables.fatal_stack.as_mut_ptr() as u64) + IST_BYTES as u64;
+        let top = |stack: &Stack| stack.as_mut_ptr() as u64 + IST_BYTES as u64;
+        (*tss).ist[usize::from(interrupt_image::ORDINARY_IST) - 1] = top(&tables.fault_stack);
+        for vector in interrupt_image::TERMINAL_VECTORS {
+            let ist = interrupt_image::ist(vector);
+            (*tss).ist[usize::from(ist) - 1] = top(&tables.terminal_stacks[terminal_index(ist)]);
+        }
         let base = tss as u64;
         let limit = (size_of::<TaskState>() - 1) as u64;
         let gdt = &raw mut tables.gdt;
@@ -505,10 +647,14 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
         let idt = &raw mut tables.idt;
         let table = &stela_vector_table;
         for (&vector, &handler) in VECTOR_NUMBERS.iter().zip(table) {
-            // Double fault, NMI and machine check use their own stack.
-            let ist = if matches!(vector, 2 | 8 | 18) { 2 } else { 1 };
-            (*idt)[vector] = gate(handler, ist);
+            // Double fault, NMI and machine check each use their own stack.
+            (*idt)[vector] = gate(handler, interrupt_image::ist(vector as u8));
         }
+        // An NMI first asks whether a shootdown sent it, then reaches its stub.
+        (*idt)[2] = gate(
+            stela_nmi_gate as *const () as usize,
+            interrupt_image::NMI_IST,
+        );
         let pointer = Pointer {
             limit: (size_of::<[[u64; 2]; 256]>() - 1) as u16,
             base: idt as u64,
@@ -532,6 +678,8 @@ fn cr3() -> u64 {
 }
 
 pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_>) {
+    // A processor woken from an idle wait flushes what it skipped first.
+    crate::native_mmio::shootdown::wake();
     if crate::native_irq::dispatch(frame.vector as u8) {
         return;
     }
@@ -553,6 +701,7 @@ pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_
         NATIVE_WAKE_VECTOR => host::wake_interrupt(),
         SIGNAL_VECTOR => host::signal_interrupt(),
         SHOOTDOWN_VECTOR => host::shootdown_interrupt(),
+        NETWORK_VECTOR => host::network_interrupt(),
         SPURIOUS_VECTOR => host::spurious_interrupt(),
         vector @ 32.. => host::stray_interrupt(vector),
         _ => fatal(frame),
@@ -624,6 +773,11 @@ pub(crate) unsafe fn observe_descriptors() -> Descriptors {
 
 /// Report an x86 exception that is a Stela failure, never a guest event.
 pub fn fatal(frame: &Frame) -> ! {
+    // A watcher's NMI after the boot stopped names no new failure: the
+    // stop's reason stays the one shown.
+    if frame.vector == 2 {
+        output::nmi_after_stop(format_args!("an NMI at rip={:#x}", frame.rip));
+    }
     report(frame);
     // Linux's minimum-deadline callbacks stop on `ud2` after recording why.
     if let Some(error) = stela_linux::owner::minimum_failure() {
@@ -653,9 +807,53 @@ pub fn fatal(frame: &Frame) -> ! {
     } else {
         "free"
     };
+    let machine_check = match frame.vector {
+        18 => machine_check(),
+        // What this processor's NMI gate found owed when nothing claimed
+        // the NMI.
+        2 => crate::native_mmio::shootdown::nmi_owed()
+            .map(|(owed, held, marked)| {
+                alloc::format!(" nmi=owed:{owed}/held:{held}/marked:{}", u8::from(marked))
+            })
+            .unwrap_or_default(),
+        _ => alloc::string::String::new(),
+    };
+    // An NMI from the step watchdog's counter: the step it names never
+    // returned, and `rip` is where it ran.
+    if frame.vector == 2
+        && let Some(reason) = super::step_watchdog::nmi_reason()
+    {
+        // Firmware AML the boot processor ran then, which an access that
+        // never completed (one into system management mode, say) holds
+        // past the AML's own bound.
+        let aml = super::aml::running_here()
+            .map(|at| alloc::format!(" AML in {at}"))
+            .unwrap_or_default();
+        output::fatal(format_args!(
+            "{reason}:{aml} rip={:#x} (image+{:#x}) code={} drivers={drivers} stack={callers}",
+            frame.rip,
+            frame.rip.wrapping_sub(&raw const __ImageBase as u64),
+            output::Code::at(frame.rip),
+        ))
+    }
+    // A fault inside the firmware's variable service, which only a stop or
+    // a restart calls, is the firmware's: the stop it came from, if any, is
+    // on the line before.
+    if let Some(reason) = crate::stop_record::take_firmware_call().fault_reason(&alloc::format!(
+        "vector={} error={:#x} rip={:#x} cr2={:#x} rax={:#x} cr3={:#x}",
+        frame.vector,
+        frame.error,
+        frame.rip,
+        cr2(),
+        frame.rax,
+        cr3()
+    )) {
+        output::fatal(reason)
+    }
     output::fatal(format_args!(
         "unexpected x86 exception in the system engine: vector={} error={:#x} rip={:#x} \
-         (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} stack={callers}",
+         (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} \
+         stack={callers}{machine_check}",
         frame.vector,
         frame.error,
         frame.rip,
@@ -665,6 +863,28 @@ pub fn fatal(frame: &Frame) -> ! {
         cr2(),
         cr3()
     ))
+}
+
+/// `; ` and this processor's machine-check report
+/// (`stela_boot_core::machine_check`), for a #MC's fatal report; empty on a
+/// processor without machine-check architecture.
+fn machine_check() -> alloc::string::String {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    use stela_boot_core::{machine_check::MachineCheck, msr};
+    if !msr::MCG_CAP.implemented() {
+        return alloc::string::String::new();
+    }
+    let apic = match __cpuid(0).eax >= 0xb && __cpuid_count(0xb, 0).ebx != 0 {
+        true => __cpuid_count(0xb, 0).edx,
+        false => __cpuid(1).ebx >> 24,
+    };
+    let report = MachineCheck::read(apic, |index| {
+        // SAFETY: CPL0 on the processor that took #MC, which implements
+        // machine-check architecture: its global registers and the banks
+        // MCG_CAP counts are architectural, and reading them changes nothing.
+        unsafe { msr::rdmsr(index) }
+    });
+    alloc::format!("; {report}")
 }
 
 /// Print an x86 exception's detail, straight to the port: whatever raised it

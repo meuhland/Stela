@@ -232,13 +232,14 @@ pub(super) fn discover() -> Result<Toolchain> {
 /// What the GPU build trees under `target/gpu` were made with, beside them.
 const IDENTITY: &str = "toolchain";
 
-/// Every flag, define and Meson option the GPU builds pass on their own,
-/// or drop from Meson's commands, whose change must rebuild their objects
-/// and Meson's probe results as a compiler change does.
+/// Every flag and define the GPU builds pass on their own, or drop from
+/// Meson's commands, whose change must rebuild their objects and Meson's
+/// probe results as a compiler change does. Meson's options are not here:
+/// a change of them configures Mesa again (`nvk::configured`), which
+/// leaves LLVM and the C library as they are.
 fn flags() -> String {
     use super::{llvm, nvk, sysroot};
     [
-        nvk::OPTIONS.as_slice(),
         nvk::TARGET_FLAGS.as_slice(),
         nvk::LIBC_TEST_FLAGS.as_slice(),
         nvk::HOST_FLAGS.as_slice(),
@@ -339,15 +340,16 @@ mod tests {
         let record = fs::read_to_string(root.path().join(IDENTITY)).unwrap();
         assert!(record.contains("/home/me/wrapper/clang"), "{record}");
         assert!(record.contains("-fno-stack-protector"), "{record}");
-        // The probes' link flags and Meson's options key the trees too.
+        // The probes' link flags key the trees too; Meson's options only
+        // Mesa's configuration.
         for flag in [
             super::super::sysroot::PROBE_LINK.join(" ").as_str(),
             super::super::sysroot::POSITION_INDEPENDENT,
-            "-Dbuildtype=release",
             "-mtls-dialect=gnu2",
         ] {
             assert!(record.contains(flag), "{flag}: {record}");
         }
+        assert!(!record.contains("-Dbuildtype=release"), "{record}");
     }
 
     /// A distribution's Clang that hardens by default, as Arch's turns on

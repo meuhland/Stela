@@ -149,8 +149,12 @@ impl Build {
         let mut archives = BTreeSet::new();
         let mut external = BTreeSet::new();
         for file in files.into_iter().chain(headers) {
+            // Meson names the system's libraries a found library may be,
+            // by absolute path, beside the archives the build made.
             if file.ends_with(".a") {
-                archives.insert(self.directory.join(file));
+                if !Path::new(file).is_absolute() {
+                    archives.insert(self.directory.join(file));
+                }
                 continue;
             }
             let path = fs::canonicalize(self.directory.join(file))

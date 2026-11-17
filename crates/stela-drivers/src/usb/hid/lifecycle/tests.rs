@@ -283,11 +283,9 @@ fn same_controller_root_reuse_refuses_kept_hid_stop_without_touching_current_dma
                 // leaf inventory; old consumers are exercised only
                 // for pure rejection after this acknowledged retirement.
                 let mut fresh = unsafe {
-                    shared.borrow_mut().reset_and_reuse_root(
-                        &original,
-                        &interface.endpoints,
-                        &mut dma,
-                    )
+                    shared
+                        .borrow_mut()
+                        .reset_and_reuse(&original, &interface.endpoints, &mut dma)
                 }
                 .unwrap();
                 fresh.configuration = fresh.configurations[0].clone();

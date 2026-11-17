@@ -195,6 +195,39 @@ pub(super) fn host_drivers_held_here() -> bool {
     let gs = unsafe { crate::cpu::msr::GS_BASE.read() };
     gs != 0 && HOST_DRIVERS_GS.load(Ordering::Acquire) == gs
 }
+/// Whether this activated processor holds the host drivers' lock, which
+/// every Linux entry holds on whichever processor it runs: one load while
+/// nobody holds it, and no RDMSR.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(super) fn holds_host_drivers() -> bool {
+    HOST_DRIVERS.load(Ordering::Acquire)
+        && HOST_DRIVERS_GS.load(Ordering::Acquire) == super::host::activated_base()
+}
+
+/// Run `read`, a bounded read of state only Linux entries change, with no
+/// Linux entry running on another processor: holding the host drivers'
+/// lock, taken only when free (`None` when another processor holds it), or
+/// as this processor already does. No root changes and no driver is called.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(super) fn with_drivers_held<T>(read: impl FnOnce() -> T) -> Option<T> {
+    if holds_host_drivers() {
+        return Some(read());
+    }
+    if !try_lock_host_drivers() {
+        return None;
+    }
+    let flags: u64;
+    // SAFETY: CPL0 IF save; restored below on this processor.
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    HOST_DRIVERS_GS.store(super::host::activated_base(), Ordering::Release);
+    let result = read();
+    HOST_DRIVERS_GS.store(0, Ordering::Release);
+    HOST_DRIVERS.store(false, Ordering::Release);
+    // SAFETY: the save above, on this processor.
+    unsafe { asm!("push {}", "popfq", in(reg) flags) };
+    Some(result)
+}
+
 /// The GS base of the processor starting the host's devices, zero while
 /// none does ([`starting_devices_here`]).
 static STARTING_GS: AtomicU64 = AtomicU64::new(0);
@@ -645,7 +678,14 @@ struct Service {
     /// Host commands that failed, which the guest sees only as its
     /// controller's error status.
     failures: u64,
+    /// The commands started and not finished, by tag, to name one whose
+    /// finish held its processor ([`HELD`]).
+    started: Vec<(u32, staged_disk::CommandName)>,
 }
+
+/// The longest host disk call over 50 ms since the last report, which
+/// names it ([`staged_disk::HeldCalls`]).
+static HELD: staged_disk::HeldCalls = staged_disk::HeldCalls::new();
 
 impl Service {
     /// Logs a failed host command: the first few, then each power-of-two
@@ -657,6 +697,8 @@ impl Service {
         result: Result<T, BlockError>,
     ) -> Result<T, BlockError> {
         if let Err(error) = &result {
+            // What the USB storage recovery did for it comes first.
+            report_usb_recoveries();
             self.failures += 1;
             if self.failures <= 16 || self.failures.is_power_of_two() {
                 output::arguments(format_args!(
@@ -670,7 +712,73 @@ impl Service {
     }
 }
 
+/// One line per USB storage command the recovery ladder ran for since the
+/// last call (`stela_drivers::usb::storage::take_recoveries`): what failed
+/// it, the furthest step that ran, and whether it completed.
+fn report_usb_recoveries() {
+    let (recoveries, replaced) = stela_drivers::usb::storage::take_recoveries();
+    for recovery in &recoveries {
+        output::arguments(format_args!("HOST USB DISK RECOVERY {recovery}\n"));
+    }
+    if replaced != 0 {
+        output::arguments(format_args!(
+            "HOST USB DISK RECOVERY {replaced} more commands recovered or failed since the last report\n"
+        ));
+    }
+    let (changed, sense) = stela_drivers::usb::storage::take_media_changes();
+    if changed != 0 {
+        let why = sense.map_or(String::from("an eject"), |sense| {
+            format!(
+                "sense {:02x}/{:02x}/{:02x}",
+                sense.key, sense.asc, sense.ascq
+            )
+        });
+        output::arguments(format_args!(
+            "HOST USB DISK media changed on {changed} published units, the last by {why}: \
+             their disks fail until published again, as Linux's sd fails a removable unit \
+             after an unexpected UNIT ATTENTION\n"
+        ));
+    }
+}
+
 impl Service {
+    /// A call `call` of this disk for `command`, begun at counter `since`,
+    /// has ended: one that held its processor over 50 ms is named once a
+    /// report ([`HELD`]), as XNU's watchdogs give a processor half a
+    /// second.
+    fn held(&self, since: u64, call: &'static str, command: staged_disk::CommandName) {
+        let micros = super::host::fresh_counter().wrapping_sub(since)
+            / (super::host::COUNTER_HZ / 1_000_000);
+        HELD.record(micros, || {
+            (
+                self.inner.identity().serial.clone(),
+                call,
+                format!("{command}"),
+            )
+        });
+    }
+
+    /// The blocks of a transfer of `bytes`.
+    fn blocks(&self, bytes: usize) -> u64 {
+        bytes as u64 / u64::from(self.inner.identity().block_size.max(1))
+    }
+
+    /// The command started under `tag`, which a finish took.
+    fn finished_command(&mut self, tag: u32) -> staged_disk::CommandName {
+        match self.started.iter().position(|(started, _)| *started == tag) {
+            Some(at) => self.started.swap_remove(at).1,
+            None => staged_disk::CommandName::waited("unknown", 0, 0),
+        }
+    }
+
+    /// A command still running, for a look or commit that held.
+    fn running_command(&self) -> staged_disk::CommandName {
+        self.started.first().map_or(
+            staged_disk::CommandName::waited("none", 0, 0),
+            |(_, name)| *name,
+        )
+    }
+
     /// A command completed: a disk said to signal that has sent no signal
     /// over [`staged_disk::SILENT_COMPLETIONS`] completions is looked at
     /// as one that sends none, and reported once.
@@ -716,6 +824,8 @@ impl Service {
     /// store, whose commit may be put off.
     fn start_with(&mut self, command: Command, more: bool) -> Result<u32, BlockError> {
         let lba = command_lba(&command);
+        let name = staged_disk::CommandName::of(&command, self.inner.identity().block_size);
+        let since = super::host::fresh_counter();
         let more = !drivers_turn::rings_at_once(turn_here(), more);
         let started = {
             let _root = self.enter_for(Call::Start);
@@ -728,6 +838,10 @@ impl Service {
             })
         };
         self.running += u32::from(started.is_ok());
+        if let Ok(tag) = started {
+            self.started.push((tag, name));
+        }
+        self.held(since, "start", name);
         self.looked.set(staged_disk::LookGate::default());
         // Reported with the loader's root and interrupts restored.
         self.failed("start lba", lba, started)
@@ -750,56 +864,74 @@ impl BlockDevice for Service {
         self.inner.identity()
     }
     fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        let since = super::host::fresh_counter();
         let read = {
             // SAFETY: open() captured the loader root; callers supply window RAM.
             let _root = unsafe { RestoreRoot::enter(self.root) };
             self.inner.read(lba, buffer)
         };
+        let name = staged_disk::CommandName::waited("read", lba, self.blocks(buffer.len()));
+        self.held(since, "waited", name);
         // Reported with the loader's root and interrupts restored.
         self.failed("read lba", lba, read)
     }
     fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        let since = super::host::fresh_counter();
         let written = {
             // SAFETY: as in read().
             let _root = unsafe { RestoreRoot::enter(self.root) };
             self.inner.write(lba, data)
         };
+        let name = staged_disk::CommandName::waited("write", lba, self.blocks(data.len()));
+        self.held(since, "waited", name);
         // Reported with the loader's root and interrupts restored.
         self.failed("write lba", lba, written)
     }
     fn flush_cache(&mut self) -> Result<(), BlockError> {
+        let since = super::host::fresh_counter();
         let flushed = {
             // SAFETY: as in read().
             let _root = unsafe { RestoreRoot::enter(self.root) };
             self.inner.flush_cache()
         };
+        let name = staged_disk::CommandName::waited("flush", 0, 0);
+        self.held(since, "waited", name);
         // Reported with the loader's root and interrupts restored.
         self.failed("flush lba", 0, flushed)
     }
     fn write_fua(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        let since = super::host::fresh_counter();
         let written = {
             // SAFETY: as in read().
             let _root = unsafe { RestoreRoot::enter(self.root) };
             self.inner.write_fua(lba, data)
         };
+        let name = staged_disk::CommandName::waited("write_fua", lba, self.blocks(data.len()));
+        self.held(since, "waited", name);
         // Reported with the loader's root and interrupts restored.
         self.failed("write_fua lba", lba, written)
     }
     fn discard(&mut self, lba: u64, blocks: u64) -> Result<(), BlockError> {
+        let since = super::host::fresh_counter();
         let discarded = {
             // SAFETY: as in read().
             let _root = unsafe { RestoreRoot::enter(self.root) };
             self.inner.discard(lba, blocks)
         };
+        let name = staged_disk::CommandName::waited("discard", lba, blocks);
+        self.held(since, "waited", name);
         // Reported with the loader's root and interrupts restored.
         self.failed("discard lba", lba, discarded)
     }
     fn write_zeroes(&mut self, lba: u64, blocks: u64, unmap: bool) -> Result<(), BlockError> {
+        let since = super::host::fresh_counter();
         let zeroed = {
             // SAFETY: as in read().
             let _root = unsafe { RestoreRoot::enter(self.root) };
             self.inner.write_zeroes(lba, blocks, unmap)
         };
+        let name = staged_disk::CommandName::waited("write_zeroes", lba, blocks);
+        self.held(since, "waited", name);
         // Reported with the loader's root and interrupts restored.
         self.failed("write_zeroes lba", lba, zeroed)
     }
@@ -817,15 +949,23 @@ impl BlockDevice for Service {
     }
     /// Put off in a service turn's store, whose starts rang at once.
     fn commit(&mut self) {
+        let since = super::host::fresh_counter();
         if let Some(_root) = self.enter_for(Call::Commit) {
             self.inner.commit();
         }
+        self.held(since, "commit", self.running_command());
     }
     fn finish(&mut self, tag: u32) -> Option<Finished> {
+        let since = super::host::fresh_counter();
         let finished = {
             let _root = self.enter_for(Call::Look)?;
             timed(DiskPart::Finish, || self.inner.finish(tag))
         };
+        let name = match finished {
+            Some(_) => self.finished_command(tag),
+            None => self.running_command(),
+        };
+        self.held(since, "finish", name);
         self.running = self.running.saturating_sub(u32::from(finished.is_some()));
         self.looked.set(staged_disk::LookGate::default());
         if finished.is_some() {
@@ -841,6 +981,7 @@ impl BlockDevice for Service {
     /// maps: no driver call and no root change.
     fn finished(&mut self, tag: u32) -> Option<Finished> {
         let finished = self.inner.finished(tag)?;
+        self.finished_command(tag);
         self.running = self.running.saturating_sub(1);
         self.heard();
         Some(self.failed("finished tag", u64::from(tag), finished))
@@ -857,10 +998,12 @@ impl BlockDevice for Service {
         if gate.skip(self.signals(), doorbells, now, window) {
             return false;
         }
+        let since = super::host::fresh_counter();
         let Some(_root) = self.enter_for(Call::Look) else {
             return false;
         };
         let posted = timed(DiskPart::Posted, || self.inner.posted());
+        self.held(since, "look", self.running_command());
         gate.looked(posted, doorbells, now);
         self.looked.set(gate);
         posted
@@ -1037,6 +1180,7 @@ impl stela_drivers::probe::Observer for Observer {
             looked: Cell::new(staged_disk::LookGate::default()),
             heard: staged_disk::SignalWatch::default(),
             failures: 0,
+            started: Vec::new(),
         });
         self.resumed = between_drivers(|| crate::log_file::resume_quietly(Box::new(log)));
         HELD_USB_LOG.store(self.resumed, Ordering::Release);
@@ -1400,6 +1544,23 @@ impl Drop for Stepping {
     }
 }
 
+/// The macOS disk's model, the first of [`HostDisks`], written once as the
+/// disks open, before the PEs run.
+static MACOS_DISK_MODEL: output::Global<String> =
+    output::Global(core::cell::RefCell::new(String::new()));
+/// Its time per command while it worked (`disk_speed::service_us`) at the
+/// last [`HostDisks::report`]; `u64::MAX` before one could judge it.
+static MACOS_DISK_SERVICE_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// What a stop on guest panic `panic` says of the macOS disk: its model and
+/// time per read when the panic is the kernelmanagerd check-in stall and
+/// the disk was too slow for it (`disk_speed::stop_note`).
+pub(super) fn slow_disk_note(panic: &str) -> Option<String> {
+    let model = MACOS_DISK_MODEL.0.try_borrow().ok()?;
+    let micros = MACOS_DISK_SERVICE_US.load(Ordering::Relaxed);
+    stela_boot_core::disk_speed::stop_note(panic, &model, (micros != u64::MAX).then_some(micros))
+}
+
 /// The host disks [`open`] took, each once with its serial, to report
 /// their I/O and to shut down before the PC restarts or turns off.
 pub struct HostDisks {
@@ -1434,8 +1595,16 @@ impl HostDisks {
     /// the most commands it ran at once.
     pub fn report(&self, tsc_hz: u64) {
         let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
-        for (serial, disk) in &self.disks {
+        for (index, (serial, disk)) in self.disks.iter().enumerate() {
             let stats = disk.stats();
+            if index == 0 {
+                let commands = stats.directions.iter().map(|counts| counts.ios).sum();
+                let busy = u64::try_from(micros(stats.busy)).unwrap_or(u64::MAX);
+                MACOS_DISK_SERVICE_US.store(
+                    stela_boot_core::disk_speed::service_us(commands, busy).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             let mut line = format!("HOST DISK IO serial={serial}");
             for direction in Direction::ALL {
                 let counts = stats.directions[direction as usize];
@@ -1458,6 +1627,15 @@ impl HostDisks {
             if let Some(callbacks) = stats.callbacks {
                 Self::report_callback(serial, callbacks, tsc_hz, "periodic");
             }
+        }
+        report_usb_recoveries();
+        let refused = stela_drivers::usb::storage::take_cache_refusals();
+        if refused != 0 {
+            output::arguments(format_args!(
+                "HOST USB DISK units={refused} refused SYNCHRONIZE CACHE as an invalid opcode \
+                 (sense 05/20): their flushes complete without it, as Linux's sd_sync_cache \
+                 takes that answer\n"
+            ));
         }
         // Where NVMe commands' starts and finishes went on the host: each
         // part's calls and microseconds since the last report
@@ -1515,6 +1693,11 @@ impl HostDisks {
             counter_micros(&OWED_TIMES[2]),
         ));
         output::arguments(format_args!("{line}\n"));
+        // The host disk call that held its processor longest over 50 ms
+        // since the last report, if any did.
+        if let Some(line) = HELD.take() {
+            output::arguments(format_args!("{line}\n"));
+        }
     }
 
     /// One bounded snapshot before stop-time persistence; never waits for a
@@ -1738,11 +1921,12 @@ pub unsafe fn open(
         .collect();
     let service = |partition: PartitionDevice<Window>, role: &str| -> Box<dyn BlockDevice> {
         output::arguments(format_args!(
-            "HOST PARTITION serial={} partition={} blocks={} block_size={}{role}\n",
+            "HOST PARTITION serial={} partition={} blocks={} block_size={} rotation={}{role}\n",
             partition.disk().serial,
             partition.partition().unique_guid,
             partition.identity().blocks,
-            partition.identity().block_size
+            partition.identity().block_size,
+            partition.disk().features.rotation
         ));
         Box::new(Service {
             inner: Box::new(partition),
@@ -1752,6 +1936,7 @@ pub unsafe fn open(
             looked: Cell::new(staged_disk::LookGate::default()),
             heard: staged_disk::SignalWatch::default(),
             failures: 0,
+            started: Vec::new(),
         })
     };
     // The USB's log, when its disk is here and the start does not write on
@@ -1915,6 +2100,9 @@ pub unsafe fn open(
     for (location, error) in &devices.platform_failures {
         output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
     }
+    for (location, why) in &devices.platform_unsupported {
+        output::arguments(format_args!("PLATFORM UNSUPPORTED {location}: {why}\n"));
+    }
     match &devices.regulatory {
         Some(Ok(_)) => output::arguments(format_args!("HOST Wi-Fi regulatory database loaded\n")),
         Some(Err(error)) => output::arguments(format_args!(
@@ -2046,11 +2234,19 @@ pub unsafe fn open(
             Ok(opened) => break opened,
             Err((at, error)) if at >= required => {
                 let (named, which) = optional.remove(at - required);
+                let why = describe(&named, error);
                 output::arguments(format_args!(
-                    "HOST PARTITION {} left out: {}\n",
+                    "HOST PARTITION {} left out: {why}\n",
                     which.role(),
-                    describe(&named, error)
                 ));
+                // The USB's log has nothing since the firmware's exit and
+                // gets nothing more: the screen says so once.
+                if matches!(which, Optional::Log) {
+                    output::log_lost(
+                        output::Log::Usb,
+                        format_args!("Stela's drivers did not find its partition: {why}"),
+                    );
+                }
             }
             Err((at, error)) => {
                 let role = role_of(at, targets.len(), medium.is_some(), preboot.is_some());
@@ -2079,6 +2275,13 @@ pub unsafe fn open(
     };
     for partition in &opened {
         host_disks.add(partition.device().shared());
+    }
+    // The targets come first: the first disk holds macOS.
+    if let (Some((_, disk)), Ok(mut model)) = (
+        host_disks.disks.first(),
+        MACOS_DISK_MODEL.0.try_borrow_mut(),
+    ) {
+        model.clone_from(&disk.whole().identity().model);
     }
     let (mut store_partition, mut log_partition) = (None, None);
     for (_, which) in optional.iter().rev() {
@@ -2130,12 +2333,14 @@ pub unsafe fn open(
             host_disks.add(&disk);
             let disk = disk.whole();
             output::arguments(format_args!(
-                "HOST USB DISK serial={} model={:?} blocks={} block_size={} read_only={}\n",
+                "HOST USB DISK serial={} model={:?} blocks={} block_size={} read_only={} \
+                 rotation={}\n",
                 disk.identity().serial,
                 disk.identity().model,
                 disk.identity().blocks,
                 disk.identity().block_size,
-                disk.identity().read_only
+                disk.identity().read_only,
+                disk.identity().features.rotation
             ));
             Box::new(Service {
                 inner: Box::new(disk),
@@ -2145,6 +2350,7 @@ pub unsafe fn open(
                 looked: Cell::new(staged_disk::LookGate::default()),
                 heard: staged_disk::SignalWatch::default(),
                 failures: 0,
+                started: Vec::new(),
             }) as Box<dyn BlockDevice>
         })
         .collect();
@@ -2164,6 +2370,8 @@ pub unsafe fn open(
             root,
         ),
         gpus: core::mem::take(&mut devices.gpus),
+        gpu_companions: core::mem::take(&mut devices.gpu_companions),
+        isa_bridges: core::mem::take(&mut devices.isa_bridges),
         usb,
         usb_disks,
         disks: host_disks,
@@ -2505,6 +2713,11 @@ pub struct Opened {
     pub bluetooth: Option<super::bluetooth::HostBluetooth>,
     /// The display controllers probe left for their own drivers.
     pub gpus: alloc::vec::Vec<stela_drivers::gpu::Adapter>,
+    /// Each display controller's ACPI companion path, where probe found one.
+    pub gpu_companions: alloc::vec::Vec<(stela_drivers::bus::pci::Address, alloc::string::String)>,
+    /// The PCI-to-ISA bridges probe read, which a GPU's kernel driver may
+    /// name the chipset by.
+    pub isa_bridges: alloc::vec::Vec<stela_drivers::probe::IsaBridge>,
     /// The xHCI controllers' topology owners, polled for hotplug.
     pub usb: super::usb::HostUsb,
     /// Whole disks for the guest's USB mass storage, in option order.

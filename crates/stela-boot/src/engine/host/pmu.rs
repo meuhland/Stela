@@ -51,6 +51,7 @@ use core::arch::{
 };
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering::Relaxed};
+use stela_boot_core::host_samples::SAMPLED;
 use stela_engine::machine::engine::step_timing::Phase;
 
 /// Counters this module uses at most.
@@ -73,7 +74,7 @@ const READ_SHARE: u64 = 500;
 /// A read of the set dearer than this (RDPMC trapped by a hypervisor)
 /// switches the core to windows: reading around short intervals would
 /// measure the refill after each trap, not the interval.
-const WINDOW_READ_TICKS: u64 = 2_000;
+pub(super) const WINDOW_READ_TICKS: u64 = 2_000;
 /// A window lasts at least this many ticks (about 2 ms at 3 GHz), and at
 /// least READ_SHARE reads' cost. A tick count, not a time.
 const WINDOW_TICKS: u64 = 6_000_000;
@@ -102,6 +103,16 @@ global_asm!(
     "rdpmc",
     "xor eax, eax",
     "ret",
+    ".global stela_pmu_rdmsr",
+    "stela_pmu_rdmsr:",
+    "mov ecx, edi",
+    ".global stela_pmu_rdmsr_instruction",
+    "stela_pmu_rdmsr_instruction:",
+    "rdmsr",
+    "mov dword ptr [rsi], eax",
+    "mov dword ptr [rsi + 4], edx",
+    "xor eax, eax",
+    "ret",
     ".global stela_pmu_refused",
     "stela_pmu_refused:",
     "mov eax, 1",
@@ -111,19 +122,22 @@ global_asm!(
 unsafe extern "sysv64" {
     fn stela_pmu_wrmsr(index: u32, value: u64) -> u32;
     fn stela_pmu_rdpmc(counter: u32) -> u32;
+    fn stela_pmu_rdmsr(index: u32, value: *mut u64) -> u32;
     static stela_pmu_wrmsr_instruction: u8;
     static stela_pmu_rdpmc_instruction: u8;
+    static stela_pmu_rdmsr_instruction: u8;
     static stela_pmu_refused: u8;
 }
 
-/// Resume a #GP of the probing WRMSR or RDPMC at its refusal: the event or
-/// counter is unsupported.
+/// Resume a #GP of the probing WRMSR, RDPMC or RDMSR at its refusal: the
+/// event, counter or register is unsupported.
 pub(crate) fn fixup(frame: &mut Frame) -> bool {
     let rip = frame.rip;
     if frame.vector != 13
         || frame.cs & 3 != 0
         || (rip != (&raw const stela_pmu_wrmsr_instruction).addr() as u64
-            && rip != (&raw const stela_pmu_rdpmc_instruction).addr() as u64)
+            && rip != (&raw const stela_pmu_rdpmc_instruction).addr() as u64
+            && rip != (&raw const stela_pmu_rdmsr_instruction).addr() as u64)
     {
         return false;
     }
@@ -132,9 +146,44 @@ pub(crate) fn fixup(frame: &mut Frame) -> bool {
 }
 
 /// WRMSR that answers a #GP with `false`.
-fn write(index: u32, value: u64) -> bool {
+pub(crate) fn write(index: u32, value: u64) -> bool {
     // SAFETY: ring 0; a refused write takes #GP, which `fixup` resumes.
     unsafe { stela_pmu_wrmsr(index, value) == 0 }
+}
+
+/// RDMSR that answers a #GP with `None`: the register is not implemented.
+pub(crate) fn read(index: u32) -> Option<u64> {
+    let mut value = 0;
+    // SAFETY: ring 0; an unimplemented register takes #GP, which `fixup`
+    // resumes; the value goes to this frame's `value`.
+    (unsafe { stela_pmu_rdmsr(index, &mut value) } == 0).then_some(value)
+}
+
+/// The SMI counter's register (`stela_boot_core::smi`), probed once for
+/// every processor, which share a vendor: `u32::MAX` before the probe, 0
+/// where there is none.
+static SMI_COUNTER: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The SMIs this processor has taken, where it counts them.
+pub(crate) fn smi_count() -> Option<u64> {
+    let counter = match SMI_COUNTER.load(Relaxed) {
+        u32::MAX => {
+            let identity = __cpuid(0);
+            // "GenuineIntel".
+            let intel = (identity.ebx, identity.edx, identity.ecx)
+                == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+            let counter = stela_boot_core::smi::counter(intel)
+                .filter(|&index| read(index).is_some())
+                .unwrap_or(0);
+            SMI_COUNTER.store(counter, Relaxed);
+            counter
+        }
+        counter => counter,
+    };
+    match counter {
+        0 => None,
+        index => read(index),
+    }
 }
 
 #[inline]
@@ -305,6 +354,23 @@ impl Layout {
         events
     }
 
+    /// Counter `counter`'s count register.
+    fn counter(&self, counter: usize) -> u32 {
+        let counter = counter as u32;
+        match (self.amd, self.stride) {
+            (true, 2) => self.select + 1 + 2 * counter,
+            (true, _) => 0xc001_0004 + counter,
+            (false, _) => 0xc1 + counter,
+        }
+    }
+
+    /// The register that clears counters' overflow status, where there is
+    /// one: AMD's PerfCntrGlobalStatusClr, Intel's IA32_PERF_GLOBAL_OVF_CTRL.
+    fn overflow_clear(&self) -> Option<u32> {
+        self.global
+            .map(|_| if self.amd { 0xc000_0302 } else { 0x390 })
+    }
+
     fn select(&self, event: Event) -> u64 {
         const OS: u64 = 1 << 17;
         const USR: u64 = 1 << 16;
@@ -402,9 +468,17 @@ fn core() -> Option<&'static Core> {
 /// core refused.
 fn program(layout: &Layout, set: usize) -> usize {
     let events = layout.events(set);
+    // The sampled counters interrupt on overflow (`sampling`).
+    const INTERRUPT: u64 = 1 << 20;
     for counter in 0..layout.counters {
         let index = layout.select + counter as u32 * layout.stride;
-        let value = events.get(counter).map_or(0, |event| layout.select(*event));
+        let interrupt = match counter < SAMPLED && super::sampling::enabled() {
+            true => INTERRUPT,
+            false => 0,
+        };
+        let value = events
+            .get(counter)
+            .map_or(0, |event| layout.select(*event) | interrupt);
         if !write(index, value) && value != 0 {
             let bit = 1 << (set * MAX_COUNTERS + counter);
             if REFUSED.fetch_or(bit, Relaxed) & bit == 0 {
@@ -496,6 +570,7 @@ pub(crate) fn start(pe: usize) {
         ));
         return;
     }
+    super::sampling::enable(layout.fixed.len());
     let read = program(layout, SET.load(Relaxed) as usize % layout.sets());
     // What reading the set costs: RDPMC may trap under a hypervisor.
     let before = crate::apic::rdtsc();
@@ -535,6 +610,12 @@ pub(crate) fn start(pe: usize) {
             layout.described
         ));
     }
+    super::sampling::start(
+        pe,
+        [layout.counter(0), layout.counter(1)],
+        layout.overflow_clear(),
+        cost / read.max(1) as u64,
+    );
     let started = crate::apic::rdtsc();
     let own = Own {
         set: SET.load(Relaxed) as usize % layout.sets(),
@@ -564,7 +645,7 @@ pub(crate) fn start(pe: usize) {
 fn read_all(read: usize) -> [u64; MAX_COUNTERS] {
     let mut values = [0; MAX_COUNTERS];
     for (counter, value) in values.iter_mut().enumerate().take(read) {
-        *value = rdpmc(counter as u32);
+        *value = super::sampling::read(counter, rdpmc);
     }
     values
 }
@@ -715,6 +796,7 @@ pub(crate) fn fill_begin() {
     };
     // SAFETY: the owner core; its boundary code is not running.
     let own = unsafe { &mut *core.own.get() };
+    super::sampling::fill(true);
     let now = crate::apic::rdtsc();
     // A fill inside a sampled interval is read at both ends while the
     // budget allows; else the interval's `nat` sample still holds it.
@@ -730,6 +812,7 @@ pub(crate) fn fill_end() {
     };
     // SAFETY: as `fill_begin`.
     let own = unsafe { &mut *core.own.get() };
+    super::sampling::fill(false);
     let Some((then, before)) = own.fill.take() else {
         return;
     };
@@ -751,6 +834,8 @@ pub(crate) struct Seen {
     totals: Vec<[[[u64; MAX_COUNTERS + 2]; BUCKETS + 1]; MAX_SETS]>,
     /// Each core's reading and programming ticks at the last beat.
     spent: Vec<u64>,
+    /// The `PES WHERE` lines' ([`super::sampling::report`]).
+    sampled: super::sampling::Seen,
 }
 
 impl Seen {
@@ -758,6 +843,7 @@ impl Seen {
         Self {
             totals: Vec::new(),
             spent: Vec::new(),
+            sampled: super::sampling::Seen::new(),
         }
     }
 }
@@ -795,7 +881,9 @@ fn totals(core: &Core) -> [[[u64; MAX_COUNTERS + 2]; BUCKETS + 1]; MAX_SETS] {
 /// ends. `method=window:NMticks` (RDPMC trapped): a leading `pe=` is the
 /// whole PE from every window, unbiased; each phase bucket comes only from
 /// the windows that phase held 90% of, so a phase that never dominates a
-/// window shows `-` (`fill` always does).
+/// window shows `-` (`fill` always does). Where no window measured `nat`
+/// alone, `nat~=C/I` is the whole PE's cycles and instructions times the
+/// shares of each native code took in the PE's `PES WHERE` samples.
 pub(crate) fn report(seen: &mut Seen) {
     let Some(layout) = shared_layout() else {
         return;
@@ -893,6 +981,7 @@ pub(crate) fn report(seen: &mut Seen) {
             now[set][bucket][MAX_COUNTERS].wrapping_sub(before[set][bucket][MAX_COUNTERS])
         };
         line.push_str(&format!(" {}:", core.pe));
+        let mut whole: Option<[u64; MAX_COUNTERS]> = None;
         for &bucket in &order {
             // The whole PE ran every phase's ticks.
             let ticks = if bucket == BUCKETS {
@@ -906,7 +995,21 @@ pub(crate) fn report(seen: &mut Seen) {
                 continue;
             }
             if sampled == 0 {
-                line.push_str(&format!(" {}=-", name(bucket)));
+                let estimate = (bucket == Phase::Native as usize)
+                    .then_some(whole)
+                    .flatten()
+                    .zip(super::sampling::native_share(&seen.sampled, core.pe));
+                match estimate {
+                    Some((whole, share)) => {
+                        let [cycles, instructions] = [0, 1].map(|counter: usize| {
+                            (u128::from(whole[counter]) * u128::from(share[counter]) / 1_000_000)
+                                as u64
+                                / 1_000_000
+                        });
+                        line.push_str(&format!(" nat~={cycles}/{instructions}"));
+                    }
+                    None => line.push_str(&format!(" {}=-", name(bucket))),
+                }
                 continue;
             }
             let mut scaled = [0u64; MAX_COUNTERS];
@@ -917,6 +1020,9 @@ pub(crate) fn report(seen: &mut Seen) {
                 machine[bucket][counter] += scaled[counter];
             }
             ran[bucket] = true;
+            if bucket == BUCKETS {
+                whole = Some(scaled);
+            }
             format_bucket(&mut line, name(bucket), &scaled);
         }
         seen.totals[core.pe] = now;
@@ -929,6 +1035,7 @@ pub(crate) fn report(seen: &mut Seen) {
     }
     line.push('\n');
     output::arguments(format_args!("{line}"));
+    super::sampling::report(&mut seen.sampled);
     if sets > 1 {
         SET.store(((set + 1) % sets) as u32, Relaxed);
     }

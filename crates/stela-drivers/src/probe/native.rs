@@ -802,13 +802,13 @@ impl wifi::intel::boot::FunctionOwner for IntelOwner {
 /// way down, then the function. `bridges` lists each PCI bridge with its
 /// secondary bus.
 #[cfg(feature = "native-acpi")]
-pub(super) fn companion(
-    session: &'static crate::platform::acpi::Session,
+pub(super) fn companion<'a>(
+    session: &'a crate::platform::acpi::Session,
     address: Address,
     bridges: &[Bridge],
-) -> Option<crate::platform::acpi::Handle<'static>> {
+) -> Option<crate::platform::acpi::Handle<'a>> {
     use crate::platform::acpi::Handle;
-    let parent = |handle: Handle<'static>| -> Option<String> {
+    let parent = |handle: Handle<'a>| -> Option<String> {
         let path = handle.path().ok()?;
         path.rsplit_once('.')
             .map(|(parent, _)| String::from(parent))
@@ -829,7 +829,7 @@ pub(super) fn companion(
         // acpi_find_child_device and find_child_checks: an enabled device
         // without _HID wins; one without _STA or with a _HID only scores
         // lower; a bridge's companion needs children.
-        let mut best: Option<(u8, Handle<'static>)> = None;
+        let mut best: Option<(u8, Handle<'a>)> = None;
         for &device in &devices {
             if parent(device).as_deref() != Some(path.as_str())
                 || integer(device, "_ADR") != Some(adr)
@@ -866,16 +866,71 @@ pub(super) fn companion(
     Some(current)
 }
 
-/// An Intel VMD host's first NVMe controller, the devices behind it no
-/// driver here takes, and the hierarchy owner that hands back the parent's
-/// owners when the controller retires.
+/// The VMD parent's BAR registers as read, its memory BARs as the PCI core
+/// sized them, and its VMCAP and VMCONFIG, which a refusal of the host's own
+/// resources names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmdWords {
+    pub registers: [u32; 6],
+    pub sized: [Option<(u64, u64)>; 3],
+    pub vmcap: u16,
+    pub vmconfig: u16,
+}
+
+impl VmdWords {
+    fn read(
+        config: &impl ConfigSpace,
+        bars: &[Option<Bar>; 6],
+    ) -> Result<Self, crate::bus::pci::ConfigError> {
+        let mut registers = [0; 6];
+        for (index, register) in registers.iter_mut().enumerate() {
+            *register = config.read32(0x10 + index as u16 * 4)?;
+        }
+        let sized = [0, 2, 4].map(|index| match bars[index] {
+            Some(Bar::Memory { address, size, .. }) => Some((address, size)),
+            _ => None,
+        });
+        Ok(Self {
+            registers,
+            sized,
+            vmcap: config.read16(0x40)?,
+            vmconfig: config.read16(0x44)?,
+        })
+    }
+}
+
+impl core::fmt::Display for VmdWords {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BAR registers")?;
+        for register in self.registers {
+            write!(f, " {register:08x}")?;
+        }
+        f.write_str(", sized")?;
+        for (index, sized) in [0, 2, 4].into_iter().zip(self.sized) {
+            match sized {
+                Some((address, size)) => write!(f, " BAR{index} {address:#x}+{size:#x}")?,
+                None => write!(f, " BAR{index} none")?,
+            }
+        }
+        write!(
+            f,
+            ", VMCAP {:04x} VMCONFIG {:04x}",
+            self.vmcap, self.vmconfig
+        )
+    }
+}
+
+/// An Intel VMD host's NVMe controllers, each attached or with the reason it
+/// is not, by location, the devices behind it no driver here takes, and the
+/// hierarchy owner that hands back the parent's owners when every attached
+/// controller retires.
 pub struct Vmd {
-    pub nvme: Option<nvme::Attached>,
+    pub nvme: Vec<(String, Result<nvme::Attached, crate::block::BlockError>)>,
     pub others: Vec<vmd::Child>,
     pub owner: Box<dyn Any>,
 }
 
-/// Attach the NVMe controller behind an Intel VMD host: BAR0 holds the
+/// Attach every NVMe controller behind an Intel VMD host: BAR0 holds the
 /// children's configuration space, BAR2 and BAR4 their memory windows.
 ///
 /// # Safety
@@ -888,6 +943,7 @@ pub(super) unsafe fn vmd(
     services: &dyn NativeServices,
     address: Address,
     clock: Clock,
+    platform: &crate::firmware::smbios::SystemIdentity<'_>,
 ) -> Result<Vmd, Failure> {
     let minimum = services
         .minimum_delay()
@@ -903,6 +959,15 @@ pub(super) unsafe fn vmd(
     let bars = match preparing.function_mut().bars() {
         Ok(bars) => bars,
         Err(error) => return Err(keep_error(error, preparing)),
+    };
+    let words = match VmdWords::read(preparing.function_mut().config(), &bars) {
+        Ok(words) => words,
+        Err(error) => return Err(keep_error(error, preparing)),
+    };
+    // A refusal of the host's own BARs or bus range names what it read.
+    let host_error = |error: vmd::Error| match error {
+        vmd::Error::InvalidResource => Error::VmdResource(error, words),
+        error => Error::Vmd(error),
     };
     // SAFETY: VMD has no engine of its own: every request it issues is a
     // child's, forwarded upstream under its requester ID. Its Bus Master bit
@@ -965,59 +1030,86 @@ pub(super) unsafe fn vmd(
     // and no other owner reaches the hierarchy behind it.
     let registers = match unsafe { vmd::NativeRegisters::claim(resources) } {
         Ok(registers) => registers,
-        Err((error, resources)) => return Err(failed(error, Box::new((resources, attachment)))),
+        Err((error, resources)) => {
+            return Err(keep_error(host_error(error), (resources, attachment)));
+        }
     };
     let mut host = match vmd::Host::initialize(registers) {
         Ok(host) => host,
         Err((error, registers)) => {
-            return Err(keep_error(Error::Vmd(error), (registers, attachment)));
+            return Err(keep_error(host_error(error), (registers, attachment)));
         }
     };
     let mut others = match host.scan() {
         Ok(children) => children,
         Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
-    let Some(index) = others.iter().position(|child| child.class == [1, 8, 2]) else {
+    let location = |child: &vmd::Child| {
+        alloc::format!(
+            "{address} VMD {:02x}:{:02x}.{}",
+            child.address.bus,
+            child.address.device,
+            child.address.function
+        )
+    };
+    // Every NVMe controller below the host, each with its own firmware BAR0
+    // inside the host's windows, as Linux's VMD driver enumerates them; one
+    // whose BAR is refused stays a stopped function with its own cause.
+    let mut controllers = Vec::new();
+    let mut unclaimed = Vec::new();
+    let mut index = 0;
+    while index < others.len() {
+        if others[index].class != [1, 8, 2] {
+            index += 1;
+            continue;
+        }
+        let child = others.remove(index);
+        let label = location(&child);
+        // SAFETY: `bytes` is the child's firmware-assigned BAR0, sized with
+        // its decode off, and the stopped hierarchy has no other owner.
+        let bar = host
+            .memory_bar_bytes(child.address)
+            .and_then(|bytes| unsafe {
+                vmd::endpoint::FirmwareBar::claim(&mut host, child.address, bytes)
+            });
+        match bar {
+            Ok(bar) => controllers.push(crate::storage::nvme::vmd::Controller {
+                bar,
+                label,
+                quirks: nvme::Quirks::for_device(child.vendor, child.device)
+                    | nvme::Quirks::for_platform(child.vendor, child.device, platform),
+            }),
+            Err(error) => unclaimed.push((label, error)),
+        }
+    }
+    let unclaimed = unclaimed
+        .into_iter()
+        .map(|(label, error)| (label, Err(crate::storage::nvme::vmd::block(error))));
+    if controllers.is_empty() {
+        // No controller's BAR could be claimed: each is reported by its
+        // location with its own cause, and the host keeps its owners.
         return Ok(Vmd {
-            nvme: None,
+            nvme: unclaimed.collect(),
             others,
             owner: Box::new((host, attachment)),
         });
-    };
-    let child = others.remove(index);
-    let bytes = match host.memory_bar_bytes(child.address) {
-        Ok(bytes) => bytes,
-        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
-    };
-    // SAFETY: `bytes` is the child's firmware-assigned BAR0, sized with its
-    // decode off, and the stopped hierarchy has no other owner.
-    let bar = match unsafe { vmd::endpoint::FirmwareBar::claim(&mut host, child.address, bytes) } {
-        Ok(bar) => bar,
-        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
-    };
-    let label = alloc::format!(
-        "{address} VMD {:02x}:{:02x}.{}",
-        child.address.bus,
-        child.address.device,
-        child.address.function
-    );
+    }
     // SAFETY: the host's own attached domain covers its requester, under
     // which every child's request reaches the root; the mount's permission
     // issued these mappings, and the hierarchy is stopped.
     match unsafe {
         crate::storage::nvme::vmd::attach(
             host,
-            bar,
+            controllers,
             domain,
             authority,
             services.pages(),
             clock,
             minimum.clone(),
-            label,
         )
     } {
         Ok((attached, hierarchy)) => Ok(Vmd {
-            nvme: Some(attached),
+            nvme: attached.into_iter().chain(unclaimed).collect(),
             others,
             owner: Box::new((hierarchy, attachment)),
         }),
@@ -1076,9 +1168,9 @@ pub(super) fn root_buses(
 
 /// Each ACPI PCI host bridge with its `_SEG` and `_BBN`, zero when absent.
 #[cfg(feature = "native-acpi")]
-fn roots(
-    session: &'static crate::platform::acpi::Session,
-) -> Vec<(crate::platform::acpi::Handle<'static>, u16, u8)> {
+pub(super) fn roots(
+    session: &crate::platform::acpi::Session,
+) -> Vec<(crate::platform::acpi::Handle<'_>, u16, u8)> {
     let mut roots = session.devices("PNP0A08").unwrap_or_default();
     roots.extend(session.devices("PNP0A03").unwrap_or_default());
     roots
@@ -1093,7 +1185,7 @@ fn roots(
 
 /// The integer `name` evaluates to on `handle`, when it has one.
 #[cfg(feature = "native-acpi")]
-fn integer(handle: crate::platform::acpi::Handle<'static>, name: &str) -> Option<u64> {
+pub(super) fn integer(handle: crate::platform::acpi::Handle<'_>, name: &str) -> Option<u64> {
     use crate::platform::acpi::Value;
     handle.child(name).ok()?;
     match handle.evaluate(Some(name), &[]).ok()? {
@@ -1471,7 +1563,7 @@ mod tests {
         ));
         assert_eq!(*services.preparations.borrow(), [address(); 2]);
         // SAFETY: as above.
-        let vmd = unsafe { vmd(&services, address(), clock) };
+        let vmd = unsafe { vmd(&services, address(), clock, &Default::default()) };
         assert!(matches!(
             vmd,
             Err((Error::Native(ServiceError::Unavailable), None))
@@ -1518,5 +1610,62 @@ mod tests {
             Some(bcm4377::Chip::Bcm4388)
         );
         assert_eq!(bcm4377::Chip::of_device(0x4377), None);
+    }
+
+    /// A VMD parent's configuration space, by dword.
+    struct Parent([u32; 64]);
+    impl ConfigSpace for Parent {
+        fn read8(&self, offset: u16) -> Result<u8, crate::bus::pci::ConfigError> {
+            Ok((self.0[usize::from(offset / 4)] >> (offset % 4 * 8)) as u8)
+        }
+        fn read16(&self, offset: u16) -> Result<u16, crate::bus::pci::ConfigError> {
+            Ok((self.0[usize::from(offset / 4)] >> (offset % 4 * 8)) as u16)
+        }
+        fn read32(&self, offset: u16) -> Result<u32, crate::bus::pci::ConfigError> {
+            Ok(self.0[usize::from(offset / 4)])
+        }
+        fn write8(&mut self, _: u16, _: u8) -> Result<(), crate::bus::pci::ConfigError> {
+            unreachable!()
+        }
+        fn write16(&mut self, _: u16, _: u16) -> Result<(), crate::bus::pci::ConfigError> {
+            unreachable!()
+        }
+        fn write32(&mut self, _: u16, _: u32) -> Result<(), crate::bus::pci::ConfigError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_refused_vmd_host_resource_names_the_bar_words_sizes_and_bus_restriction() {
+        // A client host's 64-bit CFGBAR, 32-bit MEMBAR1 and 64-bit MEMBAR2,
+        // with buses from e0.
+        let mut parent = Parent([0; 64]);
+        parent.0[4..10].copy_from_slice(&[0x2c00_0004, 0x62, 0x5000_0000, 0, 0x2f10_0004, 0x62]);
+        parent.0[0x10] = 1;
+        parent.0[0x11] = 2 << 8;
+        let memory = |address, size, wide| {
+            Some(Bar::Memory {
+                address,
+                size,
+                prefetchable: false,
+                wide,
+            })
+        };
+        let bars = [
+            memory(0x62_2c00_0000, 32 << 20, true),
+            None,
+            memory(0x5000_0000, 32 << 20, false),
+            memory(0, 0, false),
+            memory(0x62_2f10_0000, 1 << 20, true),
+            None,
+        ];
+        let words = VmdWords::read(&parent, &bars).unwrap();
+        let error = Error::VmdResource(vmd::Error::InvalidResource, words);
+        assert_eq!(
+            alloc::format!("{error}"),
+            "VMD: a BAR, window or bus range VMD cannot use; BAR registers 2c000004 00000062 \
+             50000000 00000000 2f100004 00000062, sized BAR0 0x622c000000+0x2000000 \
+             BAR2 0x50000000+0x2000000 BAR4 0x622f100000+0x100000, VMCAP 0001 VMCONFIG 0200"
+        );
     }
 }

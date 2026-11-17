@@ -1,4 +1,4 @@
-//! The persistent translation store's home on the USB: where `stela.efi`
+//! The persistent translation store's home on the stick: where `stela.efi`
 //! keeps its `STLTPACK` packs, how much room each may take, and which packs are
 //! kept. The pack format is the engine's; setup never reads a pack beyond
 //! its header.
@@ -21,7 +21,7 @@
 //! the first four bytes of its translator id in hex, and its header names
 //! the whole id.
 //!
-//! The home is the USB's FAT32 data partition, which also holds the install
+//! The home is the stick's FAT32 data partition, which also holds the install
 //! medium and the boot bundles, as the firmware writes it. `stela.efi`
 //! writes only its own translator id's pack, never past the bound. Setup
 //! keeps the most recently written pack and removes the others when Stela is
@@ -52,8 +52,13 @@ pub(super) const SPARE: &str = "spare.bin";
 /// it does a pack.
 /// A blank one holds nothing yet.
 pub(super) const PIPELINES: &str = "pipeline.bin";
-/// The pipeline store's size, its bound.
+/// The pipeline store's least size, and its most: a sixty-fourth of the
+/// volume's room between. A larger file keeps more compiled pipelines and
+/// their NIR; past the most, what `stela.efi` keeps is bound by its heap,
+/// not the file.
 pub(super) const PIPELINE_BYTES: u64 = 64 * MIB;
+pub(super) const PIPELINE_MOST: u64 = 128 * MIB;
+const PIPELINE_SHARE: u64 = 64;
 /// The translator id bytes a pack's file name holds.
 const NAME_BYTES: usize = 4;
 const MIB: u64 = 1024 * 1024;
@@ -69,10 +74,23 @@ pub(super) const PACKS_KEPT: usize = 1;
 /// The store a setup keeps.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Store {
-    /// The FAT32 volume of the USB that holds it.
+    /// The FAT32 volume of the stick that holds it.
     pub(super) volume: PathBuf,
     /// One pack's bound.
     pub(super) pack_bytes: u64,
+    /// The pipeline store's size; records before it was chosen had the
+    /// least.
+    #[serde(default = "least_pipeline_bytes")]
+    pub(super) pipeline_bytes: u64,
+}
+
+fn least_pipeline_bytes() -> u64 {
+    PIPELINE_BYTES
+}
+
+/// The pipeline store's size for a volume with `room` bytes for the store.
+pub(super) fn pipeline_bytes(room: u64) -> u64 {
+    (room / PIPELINE_SHARE / MIB * MIB).clamp(PIPELINE_BYTES, PIPELINE_MOST)
 }
 
 impl Store {
@@ -129,26 +147,32 @@ impl Store {
         Ok(())
     }
 
-    /// Whether the pipeline store holds its bound's bytes.
+    /// Whether the pipeline store holds its size's bytes.
     pub(super) fn pipelines_ready(&self) -> bool {
         fs::metadata(self.directory().join(PIPELINES))
-            .is_ok_and(|m| m.is_file() && m.len() >= PIPELINE_BYTES)
+            .is_ok_and(|m| m.is_file() && m.len() >= self.pipeline_bytes)
     }
 
     /// Allocate a blank pipeline store, as [`Self::prepare_spare`] does the
-    /// spare. One already of its size keeps what it holds.
+    /// spare, or grow a smaller one in place: its journal sits at its
+    /// start, and what it holds stays.
     fn prepare_pipelines(&self) -> Result<()> {
         if self.pipelines_ready() {
             return Ok(());
         }
         let path = self.directory().join(PIPELINES);
-        let file =
-            fs::File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
-        file.set_len(PIPELINE_BYTES)
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        file.set_len(self.pipeline_bytes)
             .and_then(|()| file.sync_all())
             .with_context(|| {
                 format!(
-                    "cannot allocate {PIPELINE_BYTES} bytes for {}",
+                    "cannot allocate {} bytes for {}",
+                    self.pipeline_bytes,
                     path.display()
                 )
             })
@@ -205,15 +229,6 @@ impl Store {
         self.packs().iter().map(|p| p.bytes).sum()
     }
 
-    /// The store, for plans and `status`.
-    pub(super) fn describe(&self) -> String {
-        format!(
-            "{}: one pack of up to {:.1} GB, the newest",
-            self.directory().display(),
-            self.pack_bytes as f64 / 1e9
-        )
-    }
-
     /// What [`Self::repair`] would change: a missing or changed
     /// `store.cfg`, and each pack to remove, damaged or past the kept
     /// ones.
@@ -231,8 +246,9 @@ impl Store {
         }
         if !self.pipelines_ready() {
             repairs.push(format!(
-                "prepare {} ({PIPELINE_BYTES} bytes)",
-                self.directory().join(PIPELINES).display()
+                "prepare {} ({} bytes)",
+                self.directory().join(PIPELINES).display(),
+                self.pipeline_bytes
             ));
         }
         for pack in self.stale() {
@@ -335,19 +351,21 @@ pub(super) fn pack_name(id: &[u8]) -> String {
     format!("{}.{PACK_EXTENSION}", hex::encode(&id[..NAME_BYTES]))
 }
 
-/// The bytes a store of `pack_bytes` needs on its volume: the kept packs
-/// and the spare beside them, the pipeline store, and a margin.
-pub(super) fn needed_bytes(pack_bytes: u64) -> u64 {
-    pack_bytes * (PACKS_KEPT as u64 + 1) + PIPELINE_BYTES + MARGIN
+/// The bytes a store of `pack_bytes` and a pipeline store of
+/// `pipeline_bytes` need on its volume: the kept packs and the spare beside
+/// them, the pipeline store, and a margin.
+pub(super) fn needed_bytes(pack_bytes: u64, pipeline_bytes: u64) -> u64 {
+    pack_bytes * (PACKS_KEPT as u64 + 1) + pipeline_bytes + MARGIN
 }
 
-/// The largest bound, on a 1 MiB boundary, whose store fits in `room`.
-fn fitting(room: u64) -> u64 {
-    let bound = room.saturating_sub(PIPELINE_BYTES + MARGIN) / (PACKS_KEPT as u64 + 1);
+/// The largest bound, on a 1 MiB boundary, whose store fits in `room`
+/// beside a pipeline store of `pipeline_bytes`.
+fn fitting(room: u64, pipeline_bytes: u64) -> u64 {
+    let bound = room.saturating_sub(pipeline_bytes + MARGIN) / (PACKS_KEPT as u64 + 1);
     bound / MIB * MIB
 }
 
-/// The store's home among `candidates` (the USB's data partition): the
+/// The store's home among `candidates` (the stick's data partition): the
 /// first FAT32 one. `planned` is what setup writes to a volume besides the
 /// store, and `requested` the user's bound (`--translation-store-bytes`, 0
 /// for none).
@@ -389,12 +407,14 @@ pub(super) fn choose(
         let existing = Store {
             volume: volume.to_path_buf(),
             pack_bytes: MAX_PACK_BYTES,
+            pipeline_bytes: PIPELINE_BYTES,
         }
         .used_bytes();
         let room = (info.free_bytes + existing).saturating_sub(planned(volume));
+        let pipeline_bytes = pipeline_bytes(room);
         let pack_bytes = match requested {
             Some(bytes) => {
-                let need = needed_bytes(bytes);
+                let need = needed_bytes(bytes, pipeline_bytes);
                 if room < need {
                     bail!(
                         "{} has {:.1} GB for the translation store; {} packs of {:.1} GB and a \
@@ -409,17 +429,16 @@ pub(super) fn choose(
                 }
                 bytes
             }
-            None => fitting(room).min(DEFAULT_PACK_BYTES),
+            None => fitting(room, pipeline_bytes).min(DEFAULT_PACK_BYTES),
         };
         if pack_bytes < MIN_PACK_BYTES {
             return Ok((
                 None,
                 Some(format!(
-                    "no translation store: {} ({:.1} GB free) has no room for {} packs of 64 \
-                     MiB; every boot translates anew",
+                    "no translation cache: {} has too little room ({:.1} GB free), so every \
+                     start is slower",
                     volume.display(),
                     room as f64 / 1e9,
-                    PACKS_KEPT
                 )),
             ));
         }
@@ -427,6 +446,7 @@ pub(super) fn choose(
             Some(Store {
                 volume: volume.to_path_buf(),
                 pack_bytes,
+                pipeline_bytes,
             }),
             None,
         ));
@@ -434,8 +454,8 @@ pub(super) fn choose(
     Ok((
         None,
         Some(
-            "no translation store: the USB has no FAT32 volume the firmware writes; every boot \
-             translates anew"
+            "no translation cache: the stick has no volume the PC can write at boot, so every \
+             start is slower"
                 .into(),
         ),
     ))
@@ -494,6 +514,7 @@ pub(super) mod tests {
         let store = Store {
             volume: dir.path().to_path_buf(),
             pack_bytes: 2 * SMALL_PACK as u64,
+            pipeline_bytes: PIPELINE_BYTES,
         };
         store.publish().unwrap();
         assert!(store.config_intact());
@@ -557,6 +578,7 @@ pub(super) mod tests {
         let store = Store {
             volume: dir.path().to_path_buf(),
             pack_bytes: 4 * SMALL_PACK as u64,
+            pipeline_bytes: PIPELINE_BYTES,
         };
         let path = write_pack(&store.directory(), [1; ID_BYTES], SMALL_PACK);
         let bytes = fs::read(&path).unwrap();
@@ -583,6 +605,7 @@ pub(super) mod tests {
         let store = Store {
             volume: dir.path().to_path_buf(),
             pack_bytes: 4096,
+            pipeline_bytes: PIPELINE_BYTES,
         };
         fs::create_dir_all(store.directory()).unwrap();
         let config = store.directory().join(CONFIG);
@@ -610,14 +633,58 @@ pub(super) mod tests {
 
     #[test]
     fn translation_bound_fits_volume() {
-        assert_eq!(
-            fitting(needed_bytes(DEFAULT_PACK_BYTES)),
-            DEFAULT_PACK_BYTES
+        for pipelines in [PIPELINE_BYTES, PIPELINE_MOST] {
+            assert_eq!(
+                fitting(needed_bytes(DEFAULT_PACK_BYTES, pipelines), pipelines),
+                DEFAULT_PACK_BYTES
+            );
+            assert_eq!(
+                fitting(needed_bytes(MIN_PACK_BYTES, pipelines) - 1, pipelines),
+                MIN_PACK_BYTES - MIB
+            );
+            assert_eq!(fitting(0, pipelines), 0);
+        }
+    }
+
+    #[test]
+    fn the_pipeline_store_takes_a_share_of_the_room_within_bounds_and_grows_in_place() {
+        assert_eq!(pipeline_bytes(0), PIPELINE_BYTES);
+        assert_eq!(pipeline_bytes(4 * 1024 * MIB), PIPELINE_BYTES);
+        assert_eq!(pipeline_bytes(6 * 1024 * MIB), 96 * MIB);
+        assert_eq!(pipeline_bytes(64 * 1024 * MIB), PIPELINE_MOST);
+        // A record from before the size was chosen has the least.
+        let record: Store = serde_json::from_str(r#"{"volume":"/v","pack_bytes":4096}"#).unwrap();
+        assert_eq!(record.pipeline_bytes, PIPELINE_BYTES);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store {
+            volume: dir.path().to_path_buf(),
+            pack_bytes: 4096,
+            pipeline_bytes: 2 * MIB,
+        };
+        store.publish().unwrap();
+        let path = store.directory().join(PIPELINES);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 2 * MIB);
+        // A journal written at its start stays when it grows.
+        let journal = [0x5a; 4096];
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all(&journal).unwrap();
+        }
+        store.pipeline_bytes = 3 * MIB;
+        assert!(!store.pipelines_ready());
+        assert!(
+            store
+                .repairs()
+                .iter()
+                .any(|repair| repair.contains("3145728 bytes"))
         );
-        assert_eq!(
-            fitting(needed_bytes(MIN_PACK_BYTES) - 1),
-            MIN_PACK_BYTES - MIB
-        );
-        assert_eq!(fitting(0), 0);
+        store.repair().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 3 * MIB);
+        assert_eq!(fs::read(&path).unwrap()[..4096], journal);
+        // A larger file than the record says is kept as it is.
+        store.pipeline_bytes = 2 * MIB;
+        assert!(store.pipelines_ready());
     }
 }

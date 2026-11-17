@@ -175,6 +175,7 @@ impl Reader<'_> {
         let context = self.digest()?;
         let offset = self.u16()?;
         let _source_bytes = self.u16()?;
+        let _cold = (self.u32()?, self.u32()?);
         let input_bytes = usize::from(self.u16()?);
         if input_bytes > super::PAGE_BYTES {
             return Err(FormatError::Entry);

@@ -101,10 +101,18 @@ struct stela_metal_reflection {
 };
 #define STELA_METAL_REFLECTION_BYTES 18800u
 
+/* The stages the device's shaders take, which index stela_metal_target::nir
+ * by Mesa's mesa_shader_stage: vertex through mesh. */
+#define STELA_METAL_NIR_STAGES 8u
+/* Every stage's options the same, for a driver with one set for all. */
+#define STELA_METAL_NIR_ALL(options) \
+   {(options), (options), (options), (options), (options), (options), (options), (options)}
+
 /* The target's facts, fixed for a device. nir is the Vulkan driver's
- * compiler options, which must outlive every shader compiled with them. */
+ * compiler options for each stage, which must outlive every shader compiled
+ * with them: a driver builds a stage's shaders with that stage's. */
 struct stela_metal_target {
-   const nir_shader_compiler_options *nir;
+   const nir_shader_compiler_options *nir[STELA_METAL_NIR_STAGES];
    uint32_t max_instructions, max_threadgroup_bytes, max_private_bytes, max_constant_bytes;
    uint32_t max_varying_slots, max_payload_bytes, max_mesh_vertices, max_mesh_primitives;
    /* Nonzero when fragment shaders may write the stencil reference. */
@@ -115,7 +123,7 @@ struct stela_metal_target {
     * stencil export runs the fragment tests itself. */
    uint32_t fragment_tests;
 };
-#define STELA_METAL_TARGET_BYTES 56u
+#define STELA_METAL_TARGET_BYTES 112u
 
 /* A threadgroup buffer's setThreadgroupMemoryLength:atIndex:. */
 struct stela_metal_threadgroup_length {
@@ -344,6 +352,12 @@ void stela_metal_tessellation_stages(const struct stela_metal_target *target,
                                      nir_shader *stages[2]);
 
 void stela_metal_release(nir_shader *shader);
+
+/* The NIR nir_serialize wrote of a shader stela_metal_compile made, with its
+ * stage's options, which stela_metal_release frees, or NULL when the bytes
+ * are not one whole serialized shader of a stage the target has. */
+nir_shader *stela_metal_deserialize(const void *data, size_t size,
+                                    const struct stela_metal_target *target);
 
 /* The buffer slots a compiled function accesses through its stage's table,
  * one bit each: the arguments it references, which Metal requires bound. */

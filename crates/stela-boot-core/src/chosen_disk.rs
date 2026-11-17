@@ -91,6 +91,97 @@ impl Stale {
     }
 }
 
+/// Which partition the macOS choice starts from when the USB holds no
+/// record: a USB made new, or made again, has none, yet the PC may hold the
+/// macOS an earlier USB installed. Offering only Install macOS there offers
+/// only to erase it. A USB with a record keeps it whatever it starts: its
+/// disk may be out for now or its install unfinished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adopted {
+    /// The USB holds a record: nothing is looked for.
+    Recorded,
+    /// The one partition on this PC's disks that starts macOS, by its place
+    /// among those found. The record names it once the macOS choice is
+    /// taken.
+    One(usize),
+    /// No partition found starts macOS: only Install macOS is offered.
+    None,
+    /// This many partitions start macOS, so none can be told to be the one
+    /// meant: only Install macOS is offered, and its picker shows them.
+    Several(usize),
+}
+
+/// What the macOS choice starts from. `recorded` is whether the USB holds
+/// a record; `found` holds, for each of Stela's macOS partitions
+/// on this PC's disks, whether macOS can start from it.
+pub fn adopt(recorded: bool, found: &[bool]) -> Adopted {
+    if recorded {
+        return Adopted::Recorded;
+    }
+    let mut ready = found.iter().enumerate().filter(|(_, ready)| **ready);
+    match (ready.next(), ready.count()) {
+        (None, _) => Adopted::None,
+        (Some((index, _)), 0) => Adopted::One(index),
+        (Some(_), more) => Adopted::Several(more + 1),
+    }
+}
+
+/// The disk a startup choice takes: `disk` as the record names it, or as
+/// it was `found` on the PC's disks. A found partition is the macOS
+/// choice's alone (`mac`), so no other choice, an update among them,
+/// changes a disk nobody chose for it.
+pub fn disk_for(mac: bool, disk: Option<&str>, found: bool) -> Option<&str> {
+    match found && !mac {
+        true => None,
+        false => disk,
+    }
+}
+
+/// A whole disk Install macOS's picker lists, as far as whether it can be
+/// chosen goes.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate<'a> {
+    /// The serial number its controller reports, by which Stela finds it
+    /// again once the firmware has exited.
+    pub serial: Option<&'a str>,
+    pub bytes: u64,
+    /// Why Stela's own drivers cannot reach its controller.
+    pub controller: Option<&'static str>,
+}
+
+/// The picker's refusal of a disk whose serial another listed disk also
+/// reports: after the firmware exits, Stela finds the chosen disk by its
+/// serial alone, and two disks with one serial name neither
+/// ([`Search::SeveralDisks`]), so the install would stop.
+pub const SAME_SERIAL: &str = "Same serial as another disk";
+
+/// Why the picker refuses disk `index` of `disks`, which it shows by the
+/// disk; `None` when it can be chosen. A disk Stela's drivers cannot reach
+/// or cannot find again by its serial is refused before its size is.
+pub fn picker_refusal(
+    disks: &[Candidate<'_>],
+    index: usize,
+    min_bytes: u64,
+) -> Option<&'static str> {
+    let disk = disks.get(index)?;
+    if disk.controller.is_some() {
+        return disk.controller;
+    }
+    let shared = |serial: &str| {
+        disks
+            .iter()
+            .enumerate()
+            .any(|(other, listed)| other != index && listed.serial == Some(serial))
+    };
+    match disk.serial {
+        None => Some("No serial number"),
+        Some(serial) if serial.contains(char::is_whitespace) => Some("Serial number has spaces"),
+        Some(serial) if shared(serial) => Some(SAME_SERIAL),
+        Some(_) if disk.bytes < min_bytes => Some("Smaller than 60 GB"),
+        Some(_) => None,
+    }
+}
+
 /// What a chosen partition whose NVRAM store could not be read is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unreadable {
@@ -118,7 +209,44 @@ pub const UNREADABLE_STORE: &str = "NVRAM on the disk chosen for macOS cannot be
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_usb_without_a_usable_record_takes_the_one_macos_on_the_pc() {
+        // The record starts macOS: the disks are not looked at.
+        assert_eq!(adopt(true, &[true, true]), Adopted::Recorded);
+        assert_eq!(adopt(true, &[]), Adopted::Recorded);
+        // A new USB on a PC with one installed macOS, beside a partition
+        // an interrupted install left.
+        assert_eq!(adopt(false, &[true]), Adopted::One(0));
+        assert_eq!(adopt(false, &[false, true]), Adopted::One(1));
+        // Nothing to start, or no way to tell which is meant.
+        assert_eq!(adopt(false, &[]), Adopted::None);
+        assert_eq!(adopt(false, &[false, false]), Adopted::None);
+        assert_eq!(adopt(false, &[true, false, true]), Adopted::Several(2));
+    }
+
     use super::*;
+
+    #[test]
+    fn a_slow_disk_is_marked_but_not_refused() {
+        // The caution (`disk_speed::caution`) is no refusal: a spinning disk
+        // of any size and a unique serial can still be chosen.
+        let disks = [Candidate {
+            serial: Some("WD-1"),
+            bytes: 1_000_000_000_000,
+            controller: None,
+        }];
+        assert_eq!(picker_refusal(&disks, 0, 60_000_000_000), None);
+    }
+
+    #[test]
+    fn a_found_partition_goes_to_the_macos_choice_alone() {
+        assert_eq!(disk_for(true, Some("A:1"), true), Some("A:1"));
+        assert_eq!(disk_for(false, Some("A:1"), true), None);
+        // A recorded one goes to every choice, as before.
+        assert_eq!(disk_for(true, Some("A:1"), false), Some("A:1"));
+        assert_eq!(disk_for(false, Some("A:1"), false), Some("A:1"));
+        assert_eq!(disk_for(false, None, false), None);
+    }
 
     #[test]
     fn the_found_partition_is_not_stale() {
@@ -158,6 +286,55 @@ mod tests {
         }
         assert!(Stale::Wiped.screen().contains("is not there"));
         assert!(Stale::NoMacOs.screen().contains("has no macOS"));
+    }
+
+    #[test]
+    fn the_picker_refuses_every_disk_whose_serial_another_disk_reports() {
+        const MIN: u64 = 60_000_000_000;
+        let disk = |serial: Option<&'static str>, bytes: u64| Candidate {
+            serial,
+            bytes,
+            controller: None,
+        };
+        // Two disks behind one USB-SATA bridge, or a cloned NVMe disk,
+        // report one serial: neither can be chosen; the third can.
+        let disks = [
+            disk(Some("S1"), 500_000_000_000),
+            disk(Some("S1"), 1_000_000_000_000),
+            disk(Some("S2"), 500_000_000_000),
+        ];
+        let refusals: Vec<_> = (0..disks.len())
+            .map(|index| picker_refusal(&disks, index, MIN))
+            .collect();
+        assert_eq!(refusals, [Some(SAME_SERIAL), Some(SAME_SERIAL), None]);
+        // The other refusals keep their order: the controller first, then
+        // the serial, then the size.
+        let others = [
+            Candidate {
+                controller: Some("Controller not supported"),
+                ..disk(None, 1)
+            },
+            disk(None, 500_000_000_000),
+            disk(Some("A B"), 500_000_000_000),
+            disk(Some("S3"), 1),
+            disk(Some("S4"), MIN),
+        ];
+        let refusals: Vec<_> = (0..others.len())
+            .map(|index| picker_refusal(&others, index, MIN))
+            .collect();
+        assert_eq!(
+            refusals,
+            [
+                Some("Controller not supported"),
+                Some("No serial number"),
+                Some("Serial number has spaces"),
+                Some("Smaller than 60 GB"),
+                None
+            ]
+        );
+        // No serial is shared by two disks that report none.
+        let unknown = [disk(None, 1), disk(None, 1)];
+        assert_eq!(picker_refusal(&unknown, 0, MIN), Some("No serial number"));
     }
 
     #[test]

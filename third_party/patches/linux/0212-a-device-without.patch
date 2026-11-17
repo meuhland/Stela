@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:43:15 +0000
+Subject: [PATCH] fix(xe): a device without CONFIG_PM counts as active for xe's
+ conditional runtime PM references, as i915's do, where
+ pm_runtime_get_if_active answered -EINVAL and the GuC's replies were never
+ read
+
+---
+ drivers/gpu/drm/xe/xe_pm.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_pm.c b/drivers/gpu/drm/xe/xe_pm.c
+index 99562f691080bf22ceb01b419fbdc3482b9e3ee9..ccf0e826815beaa90f510d6f6387630f8be51524 100644
+--- a/drivers/gpu/drm/xe/xe_pm.c
++++ b/drivers/gpu/drm/xe/xe_pm.c
+@@ -849,6 +849,16 @@ int xe_pm_runtime_get_ioctl(struct xe_device *xe)
+  */
+ bool xe_pm_runtime_get_if_active(struct xe_device *xe)
+ {
++	/*
++	 * Without CONFIG_PM the device never suspends, so it is always active,
++	 * while pm_runtime_get_if_active() answers -EINVAL there. As i915 does
++	 * (__intel_runtime_pm_get_if_active), take the reference and go on.
++	 */
++	if (!IS_ENABLED(CONFIG_PM)) {
++		pm_runtime_get_noresume(xe->drm.dev);
++		return true;
++	}
++
+ 	return pm_runtime_get_if_active(xe->drm.dev) > 0;
+ }
+ 
+@@ -867,6 +877,12 @@ bool xe_pm_runtime_get_if_in_use(struct xe_device *xe)
+ 		return true;
+ 	}
+ 
++	/* Always awake without CONFIG_PM, see xe_pm_runtime_get_if_active(). */
++	if (!IS_ENABLED(CONFIG_PM)) {
++		pm_runtime_get_noresume(xe->drm.dev);
++		return true;
++	}
++
+ 	return pm_runtime_get_if_in_use(xe->drm.dev) > 0;
+ }
+ 

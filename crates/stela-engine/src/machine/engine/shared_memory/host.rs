@@ -419,6 +419,17 @@ impl<H: Host, T: ServiceTransport> Host for ServiceHost<H, T> {
     fn profile_boundary(&mut self, phase: crate::machine::engine::step_timing::Phase, now: u64) {
         self.local.profile_boundary(phase, now);
     }
+    fn profile_exit(&mut self, slot: usize, now: u64) {
+        self.local.profile_exit(slot, now);
+    }
+    fn profile_code(
+        &mut self,
+        code: NativeCode,
+        bytes: usize,
+        regions: &[(u32, crate::machine::engine::step_timing::CodeRegion)],
+    ) {
+        self.local.profile_code(code, bytes, regions);
+    }
     fn translations(&mut self) -> Option<&mut dyn crate::machine::Translations> {
         self.local.translations()
     }

@@ -13,24 +13,89 @@ fn usage_values(heap: &Heap) -> [usize; 5] {
     [u.total, u.live, u.carved, u.peak, u.largest]
 }
 
+/// A heap of `bytes` aligned to the largest slab, leaked by the test.
+fn slab_aligned(heap: &Heap, bytes: usize) -> usize {
+    let layout = Layout::from_size_align(bytes, SLAB_LARGEST).unwrap();
+    // SAFETY: a nonzero layout; the test leaks this backing.
+    let ram = unsafe { std::alloc::alloc(layout) };
+    // SAFETY: exclusive backing for the test's whole run.
+    unsafe { heap.initialize(ram, layout.size()) };
+    ram as usize
+}
+
 #[test]
-fn a_heap_whose_bins_are_nearly_empty_is_low_though_little_is_live() {
+fn freed_small_blocks_return_their_slabs_to_the_bins_but_one_per_class() {
     let heap = Heap::new();
-    let mut ram = backing();
-    // SAFETY: exclusive test backing, kept through every exact free.
-    unsafe { heap.initialize(ram.0.as_mut_ptr(), ram.0.len()) };
+    let start = slab_aligned(&heap, 512 << 10);
     let layout = Layout::from_size_align(4096, 16).unwrap();
-    // SAFETY: valid layouts; the blocks return to their class, never to the
-    // bins, which is what this test measures.
+    let class = class(layout).unwrap();
+    // SAFETY: valid layouts, each block freed once.
     unsafe {
         let blocks: Vec<*mut u8> = (0..31).map(|_| heap.alloc(layout)).collect();
         assert!(blocks.iter().all(|block| !block.is_null()));
+        // Three slabs of 15, with no header per block.
+        assert_eq!(heap.usage().slabs, 3);
+        for &block in &blocks {
+            let slab = slab_of(block, class) as usize - HEADER_BYTES;
+            assert_eq!(slab % slab_bytes(class), 0);
+            assert!(block as usize >= slab + SLAB_FIRST);
+            assert!(block as usize + 4096 <= slab + slab_bytes(class));
+            assert!(slab >= start);
+        }
         for block in blocks {
             heap.dealloc(block, layout);
         }
     }
-    assert_eq!(heap.usage().live, 0);
-    assert!(heap.low());
+    let usage = heap.usage();
+    assert_eq!(usage.live, 0);
+    assert_eq!((usage.slabs, usage.carved), (1, slab_bytes(class)));
+    assert_eq!(usage.slab_free, 15 * 4096);
+    assert!(!heap.low());
+}
+
+#[test]
+fn a_freed_slab_leaves_a_hole_the_next_slab_takes() {
+    let heap = Heap::new();
+    slab_aligned(&heap, 1 << 20);
+    let small = Layout::from_size_align(4096, 16).unwrap();
+    let large = Layout::from_size_align(40 << 10, 16).unwrap();
+    // SAFETY: valid layouts, each block freed once.
+    unsafe {
+        // Slabs between large blocks, then all but one slab's blocks freed:
+        // the empty slabs past the kept one leave holes of their size.
+        let mut smalls = Vec::new();
+        let mut larges = Vec::new();
+        for _ in 0..6 {
+            smalls.extend((0..15).map(|_| heap.alloc(small)));
+            larges.push(heap.alloc(large));
+        }
+        assert!(smalls.iter().chain(&larges).all(|block| !block.is_null()));
+        assert_eq!(heap.usage().slabs, 6);
+        for block in smalls.drain(..) {
+            heap.dealloc(block, small);
+        }
+        assert_eq!(heap.usage().slabs, 1);
+        // New slabs fill those holes, not the free tail past the last
+        // large block.
+        let tail = *larges.iter().max().unwrap() as usize;
+        let again: Vec<*mut u8> = (0..60).map(|_| heap.alloc(small)).collect();
+        assert!(
+            again
+                .iter()
+                .all(|&block| !block.is_null() && (block as usize) < tail)
+        );
+        for block in again {
+            heap.dealloc(block, small);
+        }
+        for block in larges {
+            heap.dealloc(block, large);
+        }
+    }
+    let usage = heap.usage();
+    assert_eq!(
+        (usage.live, usage.slabs, usage.carved),
+        (0, 1, SLAB_LARGEST)
+    );
 }
 
 #[test]
@@ -728,9 +793,9 @@ fn fragmented_selection_skips_earlier_extents_and_preserves_other_owners() {
         heap.dealloc(metadata, small);
         heap.dealloc(b, page);
     }
-    // The ordinary small-object cache keeps its own block, as before.
+    // The small block's class keeps its empty slab.
     assert_eq!(heap.usage().live, 0);
-    assert!(heap.usage().carved < 2 * PAGE_BYTES);
+    assert_eq!(heap.usage().carved, slab_bytes(class(small).unwrap()));
 }
 
 #[test]
@@ -945,3 +1010,6 @@ fn the_room_is_what_no_block_was_carved_from_and_comes_back_when_freed() {
     }
     assert_eq!(heap.room(), total);
 }
+
+#[path = "replay.rs"]
+mod replay;

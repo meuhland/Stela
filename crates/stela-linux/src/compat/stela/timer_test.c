@@ -163,6 +163,21 @@ static void hrtimer_waits(void)
 		usleep_range(0, 1);
 	assert(fires == 1 && !hrtimer_active(&earlier));
 	assert(try_wait_for_completion(&high_fired));
+
+	/* A sleep where the caller may not sleep is reported and spins for its
+	 * minimum, as Linux warns and goes on; due work waits for it. */
+	fires = 0;
+	hrtimer_start(&earlier, ktime_get() - 1, HRTIMER_MODE_ABS);
+	preempt_disable();
+	ktime_t before = ktime_get();
+	msleep(2);
+	usleep_range(500, 1000);
+	assert(ktime_get() - before >= 2 * NSEC_PER_MSEC + 500 * NSEC_PER_USEC);
+	assert(!READ_ONCE(fires) && hrtimer_active(&earlier));
+	preempt_enable();
+	for (int sleeps = 0; sleeps < 1000 && !READ_ONCE(fires); sleeps++)
+		usleep_range(0, 1);
+	assert(fires == 1 && try_wait_for_completion(&high_fired));
 }
 
 void stela_linux_timer_test_sleeper(void)

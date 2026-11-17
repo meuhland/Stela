@@ -17,6 +17,8 @@ use uefi::{
 pub(crate) struct Entry {
     pub number: u16,
     pub name: String,
+    /// It starts a system on the PC's disks (`LoadOption::on_disk`).
+    pub on_disk: bool,
 }
 
 /// The firmware's listed boot entries in its order, without Stela's own.
@@ -37,6 +39,7 @@ pub(crate) fn list() -> Vec<Entry> {
         match LoadOption::parse(&bytes) {
             Ok(option) if option.listed() && !option.starts_from(&own) => entries.push(Entry {
                 number,
+                on_disk: option.on_disk(),
                 name: match option.description.is_empty() {
                     true => firmware_boot::variable(number),
                     false => option.description,

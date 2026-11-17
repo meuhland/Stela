@@ -395,11 +395,61 @@ fn a_pending_bundle_repair_boots_macos_once_for_it_and_never_again_by_itself() {
     // leaves no request to repeat.
     assert!(consume(&mut vars, &selection).unwrap());
     assert_eq!(lookup(&vars, BUNDLE_REPAIR), Some(BUNDLE_REPAIR_ATTEMPTED));
+    // By this version, so a later Stela may try once more.
+    assert_eq!(
+        lookup(&vars, BUNDLE_REPAIR_VERSION),
+        Some(BUNDLE_REPAIR_VERSION_VALUE)
+    );
     let next = select(&vars).unwrap();
     assert!(!next.bundle_repair);
     assert!(!next.consumes());
     let (plain, _) = route(CONFIG, Some(&next)).unwrap();
     assert!(!plain.contains(BUNDLE_REPAIR_OPTION), "{plain}");
+}
+
+#[test]
+fn a_retry_boots_macos_for_the_repair_once_more_and_then_never_by_itself() {
+    let mut vars = variables(&[(Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_RETRY)]);
+    let selection = select(&vars).unwrap();
+    assert_eq!(selection.target, Target::MacOs { safe: false });
+    assert!(selection.bundle_repair);
+    let (options, _) = route(CONFIG, Some(&selection)).unwrap();
+    assert!(options.ends_with(BUNDLE_REPAIR_OPTION), "{options}");
+    assert!(consume(&mut vars, &selection).unwrap());
+    assert_eq!(lookup(&vars, BUNDLE_REPAIR), Some(BUNDLE_REPAIR_RETRIED));
+    let next = select(&vars).unwrap();
+    assert!(!next.bundle_repair && !next.consumes());
+}
+
+#[test]
+fn taking_a_bundle_repair_removes_the_last_attempts_result() {
+    for record in [
+        BUNDLE_REPAIR_PENDING,
+        BUNDLE_REPAIR_RETRY,
+        BUNDLE_REPAIR_INSTALLED,
+    ] {
+        let mut vars = variables(&[
+            (Partition::System, BUNDLE_REPAIR, record),
+            (Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited"),
+        ]);
+        let selection = select(&vars).unwrap();
+        assert!(selection.consumed.contains(&BUNDLE_REPAIR_RESULT));
+        assert!(consume(&mut vars, &selection).unwrap());
+        assert_eq!(lookup(&vars, BUNDLE_REPAIR_RESULT), None);
+        // A boot that takes nothing keeps it for the stop to name.
+        let mut empty = select(&variables(&[
+            (Partition::System, BUNDLE_REPAIR, record),
+            (Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited"),
+        ]))
+        .unwrap();
+        empty.missing_boot_media();
+        assert!(!empty.consumes());
+    }
+    let vars = variables(&[
+        (Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_ATTEMPTED),
+        (Partition::System, BUNDLE_REPAIR_RESULT, b"step 3 exited"),
+    ]);
+    assert!(!select(&vars).unwrap().consumes());
 }
 
 #[test]
@@ -414,6 +464,13 @@ fn an_installs_bundle_repair_boots_macos_once_for_it_and_leaves_no_record() {
     // boot free to ask for the usual one.
     assert!(consume(&mut vars, &selection).unwrap());
     assert_eq!(lookup(&vars, BUNDLE_REPAIR), None);
+    let mut older = variables(&[
+        (Partition::System, BUNDLE_REPAIR, BUNDLE_REPAIR_INSTALLED),
+        (Partition::System, BUNDLE_REPAIR_VERSION, b"0.0.1"),
+    ]);
+    let selection = select(&older).unwrap();
+    consume(&mut older, &selection).unwrap();
+    assert_eq!(lookup(&older, BUNDLE_REPAIR_VERSION), None);
     assert!(!select(&vars).unwrap().bundle_repair);
     // A recoveryOS boot and a disk without a system leave the request.
     let mut empty = select(&variables(&[(

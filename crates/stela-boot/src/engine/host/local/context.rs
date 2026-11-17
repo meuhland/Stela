@@ -17,7 +17,7 @@ use stela_drivers::{bus::mmio::owned::PhysicalSpan, platform::work::WorkError};
 
 const IF: u64 = 1 << 9;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
-/// CR4.PCIDE: CR3's low twelve bits name the root's PCID.
+/// CR4.PCIDE: CR3's low twelve bits are the root's PCID.
 const CR4_PCIDE: u64 = 1 << 17;
 
 /// This processor's GS base, as its record's self pointer names it. Every
@@ -54,6 +54,55 @@ fn unavailable<T>(_: T) -> WorkError {
     WorkError::Unavailable
 }
 
+/// The processor running an identity's Linux work in its place
+/// ([`RootIdentity::move_here`]): the GS record of the identity's own
+/// processor and of the one in its place, zero while none is.
+static MOVED_FROM: AtomicU64 = AtomicU64::new(0);
+static MOVED_TO: AtomicU64 = AtomicU64::new(0);
+/// No processor takes an identity's place any more ([`close_moves`]).
+static MOVES_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// This processor runs Linux work in place of an identity's own processor
+/// until dropped ([`RootIdentity::move_here`]).
+pub(crate) struct Moved {
+    _local: PhantomData<*mut ()>,
+}
+impl Drop for Moved {
+    fn drop(&mut self) {
+        MOVED_TO.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Whether [`close_moves`] ran.
+pub(crate) fn moves_closed() -> bool {
+    MOVES_CLOSED.load(Ordering::Relaxed)
+}
+
+/// Whether this processor runs an identity's Linux work in its place now.
+pub(crate) fn moved_here() -> bool {
+    let to = MOVED_TO.load(Ordering::Acquire);
+    to != 0 && to == gs_base()
+}
+
+/// No processor takes an identity's place from now on, and the one that
+/// has, if any, is waited for, for at most `ticks` TSC ticks: the GPUs'
+/// stop, whose Linux work changes interrupt routes and unloads firmware,
+/// runs on the boot processor only. Whether none runs in its place now.
+#[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+pub(crate) fn close_moves(ticks: u64) -> bool {
+    MOVES_CLOSED.store(true, Ordering::SeqCst);
+    let start = crate::engine::host::rdtsc();
+    while MOVED_TO.load(Ordering::SeqCst) != 0 {
+        if crate::engine::host::rdtsc().wrapping_sub(start) >= ticks {
+            return false;
+        }
+        // The processor in its place may be retiring a mapping.
+        crate::native_mmio::shootdown::service();
+        core::hint::spin_loop();
+    }
+    true
+}
+
 /// Immutable CPU/descriptor/fixed-root identity, pinned by HostOwner.
 /// This survives only checked RAM ownership joins. It grants no RAM-absence,
 /// mutable mapping-publication, task switching, or cross-CPU execution permission.
@@ -88,7 +137,7 @@ impl ProcessRootScope<'_> {
             || !core::ptr::eq(self.identity.loader_tables, owner)
             || !crate::engine::storage::entered_loader_root(owner)
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
@@ -98,7 +147,7 @@ impl ProcessRootScope<'_> {
     ) -> Result<Option<stela_boot_core::guarded_stacks::mappings::Observation>, WorkError> {
         self.identity.validate_process_root()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: same HostOwner/original loader owner, kept shared
         // aliases and IF0 scope were checked immediately above. No callbacks.
@@ -106,7 +155,7 @@ impl ProcessRootScope<'_> {
             unsafe { self.identity.loader_tables.observe_shared(address) }.map_err(unavailable)?;
         self.identity.validate_process_root()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(result)
     }
@@ -127,7 +176,7 @@ impl RootIdentity {
         if root() != self.snapshot.cr3
             && !crate::engine::storage::entered_loader_root(self.loader_tables)
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: fixed Host root is held by roots._lease, and the
         // entered original loader root is held by loader_tables. Both shared
@@ -154,10 +203,10 @@ impl RootIdentity {
             let address = crate::layout::physical(self.loader_tables.root());
             let observed = scope
                 .observe_original(address)?
-                .ok_or(WorkError::CorruptContext)?;
+                .ok_or_else(|| WorkError::corrupt())?;
             if observed.physical != self.loader_tables.root() || observed.user || !observed.writable
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             Ok(())
         })();
@@ -173,40 +222,58 @@ impl RootIdentity {
         // so none can borrow this processor's removable scope. Every Linux
         // context check comes here; CPUID or reading APIC_BASE would exit to
         // a hypervisor, and the GS record already names one processor.
-        if gs_base() != self.gs {
+        // The one processor in its place ([`Self::move_here`]) holds the
+        // host drivers' lock, which every Linux entry takes, and has its
+        // own descriptors.
+        let gs = gs_base();
+        if gs != self.gs {
+            if gs != 0
+                && MOVED_TO.load(Ordering::Acquire) == gs
+                && MOVED_FROM.load(Ordering::Acquire) == self.gs
+            {
+                return Ok(());
+            }
             return Err(WorkError::WrongCpu);
         }
         // SAFETY: immutable architectural observation; original owner kept.
         let observed = unsafe { interrupts::observe_descriptors() };
         if observed.gdt != self.gdt || observed.idt != self.idt || observed.task != self.task {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
     pub(crate) fn check_current(&self) -> Result<(), WorkError> {
         self.affinity()?;
         if root() != self.snapshot.cr3 {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
-        // With CR4.PCIDE the low twelve bits are the root's PCID: the engine
-        // tags each guest view's root with its own context (`tag_views`), so a
-        // registered root may be current as root|context. Without PCIDE they
-        // are PWT/PCD, and any of them set is refused as before.
-        let cr4: u64;
-        // SAFETY: a CPL0 control register read.
-        unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
-        let context = if cr4 & CR4_PCIDE != 0 { 0xfff } else { 0 };
-        if current & !ADDRESS & !context != 0 || !self.roots.roots().contains(&(current & ADDRESS)) {
+        // While this core's views are tagged (`host::tag_views`), its guest
+        // roots load as root | PCID, and an IRQ or a Linux call between the
+        // run's slices observes one: the base decides. CR4 is read only for
+        // such a root, not from the host's state, which an IRQ must not
+        // borrow; an untagged root needs no read.
+        let tagged = current & stela_boot_core::paging_controls::ROOT_CONTEXT != 0 && {
+            let cr4: u64;
+            // SAFETY: CPL0 control register read.
+            unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+            cr4 & CR4_PCIDE != 0
+        };
+        if !stela_boot_core::paging_controls::registered_root(
+            current,
+            tagged,
+            super::super::CONTEXTS,
+            self.roots.roots(),
+        ) {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
             if !crate::engine::storage::entered_loader_root(self.loader_tables) {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let saved = disable();
             let result = self.validate_process_root();
@@ -217,6 +284,41 @@ impl RootIdentity {
             return result;
         }
         Ok(())
+    }
+    /// Whether this is the identity's own processor.
+    pub(crate) fn owner_here(&self) -> bool {
+        gs_base() == self.gs
+    }
+    /// Have this processor run the identity's Linux work in its place
+    /// until the result drops: its checks accept this processor then, and
+    /// only it. `None` on the identity's own processor, while another
+    /// processor is in its place, or once [`close_moves`] ran.
+    ///
+    /// # Safety
+    /// This processor holds the host drivers' lock, which every Linux entry
+    /// takes, from before this until after the result drops, and runs only
+    /// the identity's Linux work meanwhile: no interrupt route, timer or
+    /// idle wait of the identity's processor.
+    pub(crate) unsafe fn move_here(&self) -> Option<Moved> {
+        let gs = gs_base();
+        if gs == self.gs || gs == 0 {
+            return None;
+        }
+        if MOVED_TO
+            .compare_exchange(0, gs, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        MOVED_FROM.store(self.gs, Ordering::SeqCst);
+        let moved = Moved {
+            _local: PhantomData,
+        };
+        // Against `close_moves`' store before its look at `MOVED_TO`.
+        if MOVES_CLOSED.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(moved)
     }
     pub(crate) fn in_interrupt(&self) -> bool {
         self.affinity().is_err() || irq_active()
@@ -237,8 +339,7 @@ impl RootIdentity {
     }
 
     pub(crate) fn fatal(&self, error: WorkError) -> ! {
-        crate::output::arguments(format_args!("NATIVE ROOT FATAL {error:?}\n"));
-        crate::output::fatal("native root contract failed")
+        crate::output::fatal(format_args!("native root contract failed: {error:?}"))
     }
     pub(crate) fn root_pages(&self) -> &[u64] {
         self.roots.roots()
@@ -359,12 +460,12 @@ impl Owner {
         // SAFETY: processor's installed descriptor set.
         let observed = unsafe { interrupts::observe() };
         if observed.gs != self.local.as_ptr() as u64 || snapshot.cr3 & !ADDRESS != 0 {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let state = state();
         let levels = if snapshot.cr4 & (1 << 12) != 0 { 5 } else { 4 };
         if state._loader_tables.levels() != levels {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if state.native || snapshot.cr3 != state.host_root {
             return Err(WorkError::Busy);
@@ -379,7 +480,7 @@ impl Owner {
         roots.sort_unstable();
         roots.dedup();
         if roots.iter().any(|r| *r == 0 || r & !ADDRESS != 0) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let mut ram = alloc::vec::Vec::new();
         ram.try_reserve_exact(state.ram.len())
@@ -490,7 +591,7 @@ impl Owner {
             let context = if let Some(context) = self.root_context.upgrade() {
                 context.check_current()?;
                 if !Arc::ptr_eq(&context.identity, &identity) {
-                    return Err(WorkError::CorruptContext);
+                    return Err(WorkError::corrupt());
                 }
                 context
             } else {

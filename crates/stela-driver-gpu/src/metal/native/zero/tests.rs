@@ -334,6 +334,7 @@ fn rendering(extent: [u32; 2], color: Vec<Option<Attachment>>) -> Rendering {
         color,
         depth: None,
         stencil: None,
+        note: 0,
     }
 }
 

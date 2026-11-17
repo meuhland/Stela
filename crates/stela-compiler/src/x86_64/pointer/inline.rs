@@ -36,6 +36,10 @@ pub struct Cells {
     pub strips: u32,
     /// The word holding the address of the [`super::ServiceRoutine`].
     pub routine: u32,
+    /// The [`super::cipher::Cipher`] blocks compute PAC results from, where
+    /// the engine keeps one; else they look them up in the memo.
+    #[serde(default)]
+    pub cipher: Option<u32>,
 }
 
 /// Whether a block completes `operation` inside itself.
@@ -80,11 +84,14 @@ pub(crate) fn emit(code: &mut Code, operation: Operation, pc: GuestAddress, cell
     let form = Form::of(operation)
         .filter(|form| form.completion == Finish::Register)
         .expect("a form that completes into its register");
-    let Lookup { misses, modifier } = lookup(
-        &mut asm,
-        form,
-        Place::new(Anchor::Pointer, cells.tags as usize),
-    );
+    let tags = Place::new(Anchor::Pointer, cells.tags as usize);
+    let Lookup { misses, modifier } = match cells.cipher {
+        Some(cipher) => {
+            let cipher = Place::new(Anchor::Pointer, cipher as usize);
+            super::cipher::compute(&mut asm, form, tags, cipher)
+        }
+        None => lookup(&mut asm, form, tags),
+    };
     let complete = asm.len();
     let result = asm.guest(Register::X(form.result)).expect("X0..X30");
     asm.mov_store(Size::Qword, result, Gpr::Rax);
@@ -152,6 +159,7 @@ mod tests {
         tags: core::mem::offset_of!(Service, tags) as u32,
         strips: core::mem::offset_of!(Service, strips) as u32,
         routine: core::mem::offset_of!(Service, routine) as u32,
+        cipher: None,
     };
 
     fn compile(words: &[u32], cells: Option<Cells>) -> crate::block::CompiledBlock {
@@ -168,6 +176,20 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap()
+    }
+
+    /// A block's service call through the cell ends as `--profile`'s host
+    /// samples look for it before a return address.
+    #[test]
+    fn block_service_calls_end_as_host_samples_look_for_them() {
+        const PACIBSP: u32 = 0xd503_237f;
+        const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+        let block = compile(&[PACIBSP, ADD], Some(CELLS));
+        let [cell, address] = super::super::service_call_ends(CELLS.routine, 0x1234_5678);
+        let code = &block.native.x86_64_code;
+        let contains = |end: &[u8]| code.windows(end.len()).any(|bytes| bytes == end);
+        assert!(contains(&cell));
+        assert!(!contains(&address));
     }
 
     #[test]
@@ -295,8 +317,9 @@ mod tests {
             assert!(bytes.len() <= BYTES);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
             assert_eq!(mprotect(page, BYTES, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(&mut state);
             assert_eq!(munmap(page, BYTES), 0);
             exit

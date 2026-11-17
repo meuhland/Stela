@@ -154,7 +154,7 @@ impl<const N: usize> Runtime<N> {
             if task.state == TaskState::Ready && matches!(task.lane, Lane::Notify | Lane::Portal) {
                 let sequence = match task.job {
                     Some((_, job)) => job.sequence,
-                    None => self.queue.cpu.fatal(WorkError::CorruptContext),
+                    None => self.queue.cpu.fatal(WorkError::corrupt()),
                 };
                 let earlier = (0..count).any(|peer| {
                     // SAFETY: same stopped task vector; this read cannot switch or invoke work.
@@ -258,7 +258,7 @@ impl<const N: usize> Runtime<N> {
                 // wake preserves its original ready order.
                 let ready = task
                     .job
-                    .ok_or(WorkError::CorruptContext)
+                    .ok_or_else(|| WorkError::corrupt())
                     .and_then(|job| guard.state().scheduling.wake(task.id, job.1.sequence));
                 if let Err(error) = ready {
                     self.queue.cpu.fatal(error);
@@ -289,11 +289,11 @@ impl<const N: usize> Runtime<N> {
                         guard.state().scheduling.precedes(
                             (
                                 task.id,
-                                task.job.ok_or(WorkError::CorruptContext)?.1.sequence,
+                                task.job.ok_or_else(|| WorkError::corrupt())?.1.sequence,
                             ),
                             (
                                 prior.id,
-                                prior.job.ok_or(WorkError::CorruptContext)?.1.sequence,
+                                prior.job.ok_or_else(|| WorkError::corrupt())?.1.sequence,
                             ),
                         )
                     })();
@@ -351,7 +351,7 @@ impl<const N: usize> Runtime<N> {
         let running = (|| {
             self.queue.lock()?.state().scheduling.running(
                 task.id,
-                task.job.ok_or(WorkError::CorruptContext)?.1.sequence,
+                task.job.ok_or_else(|| WorkError::corrupt())?.1.sequence,
                 now,
             )
         })();
@@ -363,7 +363,7 @@ impl<const N: usize> Runtime<N> {
             // invariant failure retains fatally rather than returning a partly
             // dispatched row as a normal refused step.
             let opened = (|| {
-                let sequence = task.job.ok_or(WorkError::CorruptContext)?.1.sequence;
+                let sequence = task.job.ok_or_else(|| WorkError::corrupt())?.1.sequence;
                 let (total, through, segment) = self
                     .queue
                     .lock()?
@@ -396,6 +396,13 @@ impl<const N: usize> Runtime<N> {
         self.physical_enter(i)
             .unwrap_or_else(|error| self.queue.cpu.fatal(error));
         let switched = step_counts::now();
+        // SAFETY: task `i` is valid and IRQs are disabled; this read ends
+        // before the switch.
+        let (id, sequence) = unsafe {
+            let task = &*self.task(i);
+            (task.id.get(), task.job.map_or(0, |(_, job)| job.sequence))
+        };
+        step_counts::begin(id, sequence, switched);
         // SAFETY: both frames are held, pinned and initialized; IRQs stay disabled
         // across the switch, and no lock or borrow spans it.
         unsafe {
@@ -405,8 +412,9 @@ impl<const N: usize> Runtime<N> {
             )
         };
         let returned = step_counts::now();
+        step_counts::end(returned);
         if self.current.get() != NONE || self.queue.active.id.load(Ordering::Acquire) != 0 {
-            self.queue.cpu.fatal(WorkError::CorruptContext);
+            self.queue.cpu.fatal(WorkError::corrupt());
         }
         // Original do_task_dead never returns through its C/Rust callback.
         // Only this real architectural successor may acknowledge its tail.
@@ -438,6 +446,8 @@ impl<const N: usize> Runtime<N> {
         let Some(domain) = self.domain() else {
             return Ok(false);
         };
+        // Nothing runs: no step is stuck while the dispatcher idles.
+        step_counts::WATCH.returned(step_counts::now());
         if let Err(error) = domain.idle() {
             self.queue.cpu.fatal(error);
         }

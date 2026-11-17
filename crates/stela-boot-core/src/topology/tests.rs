@@ -443,8 +443,41 @@ fn disabled_and_unhealthy_aps_cannot_supply_guest_capacity() {
     cores[1].flags = HEALTHY;
     cores[2].flags = ENABLED;
     assert_eq!(select(&cores), Ok(alloc::vec![0]));
+    // The health bit is advisory for the bootstrap processor alone.
     cores[0].flags = BSP | ENABLED;
+    assert_eq!(select(&cores), Ok(alloc::vec![0]));
+    cores[0].flags = BSP | HEALTHY;
     assert_eq!(select(&cores), Err(Refusal::BootstrapUnavailable));
+}
+
+#[test]
+fn health_bits_that_mark_the_running_bootstrap_processor_unhealthy_leave_no_ap_out() {
+    // Firmware that marks every processor unhealthy, the BSP included.
+    let mut cores = [
+        processor(0, 0, 0, 0),
+        processor(1, 0, 1, 0),
+        processor(2, 0, 2, 0),
+    ];
+    for core in &mut cores {
+        core.flags = ENABLED;
+    }
+    cores[0].flags |= BSP;
+    assert_eq!(select(&cores), Ok(alloc::vec![0]));
+    assert!(ignore_unreported_health(&mut cores));
+    assert_eq!(select(&cores), Ok(alloc::vec![0, 1, 2]));
+    // A disabled processor stays out.
+    cores[2].flags = ENABLED | BSP;
+    cores[0].flags = HEALTHY;
+    cores[1].flags = ENABLED;
+    assert!(ignore_unreported_health(&mut cores));
+    assert_eq!(select(&cores), Ok(alloc::vec![2, 1]));
+    // With a healthy BSP, an AP marked unhealthy stays out.
+    let mut cores = [processor(0, 0, 0, 0), processor(1, 0, 1, 0)];
+    cores[0].flags |= BSP;
+    cores[1].flags = ENABLED;
+    assert!(!ignore_unreported_health(&mut cores));
+    assert_eq!(cores[1].flags, ENABLED);
+    assert_eq!(select(&cores), Ok(alloc::vec![0]));
 }
 
 #[test]
@@ -712,6 +745,52 @@ fn common_target_keeps_vex_vector_recipes_only_with_every_worker_ymm_state() {
     assert!(!common.supports(TargetCpu::Avx2));
 }
 
+/// AVX-512F and its extensions need opmask and ZMM state that every
+/// installed worker's XCR0 enables beside its YMM state, and the CPUID bits
+/// on every worker.
+#[test]
+fn common_target_keeps_evex_recipes_only_with_every_worker_zmm_state() {
+    use stela_compiler::TargetCpu;
+    const AVX2: u32 = 1 << 5;
+    const AVX512F: u32 = 1 << 16;
+    const AVX512_EBX: u32 = (1 << 17) | (1 << 28) | (1 << 30) | (1 << 31);
+    let mut rich = target_snapshot(TargetCpu::AMD_VENDOR);
+    rich.records[2].ebx |= AVX2 | AVX512F | AVX512_EBX;
+    rich.records[2].ecx |= 1 << 14;
+    rich.xcr0 = 0xe7;
+    rich.xcr0_valid = true;
+    let common = common_native_target(&[&rich]).unwrap();
+    assert!(common.supports(TargetCpu::Baseline.with_avx2()));
+    assert!(common.supports(TargetCpu::Baseline.with_avx512f().with_avx512vl()));
+    assert!(common.supports(TargetCpu::Avx512vpopcntdq));
+    assert!(!common.supports(TargetCpu::Avx512vbmi));
+    let mut ymm_only = rich;
+    ymm_only.xcr0 = 0x7;
+    let mut unobserved = rich;
+    unobserved.xcr0_valid = false;
+    let mut without_avx = rich;
+    without_avx.records[0].ecx &= !(1 << 28);
+    let mut fused_off = rich;
+    fused_off.records[2].ebx &= !AVX512F;
+    for worker in [ymm_only, unobserved, without_avx, fused_off] {
+        let common = common_native_target(&[&rich, &worker]).unwrap();
+        for excluded in [
+            TargetCpu::Avx512f,
+            TargetCpu::Avx512vl,
+            TargetCpu::Avx512bw,
+            TargetCpu::Avx512vpopcntdq,
+        ] {
+            assert!(!common.supports(excluded), "{excluded:?}");
+        }
+    }
+    // A worker without one extension removes only that one.
+    let mut without_vl = rich;
+    without_vl.records[2].ebx &= !(1 << 31);
+    let common = common_native_target(&[&rich, &without_vl]).unwrap();
+    assert!(common.supports(TargetCpu::Avx512f.with_avx512bw()));
+    assert!(!common.supports(TargetCpu::Avx512vl));
+}
+
 /// BMI1 and BMI2 need VEX decoding, which an Intel worker without AVX
 /// lacks, and fast PDEP a Zen 3 or later AMD core on every worker.
 #[test]
@@ -897,6 +976,46 @@ fn mtrr_pat_equality_does_not_conflate_clock_adjustment() {
     );
 }
 
+/// The memory-type registers firmware changed after the capture are named
+/// each with both values, a register only one side holds too, and no other
+/// register or PAT.
+#[test]
+fn memory_type_differences_name_each_changed_register() {
+    let captured = native_snapshot();
+    assert_eq!(captured.memory_type_differences(&captured).count(), 0);
+    let mut now = captured;
+    now.pat ^= 1 << 8;
+    now.msrs[now.msr_count as usize] = Msr {
+        index: 0x3b,
+        value: 5,
+    };
+    now.msr_count += 1;
+    assert_eq!(now.memory_type_differences(&captured).count(), 0);
+    let mut now = captured;
+    now.msrs[1].value ^= 1;
+    now.msrs[now.msr_count as usize] = Msr {
+        index: 0x20f,
+        value: 0xff00_0800,
+    };
+    now.msr_count += 1;
+    let differences: Vec<_> = captured.memory_type_differences(&now).collect();
+    assert_eq!(
+        differences,
+        [
+            (
+                captured.msrs[1].index,
+                Some(captured.msrs[1].value),
+                Some(captured.msrs[1].value ^ 1)
+            ),
+            (0x20f, None, Some(0xff00_0800)),
+        ]
+    );
+    assert_eq!(
+        captured.same_memory_types(&now),
+        Err(CapabilityRefusal::MemoryTypes)
+    );
+}
+
 /// The legacy hole's DRAM routing is each processor's own on AMD: two
 /// processors that differ only there have the same installed memory types.
 #[test]
@@ -1039,5 +1158,62 @@ fn a_missing_floor_names_each_feature() {
         refusal(changed).refusal().to_string(),
         "this PC's CPU lacks SSE and a valid PAT setting; Stela needs an x86-64-v2 CPU (Intel Nehalem, AMD \
          Bulldozer or newer)"
+    );
+}
+
+#[test]
+fn an_unhealthy_bootstrap_processor_still_leads_and_unhealthy_aps_run_no_pe() {
+    let mut processors = [
+        processor(0, 0, 0, 0),
+        processor(1, 0, 1, 0),
+        processor(2, 0, 2, 0),
+    ];
+    processors[0].flags = BSP | ENABLED;
+    processors[2].flags = ENABLED;
+    assert_eq!(select(&processors), Ok(alloc::vec![0, 1]));
+    processors[0].flags = BSP;
+    assert_eq!(select(&processors), Err(Refusal::BootstrapUnavailable));
+}
+
+#[test]
+fn an_ap_that_cannot_be_observed_is_left_out_and_its_sibling_takes_its_place() {
+    // Two cores of two threads; the first core's second thread fails.
+    let mut processors = [
+        processor(0, 0, 0, 0),
+        processor(1, 0, 0, 1),
+        processor(2, 0, 1, 0),
+        processor(3, 0, 1, 1),
+    ];
+    processors[0].flags |= BSP;
+    let mut calls = alloc::vec::Vec::new();
+    let selected = select_observed(
+        &mut processors,
+        |slot, index, _| {
+            calls.push((slot, index));
+            Ok::<_, Refusal>(index != 2)
+        },
+        |refusal| refusal,
+    )
+    .unwrap();
+    assert_eq!(selected, [0, 3, 1]);
+    // Each processor is observed once; the one left out is unavailable now,
+    // so the inventory selects the same order again.
+    assert_eq!(calls, [(0, 0), (1, 2), (2, 1), (3, 3)]);
+    assert!(!processors[2].available());
+    assert_eq!(select(&processors), Ok(selected));
+    // The bootstrap processor cannot be left out, and errors stop.
+    let mut fresh = [processor(0, 0, 0, 0), processor(1, 0, 1, 0)];
+    fresh[0].flags |= BSP;
+    assert_eq!(
+        select_observed(&mut fresh, |_, index, _| Ok(index != 0), |refusal| refusal),
+        Err(Refusal::BootstrapUnavailable)
+    );
+    assert_eq!(
+        select_observed(
+            &mut fresh,
+            |_, _, _| Err(Refusal::InvalidAssignment),
+            |refusal| refusal
+        ),
+        Err(Refusal::InvalidAssignment)
     );
 }

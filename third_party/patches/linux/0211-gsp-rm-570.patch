@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:15:29 +0000
+Subject: [PATCH] fix(nouveau): GSP-RM 570.211.01 gets 570.144's system info
+ through one shared fill plus its three new fields, a behind-bridge flag set
+ as OpenRM sets it and a notify-op surface allocated for it alone, where a
+ full copy of the structure carried a bus-number guess and every GSP chip
+ allocated the surface
+
+---
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c |  4 -
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c | 83 ++++++++++++-------
+ .../nvkm/subdev/gsp/rm/r570/nvrm/gsp.h        | 56 ++-----------
+ 3 files changed, 58 insertions(+), 85 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index 09f8bbd63afd9fbcbae2cc68569029a5a20e155d..34a84a7b076b1b81627c505edd99d1eb8e53d523 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -2471,10 +2471,6 @@ r535_gsp_oneinit(struct nvkm_gsp *gsp)
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
+-	ret = nvkm_gsp_mem_ctor(gsp, GSP_PAGE_SIZE, &gsp->notify_op);
+-	if (WARN_ON(ret))
+-		return ret;
+-
+ 	ret = rmapi->gsp->set_system_info(gsp);
+ 	if (WARN_ON(ret))
+ 		return ret;
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
+index a6dbdbb8e008aacd5b3535559332b762d96955bb..db099a25f8718f7ee18190b41d42b8b42882af8a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
+@@ -157,19 +157,11 @@ r570_gsp_acpi_info(struct nvkm_gsp *gsp, ACPI_METHOD_DATA *acpi)
+ #endif
+ }
+ 
+-static int
+-r570_gsp_set_system_info(struct nvkm_gsp *gsp)
++/* The fields of GspSystemInfo every r570 release takes from nouveau. */
++static void
++r570_gsp_system_info(struct nvkm_gsp *gsp, struct pci_dev *pdev, GspSystemInfo *info)
+ {
+ 	struct nvkm_device *device = gsp->subdev.device;
+-	struct pci_dev *pdev = container_of(device, struct nvkm_device_pci, device)->pdev;
+-	GspSystemInfo *info;
+-
+-	if (WARN_ON(device->type == NVKM_DEVICE_TEGRA))
+-		return -ENOSYS;
+-
+-	info = nvkm_gsp_rpc_get(gsp, NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, sizeof(*info));
+-	if (IS_ERR(info))
+-		return PTR_ERR(info);
+ 
+ 	info->gpuPhysAddr = device->func->resource_addr(device, NVKM_BAR0_PRI);
+ 	info->gpuPhysFbAddr = device->func->resource_addr(device, NVKM_BAR1_FB);
+@@ -184,10 +176,39 @@ r570_gsp_set_system_info(struct nvkm_gsp *gsp)
+ 	r570_gsp_acpi_info(gsp, &info->acpiMethodData);
+ 	info->bIsPrimary = video_is_primary_device(device->dev);
+ 	info->bPreserveVideoMemoryAllocations = false;
++}
++
++static int
++r570_gsp_set_system_info(struct nvkm_gsp *gsp)
++{
++	struct nvkm_device *device = gsp->subdev.device;
++	struct pci_dev *pdev = container_of(device, struct nvkm_device_pci, device)->pdev;
++	GspSystemInfo *info;
++
++	if (WARN_ON(device->type == NVKM_DEVICE_TEGRA))
++		return -ENOSYS;
++
++	info = nvkm_gsp_rpc_get(gsp, NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, sizeof(*info));
++	if (IS_ERR(info))
++		return PTR_ERR(info);
+ 
++	r570_gsp_system_info(gsp, pdev, info);
+ 	return nvkm_gsp_rpc_wr(gsp, info, NVKM_GSP_RPC_REPLY_NOSEQ);
+ }
+ 
++/*
++ * Whether a bridge other than the root port lies between the GPU and the
++ * root complex, as OpenRM sets PDB_PROP_GPU_BEHIND_BRIDGE: the GPU's
++ * upstream port is not its root port.
++ */
++static bool
++r570_gsp_behind_bridge(struct pci_dev *pdev)
++{
++	struct pci_dev *bridge = pci_upstream_bridge(pdev);
++
++	return bridge && pci_is_pcie(bridge) && pci_pcie_type(bridge) != PCI_EXP_TYPE_ROOT_PORT;
++}
++
+ static int
+ r570_211_gsp_set_system_info(struct nvkm_gsp *gsp)
+ {
+@@ -195,45 +216,43 @@ r570_211_gsp_set_system_info(struct nvkm_gsp *gsp)
+ 	struct pci_dev *pdev = container_of(device, struct nvkm_device_pci, device)->pdev;
+ 	GspSystemInfo_r570_211 *info;
+ 	u32 lnk_cap = 0;
++	int ret;
+ 
+-	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, hostPageSize) != 920);
++	/* open-gpu-kernel-modules 570.211.01 gsp_abi_check.c */
++	BUILD_BUG_ON(offsetof(GspSystemInfo, hostPageSize) != 920);
++	BUILD_BUG_ON(sizeof(GspSystemInfo) != 928);
+ 	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, bGspNocatEnabled) != 928);
++	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, bS0ixSupport) != 929);
+ 	BUILD_BUG_ON(offsetof(GspSystemInfo_r570_211, virtualConfigBits) != 930);
++	BUILD_BUG_ON(sizeof(GspSystemInfo_r570_211) != 936);
+ 
+ 	if (WARN_ON(device->type == NVKM_DEVICE_TEGRA))
+ 		return -ENOSYS;
+ 
++	/* The surface this release is told of; set_system_info runs once. */
++	ret = nvkm_gsp_mem_ctor(gsp, GSP_PAGE_SIZE, &gsp->notify_op);
++	if (ret)
++		return ret;
++
+ 	info = nvkm_gsp_rpc_get(gsp, NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO, sizeof(*info));
+ 	if (IS_ERR(info))
+ 		return PTR_ERR(info);
+ 
+-	info->gpuPhysAddr = device->func->resource_addr(device, NVKM_BAR0_PRI);
+-	info->gpuPhysFbAddr = device->func->resource_addr(device, NVKM_BAR1_FB);
+-	info->gpuPhysInstAddr = device->func->resource_addr(device, NVKM_BAR2_INST);
++	r570_gsp_system_info(gsp, pdev, &info->base);
+ 	if (pci_resource_flags(pdev, 5) & IORESOURCE_IO)
+-		info->gpuPhysIoAddr = pci_resource_start(pdev, 5);
+-	info->nvDomainBusDeviceFunc = pci_dev_id(pdev);
+-	info->notifyOpSharedSurfacePhysAddr = gsp->notify_op.addr;
+-	info->maxUserVa = TASK_SIZE;
+-	info->pciConfigMirrorBase = device->pci->func->cfg.addr;
+-	info->pciConfigMirrorSize = device->pci->func->cfg.size;
+-	info->PCIDeviceID = (pdev->device << 16) | pdev->vendor;
+-	info->PCISubDeviceID = (pdev->subsystem_device << 16) | pdev->subsystem_vendor;
+-	info->PCIRevisionID = pdev->revision;
+-	info->bGpuBehindBridge = pdev->bus && pdev->bus->number != 0;
+-	info->b64bBar0Supported = !!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM_64);
+-	r570_gsp_acpi_info(gsp, &info->acpiMethodData);
+-	info->bIsPrimary = video_is_primary_device(device->dev);
++		info->base.gpuPhysIoAddr = pci_resource_start(pdev, 5);
++	info->base.notifyOpSharedSurfacePhysAddr = gsp->notify_op.addr;
++	info->base.bGpuBehindBridge = r570_gsp_behind_bridge(pdev);
++	info->base.b64bBar0Supported = !!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM_64);
+ 	if (pdev->pcie_cap) {
+ 		u32 dev_cap = 0;
+ 
+ 		if (pci_read_config_dword(pdev, pdev->pcie_cap + PCI_EXP_DEVCAP, &dev_cap) == 0)
+-			info->bFlrSupported = !!(dev_cap & PCI_EXP_DEVCAP_FLR);
++			info->base.bFlrSupported = !!(dev_cap & PCI_EXP_DEVCAP_FLR);
+ 		if (pci_read_config_dword(pdev, pdev->pcie_cap + PCI_EXP_LNKCAP, &lnk_cap) == 0)
+-			info->pcieConfigReg.linkCap = lnk_cap;
++			info->base.pcieConfigReg.linkCap = lnk_cap;
+ 	}
+-	info->bPreserveVideoMemoryAllocations = false;
+-	info->hostPageSize = PAGE_SIZE;
++	info->base.hostPageSize = PAGE_SIZE;
+ 
+ 	return nvkm_gsp_rpc_wr(gsp, info, NVKM_GSP_RPC_REPLY_NOSEQ);
+ }
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h
+index 8bbfca4836431aed1ceef3b01e929ac327bc0f31..4e71a74eb9b77ce6dd812a23faf929f71f3b5899 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/gsp.h
+@@ -331,57 +331,15 @@ typedef struct GspSystemInfo
+     NvU64  hostPageSize;
+ } GspSystemInfo;
+ 
+-/* Excerpt of RM GspSystemInfo from https://github.com/NVIDIA/open-gpu-kernel-modules/tree/570.211.01 */
++/*
++ * RM 570.211.01's GspSystemInfo: 570.144's, which ends 8-byte aligned at
++ * hostPageSize, then three fields (open-gpu-kernel-modules 570.211.01
++ * gsp_static_config.h). Every other structure nouveau exchanges with RM is
++ * the same in both releases.
++ */
+ typedef struct GspSystemInfo_r570_211
+ {
+-    NvU64 gpuPhysAddr;
+-    NvU64 gpuPhysFbAddr;
+-    NvU64 gpuPhysInstAddr;
+-    NvU64 gpuPhysIoAddr;
+-    NvU64 nvDomainBusDeviceFunc;
+-    NvU64 simAccessBufPhysAddr;
+-    NvU64 notifyOpSharedSurfacePhysAddr;
+-    NvU64 pcieAtomicsOpMask;
+-    NvU64 consoleMemSize;
+-    NvU64 maxUserVa;
+-    NvU32 pciConfigMirrorBase;
+-    NvU32 pciConfigMirrorSize;
+-    NvU32 PCIDeviceID;
+-    NvU32 PCISubDeviceID;
+-    NvU32 PCIRevisionID;
+-    NvU32 pcieAtomicsCplDeviceCapMask;
+-    NvU8 oorArch;
+-    NvU64 clPdbProperties;
+-    NvU32 Chipset;
+-    NvBool bGpuBehindBridge;
+-    NvBool bFlrSupported;
+-    NvBool b64bBar0Supported;
+-    NvBool bMnocAvailable;
+-    NvU32  chipsetL1ssEnable;
+-    NvBool bUpstreamL0sUnsupported;
+-    NvBool bUpstreamL1Unsupported;
+-    NvBool bUpstreamL1PorSupported;
+-    NvBool bUpstreamL1PorMobileOnly;
+-    NvBool bSystemHasMux;
+-    NvU8   upstreamAddressValid;
+-    BUSINFO FHBBusInfo;
+-    BUSINFO chipsetIDInfo;
+-    ACPI_METHOD_DATA acpiMethodData;
+-    NvU32 hypervisorType;
+-    NvBool bIsPassthru;
+-    NvU64 sysTimerOffsetNs;
+-    GSP_VF_INFO gspVFInfo;
+-    NvBool bIsPrimary;
+-    NvBool isGridBuild;
+-    GSP_PCIE_CONFIG_REG pcieConfigReg;
+-    NvU32 gridBuildCsp;
+-    NvBool bPreserveVideoMemoryAllocations;
+-    NvBool bTdrEventSupported;
+-    NvBool bFeatureStretchVblankCapable;
+-    NvBool bEnableDynamicGranularityPageArrays;
+-    NvBool bClockBoostSupported;
+-    NvBool bRouteDispIntrsToCPU;
+-    NvU64  hostPageSize;
++    GspSystemInfo base;
+     NvBool bGspNocatEnabled;
+     NvBool bS0ixSupport;
+     NvU16  virtualConfigBits;

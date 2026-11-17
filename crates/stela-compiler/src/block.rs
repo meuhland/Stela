@@ -229,6 +229,11 @@ pub struct CompiledBlock {
     /// The block runs its iterations inside itself (`x86_64::block`'s
     /// self-loops), for the engine's counts.
     pub self_loop: bool,
+    /// The code offsets of its cold code, start to end: the slow paths moved
+    /// out of line and the paths placed behind the jumps over them, which
+    /// `--profile`'s host samples tell apart (`PES WHERE`). `(0, 0)` with
+    /// none.
+    pub cold: (u32, u32),
 }
 
 impl CompiledBlock {
@@ -240,6 +245,7 @@ impl CompiledBlock {
             direct_exits: alloc::vec::Vec::new(),
             fault_recovery: alloc::vec::Vec::new(),
             self_loop: false,
+            cold: (0, 0),
         }
     }
 }
@@ -625,7 +631,7 @@ impl CompilationPlan {
             // registers pinned; every other profile keeps the default checks.
             // Every profile keeps the locked recipes: system mode runs its
             // PEs concurrently.
-            let (mut native, fault_recovery, self_loop) = if profile.has(Features::FULL_SYSTEM) {
+            let (mut native, fault_recovery, shape) = if profile.has(Features::FULL_SYSTEM) {
                 crate::x86_64::block::emit_system_mode_looped(
                     &parsed.instructions,
                     parsed.terminal.as_ref(),
@@ -643,7 +649,10 @@ impl CompilationPlan {
                         target,
                     ),
                     alloc::vec::Vec::new(),
-                    false,
+                    crate::x86_64::block::Shape {
+                        self_loop: false,
+                        cold: (0, 0),
+                    },
                 )
             };
             let linked = profile.has(Features::FULL_SYSTEM).then(|| {
@@ -674,7 +683,8 @@ impl CompilationPlan {
                 source_bytes: parsed.source_bytes,
                 direct_exits,
                 fault_recovery,
-                self_loop,
+                self_loop: shape.self_loop,
+                cold: shape.cold,
             });
         };
         Ok(CompiledBlock::unchained(native, parsed.source_bytes))

@@ -23,8 +23,102 @@ pub const WIFI_FIRMWARE_REVISION: &str = "59f9fc2ef8d1e312d2a613d4e1ffad2ff31a0a
 /// this build answers it under both.
 pub const MT7925_BLUETOOTH_REVISION: &str = "2d70539375587a68bdef08fec2e0e1a51698c93a";
 pub const GSP_REVISION: &str = "1987bb2044a6c2d68c39d01c360bdbe17f1eb60c";
-/// The GSP-RM release nouveau's newest interface takes.
-const GSP_RELEASE: &str = "570.144";
+/// NVIDIA's open GPU kernel modules repository, whose generated `bindata`
+/// sources hold the signed bootloader and GSP-FMC images of each release.
+pub const NVIDIA_OPEN_GPU: &str = "https://github.com/NVIDIA/open-gpu-kernel-modules";
+/// NVIDIA's Linux x86_64 driver releases, one directory per release.
+pub const NVIDIA_LINUX_DRIVER: &str = "https://download.nvidia.com/XFree86/Linux-x86_64";
+/// The US mirror of [`NVIDIA_LINUX_DRIVER`], asked second.
+pub const NVIDIA_LINUX_DRIVER_MIRROR: &str = "https://us.download.nvidia.com/XFree86/Linux-x86_64";
+
+/// Where the files of a GSP-RM release come from.
+#[derive(Clone, Copy, Debug)]
+pub enum GspOrigin {
+    /// linux-firmware at [`GSP_REVISION`], under its `LICENCE.nvidia`.
+    LinuxFirmware,
+    /// NVIDIA's own publication of the release, which linux-firmware does
+    /// not have.
+    Nvidia(&'static NvidiaGsp),
+}
+
+/// A chip family's GSP-RM release as NVIDIA publishes it: the bootloader
+/// and GSP-FMC images are built from open-gpu-kernel-modules' generated
+/// sources at the release's tag, the format linux-firmware's own files of
+/// earlier releases have; the GSP-RM image is the first file of the driver
+/// installer's `zstd` tar stream, cut out of a pinned byte range of it. Each
+/// download and each image is pinned by length and SHA-256.
+#[derive(Debug)]
+pub struct NvidiaGsp {
+    /// The chip the `bindata` arrays are named after, as in
+    /// `kgspBinArchiveGspRmBoot_GB202_ucode_image_prod_data`.
+    pub bindata_chip: &'static str,
+    /// The generated source holding the bootloader's descriptor and image.
+    pub bootloader_source: Artifact,
+    /// The generated source holding the GSP-FMC's hash, signature, public
+    /// key and image.
+    pub fmc_source: Artifact,
+    /// The installer's first `length` bytes from `installer_offset`, where
+    /// its `zstd` stream starts, of `installer_length`.
+    pub installer_prefix: Artifact,
+    pub installer_offset: u64,
+    pub installer_length: u64,
+    /// The bootloader, the GSP-FMC and the GSP-RM image, as the stick holds
+    /// them under nouveau's names.
+    pub images: [Recipe; 3],
+}
+
+/// Which of an [`NvidiaGsp`]'s images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvidiaPart {
+    Bootloader,
+    Fmc,
+    Gsp,
+}
+
+impl NvidiaGsp {
+    /// The download `part` is made from.
+    pub fn source(&self, part: NvidiaPart) -> &Artifact {
+        match part {
+            NvidiaPart::Bootloader => &self.bootloader_source,
+            NvidiaPart::Fmc => &self.fmc_source,
+            NvidiaPart::Gsp => &self.installer_prefix,
+        }
+    }
+}
+
+/// One GSP-RM release and the chip families (`gsp` directories, see
+/// [`gsp_directory`]) nouveau runs it on. nouveau's firmware list names one
+/// release per family; a test checks that its source names the same
+/// releases as this table. A further release is one row here, with an
+/// [`NvidiaGsp`] when linux-firmware does not have it.
+#[derive(Debug)]
+pub struct GspRelease {
+    pub release: &'static str,
+    pub directories: &'static [&'static str],
+    pub origin: GspOrigin,
+}
+
+/// Every GSP-RM release nouveau takes. GeForce Blackwell takes 570.211.01:
+/// 570.144 refuses GSP_RM_ALLOC on the RTX 5060 (GB206), and its supported
+/// list lacks every GB206 and GB207 board and the newer GB202, GB203 and
+/// GB205 boards (RTX PRO 4000 to 5000 Blackwell, RTX 5070 Laptop), which
+/// 570.211.01 adds. 570.211.01 adds no Turing to Hopper board, so the other
+/// families stay on linux-firmware's 570.144.
+pub const GSP_RELEASES: [GspRelease; 2] = [
+    GspRelease {
+        release: "570.144",
+        directories: &[
+            "tu102", "tu116", "ga100", "ga102", "ad102", "gh100", "gb100",
+        ],
+        origin: GspOrigin::LinuxFirmware,
+    },
+    GspRelease {
+        release: "570.211.01",
+        directories: &["gb202"],
+        origin: GspOrigin::Nvidia(&GB20X_570_211_01),
+    },
+];
+
 /// The files of a release, of which each chip family has some.
 const GSP_KINDS: [&str; 6] = [
     "booter_load",
@@ -53,10 +147,23 @@ pub struct Artifact {
 
 impl Artifact {
     /// The member at the pinned revision: cgit's `plain` form on
-    /// git.kernel.org, GitLab's `raw` form elsewhere.
+    /// git.kernel.org, raw GitHub for open-gpu-kernel-modules, a release
+    /// directory's file for NVIDIA's drivers, and GitLab's `raw` form
+    /// elsewhere. An image built from NVIDIA's release is fetched as the
+    /// download it is made from ([`NvidiaGsp::source`]).
     pub fn url(&self) -> alloc::string::String {
+        if let Some((release, part)) = nvidia_gsp(self) {
+            return release.source(part).url();
+        }
         if self.source.starts_with(KERNEL_ORG_GIT) {
             format!("{}/plain/{}?h={}", self.source, self.member, self.revision)
+        } else if self.source == NVIDIA_OPEN_GPU {
+            format!(
+                "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/{}/{}",
+                self.revision, self.member
+            )
+        } else if self.source == NVIDIA_LINUX_DRIVER {
+            format!("{}/{}/{}", self.source, self.revision, self.member)
         } else {
             format!("{}/-/raw/{}/{}", self.source, self.revision, self.member)
         }
@@ -64,8 +171,12 @@ impl Artifact {
     /// Every source of the member at the pinned revision, the one to try
     /// first first: linux-firmware's git.kernel.org repository, then its
     /// GitLab mirror, whose unauthenticated traffic has an hourly per-IP
-    /// limit. The pinned hash is checked whichever answers.
+    /// limit; NVIDIA's primary, then US download host for its drivers. The
+    /// pinned hash is checked whichever answers.
     pub fn urls(&self) -> Vec<alloc::string::String> {
+        if let Some((release, part)) = nvidia_gsp(self) {
+            return release.source(part).urls();
+        }
         if self.source == LINUX_FIRMWARE {
             alloc::vec![
                 format!(
@@ -73,6 +184,14 @@ impl Artifact {
                     self.member, self.revision
                 ),
                 self.url(),
+            ]
+        } else if self.source == NVIDIA_LINUX_DRIVER {
+            alloc::vec![
+                self.url(),
+                format!(
+                    "{NVIDIA_LINUX_DRIVER_MIRROR}/{}/{}",
+                    self.revision, self.member
+                ),
             ]
         } else {
             alloc::vec![self.url()]
@@ -135,6 +254,8 @@ enum Consumer {
     IntelRsa,
     Wifi,
     Nouveau,
+    Xe,
+    Amdgpu,
 }
 
 const fn realtek(
@@ -733,7 +854,133 @@ const fn gsp(member: &'static str, length: usize, sha256: &'static str) -> Recip
     }
 }
 
-/// Every GSP-RM file linux-firmware holds for [`GSP_RELEASE`].
+/// An image of an [`NvidiaGsp`] release, under the notice of what it is
+/// made from.
+const fn nvidia_image(
+    source: &'static str,
+    revision: &'static str,
+    member: &'static str,
+    length: usize,
+    sha256: &'static str,
+    license: &'static Artifact,
+) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source,
+            revision,
+            member,
+            length,
+            sha256,
+        },
+        license,
+        consumer: Consumer::Nouveau,
+    }
+}
+
+/// open-gpu-kernel-modules at its tag `570.211.01`.
+const OPEN_GPU_570_211_01: &str = "498793d5e2a86c981b83c1bfb31f1f4a082d0f7b";
+
+/// open-gpu-kernel-modules' `COPYING` at [`OPEN_GPU_570_211_01`]: its files
+/// are MIT unless they say otherwise, and the generated `bindata` sources
+/// the bootloader and GSP-FMC are built from say `SPDX-License-Identifier:
+/// MIT`.
+const OPEN_GPU_570_211_01_LICENSE: Artifact = Artifact {
+    source: NVIDIA_OPEN_GPU,
+    revision: OPEN_GPU_570_211_01,
+    member: "COPYING",
+    length: 19391,
+    sha256: "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06",
+};
+
+/// The `LICENSE` of `NVIDIA-Linux-x86_64-570.211.01.run`, the NVIDIA Driver
+/// License Agreement its GSP-RM image is under. It lies 1.2 GB into the
+/// installer's single `zstd` frame, so the CLI carries this file's exact
+/// bytes rather than downloading the installer for it.
+pub const NVIDIA_DRIVER_570_211_01_LICENSE: Artifact = Artifact {
+    source: NVIDIA_LINUX_DRIVER,
+    revision: "570.211.01",
+    member: "LICENSE",
+    length: 22653,
+    sha256: "c692fb14ad4f499c6aee1b9e144e6905148c420e6225b17cb2937366c1e507ad",
+};
+
+/// GeForce Blackwell's GSP-RM 570.211.01 (`gb202` directory).
+pub const GB20X_570_211_01: NvidiaGsp = NvidiaGsp {
+    bindata_chip: "GB202",
+    bootloader_source: Artifact {
+        source: NVIDIA_OPEN_GPU,
+        revision: OPEN_GPU_570_211_01,
+        member: "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c",
+        length: 2_517_198,
+        sha256: "b439c85d1fb4f6d1aba262008f28b824547998211314ec5bdc5cf712c7aadfa1",
+    },
+    fmc_source: Artifact {
+        source: NVIDIA_OPEN_GPU,
+        revision: OPEN_GPU_570_211_01,
+        member: "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmFmcGfwProdSigned_GB202.c",
+        length: 1_254_981,
+        sha256: "7cb11763c4c80f1e212624819a1ec9f4a97cd17c5f6ed3457cecc256586bf0c9",
+    },
+    // The stream starts after the installer's 164,426-byte script; its
+    // first file, `firmware/gsp_ga10x.bin`, ends within 52,500,000 bytes.
+    installer_prefix: Artifact {
+        source: NVIDIA_LINUX_DRIVER,
+        revision: "570.211.01",
+        member: "NVIDIA-Linux-x86_64-570.211.01.run",
+        length: 52_500_000,
+        sha256: "3788bd873fb7298b3679e159c1a6824584be2552af45534caf290eec7f4674c0",
+    },
+    installer_offset: 164_426,
+    installer_length: 376_192_072,
+    images: [
+        nvidia_image(
+            NVIDIA_OPEN_GPU,
+            OPEN_GPU_570_211_01,
+            "nvidia/gb202/gsp/bootloader-570.211.01.bin",
+            200812,
+            "e5e505fb453bcd618a4966464aa601e97a1ced2b1d450cab5bcb69e4043dc7f2",
+            &OPEN_GPU_570_211_01_LICENSE,
+        ),
+        nvidia_image(
+            NVIDIA_OPEN_GPU,
+            OPEN_GPU_570_211_01,
+            "nvidia/gb202/gsp/fmc-570.211.01.bin",
+            199820,
+            "e0950cdd16fe7045adbce11543f5b6d13146fca89e78158a9ab07d28dcbe576a",
+            &OPEN_GPU_570_211_01_LICENSE,
+        ),
+        nvidia_image(
+            NVIDIA_LINUX_DRIVER,
+            "570.211.01",
+            "nvidia/gb202/gsp/gsp-570.211.01.bin",
+            64116464,
+            "3ce89a251900d0238d0593e4b9eb039c4571c6c54d09661fad7399f89e37d4bc",
+            &NVIDIA_DRIVER_570_211_01_LICENSE,
+        ),
+    ],
+};
+
+/// The [`NvidiaGsp`] release `image` is one of, and which.
+pub fn nvidia_gsp(image: &Artifact) -> Option<(&'static NvidiaGsp, NvidiaPart)> {
+    GSP_RELEASES.iter().find_map(|row| {
+        let GspOrigin::Nvidia(release) = row.origin else {
+            return None;
+        };
+        let part = release
+            .images
+            .iter()
+            .position(|recipe| recipe.image == *image)?;
+        Some((
+            release,
+            [NvidiaPart::Bootloader, NvidiaPart::Fmc, NvidiaPart::Gsp][part],
+        ))
+    })
+}
+
+/// Every GSP-RM file nouveau loads: linux-firmware's for each family of a
+/// [`GspOrigin::LinuxFirmware`] release, an [`NvidiaGsp`]'s images for the
+/// others, and the unversioned ACR bootloader Turing's FWSEC path loads
+/// beside them ([`ACR_BOOTLOADER`]).
 pub const GSP: &[Recipe] = &[
     gsp(
         "nvidia/ad102/gsp/booter_load-570.144.bin",
@@ -800,16 +1047,9 @@ pub const GSP: &[Recipe] = &[
         198028,
         "bc7497c2d8116cceec2fe5638081d60b8f9c0e3dceb0b57dc93950c84909ce21",
     ),
-    gsp(
-        "nvidia/gb202/gsp/bootloader-570.144.bin",
-        200812,
-        "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071",
-    ),
-    gsp(
-        "nvidia/gb202/gsp/fmc-570.144.bin",
-        199820,
-        "cb59a35c1d4bd1274d7267fd10243c29f843ff41c851b9cbd59f5af2ddd7fece",
-    ),
+    GB20X_570_211_01.images[0],
+    GB20X_570_211_01.images[1],
+    GB20X_570_211_01.images[2],
     gsp(
         "nvidia/gh100/gsp/bootloader-570.144.bin",
         168044,
@@ -819,6 +1059,11 @@ pub const GSP: &[Recipe] = &[
         "nvidia/gh100/gsp/fmc-570.144.bin",
         166600,
         "f3ce25f3897c860e4cdde183ebf09b254d94a5d8191d666c12afb33cc7121107",
+    ),
+    gsp(
+        "nvidia/tu102/acr/bl.bin",
+        1280,
+        "01326cc997716bebb0eab9fe1f463fffa0ee586079e4ca0e5bb096ab6fcfedab",
     ),
     gsp(
         "nvidia/tu102/gsp/booter_load-570.144.bin",
@@ -857,6 +1102,771 @@ pub const GSP: &[Recipe] = &[
     ),
 ];
 
+const AMDGPU_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: GSP_REVISION,
+    member: "LICENSES/LICENSE.amdgpu",
+    length: 2938,
+    sha256: "572872598565dc3513470de971a32bf9db301f47afeef3636345eadae33b2eee",
+};
+
+/// A file of linux-firmware's `amdgpu` directory, under its notice, at the
+/// revision the GSP-RM files are pinned at.
+const fn amdgpu(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: GSP_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &AMDGPU_LICENSE,
+        consumer: Consumer::Amdgpu,
+    }
+}
+
+/// What amdgpu loads on the GPUs with pinned files, named as the driver
+/// names them: the graphics core's microcode (`gfx_v10_0.c`), the security
+/// processor's table of contents and trusted applications (`psp_v13_0.c`),
+/// the DMA engine's (`sdma_v5_2.c`), the display microcontroller's
+/// (`amdgpu_dm.c`) and the video decoder's (`amdgpu_vcn.c`).
+pub const AMDGPU: &[Recipe] = &[
+    amdgpu(
+        "amdgpu/gc_10_3_6_ce.bin",
+        263296,
+        "ed5fe8488d16ecc0923ff34afe8aa67177d5e1f3242e1de48ef1643b263ba33b",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_pfp.bin",
+        263424,
+        "042f5d2d223aac6a62b500a47d0d0bf33984200110da0ffca4fe5df9a96571c0",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_me.bin",
+        263424,
+        "776d2299bc4f3abffd4a7999f5a21a4e38aced8b6b4c199a83610dbabf08176d",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_mec.bin",
+        268592,
+        "7003c4a77537e9edaf67064104cd9371fac38a84f71f948349140b28d3c210e8",
+    ),
+    // The same bytes as `mec`, under the second name the driver asks for.
+    amdgpu(
+        "amdgpu/gc_10_3_6_mec2.bin",
+        268592,
+        "7003c4a77537e9edaf67064104cd9371fac38a84f71f948349140b28d3c210e8",
+    ),
+    amdgpu(
+        "amdgpu/gc_10_3_6_rlc.bin",
+        177104,
+        "acfbac75c0dcfbfe40e222640ef17eb3dc8d206d30bc3863f275f2dd1cb132a5",
+    ),
+    amdgpu(
+        "amdgpu/psp_13_0_5_toc.bin",
+        1792,
+        "2dfcc2b4d6b7f072a471da3852164560ae709bb563626997c41ef1ef17588bbe",
+    ),
+    amdgpu(
+        "amdgpu/psp_13_0_5_ta.bin",
+        246784,
+        "0b7fc5a0bea6e3559df9791a57ae5a648ec6246679f8f8a6bc27defb2aa7a75e",
+    ),
+    amdgpu(
+        "amdgpu/sdma_5_2_6.bin",
+        34048,
+        "3a163db00eb7e4752be8adbd61cf7dd8f08d924e59a6f798ced7dfcd89f340ed",
+    ),
+    amdgpu(
+        "amdgpu/dcn_3_1_5_dmcub.bin",
+        239648,
+        "035015964e5a33514201b50f43cc0643550cbee811be20da9f5e31ef6f405d76",
+    ),
+    amdgpu(
+        "amdgpu/vcn_3_1_2.bin",
+        575056,
+        "31176d1a359aad08d462895eb02184b5d36c8d7570afc380ec889a9c7ffe8cb4",
+    ),
+    // Navi 48: GC 12.0.1, PSP and SMU 14.0.3, SDMA 7.0.1 and VCN 5.0.0, the
+    // same bytes as at linux-firmware 20261019. MES runs one image for both its pipes
+    // (`amdgpu_uni_mes`, on by default) and the PSP loads the rest, so GC's
+    // table of contents for RLC's backdoor load is not asked for.
+    amdgpu(
+        "amdgpu/gc_12_0_1_imu.bin",
+        132352,
+        "b3b301fb636efc77b63ce4d2ced0f90c851d03c19681852faa45598e6f5773fd",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_me.bin",
+        267600,
+        "fd5eb0f205a3bb7ec41f42e83a54bdc69151706b02bbee073fa775b8270e4bec",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_mec.bin",
+        259584,
+        "83fe5e7bffe639ec9771219cde5c9809689168f769b147c86dfd5a1ca991c1a2",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_pfp.bin",
+        159616,
+        "490bcd26a62e389b3f58acf5c087d324d2324b3188797ff6a36b7a6cdf1ca9ff",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_rlc.bin",
+        150848,
+        "6ba4459532246a5c415d3cb33c9b1248294e48f67b827e2accb292a8d1a5c0ec",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_uni_mes.bin",
+        299408,
+        "309d60ad4a0210f8a68e27cae88beddb22b5ae900d70848b1e8ca0eac9d1decd",
+    ),
+    amdgpu(
+        "amdgpu/psp_14_0_3_sos.bin",
+        435632,
+        "28469a0857c813c54a0492423cdf0b0caf757428400036377e19c47e5af62478",
+    ),
+    amdgpu(
+        "amdgpu/psp_14_0_3_ta.bin",
+        291372,
+        "fff8b0b56f21bf1d34c8d1fcf6cc903c2dbb5ef88eb06157c9f08baf95124883",
+    ),
+    amdgpu(
+        "amdgpu/sdma_7_0_1.bin",
+        47104,
+        "73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59",
+    ),
+    amdgpu(
+        "amdgpu/smu_14_0_3.bin",
+        333236,
+        "7624724231b0986b59f59705e7c854c482193f6b3b591ebdda58cb62af81c010",
+    ),
+    amdgpu(
+        "amdgpu/vcn_5_0_0.bin",
+        440400,
+        "9a0ab35bf157c835cbbc4a207ba819ea0111e2a65fe7f8c20910ffff3122f903",
+    ),
+    // DCN 4.0.1's DMCUB, which the display core asks for (`amdgpu_dm.c`).
+    amdgpu(
+        "amdgpu/dcn_4_0_1_dmcub.bin",
+        368288,
+        "74b567655ac89bfe03389b660e973dc3c067aebd464c6389a071662cfbe6237f",
+    ),
+    // Navi 21 (Sienna Cichlid): amdgpu names these files after the chip,
+    // not its IP versions. MEC2 is byte for byte MEC.
+    amdgpu(
+        "amdgpu/sienna_cichlid_ce.bin",
+        263296,
+        "156769265ed26c8cb14902a13e14871732245daeffb793bdf394c1bd3de76f00",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_me.bin",
+        263424,
+        "fbdf0e27e1c232e5b0a69f52efd5692a1803ec2a0d77201ea678dc8bc6407116",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_mec.bin",
+        268160,
+        "ce7442ce45828e5726bb7b05d1fba7f228dd184f5c0a9daf6647a025540d7d39",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_mec2.bin",
+        268160,
+        "ce7442ce45828e5726bb7b05d1fba7f228dd184f5c0a9daf6647a025540d7d39",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_pfp.bin",
+        263424,
+        "fa904ab1609ab090d90edc0d11132fc9821a05800466b04a193c62d5a5c2d5ae",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_rlc.bin",
+        132960,
+        "19d19bce396b6dc725acb87cdf419e6151a1b2961ff43d6e026e17ecf20c83d0",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_sdma.bin",
+        34048,
+        "1aad9d95e1205d4a0c8da01670aa9fc6f77010ac04a321d8c644f581ada6c7ce",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_smc.bin",
+        247396,
+        "0eb99764288f764fd853d6973693ffa52419cc7ba62074aee85df4a3e8d0286d",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_sos.bin",
+        227456,
+        "67706b9e1545bf68850bf9cea97660af5972574ecb0ca30041174efbb59fac37",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_ta.bin",
+        386816,
+        "dc28d6a9abc3e3a1e9e8c4f787fc179a3e02bd1d5d6a72f178f88b1ad5e61569",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_vcn.bin",
+        582800,
+        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
+    ),
+    // DCN 3.0's DMCUB, which the display core asks for (`amdgpu_dm.c`).
+    amdgpu(
+        "amdgpu/sienna_cichlid_dmcub.bin",
+        114164,
+        "286458c7911172734dd514631dcfba9690c2242f24f9be72afd6b56c0341974a",
+    ),
+];
+
+/// A GPU family's name, PCI device IDs and files.
+type AmdgpuFamily = (&'static str, &'static [u16], &'static [&'static str]);
+
+/// The AMD GPUs that have pinned files. amdgpu names its files after the
+/// versions of the IP blocks the device's own discovery table reports, which
+/// only the device can say; the pairing of a PCI device ID with them here is
+/// what the driver's version tables give these GPUs (for Raphael: graphics
+/// core 10.3.6, security processor 13.0.5, DMA engine 5.2.6, display 3.1.5,
+/// video 3.1.2). The driver asks for the video decoder's file in the same
+/// start as the rest and fails without it, so it is required too.
+const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
+    (
+        "Ryzen 7000 or 9000 desktop graphics (Raphael, Granite Ridge)",
+        &[0x164e, 0x13c0],
+        &[
+            "amdgpu/gc_10_3_6_ce.bin",
+            "amdgpu/gc_10_3_6_pfp.bin",
+            "amdgpu/gc_10_3_6_me.bin",
+            "amdgpu/gc_10_3_6_mec.bin",
+            "amdgpu/gc_10_3_6_mec2.bin",
+            "amdgpu/gc_10_3_6_rlc.bin",
+            "amdgpu/psp_13_0_5_toc.bin",
+            "amdgpu/psp_13_0_5_ta.bin",
+            "amdgpu/sdma_5_2_6.bin",
+            "amdgpu/dcn_3_1_5_dmcub.bin",
+            "amdgpu/vcn_3_1_2.bin",
+        ],
+    ),
+    (
+        "Radeon RX 9070 or 9070 XT (Navi 48)",
+        // 1002:7550, the board checked on hardware. 1002:7551 rev C8 boards
+        // would also need the kicker images.
+        &[0x7550],
+        &[
+            "amdgpu/gc_12_0_1_imu.bin",
+            "amdgpu/gc_12_0_1_me.bin",
+            "amdgpu/gc_12_0_1_mec.bin",
+            "amdgpu/gc_12_0_1_pfp.bin",
+            "amdgpu/gc_12_0_1_rlc.bin",
+            "amdgpu/gc_12_0_1_uni_mes.bin",
+            "amdgpu/psp_14_0_3_sos.bin",
+            "amdgpu/psp_14_0_3_ta.bin",
+            "amdgpu/sdma_7_0_1.bin",
+            "amdgpu/smu_14_0_3.bin",
+            "amdgpu/vcn_5_0_0.bin",
+            "amdgpu/dcn_4_0_1_dmcub.bin",
+        ],
+    ),
+    (
+        "Radeon RX 6800, 6800 XT, 6900 XT or 6950 XT (Navi 21)",
+        // amdgpu's ID table lists these under CHIP_SIENNA_CICHLID; 1002:73bf is
+        // the RX 6800 XT checked on hardware.
+        &[
+            0x73a0, 0x73a1, 0x73a2, 0x73a3, 0x73a4, 0x73a5, 0x73a6, 0x73a7, 0x73a8, 0x73a9, 0x73aa,
+            0x73ab, 0x73ac, 0x73ad, 0x73ae, 0x73af, 0x73bf,
+        ],
+        &[
+            "amdgpu/sienna_cichlid_ce.bin",
+            "amdgpu/sienna_cichlid_me.bin",
+            "amdgpu/sienna_cichlid_mec.bin",
+            "amdgpu/sienna_cichlid_mec2.bin",
+            "amdgpu/sienna_cichlid_pfp.bin",
+            "amdgpu/sienna_cichlid_rlc.bin",
+            "amdgpu/sienna_cichlid_sdma.bin",
+            "amdgpu/sienna_cichlid_smc.bin",
+            "amdgpu/sienna_cichlid_sos.bin",
+            "amdgpu/sienna_cichlid_ta.bin",
+            "amdgpu/sienna_cichlid_vcn.bin",
+            "amdgpu/sienna_cichlid_dmcub.bin",
+        ],
+    ),
+];
+
+/// The binding amdgpu's files take: Linux's names, as for nouveau's.
+const AMDGPU_TARGET: Target<'static> = Target {
+    driver: "amdgpu",
+    hardware: "amd",
+    revision: "linux-firmware",
+    board: None,
+};
+
+/// amdgpu's request for a file, by the name the driver gives it.
+fn select_amdgpu(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != AMDGPU_TARGET.hardware
+        || request.target.revision != AMDGPU_TARGET.revision
+    {
+        return None;
+    }
+    AMDGPU
+        .iter()
+        .find(|recipe| recipe.image.member == request.name)
+}
+
+/// The family of an AMD GPU with PCI device ID `device`, as people know it,
+/// when its files are pinned.
+pub fn amd_gpu_family(device: u16) -> Option<&'static str> {
+    AMDGPU_FAMILIES
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+        .map(|(name, ..)| *name)
+}
+
+/// Requires the files amdgpu asks for on the AMD GPU with PCI device ID
+/// `device`.
+pub fn require_amdgpu(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
+    let (_, _, files) = AMDGPU_FAMILIES
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+        .ok_or_else(|| {
+            Error(format!(
+                "{device:04x} is no GPU amdgpu has pinned files for"
+            ))
+        })?;
+    for name in *files {
+        inventory.observe(Requirement {
+            name,
+            target: AMDGPU_TARGET,
+            minimum_bytes: 1,
+        })?;
+    }
+    Ok(())
+}
+
+/// The Intel GPU files and their notices: linux-firmware 20261019, whose
+/// GuC releases are at or above what the pinned xe asks of each platform.
+pub const XE_REVISION: &str = "a2dcb924f0897368b0b4f305cbf9808cdda90ce0";
+
+const I915_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: XE_REVISION,
+    member: "LICENSES/LICENSE.i915",
+    length: 2080,
+    sha256: "8542aeabf2761935122d693561e16766ce1bcc2b0d003204f9040b7d6d929f2e",
+};
+
+const XE_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: XE_REVISION,
+    member: "LICENSES/LICENSE.xe",
+    length: 2041,
+    sha256: "26b3c946f1f378ff25bb3bb7c365d108a2bc0bf08619e5e08bc0e4f9aaa6ee1e",
+};
+
+const fn xe_file(
+    member: &'static str,
+    length: usize,
+    sha256: &'static str,
+    license: &'static Artifact,
+) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: XE_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license,
+        consumer: Consumer::Xe,
+    }
+}
+
+/// A file of linux-firmware's `i915` directory, under its notice.
+const fn xe_i915(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    xe_file(member, length, sha256, &I915_LICENSE)
+}
+
+/// A file of linux-firmware's `xe` directory, under its notice.
+const fn xe_xe(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    xe_file(member, length, sha256, &XE_LICENSE)
+}
+
+/// What xe and the display code it shares with i915 load on the platforms
+/// xe's PCI ID table admits, Tiger Lake through Panther Lake: the GuC, HuC
+/// and GSC images of `xe_uc_fw.c` and the display microcontroller programs of
+/// `intel_dmc.c`, named as the drivers name them.
+pub const XE: &[Recipe] = &[
+    xe_i915(
+        "i915/tgl_guc_70.bin",
+        335360,
+        "2f1f57a1b23d186f2592318d1e07a1365968932841ccb3e7177c516ba006e2f6",
+    ),
+    xe_i915(
+        "i915/adlp_guc_70.bin",
+        347904,
+        "b7a800cbdcdf687e7b1c81f3316d040ab75fa3e5c698ebc356f077af17462ef8",
+    ),
+    xe_i915(
+        "i915/dg1_guc_70.bin",
+        321472,
+        "967e94b887024351aa363f882d3cbd0bf5fc4f5f47fd113faf8c19fb565c21a9",
+    ),
+    xe_i915(
+        "i915/dg2_guc_70.bin",
+        381760,
+        "e6e3f8b4480ba976c89c491ac736d6ce41fa82e0cf5726d0763142da3fe8a63b",
+    ),
+    xe_i915(
+        "i915/mtl_guc_70.bin",
+        320320,
+        "7794f0b6abe5fcd9c6f47035dafe2199f30a6e7d230bd5a53fbf8005a60e5911",
+    ),
+    xe_xe(
+        "xe/lnl_guc_70.bin",
+        348992,
+        "0583117763d2721b1b3a96c84d610229c18e644dce3a624b4e0ccc32952f5eaa",
+    ),
+    xe_xe(
+        "xe/bmg_guc_70.bin",
+        385856,
+        "de81c75f46a127c33cd59f604d800e9ffc7ed3495967ba0d8767cd6985ab398b",
+    ),
+    xe_xe(
+        "xe/ptl_guc_70.bin",
+        365376,
+        "ac42861c62b69f19923d9a69d971fb849921585a01924e14c0e8ac679d7cde81",
+    ),
+    xe_i915(
+        "i915/tgl_huc.bin",
+        589888,
+        "dbb1316bac13a76427ffa7827e52b5b9affe8a4cadd23dc22e2a54e35c53bdad",
+    ),
+    xe_i915(
+        "i915/dg1_huc.bin",
+        589888,
+        "ee9a00ca754931ab045e2e3e862e7b33c9ba87f6ae90aa18335b7a7a7ee87d16",
+    ),
+    xe_i915(
+        "i915/mtl_huc_gsc.bin",
+        561152,
+        "3ea23f39e946122d1446565d1a07c0866bf3e3c8819b43134925371d877ca4cd",
+    ),
+    xe_xe(
+        "xe/lnl_huc.bin",
+        643072,
+        "320e765cbe42b0f5f95333794a6a00a4e67246d6ad8393b59b64efdc3506cfe9",
+    ),
+    xe_xe(
+        "xe/bmg_huc.bin",
+        585728,
+        "747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15",
+    ),
+    xe_xe(
+        "xe/ptl_huc.bin",
+        651264,
+        "93e9aaf15362630441042a31fe864f9e4df76b401ada91de6df64e0f6b8adbca",
+    ),
+    xe_i915(
+        "i915/mtl_gsc_1.bin",
+        1142784,
+        "01e8e2bb0eae90e3b4471703bb04d1bd13adb43373480fb10be6f101b877e0f3",
+    ),
+    xe_xe(
+        "xe/lnl_gsc_1.bin",
+        1163264,
+        "b9a28846de2df43e8464cb783f965efe3a20df54da26392576583a4e0f4bbef1",
+    ),
+    xe_xe(
+        "xe/ptl_gsc_1.bin",
+        1171456,
+        "76e77660fa1a492aeef256eba65078a76f6801a8827cfd0758e8669d7462a465",
+    ),
+    xe_i915(
+        "i915/tgl_dmc_ver2_12.bin",
+        19760,
+        "3c013ef0ad96ba73aee8e5bd04a8e27cc9b1c6e9183b1a83ce124485f325afca",
+    ),
+    xe_i915(
+        "i915/rkl_dmc_ver2_03.bin",
+        18476,
+        "139ce0eb873a13679a4685463cdacf6d247073ce286c8a5bca443ef1d17ee2ac",
+    ),
+    xe_i915(
+        "i915/adls_dmc_ver2_01.bin",
+        18704,
+        "96e426ed7e80f0cc6644ada1928f4d02b163ff59b14b2339aa28a374d65a5b19",
+    ),
+    xe_i915(
+        "i915/adlp_dmc.bin",
+        79088,
+        "3516de2e134ddcf3b319c75d2e437779fecbd58cbb77234bd6f297c544e92ccb",
+    ),
+    xe_i915(
+        "i915/dg1_dmc_ver2_02.bin",
+        16624,
+        "89576b82489737ae1b4cd057f471363a75baeb7590d76a15e17895ad38e6c09d",
+    ),
+    xe_i915(
+        "i915/dg2_dmc_ver2_08.bin",
+        22540,
+        "cac5204087bba70a81c53778846340e57a4e35e5959b7b42006969f6e5f45466",
+    ),
+    xe_i915(
+        "i915/mtl_dmc.bin",
+        52712,
+        "1b3b826195d50fae6611d29e0eb348e641a3ada3e0436ee0b987124f47a0e0db",
+    ),
+    xe_i915(
+        "i915/bmg_dmc.bin",
+        45964,
+        "76e3ec6ea3a53ce727e43b84f5ea14c55400a2d118dac356d4e12a3cfac06b4d",
+    ),
+    xe_i915(
+        "i915/xe2lpd_dmc.bin",
+        60448,
+        "eb6f1283f714b9a8af3492802d1478e774e7795e09d75b56865ddaca3ae07abc",
+    ),
+    xe_i915(
+        "i915/xe3lpd_dmc.bin",
+        95624,
+        "be1d24f6262aef0a4b8a69e739d2025df2ba7e924a1697b20f5ab59a7977fc71",
+    ),
+    xe_i915(
+        "i915/xe3lpd_3002_dmc.bin",
+        67772,
+        "dbc2923b62a6fc9663b928719dd0504df6adba85a0f5b49e1482b7afbc4b36b7",
+    ),
+];
+
+/// A platform's name, PCI device IDs and files: GuC, HuC, GSC, DMC.
+type XePlatform = (&'static str, &'static [u16], [Option<&'static str>; 4]);
+
+/// The platforms of xe's PCI ID table that have pinned files, each with the
+/// device IDs Linux's `include/drm/intel/pciids.h` gives it and the files xe
+/// and the display code name for it: GuC, HuC, GSC, DMC. A platform's later
+/// re-releases share its files: Raptor Lake S with Alder Lake S, Raptor Lake
+/// P and U and Alder Lake N with Alder Lake P (N loads Tiger Lake's GuC and
+/// no HuC), Arrow Lake with Meteor Lake, Wildcat Lake with Panther Lake
+/// except for its display.
+const XE_PLATFORMS: &[XePlatform] = &[
+    (
+        "Tiger Lake",
+        &[
+            0x9a60, 0x9a68, 0x9a70, 0x9a40, 0x9a49, 0x9a59, 0x9a78, 0x9ac0, 0x9ac9, 0x9ad9, 0x9af8,
+        ],
+        [
+            Some("i915/tgl_guc_70.bin"),
+            Some("i915/tgl_huc.bin"),
+            None,
+            Some("i915/tgl_dmc_ver2_12.bin"),
+        ],
+    ),
+    (
+        "Rocket Lake",
+        &[0x4c80, 0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a],
+        [
+            Some("i915/tgl_guc_70.bin"),
+            Some("i915/tgl_huc.bin"),
+            None,
+            Some("i915/rkl_dmc_ver2_03.bin"),
+        ],
+    ),
+    (
+        "Alder Lake S or Raptor Lake S",
+        &[
+            0x4680, 0x4682, 0x4688, 0x468a, 0x468b, 0x4690, 0x4692, 0x4693, 0xa780, 0xa781, 0xa782,
+            0xa783, 0xa788, 0xa789, 0xa78a, 0xa78b,
+        ],
+        [
+            Some("i915/tgl_guc_70.bin"),
+            Some("i915/tgl_huc.bin"),
+            None,
+            Some("i915/adls_dmc_ver2_01.bin"),
+        ],
+    ),
+    (
+        "Alder Lake P or Raptor Lake P or U",
+        &[
+            0x46a0, 0x46a1, 0x46a2, 0x46a3, 0x46a6, 0x46a8, 0x46aa, 0x462a, 0x4626, 0x4628, 0x46b0,
+            0x46b1, 0x46b2, 0x46b3, 0x46c0, 0x46c1, 0x46c2, 0x46c3, 0xa721, 0xa7a1, 0xa7a9, 0xa7ac,
+            0xa7ad, 0xa720, 0xa7a0, 0xa7a8, 0xa7aa, 0xa7ab,
+        ],
+        [
+            Some("i915/adlp_guc_70.bin"),
+            Some("i915/tgl_huc.bin"),
+            None,
+            Some("i915/adlp_dmc.bin"),
+        ],
+    ),
+    (
+        "Alder Lake N",
+        &[0x46d0, 0x46d1, 0x46d2, 0x46d3, 0x46d4],
+        [
+            Some("i915/tgl_guc_70.bin"),
+            None,
+            None,
+            Some("i915/adlp_dmc.bin"),
+        ],
+    ),
+    (
+        "DG1",
+        &[0x4905, 0x4906, 0x4907, 0x4908, 0x4909],
+        [
+            Some("i915/dg1_guc_70.bin"),
+            Some("i915/dg1_huc.bin"),
+            None,
+            Some("i915/dg1_dmc_ver2_02.bin"),
+        ],
+    ),
+    (
+        "Arc A-series (DG2)",
+        &[
+            0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5, 0x56a6, 0x56b0,
+            0x56b1, 0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694, 0x5695, 0x56a3, 0x56a4, 0x56b2,
+            0x56b3, 0x5696, 0x5697, 0x56c0, 0x56c2, 0x56c1,
+        ],
+        [
+            Some("i915/dg2_guc_70.bin"),
+            None,
+            None,
+            Some("i915/dg2_dmc_ver2_08.bin"),
+        ],
+    ),
+    (
+        "Meteor Lake or Arrow Lake",
+        &[
+            0x7d40, 0x7d45, 0x7d55, 0x7d60, 0x7dd5, 0x7d51, 0x7dd1, 0x7d41, 0x7d67, 0xb640,
+        ],
+        [
+            Some("i915/mtl_guc_70.bin"),
+            Some("i915/mtl_huc_gsc.bin"),
+            Some("i915/mtl_gsc_1.bin"),
+            Some("i915/mtl_dmc.bin"),
+        ],
+    ),
+    (
+        "Lunar Lake",
+        &[0x6420, 0x64a0, 0x64b0],
+        [
+            Some("xe/lnl_guc_70.bin"),
+            Some("xe/lnl_huc.bin"),
+            Some("xe/lnl_gsc_1.bin"),
+            Some("i915/xe2lpd_dmc.bin"),
+        ],
+    ),
+    (
+        "Arc B-series (Battlemage)",
+        &[
+            0xe202, 0xe209, 0xe20b, 0xe20c, 0xe20d, 0xe210, 0xe211, 0xe212, 0xe216, 0xe220, 0xe221,
+            0xe222, 0xe223,
+        ],
+        [
+            Some("xe/bmg_guc_70.bin"),
+            Some("xe/bmg_huc.bin"),
+            None,
+            Some("i915/bmg_dmc.bin"),
+        ],
+    ),
+    (
+        "Panther Lake",
+        &[
+            0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
+            0xb0b0,
+        ],
+        [
+            Some("xe/ptl_guc_70.bin"),
+            Some("xe/ptl_huc.bin"),
+            Some("xe/ptl_gsc_1.bin"),
+            Some("i915/xe3lpd_dmc.bin"),
+        ],
+    ),
+    (
+        "Wildcat Lake",
+        &[0xfd80, 0xfd81],
+        [
+            Some("xe/ptl_guc_70.bin"),
+            Some("xe/ptl_huc.bin"),
+            Some("xe/ptl_gsc_1.bin"),
+            Some("i915/xe3lpd_3002_dmc.bin"),
+        ],
+    ),
+];
+
+/// The binding xe's files take: Linux's names, as for nouveau's.
+const XE_TARGET: Target<'static> = Target {
+    driver: "xe",
+    hardware: "intel",
+    revision: "linux-firmware",
+    board: None,
+};
+
+/// xe's request for a file, by the name the driver gives it.
+fn select_xe(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != XE_TARGET.hardware
+        || request.target.revision != XE_TARGET.revision
+    {
+        return None;
+    }
+    XE.iter().find(|recipe| recipe.image.member == request.name)
+}
+
+/// The platform of an Intel GPU with PCI device ID `device`, as people know
+/// it, when xe's PCI ID table admits the device and its files are pinned.
+/// Ice Lake and older are i915's and have no entry.
+pub fn intel_gpu_platform(device: u16) -> Option<&'static str> {
+    XE_PLATFORMS
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+        .map(|(name, ..)| *name)
+}
+
+/// The platforms whose xe loads without their GSC image, Battlemage and
+/// later: `xe_gsc_init` goes on when it is missing, as only content
+/// protection needs it there. Before them a missing GSC fails xe's probe.
+const XE_GSC_OPTIONAL: [&str; 2] = ["Panther Lake", "Wildcat Lake"];
+
+/// Whether xe and the display code start without the file `request` names
+/// when it is missing, on every platform that names it: a display
+/// microcontroller program (`intel_dmc.c` runs the display without its
+/// power states) and the GSC image of Battlemage and later. A GuC or HuC
+/// image is always needed: `xe_uc_init` fails without either. Other drivers'
+/// files are all needed.
+pub fn optional(request: &Request) -> bool {
+    if select_xe(request).is_none() {
+        return false;
+    }
+    let mut named = false;
+    for (platform, _, files) in XE_PLATFORMS {
+        for (column, file) in files.iter().enumerate() {
+            if *file != Some(request.name.as_str()) {
+                continue;
+            }
+            named = true;
+            let tolerated = column == 3 || (column == 2 && XE_GSC_OPTIONAL.contains(platform));
+            if !tolerated {
+                return false;
+            }
+        }
+    }
+    named
+}
+
+/// Requires the files xe and the display code ask for on the Intel GPU with
+/// PCI device ID `device`.
+pub fn require_xe(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
+    let (_, _, files) = XE_PLATFORMS
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+        .ok_or_else(|| Error(format!("{device:04x} is no GPU xe has pinned files for")))?;
+    for name in files.iter().flatten() {
+        inventory.observe(Requirement {
+            name,
+            target: XE_TARGET,
+            minimum_bytes: 1,
+        })?;
+    }
+    Ok(())
+}
+
 /// The chip whose `gsp` directory linux-firmware's `WHENCE` links `chip`'s to.
 fn gsp_directory(chip: &str) -> Option<&'static str> {
     Some(match chip {
@@ -872,22 +1882,57 @@ fn gsp_directory(chip: &str) -> Option<&'static str> {
     })
 }
 
+/// The ACR bootloader nouveau loads beside the GSP-RM files, unversioned and
+/// outside the `gsp` directory, as `nvkm_firmware_get(subdev, "acr/bl", 0)`
+/// names it.
+const ACR_BOOTLOADER: &str = "acr/bl.bin";
+
+/// The chip whose `acr` directory linux-firmware's `WHENCE` links `chip`'s to.
+///
+/// Only Turing has one. A chip's VBIOS says which FWSEC image it carries, and
+/// nouveau boots a v2 one (`nvkm_gsp_fwsec_v2`) with this separate bootloader,
+/// where a v3 one (`nvkm_gsp_fwsec_v3`, Ampere and later) signs its own and
+/// loads no second file. A Turing GPU whose stick lacks this file fails
+/// `fwsec-sb` with `-ENOENT` and never boots its GSP. Both Turing `gsp`
+/// directories hold the same bootloader byte for byte, so one file serves
+/// every Turing chip, as `tu116`'s shared GSP-RM files do.
+fn acr_directory(chip: &str) -> Option<&'static str> {
+    matches!(gsp_directory(chip)?, "tu102" | "tu116").then_some("tu102")
+}
+
+/// The GSP-RM release nouveau asks for on the chips of a `gsp` directory
+/// ([`gsp_directory`]): its firmware list names one release per family.
+pub fn gsp_release(directory: &str) -> Option<&'static GspRelease> {
+    GSP_RELEASES
+        .iter()
+        .find(|row| row.directories.contains(&directory))
+}
+
 /// nouveau's request for a chip's GSP-RM file, through `WHENCE`'s links: the
 /// firmware itself runs on families of chips, and only the signed booters
-/// differ between them.
+/// differ between them. The ACR bootloader follows the same links.
 fn select_gsp(request: &Request) -> Option<&'static Recipe> {
     if request.target.hardware != "nvidia" || request.target.revision != "linux-firmware" {
         return None;
     }
-    let (chip, file) = request.name.strip_prefix("nvidia/")?.split_once("/gsp/")?;
+    let named = request.name.strip_prefix("nvidia/")?;
+    if let Some(chip) = named
+        .strip_suffix(ACR_BOOTLOADER)
+        .and_then(|prefix| prefix.strip_suffix('/'))
+    {
+        let directory = acr_directory(chip)?;
+        let member = format!("nvidia/{directory}/{ACR_BOOTLOADER}");
+        return GSP.iter().find(|recipe| recipe.image.member == member);
+    }
+    let (chip, file) = named.split_once("/gsp/")?;
     let directory = gsp_directory(chip)?;
     let (kind, release) = file.strip_suffix(".bin")?.split_once('-')?;
-    if release != GSP_RELEASE {
+    if release != gsp_release(directory)?.release {
         return None;
     }
     let owner = match (directory, kind) {
         ("tu116" | "ga100", "gen_bootloader" | "gsp") | ("tu116", "bootloader") => "tu102",
-        ("ad102" | "gh100" | "gb100" | "gb202", "gsp") => "ga102",
+        ("ad102" | "gh100" | "gb100", "gsp") => "ga102",
         _ => directory,
     };
     let member = format!("nvidia/{owner}/gsp/{file}");
@@ -925,7 +1970,8 @@ pub fn nvidia_chip(device: u16) -> Option<&'static str> {
 }
 
 /// Requires the GSP-RM files nouveau asks for on `chip`, named as it names
-/// chips: `tu104`, `ga104`, `ad104`.
+/// chips: `tu104`, `ga104`, `ad104`. A Turing chip also takes the ACR
+/// bootloader its FWSEC v2 image boots with ([`acr_directory`]).
 pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
     let target = Target {
         driver: "nouveau",
@@ -933,9 +1979,13 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
         revision: "linux-firmware",
         board: None,
     };
+    let release = gsp_directory(chip)
+        .and_then(gsp_release)
+        .ok_or_else(|| Error(format!("{chip} is no chip nouveau runs GSP-RM on")))?
+        .release;
     let mut found = false;
     for kind in GSP_KINDS {
-        let name = format!("nvidia/{chip}/gsp/{kind}-{GSP_RELEASE}.bin");
+        let name = format!("nvidia/{chip}/gsp/{kind}-{release}.bin");
         let request = Requirement {
             name: &name,
             target,
@@ -945,6 +1995,17 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
             inventory.observe(request)?;
             found = true;
         }
+    }
+    // Not a GSP-RM release file, so it neither follows `GSP_KINDS` nor proves
+    // on its own that nouveau runs GSP-RM on the chip.
+    let acr = format!("nvidia/{chip}/{ACR_BOOTLOADER}");
+    let request = Requirement {
+        name: &acr,
+        target,
+        minimum_bytes: 1,
+    };
+    if select_gsp(&Request::from(request)).is_some() {
+        inventory.observe(request)?;
     }
     if found {
         Ok(())
@@ -1315,6 +2376,8 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
+        "xe" => select_xe(request),
+        "amdgpu" => select_amdgpu(request),
         _ => None,
     }
 }
@@ -1575,6 +2638,399 @@ mod tests {
         assert!(REALTEK_USB_LICENSE.verify(b"changed license").is_err());
     }
 
+    fn amdgpu_member(name: &str, hardware: &str) -> Option<&'static Recipe> {
+        let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
+            "name":name,"target":{"driver":"amdgpu","hardware":hardware,
+            "revision":"linux-firmware","board":null},"minimum_bytes":1}]});
+        let inventory = Inventory::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
+        Plan::select(&inventory)
+            .ok()
+            .map(|plan| plan.selections[0].recipe)
+    }
+
+    #[test]
+    fn an_amd_gpu_requires_the_files_amdgpu_names_for_its_ip_blocks() {
+        // Raphael and Granite Ridge integrated graphics load the same files.
+        for device in [0x164e, 0x13c0] {
+            let mut inventory = Inventory::default();
+            require_amdgpu(&mut inventory, device).unwrap();
+            let names = inventory
+                .requests()
+                .iter()
+                .map(|request| request.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 11);
+            assert_eq!(names[0], "amdgpu/gc_10_3_6_ce.bin");
+            assert!(names.contains(&"amdgpu/psp_13_0_5_toc.bin".into()));
+            assert!(names.contains(&"amdgpu/dcn_3_1_5_dmcub.bin".into()));
+            assert!(names.contains(&"amdgpu/vcn_3_1_2.bin".into()));
+            assert!(amd_gpu_family(device).unwrap().contains("Granite Ridge"));
+        }
+        // A discrete GPU (Navi 10) has no pinned files yet.
+        assert_eq!(amd_gpu_family(0x731f), None);
+        assert!(require_amdgpu(&mut Inventory::default(), 0x731f).is_err());
+    }
+
+    #[test]
+    fn navi48_requires_every_file_amdgpu_asks_for_and_nothing_else() {
+        assert_eq!(
+            amd_gpu_family(0x7550),
+            Some("Radeon RX 9070 or 9070 XT (Navi 48)")
+        );
+        assert_eq!(amd_gpu_family(0x7590), None);
+        let mut inventory = Inventory::default();
+        require_amdgpu(&mut inventory, 0x7550).unwrap();
+        let plan = Plan::select(&inventory).unwrap();
+        assert_eq!(plan.selections().len(), 12);
+        for selection in plan.selections() {
+            assert_eq!(selection.request.name, selection.recipe.image.member);
+            assert!(
+                selection.request.name.contains("_12_0_1")
+                    || selection.request.name.contains("_14_0_3")
+                    || selection.request.name.contains("_7_0_1")
+                    || selection.request.name.contains("_5_0_0")
+                    || selection.request.name.contains("_4_0_1")
+            );
+            assert_eq!(selection.request.target.driver, "amdgpu");
+            assert!(selection.recipe.image.url().contains(GSP_REVISION));
+            assert_eq!(selection.recipe.license.member, "LICENSES/LICENSE.amdgpu");
+        }
+        // One shared notice beside the twelve images.
+        assert_eq!(plan.artifacts().len(), 13);
+    }
+
+    #[test]
+    fn amdgpu_files_are_pinned_once_under_the_amdgpu_notice() {
+        let mut devices = Vec::new();
+        for (family, ids, files) in AMDGPU_FAMILIES {
+            for device in *ids {
+                assert!(!devices.contains(device), "{family} {device:04x}");
+                devices.push(*device);
+            }
+            for file in *files {
+                assert!(amdgpu_member(file, "amd").is_some(), "{family} {file}");
+            }
+        }
+        for (index, recipe) in AMDGPU.iter().enumerate() {
+            let member = recipe.image.member;
+            assert!(member.starts_with("amdgpu/"), "{member}");
+            assert!(
+                AMDGPU[..index]
+                    .iter()
+                    .all(|other| other.image.member != member),
+                "{member}"
+            );
+            assert!(
+                AMDGPU_FAMILIES
+                    .iter()
+                    .any(|(_, _, files)| files.contains(&member)),
+                "{member} has no family"
+            );
+            assert_eq!(recipe.license.member, "LICENSES/LICENSE.amdgpu");
+            assert_eq!(recipe.image.revision, GSP_REVISION);
+            assert_eq!(recipe.image.sha256.len(), 64);
+        }
+        assert_eq!(
+            amdgpu_member("amdgpu/gc_10_3_6_ce.bin", "nvidia").map(|_| ()),
+            None
+        );
+        assert_eq!(
+            amdgpu_member("amdgpu/gc_11_0_0_pfp.bin", "amd").map(|_| ()),
+            None
+        );
+    }
+
+    fn xe_files(device: u16) -> Vec<alloc::string::String> {
+        let mut inventory = Inventory::default();
+        require_xe(&mut inventory, device).unwrap();
+        let requests = inventory.requests().iter();
+        requests.map(|request| request.name.clone()).collect()
+    }
+
+    fn xe_member(name: &str, hardware: &str) -> Option<&'static Recipe> {
+        let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
+            "name":name,"target":{"driver":"xe","hardware":hardware,
+            "revision":"linux-firmware","board":null},"minimum_bytes":1}]});
+        let inventory = Inventory::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
+        Plan::select(&inventory)
+            .ok()
+            .map(|plan| plan.selections[0].recipe)
+    }
+
+    #[test]
+    fn an_intel_gpu_requires_the_files_xe_names_for_its_platform() {
+        // Tiger Lake, Alder Lake P and Raptor Lake P, U and S, as in laptops.
+        assert_eq!(
+            xe_files(0x9a49),
+            [
+                "i915/tgl_guc_70.bin",
+                "i915/tgl_huc.bin",
+                "i915/tgl_dmc_ver2_12.bin"
+            ]
+        );
+        for device in [0x46a3, 0xa7a0, 0xa7a1] {
+            assert_eq!(
+                xe_files(device),
+                [
+                    "i915/adlp_guc_70.bin",
+                    "i915/tgl_huc.bin",
+                    "i915/adlp_dmc.bin"
+                ]
+            );
+        }
+        for device in [0x468b, 0xa78b] {
+            assert_eq!(
+                xe_files(device),
+                [
+                    "i915/tgl_guc_70.bin",
+                    "i915/tgl_huc.bin",
+                    "i915/adls_dmc_ver2_01.bin"
+                ]
+            );
+        }
+        // A platform with a GSC loads its HuC through it.
+        assert_eq!(
+            xe_files(0x7d55),
+            [
+                "i915/mtl_guc_70.bin",
+                "i915/mtl_huc_gsc.bin",
+                "i915/mtl_gsc_1.bin",
+                "i915/mtl_dmc.bin"
+            ]
+        );
+        assert_eq!(
+            xe_files(0xe20b),
+            ["xe/bmg_guc_70.bin", "xe/bmg_huc.bin", "i915/bmg_dmc.bin"]
+        );
+        assert_eq!(intel_gpu_platform(0x9a49), Some("Tiger Lake"));
+        // Ice Lake and Ivy Bridge are not xe's.
+        for device in [0x8a56, 0x0166] {
+            assert_eq!(intel_gpu_platform(device), None);
+            assert!(require_xe(&mut Inventory::default(), device).is_err());
+        }
+    }
+
+    #[test]
+    fn xe_starts_without_its_display_programs_and_late_gsc_images_only() {
+        let request = |name: &str| {
+            Request::from(Requirement {
+                name,
+                target: XE_TARGET,
+                minimum_bytes: 1,
+            })
+        };
+        for name in [
+            "i915/tgl_dmc_ver2_12.bin",
+            "i915/adlp_dmc.bin",
+            "i915/bmg_dmc.bin",
+            "xe/ptl_gsc_1.bin",
+        ] {
+            assert!(optional(&request(name)), "{name}");
+        }
+        // GuC and HuC images, and GSC images before Battlemage, are needed.
+        for name in [
+            "i915/tgl_guc_70.bin",
+            "i915/tgl_huc.bin",
+            "xe/bmg_huc.bin",
+            "i915/mtl_gsc_1.bin",
+            "xe/lnl_gsc_1.bin",
+        ] {
+            assert!(!optional(&request(name)), "{name}");
+        }
+        for platform in XE_GSC_OPTIONAL {
+            assert!(XE_PLATFORMS.iter().any(|(name, ..)| *name == platform));
+        }
+    }
+
+    #[test]
+    fn xe_files_are_pinned_once_under_their_directorys_notice() {
+        let mut devices = Vec::new();
+        for (platform, ids, files) in XE_PLATFORMS {
+            for device in *ids {
+                assert!(!devices.contains(device), "{platform} {device:04x}");
+                devices.push(*device);
+            }
+            assert!(files[0].is_some() && files[3].is_some(), "{platform}");
+            for file in files.iter().flatten() {
+                assert!(xe_member(file, "intel").is_some(), "{platform} {file}");
+            }
+        }
+        for (index, recipe) in XE.iter().enumerate() {
+            let member = recipe.image.member;
+            assert!(
+                XE[..index].iter().all(|other| other.image.member != member),
+                "{member}"
+            );
+            assert!(
+                XE_PLATFORMS
+                    .iter()
+                    .any(|(_, _, files)| files.contains(&Some(member))),
+                "{member} has no platform"
+            );
+            let notice = if member.starts_with("xe/") {
+                "LICENSES/LICENSE.xe"
+            } else {
+                "LICENSES/LICENSE.i915"
+            };
+            assert_eq!(recipe.license.member, notice, "{member}");
+            assert_eq!(recipe.image.revision, XE_REVISION);
+            assert_eq!(recipe.image.sha256.len(), 64);
+        }
+        assert_eq!(xe_member("i915/tgl_guc_70.bin", "nvidia").map(|_| ()), None);
+        assert_eq!(xe_member("i915/skl_guc_70.bin", "intel").map(|_| ()), None);
+    }
+
+    /// The `(chip, release)` pairs nouveau's GSP firmware lists name, and
+    /// the release strings of its `*_gsps[]` entries, from the patched
+    /// checkout when it is there, else from the lines Stela's patch series
+    /// adds and removes (which is where a release change is made).
+    fn nouveau_gsp_releases() -> (
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        bool,
+    ) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party");
+        let directory = root.join("linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp");
+        // `NVKM_GSP_FIRMWARE_FMC(gb202, 570.211.01);` names a chip's files.
+        let pair = |line: &str| -> Option<(String, String)> {
+            let rest = line.split("NVKM_GSP_FIRMWARE_").nth(1)?;
+            let (_, args) = rest.split_once('(')?;
+            let (chip, release) = args.split_once(')')?.0.split_once(',')?;
+            Some((chip.trim().to_owned(), release.trim().to_owned()))
+        };
+        let mut chips: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let checkout = std::fs::read_dir(&directory)
+            .map(|entries| entries.count() > 0)
+            .unwrap_or(false);
+        if checkout {
+            for entry in std::fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_none_or(|e| e != "c") {
+                    continue;
+                }
+                for line in std::fs::read_to_string(&path).unwrap().lines() {
+                    if let Some((chip, release)) = pair(line) {
+                        chips.entry(chip).or_default().insert(release);
+                    }
+                }
+            }
+            return (chips, true);
+        }
+        let mut patches: Vec<_> = std::fs::read_dir(root.join("patches/linux"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        patches.sort();
+        for patch in patches {
+            let mut gsp_file = false;
+            for line in std::fs::read_to_string(&patch).unwrap().lines() {
+                if let Some(path) = line.strip_prefix("+++ ") {
+                    gsp_file = path.contains("nvkm/subdev/gsp/") && path.ends_with(".c");
+                    continue;
+                }
+                if !gsp_file || line.starts_with("---") {
+                    continue;
+                }
+                let Some((chip, release)) = line.get(1..).and_then(pair) else {
+                    continue;
+                };
+                match line.as_bytes()[0] {
+                    b'+' => {
+                        chips.entry(chip).or_default().insert(release);
+                    }
+                    b'-' => {
+                        if let Some(set) = chips.get_mut(&chip) {
+                            set.remove(&release);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        chips.retain(|_, set| !set.is_empty());
+        (chips, false)
+    }
+
+    #[test]
+    fn nouveau_the_release_table_and_the_recipes_name_the_same_gsp_releases() {
+        let (chips, checkout) = nouveau_gsp_releases();
+        // The series moves GeForce Blackwell; a checkout names every family.
+        for chip in ["gb202", "gb203", "gb205", "gb206", "gb207"] {
+            assert_eq!(
+                chips.get(chip).map(|releases| releases.len()),
+                Some(1),
+                "nouveau names no single release for {chip}"
+            );
+        }
+        if checkout {
+            assert!(chips.contains_key("tu102") && chips.contains_key("ad102"));
+        }
+        for (chip, releases) in &chips {
+            let directory = gsp_directory(chip).unwrap_or_else(|| panic!("{chip}"));
+            let row = gsp_release(directory).unwrap_or_else(|| panic!("{directory}"));
+            // nouveau tries its newest release first; older ones it lists
+            // (535.113.01) are only fallbacks Stela provides no files for.
+            let version = |release: &str| -> Vec<u32> {
+                release
+                    .split('.')
+                    .map(|part| part.parse().unwrap())
+                    .collect()
+            };
+            let newest = releases.iter().max_by_key(|release| version(release));
+            assert_eq!(
+                newest.map(String::as_str),
+                Some(row.release),
+                "nouveau and GSP_RELEASES differ on {chip}"
+            );
+            // Every file nouveau asks for on the chip has a recipe of that
+            // release.
+            let mut inventory = Inventory::default();
+            require_gsp(&mut inventory, chip).unwrap();
+            for request in inventory.requests() {
+                if request.name.ends_with(ACR_BOOTLOADER) {
+                    continue;
+                }
+                assert!(
+                    request.name.ends_with(&format!("-{}.bin", row.release)),
+                    "{}",
+                    request.name
+                );
+                assert!(recipe(request).is_some(), "{}", request.name);
+            }
+        }
+        // Each family is in exactly one row; each NVIDIA release's images
+        // are in the catalog, and the catalog's NVIDIA images all belong to
+        // a row.
+        for (index, row) in GSP_RELEASES.iter().enumerate() {
+            for directory in row.directories {
+                assert!(
+                    GSP_RELEASES[index + 1..]
+                        .iter()
+                        .all(|other| !other.directories.contains(directory))
+                );
+            }
+            if let GspOrigin::Nvidia(release) = row.origin {
+                for (recipe, kind) in release.images.iter().zip(["bootloader", "fmc", "gsp"]) {
+                    let member = format!(
+                        "nvidia/{}/gsp/{kind}-{}.bin",
+                        row.directories[0], row.release
+                    );
+                    assert_eq!(recipe.image.member, member);
+                    assert!(GSP.iter().any(|known| known.image == recipe.image));
+                }
+            }
+        }
+        for recipe in GSP {
+            let nvidia = matches!(recipe.image.source, NVIDIA_OPEN_GPU | NVIDIA_LINUX_DRIVER);
+            assert_eq!(
+                nvidia_gsp(&recipe.image).is_some(),
+                nvidia,
+                "{}",
+                recipe.image.member
+            );
+        }
+    }
+
     fn gsp_member(name: &str) -> Option<&'static str> {
         let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":name,"target":{"driver":"nouveau","hardware":"nvidia",
@@ -1597,9 +3053,24 @@ mod tests {
         };
         for name in names("tu104") {
             assert!(gsp_member(&name).is_some(), "{name}");
-            assert!(name.starts_with("nvidia/tu104/gsp/"), "{name}");
+            assert!(
+                name.starts_with("nvidia/tu104/gsp/") || name == "nvidia/tu104/acr/bl.bin",
+                "{name}"
+            );
         }
         assert!(names("tu104").iter().any(|name| name.contains("/gsp-")));
+        // Turing's FWSEC v2 image boots with the ACR bootloader, and a stick
+        // without it stops `fwsec-sb` at `-ENOENT`.
+        assert!(
+            names("tu104")
+                .iter()
+                .any(|name| name == "nvidia/tu104/acr/bl.bin")
+        );
+        assert!(
+            names("ga104").iter().all(|name| !name.contains("/acr/")),
+            "{:?}",
+            names("ga104")
+        );
         assert!(
             names("ad104")
                 .iter()
@@ -1634,9 +3105,19 @@ mod tests {
                 "nvidia/tu116/gsp/booter_unload-570.144.bin",
             ),
             (
-                "nvidia/gb207/gsp/fmc-570.144.bin",
-                "nvidia/gb202/gsp/fmc-570.144.bin",
+                "nvidia/gb207/gsp/fmc-570.211.01.bin",
+                "nvidia/gb202/gsp/fmc-570.211.01.bin",
             ),
+            (
+                "nvidia/gb206/gsp/gsp-570.211.01.bin",
+                "nvidia/gb202/gsp/gsp-570.211.01.bin",
+            ),
+            // The ACR bootloader follows the same links, unversioned, and
+            // every Turing chip shares `tu102`'s copy of it.
+            ("nvidia/tu102/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu106/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu116/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
+            ("nvidia/tu117/acr/bl.bin", "nvidia/tu102/acr/bl.bin"),
         ] {
             assert_eq!(gsp_member(name), Some(member), "{name}");
         }
@@ -1645,6 +3126,12 @@ mod tests {
             "nvidia/gk104/gsp/gsp-570.144.bin",
             "nvidia/ga102/gsp/fmc-570.144.bin",
             "nvidia/ga102/acr/bl-570.144.bin",
+            // Ampere and later carry a v3 FWSEC image, which boots without a
+            // separate bootloader; linux-firmware holds no `acr` file for them.
+            "nvidia/ga102/acr/bl.bin",
+            "nvidia/ad102/acr/bl.bin",
+            "nvidia/gb202/acr/bl.bin",
+            "nvidia/gk104/acr/bl.bin",
         ] {
             assert_eq!(gsp_member(name), None, "{name}");
         }
@@ -1664,11 +3151,21 @@ mod tests {
                 assert!(gsp_member(&name).is_some(), "{name}");
             }
         }
-        for chip in [
-            "gh100", "gb100", "gb102", "gb202", "gb203", "gb205", "gb206", "gb207",
-        ] {
+        // Every Turing chip also boots its FWSEC v2 image with the ACR
+        // bootloader, which is not a GSP-RM release file.
+        for chip in ["tu102", "tu104", "tu106", "tu116", "tu117"] {
+            let name = format!("nvidia/{chip}/acr/bl.bin");
+            assert!(gsp_member(&name).is_some(), "{name}");
+        }
+        for chip in ["gh100", "gb100", "gb102"] {
             for kind in ["fmc", "bootloader", "gsp"] {
                 let name = format!("nvidia/{chip}/gsp/{kind}-570.144.bin");
+                assert!(gsp_member(&name).is_some(), "{name}");
+            }
+        }
+        for chip in ["gb202", "gb203", "gb205", "gb206", "gb207"] {
+            for kind in ["fmc", "bootloader", "gsp"] {
+                let name = format!("nvidia/{chip}/gsp/{kind}-570.211.01.bin");
                 assert!(gsp_member(&name).is_some(), "{name}");
             }
         }
@@ -1705,19 +3202,43 @@ mod tests {
         );
         assert_eq!(artifact.urls(), [artifact.url()]);
         for recipe in super::super::bundle::recipes() {
-            let sources = recipe.image.urls().len();
-            assert_eq!(
-                sources,
-                if recipe.image.source == WIRELESS_REGDB {
-                    1
-                } else {
-                    2
-                },
-                "{}",
-                recipe.image.member
-            );
-            assert_eq!(recipe.license.urls().len(), sources);
+            // An image built from NVIDIA's release has its download's sources.
+            let image = nvidia_gsp(&recipe.image)
+                .map_or(&recipe.image, |(release, part)| release.source(part));
+            for artifact in [image, recipe.license] {
+                if *artifact == NVIDIA_DRIVER_570_211_01_LICENSE {
+                    // The CLI carries it.
+                    continue;
+                }
+                assert_eq!(
+                    artifact.urls().len(),
+                    if matches!(artifact.source, WIRELESS_REGDB | NVIDIA_OPEN_GPU) {
+                        1
+                    } else {
+                        2
+                    },
+                    "{}",
+                    artifact.member
+                );
+            }
         }
+        // NVIDIA's images come from where NVIDIA publishes them.
+        let [bootloader, _, gsp] = &GB20X_570_211_01.images;
+        assert_eq!(
+            bootloader.image.urls(),
+            [
+                "https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/498793d5e2a86c981b83c1bfb31f1f4a082d0f7b/src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c"
+            ]
+        );
+        assert_eq!(
+            gsp.image.urls(),
+            [
+                "https://download.nvidia.com/XFree86/Linux-x86_64/570.211.01/NVIDIA-Linux-x86_64-570.211.01.run",
+                "https://us.download.nvidia.com/XFree86/Linux-x86_64/570.211.01/NVIDIA-Linux-x86_64-570.211.01.run"
+            ]
+        );
+        assert_eq!(bootloader.license.member, "COPYING");
+        assert_eq!(*gsp.license, NVIDIA_DRIVER_570_211_01_LICENSE);
         let value = serde_json::json!({"schema":1,"complete":true,"requirements":[{
             "name":"regulatory.db", "target":{"driver":"wifi-regulatory","hardware":"wireless-regdb","revision":"v20","board":null},"minimum_bytes":8
         }]});
@@ -1759,9 +3280,9 @@ mod tests {
         assert_eq!(
             names,
             [
-                "nvidia/gb203/gsp/bootloader-570.144.bin",
-                "nvidia/gb203/gsp/fmc-570.144.bin",
-                "nvidia/gb203/gsp/gsp-570.144.bin",
+                "nvidia/gb203/gsp/bootloader-570.211.01.bin",
+                "nvidia/gb203/gsp/fmc-570.211.01.bin",
+                "nvidia/gb203/gsp/gsp-570.211.01.bin",
             ]
         );
         // An NVIDIA GPU's audio function is no GPU.

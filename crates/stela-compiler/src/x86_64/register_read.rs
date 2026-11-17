@@ -1377,8 +1377,10 @@ pub enum TimerAccess {
 /// cells whose `value` is the address of the compare's storage and the
 /// control's, the count before which the engine looks at the lines again
 /// ([`crate::x86_64::transition::Places::lines_until`]), the native ISR_EL1
-/// read's cell, open until a count ([`interrupt_status_thunk`]), and the
-/// count reader.
+/// read's cell, open until a count ([`interrupt_status_thunk`]), the count
+/// reader, and `quiet`, a cell open while its `value` is what
+/// [`GuestState::pending`] would hold were the channel's output low: the
+/// interrupts waiting at entry but the FIQ only this channel raised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerPlaces {
     pub compare: Place,
@@ -1386,6 +1388,7 @@ pub struct TimerPlaces {
     pub lines_until: Place,
     pub interrupt_status: Place,
     pub count: Place,
+    pub quiet: Place,
 }
 
 /// ENABLE and IMASK of a timer control.
@@ -1398,16 +1401,19 @@ const TIMER_STATUS_SHIFT: u8 = 2;
 /// The thunk completing `access` of a timer channel at `pc` with Xt, else
 /// exiting at `pc`. Both cells must be open. A write completes only when it
 /// leaves the channel's output low, and the engine's `lines_until` names a
-/// count (not 0): the output was low (disabled, masked or before the
-/// compare), and once the write is done it is disabled, masked or armed for
-/// a compare after the count. A compare before `lines_until` pulls it, and
-/// the deadline of an open ISR_EL1 cell, down to the compare: every native
-/// path that could let the line's rise pass unseen (an unmasking ERET or
-/// GEXIT, an ISR_EL1 read, a WFE's spin) stops there, and the engine, which
-/// looks at the lines again at the next boundary, finds the new compare in
-/// storage. Anything else, which could raise or lower the line now, exits.
-/// A count that passes the new compare after the thunk read it is at or
-/// past those deadlines too. It clobbers RAX, RCX and RDX.
+/// count (not 0): once the write is done the channel is disabled, masked or
+/// armed for a compare after the count. A compare before `lines_until` pulls
+/// it, and the deadline of an open ISR_EL1 cell, down to the compare: every
+/// native path that could let the line's rise pass unseen (an unmasking ERET
+/// or GEXIT, an ISR_EL1 read, a WFE's spin) stops there, and the engine,
+/// which looks at the lines again at the next boundary, finds the new
+/// compare in storage. A completed write also makes the frame's waiting
+/// interrupts `quiet`'s, which the channel's low output leaves: a kernel's
+/// timer handler that rearms the timer whose FIQ it took lowers the FIQ, so
+/// the ERET after it unmasks none. Where the output was high and `quiet` is
+/// closed, or the write would raise or keep the line, it exits. A count
+/// that passes the new compare after the thunk read it is at or past those
+/// deadlines too. It clobbers RAX, RCX and RDX.
 pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerPlaces) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
@@ -1449,7 +1455,12 @@ pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerP
     let was_quiet = asm.jcc(Cond::Ne);
     storage(&mut asm, Rax, places.compare);
     asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
-    let was_high = asm.jcc(Cond::Ae);
+    let was_low = asm.jcc8(Cond::B);
+    // High: only where the engine knows what lowering it leaves waiting.
+    asm.place(Rax, places.quiet);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
+    let was_high = asm.jcc(Cond::E);
+    asm.bind(was_low);
     asm.bind(was_quiet);
     // The new register value into RCX, and the compare it arms into RAX
     // while the control arms one, else straight to the store.
@@ -1515,6 +1526,17 @@ pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerP
     asm.bind(later);
     asm.bind(read_later);
     asm.bind(quiet);
+    // The output is low from here: the FIQ only it raised goes.
+    asm.place(Rdx, places.quiet);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rdx, 0), 0);
+    let unknown_quiet = asm.jcc8(Cond::E);
+    asm.mov_load(Dword, Rdx, Mem::base_disp8(Rdx, VALUE));
+    asm.mov_store(
+        Dword,
+        frame_field(core::mem::offset_of!(GuestState, pending)),
+        Rdx,
+    );
+    asm.bind(unknown_quiet);
     let target = match access {
         TimerAccess::WriteControl(_) => places.control,
         _ => places.compare,
@@ -1823,8 +1845,9 @@ mod tests {
                 assert_ne!(page as usize, usize::MAX);
                 core::ptr::copy_nonoverlapping(thunk.code.as_ptr(), page.cast(), thunk.code.len());
                 assert_eq!(mprotect(page, PAGE, 5), 0);
-                let entry: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                    core::mem::transmute(page);
+                let entry = |state: *mut crate::GuestState| -> u128 {
+                    crate::x86_64::native::call::<u128>(page as *const u8, state, 0, 0)
+                };
                 let exit = entry(state);
                 assert_eq!(munmap(page, PAGE), 0);
                 exit as u64
@@ -1919,8 +1942,9 @@ mod tests {
             assert_ne!(page as usize, usize::MAX);
             core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut crate::GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(state);
             assert_eq!(munmap(page, PAGE), 0);
             exit
@@ -3003,6 +3027,7 @@ mod tests {
             ctl: u64,
             lines_until: u64,
             status: Cell,
+            quiet: Cell,
         }
         const ENABLE: u64 = 1;
         const IMASK: u64 = 2;
@@ -3014,6 +3039,7 @@ mod tests {
             lines_until: place(offset_of!(Timer, lines_until)),
             interrupt_status: place(offset_of!(Timer, status)),
             count: READER,
+            quiet: place(offset_of!(Timer, quiet)),
         };
         let mut timer = alloc::boxed::Box::new(Timer::default());
         let base = &mut *timer as *mut Timer;
@@ -3053,6 +3079,8 @@ mod tests {
             timer_thunk(PC, 5, TimerAccess::WriteCompare, places).code,
         );
         let control = timer_thunk(PC, 5, TimerAccess::WriteControl(keep), places).code;
+        // The frame's waiting interrupts before each run and after it.
+        let pending = core::cell::Cell::new(0u32);
         // count, lines_until, (cval, ctl) before, the thunk, Xt, the exit
         // and (cval, ctl) after.
         let mut expect = |now: u64,
@@ -3068,7 +3096,9 @@ mod tests {
                 d.lines_until = until;
             });
             state.x[5] = xt;
+            state.pending = pending.get();
             let ran = run(code, &mut state);
+            pending.set(state.pending);
             data(&mut |d| {
                 assert_eq!(
                     (ran.pc, d.cval, d.ctl),
@@ -3110,9 +3140,35 @@ mod tests {
         expect(100, 150, armed, &compare, 150, NEXT, (150, ENABLE));
         expect(100, 150, armed, &compare, 149, NEXT, (149, ENABLE));
         data(&mut |d| assert_eq!(d.lines_until, 149));
-        // The output is high (armed and past its compare): every write exits.
+        // The output is high (armed and past its compare): with `quiet`
+        // closed every write exits.
         expect(100, 150, (90, ENABLE), &compare, 500, MISS, (90, ENABLE));
         expect(100, 150, (90, ENABLE), &control, 0, MISS, (90, ENABLE));
+        // With it open, a write that lowers the line completes and leaves
+        // the FIQ it raised no longer waiting; one that keeps it high exits
+        // with the FIQ still waiting.
+        data(&mut |d| {
+            d.quiet = Cell {
+                readable: 1,
+                value: 0b10,
+            }
+        });
+        for (code, xt, after) in [
+            (&compare, 500, (500, ENABLE)),
+            (&value, 30, (130, ENABLE)),
+            (&control, 0, (90, 0)),
+            (&control, ENABLE | IMASK, (90, ENABLE | IMASK)),
+            (&compare, 95, (90, ENABLE)),
+            (&control, ENABLE, (90, ENABLE)),
+        ] {
+            pending.set(0b11);
+            let lowers = after != (90, ENABLE);
+            let exit = if lowers { NEXT } else { MISS };
+            expect(100, 150, (90, ENABLE), code, xt, exit, after);
+            assert_eq!(pending.get(), if lowers { 0b10 } else { 0b11 });
+        }
+        data(&mut |d| d.quiet = Cell::default());
+        pending.set(0);
         // Masked or disabled, any compare completes and arms nothing.
         expect(
             100,

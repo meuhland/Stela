@@ -18,15 +18,27 @@ workspace = true
 [features]
 # Common native Linux kernel services; selecting this attaches no GPU.
 linux-kernel = ["dep:cc", "dep:stela-c-build", "stela-c-build/linux", "dep:stela-linux", "stela-linux/kernel"]
+# DRM's core and helpers with their registrations, which every driver port
+# builds over; selecting this attaches no GPU.
+linux-drm = ["linux-kernel", "stela-c-build/linux-registry"]
 # nouveau's hardware resource manager (NVKM), compiled unchanged; it reaches
 # no device until the kernel services it imports are supplied.
-nouveau-port = ["linux-kernel", "stela-c-build/linux-registry"]
+nouveau-port = ["linux-drm"]
+# amdgpu with its display core, compiled unchanged; its unit joins the
+# image's registrations and AMD's stack its GPUs.
+amdgpu-port = ["linux-drm"]
+# Intel's xe with the display code it shares with i915, compiled unchanged;
+# no boot starts it yet.
+xe-port = ["linux-drm"]
 # Stela's Metal device over the internal Vulkan boundary; no Vulkan driver.
 metal = ["dep:stela-contracts"]
 # The Metal device's native backend over a loaded Vulkan driver (NVK).
 metal-vulkan = ["metal", "dep:ash"]
 # The image links the Metal compiler's C (`crates/stela-mesa`).
 metal-linked = ["metal-vulkan"]
+# AMD's stack draws on RADV, which the image must link (`stela_vulkan_amd`);
+# without it amdgpu shows frames another GPU drew.
+radv = ["amdgpu-port", "metal-linked"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", optional = true }

@@ -1974,10 +1974,12 @@ fn conditional_exits_branch_over_the_fallthrough_exit() {
     );
     let fallthrough = super::super::chain::direct_exit(GuestAddress(0x1004), ExitKind::Fallthrough);
     let taken = super::super::chain::direct_exit(GuestAddress(0x2000), ExitKind::Direct);
-    assert_eq!(code[..6], [0x0f, 0x85, 24, 0, 0, 0]);
-    assert_eq!(code[6..30], fallthrough);
-    assert_eq!(code[30..], taken);
-    assert_eq!(code.instructions(), 23);
+    assert_eq!(code[..6], [0x0f, 0x85, DIRECT_EXIT_BYTES as u8, 0, 0, 0]);
+    assert_eq!(code[6..6 + DIRECT_EXIT_BYTES], fallthrough);
+    assert_eq!(code[6 + DIRECT_EXIT_BYTES..], taken);
+    // The branch, then MOVABS, MOV, the patch point, the return (one
+    // emission) and four INT3s each.
+    assert_eq!(code.instructions(), 17);
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
@@ -2038,7 +2040,13 @@ fn grouped_sha256_schedule_removes_only_the_intermediate_frame_round_trip() {
         let separate_bytes = body_bytes(&instructions[..1])
             + body_bytes(&instructions[1..4])
             + body_bytes(&instructions[4..]);
-        assert_eq!(body_bytes(&instructions) + 16, separate_bytes);
+        if target.supports(TargetCpu::Sha) {
+            // The rounds keep V in the block's homes, where SU0's result
+            // makes no frame round trip apart either.
+            assert!(body_bytes(&instructions) < separate_bytes);
+        } else {
+            assert_eq!(body_bytes(&instructions) + 16, separate_bytes);
+        }
 
         if (target.supports(TargetCpu::Sha) && !std::arch::is_x86_feature_detected!("sha"))
             || (target.supports(TargetCpu::Ssse3) && !std::arch::is_x86_feature_detected!("ssse3"))
@@ -2717,8 +2725,9 @@ fn vector_fused_multiply_add_keeps_zero_lanes_in_the_block() {
                 assert_ne!(page as usize, usize::MAX);
                 core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
                 assert_eq!(mprotect(page, bytes, 5), 0);
-                let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                    core::mem::transmute(page);
+                let entry = |state: *mut crate::GuestState| -> Exit {
+                    crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+                };
                 let exit = entry(&mut state);
                 assert_eq!(munmap(page, bytes), 0);
                 exit
@@ -2786,8 +2795,9 @@ fn out_of_line_slow_paths_run_as_the_inline_layout() {
             assert_ne!(page as usize, usize::MAX);
             core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
             assert_eq!(mprotect(page, bytes, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(state);
             assert_eq!(munmap(page, bytes), 0);
             exit
@@ -2995,9 +3005,7 @@ fn clock_exit_requests_runtime_service_without_counter_or_guest_writes() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
-        expected.extend([
-            0xba, 7, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-        ]);
+        expected.extend(super::super::chain::exit_word(7));
         // No RDTSC, host helper address, guessed counter, destination write
         // or placeholder ISB: only the checked runtime service may complete.
         assert_eq!(native.x86_64_code, expected);
@@ -3039,9 +3047,7 @@ fn pac_helper_exit_has_no_guest_writes_or_embedded_service_address() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
-        expected.extend([
-            0xba, 6, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-        ]);
+        expected.extend(super::super::chain::exit_word(6));
         // Only the SysV return registers RAX/RDX are touched, including for
         // RETAB: the runtime must keep signed LR while authenticating target.
         assert_eq!(native.x86_64_code, expected);
@@ -3078,9 +3084,7 @@ fn ordinary_native_prefix_is_preserved_before_pac_boundary() {
     assert_eq!(native.source_map[1].0, pc);
     assert_eq!(
         &native.x86_64_code[native.x86_64_code.len() - DYNAMIC_EXIT_BYTES..],
-        &[
-            0xba, 6, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc
-        ]
+        super::super::chain::exit_word(6)
     );
 }
 
@@ -3105,9 +3109,7 @@ fn trap_exit_uses_instruction_pc_and_only_native_return_scratch_registers() {
         );
         let mut expected = vec![0x48, 0xb8]; // movabs rax,instruction_pc
         expected.extend(pc.0.to_le_bytes());
-        expected.extend([
-            0xba, 5, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-        ]); // mov edx,Trap; ret
+        expected.extend(super::super::chain::exit_word(5)); // mov edx,Trap; ret
         assert_eq!(native.x86_64_code, expected);
         assert_eq!(native.source_map, [(pc, 0)]);
     }
@@ -3386,8 +3388,9 @@ fn pinned_select_consumes_the_preceding_compare_flags() {
     .unwrap()
     .native;
     let select = &code.x86_64_code[code.source_map[1].1..code.source_map[2].1];
-    // CMC converts Arm carry into the x86 borrow for the HI predicate.
-    assert_eq!(select[0], 0xf5);
+    // The compare's flags stay in the host's, whose borrow HI reads as it
+    // is: no CMC before the select.
+    assert_ne!(select[0], 0xf5, "{select:02x?}");
     let entry = pinned::entered(&code.x86_64_code);
     for (operand, selected, nzcv) in [
         (0, 33, 0x8000_0000),
@@ -3418,8 +3421,11 @@ fn pinned_conditional_increment_consumes_the_preceding_compare_flags() {
     // CMP X0, #1; CSINC W8, W2, W8, HI; RET.
     let csinc = 0x1a88_8448;
     for (select, prefix) in [
-        (cset, &[0x0f, 0x94, 0xc0][..]),                // SETE AL
-        (csinc, &[0x8b, 0xd6, 0x8d, 0x52, 0x01, 0xf5]), // MOV EDX, LEA, CMC
+        (cset, &[0x0f, 0x94, 0xc0][..]), // SETE AL
+        (
+            csinc,
+            &[0x8b, 0xd6, 0x8d, 0x52, 0x01, 0x8b, 0x77, 0x10, 0x0f, 0x46],
+        ), // MOV EDX, LEA, MOV ESI, CMOVBE
     ] {
         let source: Vec<_> = [0xf100_041fu32, select, 0xd65f_03c0]
             .into_iter()
@@ -3639,7 +3645,8 @@ fn masked_base_reuse_matches_the_unmasked_block() {
 }
 
 /// A flag setter whose NZCV the next one overwrites before any read, fault
-/// or exit keeps no capture in system mode; every other one keeps its own.
+/// or exit keeps no capture in system mode, nor does one whose readers take
+/// it from the host flags before that; every other one keeps its own.
 #[test]
 fn dead_nzcv_captures_are_dropped_in_system_mode() {
     use crate::{Lifter, TargetCpu, aarch64::Decoder};
@@ -3657,7 +3664,7 @@ fn dead_nzcv_captures_are_dropped_in_system_mode() {
         (&[ADDS_X0, ADD_X3, MOVZ_X4, SUBS_X2], 1),
         (&[ADDS_X0, ADDS_X1, ADD_X3], 1),
         (&[ADDS_X0, TST_X0, SUBS_X2, ADDS_X1], 1),
-        (&[ADDS_X0, CSEL_X7, ADDS_X1], 2),
+        (&[ADDS_X0, CSEL_X7, ADDS_X1], 1),
         (&[ADDS_X0, LDR_X9, ADDS_X1], 2),
         (&[ADDS_X0], 1),
     ] {
@@ -3778,4 +3785,176 @@ fn dead_nzcv_captures_leave_the_frame_emitters_state() {
         }
     }
     assert!(cases > 6000);
+}
+
+/// MOVZ, MOVN and MOVK in both widths at every shift, with immediates at
+/// the edges of the zero-extended and sign-extended 32-bit moves, into
+/// pinned and frame registers, after a CMP whose NZCV a B.cond, a CSEL and
+/// MRS read after them: the pinned system-mode block, the frame block, an
+/// ordinary block (whose regions take the constants) and a model agree.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn wide_moves_match_the_model_in_every_form() {
+    use crate::{
+        GuestState, Lifter, Options, TargetCpu,
+        aarch64::Decoder,
+        block::{BlockProfile, CompilationPlan},
+        state::Limit,
+        x86_64::{MemoryChecks, NativeSystem, native, pinned},
+    };
+    const CMP_X1_X2: u32 = 0xeb02_003f;
+    const B_EQ: u32 = 0x5400_0200;
+    /// CSEL X13, X3, X4, LT.
+    const CSEL_X13: u32 = 0x9a84_b06d;
+    const MRS_X14_NZCV: u32 = 0xd53b_420e;
+    let host = TargetCpu::detect();
+    let mut runs = 0;
+    for target in [TargetCpu::Baseline, TargetCpu::X86_64_V3, host] {
+        if !host.supports(target) {
+            continue;
+        }
+        for wide in [false, true] {
+            for opc in [0u32, 2, 3] {
+                for hw in 0..if wide { 4 } else { 2 } {
+                    for immediate in [0u32, 1, 0x7fff, 0x8000, 0xfffe, 0xffff] {
+                        for rd in [0u32, 1, 5, 8, 19, 30] {
+                            let word = u32::from(wide) << 31
+                                | opc << 29
+                                | 0x1280_0000
+                                | hw << 21
+                                | immediate << 5
+                                | rd;
+                            let words = [CMP_X1_X2, word, B_EQ, CSEL_X13, MRS_X14_NZCV];
+                            let instructions: Vec<_> = words
+                                .iter()
+                                .enumerate()
+                                .map(|(index, &word)| {
+                                    Decoder
+                                        .lift(GuestAddress(0x1000 + 4 * index as u64), word)
+                                        .unwrap()
+                                })
+                                .collect();
+                            let end = GuestAddress(0x1000 + 4 * words.len() as u64);
+                            let (system, _) = emit_system_mode(
+                                &instructions,
+                                None,
+                                end,
+                                target,
+                                MemoryChecks::DEFAULT,
+                                NativeSystem::NONE,
+                            );
+                            let system = pinned::entered(&system.x86_64_code);
+                            let frame = emit_for_target(
+                                &instructions,
+                                None,
+                                end,
+                                target,
+                                MemoryChecks::DEFAULT,
+                            )
+                            .x86_64_code;
+                            // An ordinary block ends at the B.EQ.
+                            let source: Vec<u8> = words[..2]
+                                .iter()
+                                .flat_map(|word| word.to_le_bytes())
+                                .collect();
+                            let ordinary = CompilationPlan::new(
+                                &source,
+                                GuestAddress(0x1000),
+                                &Options::new(BlockProfile::ORDINARY, target),
+                            )
+                            .unwrap()
+                            .compile()
+                            .unwrap()
+                            .native
+                            .x86_64_code;
+                            for (left, right) in [(1, 1), (1, 2), (u64::MAX, 0), (0, u64::MAX)] {
+                                let mut initial = GuestState {
+                                    lower_limit: Limit(u64::MAX),
+                                    ..GuestState::default()
+                                };
+                                for (register, x) in initial.x.iter_mut().enumerate() {
+                                    *x = 0x0123_4567_89ab_cdef_u64.rotate_left(register as u32 * 5);
+                                }
+                                initial.x[1] = left;
+                                initial.x[2] = right;
+                                let shift = 16 * hw;
+                                let field = u64::from(immediate) << shift;
+                                let old = initial.x[rd as usize];
+                                let value = match opc {
+                                    0 => !field,
+                                    2 => field,
+                                    _ => old & !(0xffff << shift) | field,
+                                };
+                                let value = if wide { value } else { value & 0xffff_ffff };
+                                let label =
+                                    alloc::format!("{word:08x} {left:#x} {right:#x} {target:?}");
+                                let mut expected = initial.clone();
+                                let exit = native::run(&frame, &mut expected);
+                                assert_eq!(expected.x[rd as usize], value, "{label}");
+                                let mut actual = initial.clone();
+                                let system_exit = native::run(&system, &mut actual);
+                                assert_eq!((system_exit, &actual), (exit, &expected), "{label}");
+                                let mut actual = initial.clone();
+                                native::run(&ordinary, &mut actual);
+                                assert_eq!(
+                                    (actual.x[rd as usize], actual.nzcv),
+                                    (value, expected.nzcv),
+                                    "{label}"
+                                );
+                                runs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(runs > 2000, "{runs}");
+}
+
+/// A system-mode block's cold range (`CompiledBlock::cold`), which
+/// `--profile`'s host samples tell apart, covers its out-of-line slow paths:
+/// it starts after the jump over them, the jumps over its parts reach its
+/// end, and no instruction's inline code starts in it. A block without slow
+/// paths has none.
+#[test]
+fn cold_ranges_cover_the_code_behind_the_jumps_over_it() {
+    use crate::{
+        Options, TargetCpu,
+        block::{BlockProfile, CompilationPlan, Features},
+    };
+    let compile = |words: &[u32]| {
+        let source: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let options = Options::new(
+            BlockProfile::new(Features::SYSTEM_MODE),
+            TargetCpu::Baseline,
+        );
+        CompilationPlan::new(&source, GuestAddress(0x1000), &options)
+            .unwrap()
+            .compile()
+            .unwrap()
+    };
+    let block = compile(&[
+        0x1e21_0802, // fmul s2,s0,s1
+        0x1e20_2843, // fadd s3,s2,s0
+        0x1e20_1909, // fdiv s9,s8,s0
+        0x1e61_c0d3, // fsqrt d19,d6
+        0x9100_0400, // add x0,x0,#1
+    ]);
+    let (start, end) = (block.cold.0 as usize, block.cold.1 as usize);
+    assert!(start < end, "slow paths out of line: {:?}", block.cold);
+    let code = &block.native.x86_64_code;
+    assert!(end <= code.len());
+    let jump = start - super::super::chain::JUMP_BYTES;
+    assert_eq!(code[jump], 0xe9, "a jump over the cold code");
+    let mut target = target_of(code, jump + 1);
+    while target < end {
+        assert_eq!(code[target], 0xe9, "a jump over the next cold part");
+        target = target_of(code, target + 1);
+    }
+    assert_eq!(target, end);
+    for &(_, offset) in &block.native.source_map {
+        assert!(!(start..end).contains(&offset), "inline code at {offset}");
+    }
+    assert_eq!(compile(&[0x9100_0400, 0x9100_0421]).cold, (0, 0));
 }

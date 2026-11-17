@@ -87,6 +87,17 @@ pub(in super::super) struct Node {
     pub hub_change: u16,
     pub after_power_status: Option<u16>,
     bot: Option<bot::Disk>,
+    pub hid: Option<HidPeer>,
+    /// The serial number its string descriptor 3 gives, in English (US).
+    pub serial: Option<&'static str>,
+}
+
+/// A boot keyboard (protocol 1) or mouse (2): its interrupt IN endpoint
+/// answers only with queued reports, as a real device NAKs until a change.
+#[derive(Clone, Default)]
+pub(in super::super) struct HidPeer {
+    pub protocol: u8,
+    pub reports: VecDeque<Vec<u8>>,
 }
 impl Node {
     pub fn hub(speed: u8, ports: usize) -> Self {
@@ -118,6 +129,8 @@ impl Node {
             hub_change: 0,
             after_power_status: None,
             bot: None,
+            hid: None,
+            serial: None,
         }
     }
     pub fn leaf(speed: u8) -> Self {
@@ -141,6 +154,24 @@ impl Node {
             hub_change: 0,
             after_power_status: None,
             bot: None,
+            hid: None,
+            serial: None,
+        }
+    }
+    /// A full-speed boot keyboard (`protocol` 1) or mouse (2).
+    pub fn hid(protocol: u8) -> Self {
+        Self {
+            hid: Some(HidPeer {
+                protocol,
+                reports: VecDeque::new(),
+            }),
+            ..Self::leaf(FULL_SPEED)
+        }
+    }
+    fn report_descriptor(&self) -> &'static [u8] {
+        match self.hid.as_ref().map(|hid| hid.protocol) {
+            Some(1) => &crate::usb::ehci::input::KEYBOARD_REPORT,
+            _ => &crate::usb::ehci::input::MOUSE_REPORT,
         }
     }
     pub fn bot_disk(speed: u8) -> Self {
@@ -151,6 +182,35 @@ impl Node {
     }
     pub fn bot_commands(&self) -> &[(u32, u8)] {
         &self.bot.as_ref().expect("BOT peer required").commands
+    }
+    /// Hang the BOT peer until a port reset readdresses it
+    /// ([`bot::Disk::wedged`]).
+    pub fn wedge_bot(&mut self) {
+        self.bot.as_mut().expect("BOT peer required").wedged = true;
+    }
+    /// [`Self::wedge_bot`], with the class reset acknowledged and no help.
+    pub fn wedge_bot_acking_reset(&mut self) {
+        self.wedge_bot();
+        self.bot.as_mut().unwrap().acks_reset = true;
+    }
+    /// Break the BOT peer's link until a port reset readdresses it
+    /// ([`bot::Disk::broken`]).
+    pub fn break_bot_link(&mut self) {
+        self.bot.as_mut().expect("BOT peer required").broken = true;
+    }
+    pub fn bot_link_broken(&self) -> bool {
+        self.bot.as_ref().expect("BOT peer required").broken
+    }
+    /// The BOT peer's RAM medium.
+    pub fn bot_media(&mut self) -> &mut [u8] {
+        self.bot.as_mut().expect("BOT peer required").media()
+    }
+    /// Fail every READ that covers `block` with MEDIUM ERROR.
+    pub fn bot_unreadable(&mut self, block: usize) {
+        self.bot.as_mut().expect("BOT peer required").unreadable = Some(block);
+    }
+    pub fn bot_wedged(&self) -> bool {
+        self.bot.as_ref().expect("BOT peer required").wedged
     }
     fn device(&self) -> Vec<u8> {
         let mut out = vec![
@@ -166,6 +226,9 @@ impl Node {
                 1
             };
         }
+        if self.serial.is_some() {
+            out[16] = 3;
+        }
         if self.speed < SUPER_SPEED {
             out[2..4].copy_from_slice(&0x0200u16.to_le_bytes());
             out[7] = 64;
@@ -180,6 +243,16 @@ impl Node {
             return configuration.clone();
         }
         let hub = self.ports.is_some();
+        if let Some(hid) = &self.hid {
+            let report = self.report_descriptor().len() as u8;
+            let mut out = vec![9, 2, 0, 0, 1, 1, 0, 0xa0, 50];
+            out.extend_from_slice(&[9, 4, 0, 0, 1, 3, 1, hid.protocol, 0]);
+            out.extend_from_slice(&[9, 0x21, 0x11, 1, 0, 1, 0x22, report, 0]);
+            out.extend_from_slice(&[7, 5, 0x81, 3, 8, 0, 10]);
+            let length = out.len() as u16;
+            out[2..4].copy_from_slice(&length.to_le_bytes());
+            return out;
+        }
         let mut out = vec![
             9,
             2,
@@ -331,6 +404,10 @@ pub(in super::super) struct Hardware {
     pub commands: Vec<(u32, u8)>,
     pub fail: Option<(u32, u8)>,
     pub silent: Option<(u32, u8)>,
+    /// The device at this route answers this many more requests, then none,
+    /// and an Address Device for it fails as a controller's does for a
+    /// device that does not answer SET_ADDRESS.
+    pub answers: Option<(u32, usize)>,
     /// A silenced command, keeping CRCR.CRR set until it is aborted.
     stuck: Option<u64>,
     pub outgoing: Vec<Vec<u8>>,
@@ -340,8 +417,18 @@ pub(in super::super) struct Hardware {
     pub root_status: Option<u32>,
     /// A warm reset of the root port leaves its link untrained.
     pub root_untrainable: bool,
+    /// A wedged BOT peer on the root port drops its link to SS.Inactive,
+    /// showing a connection or not, as a device whose firmware hung may;
+    /// then only a warm reset retrains it.
+    pub wedge_drops_root_link: Option<bool>,
+    /// How long a root port reset runs; at once when `None`.
+    pub root_reset_us: Option<u64>,
+    /// The root port reset under way and when it ends.
+    root_reset_done: Option<(u32, u64)>,
     pub notification_override: Option<u32>,
     pending_interrupts: BTreeMap<(u8, u8), (u64, u64, usize)>,
+    /// Bulk TDs a wedged BOT peer never completes; a Stop Endpoint ends them.
+    withheld: BTreeMap<(u8, u8), u64>,
     pub mmio_reads: usize,
     pub mmio_writes: usize,
     registers: BTreeMap<usize, u32>,
@@ -372,6 +459,7 @@ impl Hardware {
             commands: Vec::new(),
             fail: None,
             silent: None,
+            answers: None,
             stuck: None,
             outgoing: Vec::new(),
             loss_after_child_route: None,
@@ -379,8 +467,12 @@ impl Hardware {
             failed_configuration: None,
             root_status: None,
             root_untrainable: false,
+            wedge_drops_root_link: None,
+            root_reset_us: None,
+            root_reset_done: None,
             notification_override: None,
             pending_interrupts: BTreeMap::new(),
+            withheld: BTreeMap::new(),
             mmio_reads: 0,
             mmio_writes: 0,
             registers: BTreeMap::new(),
@@ -396,6 +488,41 @@ impl Hardware {
             free_slots: Default::default(),
             slot_limit: 32,
         }
+    }
+    /// A root port reset (`value`'s PR or WPR) ends, with its port status
+    /// event.
+    fn end_root_reset(&mut self, value: u32) {
+        let actual_speed = self.nodes[&0].speed;
+        let untrainable = self.root_untrainable;
+        if let Some(status) = self.root_status.as_mut() {
+            if value & PR != 0 && *status >> PLS_SHIFT & PLS_FIELD == LINK_INACTIVE {
+                // A hot reset cannot retrain an SS.Inactive link: it
+                // completes with the port still disabled.
+                *status = *status & !PR | PRC;
+            } else if value & PR != 0 {
+                // The device handshake determines speed when reset enables
+                // the port; its pre-reset speed field may be undefined.
+                *status = *status & !(PR | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
+                    | PED
+                    | PRC
+                    | u32::from(actual_speed) << PORT_SPEED_SHIFT;
+            }
+            if value & WPR != 0 {
+                // A warm reset clears Cold Attach Status and retrains
+                // the link to U0 (xHCI 1.2 4.19.5.1).
+                let trained = if untrainable {
+                    0
+                } else {
+                    CCS | PED | u32::from(actual_speed) << PORT_SPEED_SHIFT
+                };
+                *status = *status
+                    & !(PR | CAS | CCS | PED | PLS | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
+                    | WRC
+                    | PRC
+                    | trained;
+            }
+        }
+        self.event(1 << 24, SUCCESS, reset::PORT_STATUS_CHANGE, 0, 0, 0);
     }
     pub fn notify_root(&mut self) {
         self.notify_root_code(SUCCESS);
@@ -440,8 +567,16 @@ impl Hardware {
             self.stuck = Some(at);
             return;
         }
+        let route = (kind == ADDRESS_DEVICE)
+            .then(|| read32(parameter + self.context_bytes as u64) & 0xfffff);
         let code = if self.fail == Some((kind, slot)) {
             11
+        } else if route.is_some()
+            && self
+                .answers
+                .is_some_and(|(r, left)| Some(r) == route && left == 0)
+        {
+            transfer::USB_TRANSACTION_ERROR
         } else {
             SUCCESS
         };
@@ -515,6 +650,18 @@ impl Hardware {
                     ];
                     let route = words[0] & 0xfffff;
                     self.routes.insert(slot, route);
+                    // Only a port reset readdresses a device: it ends a
+                    // wedged BOT peer's hang.
+                    if kind == ADDRESS_DEVICE
+                        && let Some(disk) = self
+                            .nodes
+                            .get_mut(&route)
+                            .and_then(|node| node.bot.as_mut())
+                    {
+                        disk.wedged = false;
+                        disk.broken = false;
+                        disk.reset();
+                    }
                     self.contexts.push((slot, kind, words));
                     if kind == ADDRESS_DEVICE && self.loss_after_child_route == Some(route) {
                         self.nodes.get_mut(&0).unwrap().hub_status = 1;
@@ -523,6 +670,7 @@ impl Hardware {
                 reset::DISABLE_SLOT => {
                     self.free_slots.insert(slot);
                     assert!(self.pending_interrupts.keys().all(|(s, _)| *s != slot));
+                    assert!(self.withheld.keys().all(|(s, _)| *s != slot));
                     for &(s, dci) in self.endpoints.keys() {
                         if s == slot {
                             assert_eq!(
@@ -540,6 +688,9 @@ impl Hardware {
                 STOP_ENDPOINT | RESET_ENDPOINT => {
                     if let Some((trb, _, _)) = self.pending_interrupts.remove(&(slot, dci)) {
                         // Stopped transfer event precedes Stop ACK.
+                        self.event(trb, 26, TRANSFER_EVENT, slot, dci, 0);
+                    }
+                    if let Some(trb) = self.withheld.remove(&(slot, dci)) {
                         self.event(trb, 26, TRANSFER_EVENT, slot, dci, 0);
                     }
                     let output = self.outputs[&slot] + u64::from(dci) * self.context_bytes as u64;
@@ -570,12 +721,27 @@ impl Hardware {
         let index = u16::from_le_bytes([request[4], request[5]]);
         let length = u16::from_le_bytes([request[6], request[7]]);
         match (request[0], request[1]) {
+            (0x81, GET_DESCRIPTOR) if node.hid.is_some() && value == 0x2200 => {
+                Ok(node.report_descriptor().to_vec())
+            }
+            // SET_IDLE, SET_PROTOCOL.
+            (0x21, 0x0a | 0x0b) if node.hid.is_some() => Ok(Vec::new()),
             (0xa1, 0xfe) if node.bot.is_some() => {
                 assert_eq!(request, setup(0xa1, 0xfe, 0, 0, 1));
                 Ok(vec![0])
             }
             (0x21, 0xff) if node.bot.is_some() => {
                 assert_eq!(request, setup(0x21, 0xff, 0, 0, 0));
+                let disk = node.bot.as_ref().unwrap();
+                if disk.broken {
+                    return Err(transfer::USB_TRANSACTION_ERROR);
+                }
+                if disk.wedged && disk.acks_reset {
+                    return Ok(Vec::new());
+                }
+                if disk.wedged {
+                    return Err(6);
+                }
                 node.bot.as_mut().unwrap().reset();
                 Ok(Vec::new())
             }
@@ -633,6 +799,14 @@ impl Hardware {
                 DEVICE_DESCRIPTOR => Ok(node.device()),
                 CONFIGURATION_DESCRIPTOR => Ok(node.configuration()),
                 15 => Ok(node.bos.clone().unwrap_or_else(|| vec![5, 15, 5, 0, 0])),
+                STRING_DESCRIPTOR if value & 0xff == 0 => Ok(vec![4, STRING_DESCRIPTOR, 9, 4]),
+                STRING_DESCRIPTOR if value & 0xff == 3 && index == 0x0409 => {
+                    let serial = node.serial.ok_or(6u32)?;
+                    let mut out = vec![0, STRING_DESCRIPTOR];
+                    out.extend(serial.encode_utf16().flat_map(u16::to_le_bytes));
+                    out[0] = out.len() as u8;
+                    Ok(out)
+                }
                 _ => Err(6),
             },
             (0xa0, GET_DESCRIPTOR) => {
@@ -843,6 +1017,14 @@ impl Hardware {
             }
             let (status, _, _, control) = cursor.next();
             assert_eq!(control >> 10 & 0x3f, STATUS);
+            if let Some((route, left)) = &mut self.answers
+                && self.routes.get(&slot) == Some(route)
+            {
+                if *left == 0 {
+                    return;
+                }
+                *left -= 1;
+            }
             let mut reply = self.request(slot, request);
             if self.root_loss_after == Some(request) {
                 self.root_status = Some(PP);
@@ -898,6 +1080,16 @@ impl Hardware {
             let (trb, buffer, length, control) =
                 self.endpoints.get_mut(&(slot, dci)).unwrap().next();
             assert_eq!(control >> 10 & 0x3f, NORMAL);
+            if self.nodes[&self.routes[&slot]].hid.is_some() {
+                assert_eq!(dci, 3);
+                assert!(
+                    self.pending_interrupts
+                        .insert((slot, dci), (trb, buffer, length as usize))
+                        .is_none()
+                );
+                self.complete_interrupts();
+                return;
+            }
             if self.nodes[&self.routes[&slot]].ports.is_some() {
                 assert_eq!(
                     dci,
@@ -922,6 +1114,36 @@ impl Hardware {
                 .bot
                 .as_mut()
             {
+                if disk.broken {
+                    // A halted endpoint's dequeue pointer stays on the TD
+                    // that failed: a soft retry runs it again.
+                    self.endpoints.get_mut(&(slot, dci)).unwrap().at = trb;
+                    let output = self.outputs[&slot] + u64::from(dci) * self.context_bytes as u64;
+                    write32(output, read32(output) & !7 | ENDPOINT_HALTED);
+                    self.event(
+                        trb,
+                        transfer::USB_TRANSACTION_ERROR,
+                        TRANSFER_EVENT,
+                        slot,
+                        dci,
+                        length as usize,
+                    );
+                    return;
+                }
+                if disk.wedged {
+                    assert!(self.withheld.insert((slot, dci), trb).is_none());
+                    if self.routes[&slot] == 0
+                        && let Some(connected) = self.wedge_drops_root_link
+                        && let Some(status) = self.root_status.as_mut()
+                    {
+                        // PLS Inactive with Port Link State Change.
+                        *status = *status & !(CCS | PED | PLS)
+                            | u32::from(connected)
+                            | LINK_INACTIVE << PLS_SHIFT
+                            | 1 << 22;
+                    }
+                    return;
+                }
                 disk.transfer(dci & 1 != 0, buffer, length as usize);
             } else if dci & 1 != 0 {
                 // SAFETY: published IN payload belongs to this fixture.
@@ -942,8 +1164,15 @@ impl Hardware {
 impl Hardware {
     fn complete_interrupts(&mut self) {
         let mut completed = Vec::new();
+        let mut reports = Vec::new();
         for (&(slot, dci), &(trb, buffer, length)) in &self.pending_interrupts {
             let node = &self.nodes[&self.routes[&slot]];
+            if let Some(hid) = &node.hid {
+                if !hid.reports.is_empty() {
+                    reports.push((slot, dci, trb, buffer, length));
+                }
+                continue;
+            }
             let mut bits = u32::from(node.hub_change != 0);
             for (port, state) in node.ports.as_ref().unwrap().iter().enumerate() {
                 if state.change != 0 {
@@ -964,6 +1193,23 @@ impl Hardware {
         for (slot, dci, trb) in completed {
             self.pending_interrupts.remove(&(slot, dci));
             self.event(trb, SUCCESS, TRANSFER_EVENT, slot, dci, 0);
+        }
+        for (slot, dci, trb, buffer, length) in reports {
+            let route = self.routes[&slot];
+            let hid = self.nodes.get_mut(&route).unwrap().hid.as_mut().unwrap();
+            let report = hid.reports.pop_front().unwrap();
+            let n = report.len().min(length);
+            // SAFETY: only the published interrupt TD owns this device write.
+            unsafe { core::ptr::copy_nonoverlapping(report.as_ptr(), buffer as *mut u8, n) };
+            self.pending_interrupts.remove(&(slot, dci));
+            self.event(
+                trb,
+                if n < length { SHORT_PACKET } else { SUCCESS },
+                TRANSFER_EVENT,
+                slot,
+                dci,
+                length - n,
+            );
         }
     }
 }
@@ -1001,6 +1247,16 @@ impl Registers for RegistersModel {
             }
             0x88 => 1 | 1 << 8,
             0x440 => {
+                let now = Clock {
+                    ticks_per_microsecond: 1,
+                }
+                .now_us();
+                if let Some((value, done)) = state.root_reset_done
+                    && now >= done
+                {
+                    state.root_reset_done = None;
+                    state.end_root_reset(value);
+                }
                 // Hubs answer their interrupt TDs while the host samples ports.
                 state.complete_interrupts();
                 state
@@ -1018,35 +1274,25 @@ impl Registers for RegistersModel {
             state.abort();
         }
         if at == 0x440 {
-            let actual_speed = state.nodes[&0].speed;
-            let untrainable = state.root_untrainable;
             if let Some(status) = state.root_status.as_mut() {
                 *status &= !(value & PORT_CHANGES);
-                if value & PR != 0 {
-                    // The device handshake determines speed when reset enables
-                    // the port; its pre-reset speed field may be undefined.
-                    *status = *status & !(PR | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
-                        | PED
-                        | PRC
-                        | u32::from(actual_speed) << PORT_SPEED_SHIFT;
-                }
-                if value & WPR != 0 {
-                    // A warm reset clears Cold Attach Status and retrains
-                    // the link to U0 (xHCI 1.2 4.19.5.1).
-                    let trained = if untrainable {
-                        0
-                    } else {
-                        CCS | PED | u32::from(actual_speed) << PORT_SPEED_SHIFT
-                    };
-                    *status = *status
-                        & !(CAS | CCS | PED | PLS | (PORT_SPEED_FIELD << PORT_SPEED_SHIFT))
-                        | WRC
-                        | PRC
-                        | trained;
-                }
             }
             if value & (PR | WPR) != 0 {
-                state.event(1 << 24, SUCCESS, reset::PORT_STATUS_CHANGE, 0, 0, 0);
+                match state.root_reset_us {
+                    // The reset runs, Port Reset set, until its time passed.
+                    Some(us) => {
+                        let done = Clock {
+                            ticks_per_microsecond: 1,
+                        }
+                        .now_us()
+                            + us;
+                        state.root_reset_done = Some((value & (PR | WPR), done));
+                        if let Some(status) = state.root_status.as_mut() {
+                            *status |= PR;
+                        }
+                    }
+                    None => state.end_root_reset(value),
+                }
             }
         }
         if at == 0x40 {

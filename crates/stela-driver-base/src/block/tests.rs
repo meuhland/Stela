@@ -783,6 +783,120 @@ fn a_sequential_reader_finds_the_chunks_read_ahead_in_memory() {
     assert_eq!((block[0], reads.get()), (3, 1));
 }
 
+/// A disk whose block `n` holds byte `n`.
+fn numbered(blocks: u64) -> RamDisk {
+    let mut ram = RamDisk::new("b", blocks, 512);
+    for (index, byte) in ram.bytes.iter_mut().enumerate() {
+        *byte = (index / 512) as u8;
+    }
+    ram
+}
+
+/// A bounded read of a disk held by a slow command waits only its bound,
+/// leaves its command queued, and takes its result when asked again; it
+/// never reads the disk where it asks.
+#[test]
+fn a_bounded_read_waits_only_its_bound_and_takes_its_command_later() {
+    let _clock = crate::test_clock::virtualize();
+    let (delayed, (released, reads, given)) = Delayed::new(numbered(16), 2);
+    let mut device = Bounded::new(Box::new(delayed));
+    let bound = device.bound();
+    let mut block = [0; 1024];
+    // Unbounded, a read waits for the disk where it asks, as before.
+    device.read(1, &mut block).unwrap();
+    assert_eq!((block[0], block[512], reads.get()), (1, 2, 1));
+    bound.set(10_000);
+    assert_eq!(device.read(3, &mut block), Err(BlockError::Timeout));
+    assert!(bound.blocked(), "a read past its bound is blocked");
+    assert!(!bound.blocked(), "asking clears it");
+    assert_eq!(given.borrow().len(), 1, "one queued read");
+    assert_eq!(device.read(3, &mut block), Err(BlockError::Timeout));
+    assert_eq!(given.borrow().len(), 1, "asked again, the same read waits");
+    assert!(bound.blocked());
+    released.set(usize::MAX);
+    device.read(3, &mut block).unwrap();
+    assert_eq!((block[0], block[512]), (3, 4));
+    assert_eq!((reads.get(), given.borrow().len()), (1, 1));
+    assert!(!bound.blocked());
+}
+
+/// The bound runs from when it was set: reads the disk answers at once go
+/// on only until then, the read past it is started and blocked, and a new
+/// bound takes its result.
+#[test]
+fn bounded_reads_the_disk_answers_at_once_end_at_the_bound_together() {
+    // Each counter read is 100 virtual ticks.
+    let _clock = crate::test_clock::virtualize();
+    let (delayed, (released, reads, given)) = Delayed::new(numbered(64), 4);
+    released.set(usize::MAX);
+    let mut device = Bounded::new(Box::new(delayed));
+    let bound = device.bound();
+    let mut block = [0; 512];
+    bound.set(1_000);
+    let mut lba = 0;
+    while device.read(lba, &mut block).is_ok() {
+        assert_eq!(u64::from(block[0]), lba);
+        lba += 1;
+        assert!(lba <= 10, "the reads went on past the bound");
+    }
+    assert!(lba >= 2, "no read fitted the bound");
+    assert!(bound.blocked(), "the read past the turn's bound is blocked");
+    assert_eq!(given.borrow().len() as u64, lba + 1, "its command started");
+    assert_eq!(device.read(lba + 1, &mut block), Err(BlockError::Timeout));
+    assert!(bound.blocked());
+    bound.set(1_000);
+    device.read(lba, &mut block).unwrap();
+    assert_eq!(u64::from(block[0]), lba);
+    device.read(lba + 1, &mut block).unwrap();
+    assert_eq!(given.borrow().len() as u64, lba + 2);
+    assert_eq!(reads.get(), 0, "no read went to the disk directly");
+    assert!(!bound.blocked());
+}
+
+/// A read the device completed while its caller asked for another is kept
+/// for its own caller, and a failed read is a failure, not a blocked one.
+#[test]
+fn a_bounded_device_keeps_a_finished_read_and_reports_failures() {
+    let _clock = crate::test_clock::virtualize();
+    let (delayed, (released, reads, given)) = Delayed::new(numbered(16), 4);
+    let mut device = Bounded::new(Box::new(delayed));
+    let bound = device.bound();
+    bound.set(1_000);
+    let mut block = [0; 512];
+    assert_eq!(device.read(5, &mut block), Err(BlockError::Timeout));
+    released.set(1);
+    assert_eq!(device.read(6, &mut block), Err(BlockError::Timeout));
+    assert!(bound.blocked());
+    released.set(usize::MAX);
+    device.read(5, &mut block).unwrap();
+    assert_eq!(block[0], 5);
+    device.read(6, &mut block).unwrap();
+    assert_eq!(block[0], 6);
+    assert_eq!((reads.get(), given.borrow().len()), (0, 2));
+    let error = device.read(16, &mut block).unwrap_err();
+    assert!(matches!(error, BlockError::OutOfRange { .. }), "{error:?}");
+    assert!(!bound.blocked());
+}
+
+/// A read-ahead over a bounded device reads a miss as a bounded queued
+/// read, so a slow disk fails it as blocked instead of holding its caller.
+#[test]
+fn a_read_ahead_over_a_bounded_device_never_waits_past_the_bound() {
+    let _clock = crate::test_clock::virtualize();
+    let (delayed, (released, reads, _)) = Delayed::new(numbered(16), 4);
+    let device = Bounded::new(Box::new(delayed));
+    let bound = device.bound();
+    bound.set(1_000);
+    let ahead = Ahead::new(ReadAhead::new(Box::new(device), 1024, 2));
+    let mut reader = ahead.clone();
+    let mut block = [0; 512];
+    assert_eq!(reader.read(0, &mut block), Err(BlockError::Timeout));
+    assert!(bound.blocked());
+    released.set(usize::MAX);
+    reader.read(0, &mut block).unwrap();
+    assert_eq!((block[0], reads.get()), (0, 0));
+}
+
 /// Owners on different processors at once each reach the disk whole:
 /// one guest's storage on a PE, another's store on the boot processor.
 #[test]
@@ -876,6 +990,66 @@ fn runs_join_scattered_blocks_into_one_device() {
     runs.flush().unwrap();
 }
 
+/// A log file's runs on a disk that queues commands: a submission's store
+/// starts one command per run it reaches and returns before the disk runs
+/// them, where runs took no queued command and every store ran its writes
+/// where it was asked, waiting for the disk and the commands queued ahead.
+#[test]
+fn runs_queue_each_piece_on_the_disk_and_never_run_one_where_asked() {
+    let (delayed, (released, _, given)) = Delayed::new(RamDisk::new("q", 16, 512), 4);
+    let shared = Shared::new(Box::new(delayed));
+    let mut runs = shared.runs(vec![(10, 2), (3, 1), (6, 3)]).unwrap();
+    assert!(runs.depth() > 0 && runs.room());
+    // Another owner's command is queued ahead.
+    let mut other = shared.window(0, 3).unwrap();
+    let ahead = other.start(write(0, 9)).unwrap();
+    let data: Vec<u8> = (0..4 * 512).map(|i| (i / 512) as u8 + 1).collect();
+    let mut store = Submission::new(
+        Request::Write {
+            lba: 1,
+            data: data.clone(),
+            durable: false,
+        },
+        runs.identity(),
+    )
+    .unwrap();
+    assert_eq!(store.poll(&mut runs), None);
+    // Its three pieces reached the disk's queue behind the other's write,
+    // and nothing ran.
+    let lbas: Vec<u64> = given
+        .borrow()
+        .iter()
+        .map(|command| match command {
+            Command::Write { lba, .. } => *lba,
+            _ => panic!("only writes"),
+        })
+        .collect();
+    assert_eq!(lbas, [0, 11, 3, 6]);
+    assert_eq!(store.poll(&mut runs), None);
+    released.set(4);
+    assert_eq!(store.poll(&mut runs), Some(Ok(None)));
+    assert_eq!(other.finish(ahead), Some(Ok(None)));
+    // A queued read across the runs assembles its pieces in order.
+    let mut read = Submission::new(
+        Request::Read {
+            lba: 0,
+            bytes: 6 * 512,
+        },
+        runs.identity(),
+    )
+    .unwrap();
+    assert_eq!(read.poll(&mut runs), None);
+    released.set(3);
+    let back = read.poll(&mut runs).unwrap().unwrap().unwrap();
+    assert_eq!(&back[..512], &[0; 512]);
+    assert_eq!(&back[512..5 * 512], &data[..]);
+    assert_eq!(&back[5 * 512..], &[0; 512]);
+    // A command past the runs refuses before any piece queues.
+    let queued = given.borrow().len();
+    assert!(runs.start(write(6, 1)).is_err());
+    assert_eq!(given.borrow().len(), queued);
+}
+
 #[test]
 fn a_volatile_disk_reads_zeros_until_written_and_refuses_past_its_limit() {
     assert!(Volatile::new("ram", 4096, 0).is_err());
@@ -914,6 +1088,38 @@ fn identify_strings_lose_padding_and_terminators() {
     assert_eq!(ascii(b"  S4EVNX0R123   "), "S4EVNX0R123");
     assert_eq!(ascii(b"QEMU\0junk"), "QEMU");
     assert_eq!(ascii(b"a\x01b"), "a?b");
+}
+
+#[test]
+fn ata_strings_swap_each_word_and_lose_padding() {
+    // Words 10-19 of an IDENTIFY page: "WD-WCC4E1234567" padded with spaces,
+    // each word's first character in its high byte.
+    let mut data = [0u8; 512];
+    let serial = b"     WD-WCC4E1234567";
+    for (word, &[first, second]) in serial.as_chunks::<2>().0.iter().enumerate() {
+        data[2 * (10 + word)] = second;
+        data[2 * (10 + word) + 1] = first;
+    }
+    assert_eq!(ata_string(&data, 10..20), "WD-WCC4E1234567");
+    // Past the end of a short page: no text, not a panic.
+    assert_eq!(ata_string(&data[..30], 10..20), "");
+    assert_eq!(ata_string(&data, 0..0), "");
+}
+
+#[test]
+fn only_identify_data_with_its_integrity_word_counts_as_signed() {
+    let mut data = [0u8; 512];
+    data[20] = b'W';
+    assert!(!ata_identify_signed(&data));
+    data[510] = 0xa5;
+    let sum = data.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    data[511] = 0u8.wrapping_sub(sum);
+    assert!(ata_identify_signed(&data));
+    // A wrong checksum, or a short page, is not.
+    data[511] ^= 1;
+    assert!(!ata_identify_signed(&data));
+    data[511] ^= 1;
+    assert!(!ata_identify_signed(&data[..511]));
 }
 
 #[test]
@@ -1088,4 +1294,140 @@ fn a_window_start_waits_for_an_owner_that_took_the_disk_after_room() {
         }
     }
     assert_eq!(result, Some(Ok(None)));
+}
+
+#[test]
+fn a_rotation_rate_reads_as_ata_word_217_and_scsi_vpd_b1_encode_it() {
+    assert_eq!(Rotation::from_nominal(0), Rotation::Unreported);
+    assert_eq!(Rotation::from_nominal(1), Rotation::None);
+    // 0002h-0400h and FFFFh are reserved.
+    for reserved in [2, 0x0400, 0xffff] {
+        assert_eq!(Rotation::from_nominal(reserved), Rotation::Unreported);
+    }
+    assert_eq!(Rotation::from_nominal(0x0401), Rotation::Rpm(0x0401));
+    assert_eq!(Rotation::from_nominal(5400), Rotation::Rpm(5400));
+    assert_eq!(Rotation::from_nominal(0xfffe), Rotation::Rpm(0xfffe));
+    assert_eq!(alloc::format!("{}", Rotation::Rpm(7200)), "7200rpm");
+    assert_eq!(alloc::format!("{}", Rotation::None), "none");
+    assert_eq!(alloc::format!("{}", Rotation::default()), "unreported");
+}
+
+/// A disk that runs each command where it is asked, as a card reader or a
+/// port without a command queue does, recording the bytes of each call: a
+/// slow stick or a spinning disk takes a time to match.
+struct Synchronous {
+    disk: RamDisk,
+    calls: Rc<core::cell::RefCell<Vec<usize>>>,
+}
+
+impl BlockDevice for Synchronous {
+    fn identity(&self) -> &Identity {
+        &self.disk.identity
+    }
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.calls.borrow_mut().push(buffer.len());
+        self.disk.read(lba, buffer)
+    }
+    fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        self.calls.borrow_mut().push(data.len());
+        self.disk.write(lba, data)
+    }
+}
+
+/// One look at a disk without a queue runs one piece of one command: a
+/// 1 MiB write queued behind another, then a read of both, never hold the
+/// looking processor for a whole transfer, or for every waiting command,
+/// as one look did before.
+#[test]
+fn a_disk_without_a_queue_runs_one_bounded_piece_a_look() {
+    let calls: Rc<core::cell::RefCell<Vec<usize>>> = Rc::default();
+    let disk = Shared::new(Box::new(Synchronous {
+        disk: RamDisk::new("sync", 8192, 512),
+        calls: calls.clone(),
+    }));
+    let mut window = disk.whole();
+    let mebibyte = 1 << 20;
+    let first: Vec<u8> = (0..mebibyte).map(|at| (at / 512) as u8).collect();
+    let second: Vec<u8> = (0..mebibyte).map(|at| (at / 512 + 7) as u8).collect();
+    let mut tags = Vec::new();
+    for (lba, data) in [(0, first.clone()), (2048, second.clone())] {
+        let before = calls.borrow().len();
+        tags.push(
+            window
+                .start(Command::Write {
+                    lba,
+                    data,
+                    fua: false,
+                })
+                .unwrap(),
+        );
+        assert!(calls.borrow().len() - before <= 1);
+    }
+    let read = window
+        .start(Command::Read {
+            lba: 0,
+            bytes: 2 * mebibyte,
+        })
+        .unwrap();
+    tags.push(read);
+    let mut results = BTreeMap::new();
+    for _ in 0..1000 {
+        if results.len() == tags.len() {
+            break;
+        }
+        assert!(window.posted());
+        for &tag in &tags {
+            if results.contains_key(&tag) {
+                continue;
+            }
+            let before = calls.borrow().len();
+            if let Some(result) = window.finish(tag) {
+                results.insert(tag, result);
+            }
+            assert!(calls.borrow().len() - before <= 1, "a look ran two pieces");
+        }
+    }
+    assert!(!window.posted());
+    assert!(calls.borrow().iter().all(|&bytes| bytes <= 64 << 10));
+    assert_eq!(calls.borrow().len(), 4 * mebibyte / (64 << 10));
+    assert_eq!(results[&tags[0]], Ok(None));
+    assert_eq!(results[&tags[1]], Ok(None));
+    let mut both = first;
+    both.extend_from_slice(&second);
+    assert_eq!(results[&read], Ok(Some(both)));
+}
+
+/// A piece that fails ends its request, whose rest never runs, and the
+/// next request runs.
+#[test]
+fn a_failed_piece_ends_its_request_and_the_queue_goes_on() {
+    let calls: Rc<core::cell::RefCell<Vec<usize>>> = Rc::default();
+    let disk = Shared::new(Box::new(Synchronous {
+        disk: RamDisk::new("short", 256, 512),
+        calls: calls.clone(),
+    }));
+    // A window of the whole disk lets a read past its end through to the
+    // device's own check, which fails the second piece.
+    let mut window = disk.whole();
+    window.identity.blocks = 1024;
+    let past = window
+        .start(Command::Read {
+            lba: 0,
+            bytes: 256 << 10,
+        })
+        .unwrap();
+    let next = window.start(write(0, 9)).unwrap();
+    let mut results = BTreeMap::new();
+    for _ in 0..100 {
+        for tag in [past, next] {
+            if !results.contains_key(&tag)
+                && let Some(result) = window.finish(tag)
+            {
+                results.insert(tag, result);
+            }
+        }
+    }
+    assert!(results[&past].is_err());
+    assert_eq!(results[&next], Ok(None));
+    assert_eq!(*calls.borrow(), [64 << 10, 64 << 10, 64 << 10, 512]);
 }

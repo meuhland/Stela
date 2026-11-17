@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sat, 14 Nov 2026 18:41:20 +0000
+Subject: [PATCH] radv: advertise VK_KHR_unified_image_layouts from GFX10.3, as
+ GENERAL is valid for every use
+
+Stela's Metal device keeps every image in VK_IMAGE_LAYOUT_GENERAL and
+requires unifiedImageLayouts. GENERAL is a valid layout for every use on every
+generation; before GFX11 RADV may keep fewer images compressed in it, which
+costs bandwidth, not correctness.
+---
+ src/amd/vulkan/radv_physical_device.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index f623cb04397dd740b37fee57d33439483718ab48..dbaa1f650569e62788573f57263cd89ca076aa14 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -815,7 +815,10 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device
+ #endif
+       .KHR_synchronization2 = true,
+       .KHR_timeline_semaphore = pdev->info.has_timeline_syncobj,
+-      .KHR_unified_image_layouts = pdev->info.gfx_level >= GFX11,
++      /* GENERAL is valid for every use on every generation; before GFX11 it can
++       * cost compression, never correctness. Stela's Metal device keeps every
++       * image in GENERAL and schedules no layout transitions. */
++      .KHR_unified_image_layouts = pdev->info.gfx_level >= GFX10_3,
+       .KHR_uniform_buffer_standard_layout = true,
+       .KHR_variable_pointers = true,
+       .KHR_vertex_attribute_divisor = true,

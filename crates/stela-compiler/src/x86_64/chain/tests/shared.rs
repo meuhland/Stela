@@ -140,9 +140,6 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                 while !stop.load(Ordering::Acquire) {
                     control.budget = 1;
                     control.block = 0;
-                    // SAFETY: the table's stamps, which outlive the runners;
-                    // each runner's own, and nothing of its runs meanwhile.
-                    unsafe { next_jump_serial(stamps) };
                     let target = if round.is_multiple_of(2) {
                         TARGET
                     } else {
@@ -153,9 +150,12 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                     // the block ABI and touches the frame's control and the
                     // tables, which outlive the runners.
                     let result = unsafe {
-                        let run: unsafe extern "sysv64" fn(*mut GuestState, u64) -> u128 =
-                            core::mem::transmute(code.0.add(entry));
-                        run(&mut *frame, target)
+                        crate::x86_64::native::enter(
+                            code.0.add(entry) as *const u8,
+                            &mut *frame,
+                            target,
+                            0,
+                        )
                     };
                     let value = result as u64;
                     if value == target {

@@ -34,6 +34,10 @@ pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const NATIVE_CORES: &str = "--native-cores";
 pub const GUEST_PES: &str = "--guest-pes";
+/// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
+/// place of the monitor's preferred mode: for a capture device that cannot
+/// take the mode its EDID prefers.
+pub const DISPLAY_SIZE: &str = "--display-size";
 pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
 /// Boots the installed system to its single-user shell.
 pub const SINGLE_USER: &str = "--single-user";
@@ -276,6 +280,8 @@ pub struct System {
     /// The source PE count (`--guest-pes N`) recorded by setup for disk
     /// boots whose verified DeviceTree is loaded after firmware exit.
     pub guest_pes: Option<usize>,
+    /// The size a GPU's display is taken in ([`DISPLAY_SIZE`]).
+    pub display_size: Option<(u32, u32)>,
     /// Check owned AP startup/host resources, then stop before guest entry.
     pub native_bootstrap_check: bool,
     /// Bounded checked-memory kernel execution on the selected cores.
@@ -390,6 +396,7 @@ impl Default for System {
             input: false,
             native_cores: None,
             guest_pes: None,
+            display_size: None,
             native_bootstrap_check: false,
             native_shared_check: false,
             native_artifacts: false,
@@ -550,6 +557,40 @@ impl System {
     /// display, as a restore does.
     pub fn boots_macos(&self) -> bool {
         self.preboot.is_some() && self.recovery.is_none() && !self.upgrade
+    }
+
+    /// This boot starts a full system from the boot disk, the installed
+    /// macOS or a recoveryOS, whose WindowServer, and in the installed macOS
+    /// its other Metal clients, use a Metal device whenever one exists. A
+    /// restore and a staged update run Apple's restore ramdisk
+    /// (`-restore`), which starts no WindowServer and no Metal client.
+    pub fn starts_metal_clients(&self) -> bool {
+        self.preboot.is_some() && !self.upgrade
+    }
+
+    /// Whether this boot hides the guest's AGX model (`sgx` and its `gfx-asc`
+    /// coprocessor) from macOS, `metal_device` saying whether a host GPU
+    /// serves macOS's Metal through StelaGPU.
+    ///
+    /// The model runs no GPU work: a Metal client's command buffers on it
+    /// never complete, so Apple's GPU kext stops its firmware for recovery,
+    /// and macOS panics when the model cannot follow that stop (a kext
+    /// revision whose initdata layout it has not checked). So no boot that
+    /// starts Metal clients sees it ([`Self::starts_metal_clients`]): with a
+    /// host GPU StelaGPU is the only Metal device, and without one the boot
+    /// has none. The model draws nothing, so hiding it takes nothing from a
+    /// boot without a GPU: a single-user or repair boot's console needs no
+    /// Metal device, and a recoveryOS's WindowServer composites in software
+    /// when it finds none (SkyLight of the 26B123 arm64e cache carries a
+    /// software compositor: "The software renderer does not support 10-bit
+    /// or YUV DisplayStream output", "We do not support zoom and software
+    /// compositor (yet)"), where with the model it would choose the model.
+    /// A restore and a staged update keep the model as they always have: they
+    /// open no host GPU, run no Metal client (no install log shows a work
+    /// doorbell or a protected context in 1-2 h), and the model's firmware
+    /// start is all they have of a GPU.
+    pub fn hides_agx(&self, metal_device: bool) -> bool {
+        metal_device || self.starts_metal_clients()
     }
 
     /// Select the exact number of host processors the loader reserves.
@@ -805,6 +846,11 @@ impl fmt::Display for System {
         line.flag("--sep-observe", self.sep_observe)?;
         line.value(NATIVE_CORES, self.native_cores)?;
         line.value(GUEST_PES, self.guest_pes)?;
+        line.value(
+            DISPLAY_SIZE,
+            self.display_size
+                .map(|(width, height)| alloc::format!("{width}x{height}")),
+        )?;
         line.flag("--native-rounds", self.native_rounds)?;
         line.flag("--native-artifacts", self.native_artifacts)?;
         line.flag("--native-bootstrap-check", self.native_bootstrap_check)?;

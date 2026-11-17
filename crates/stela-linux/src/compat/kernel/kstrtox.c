@@ -22,6 +22,20 @@ static bool hex_prefix(const char *s)
 	return s[0] == '0' && (s[1] | 0x20) == 'x' && digit(s[2]) < 16;
 }
 
+/* lib/kstrtox.c's reader of a number's radix prefix, which Linux's
+ * simple_strto family and vsscanf (lib/vsscanf.c) start from: base 0 becomes
+ * 16 for "0x" before a hex digit, 8 for another leading "0" and else 10, and
+ * a "0x" of base 16 is passed over. lib/kstrtox.h declares it. */
+const char *_parse_integer_fixup_radix(const char *s, unsigned int *base);
+const char *_parse_integer_fixup_radix(const char *s, unsigned int *base)
+{
+	if (*base == 0)
+		*base = hex_prefix(s) ? 16 : s[0] == '0' ? 8 : 10;
+	if (*base == 16 && s[0] == '0' && (s[1] | 0x20) == 'x')
+		s += 2;
+	return s;
+}
+
 /* kstrtoull without its optional '+', which kstrtoll's '-' excludes. */
 static int parse(const char *s, unsigned int base, unsigned long long *res)
 {
@@ -90,25 +104,6 @@ int kstrtoint(const char *s, unsigned int base, int *res)
 		return -ERANGE;
 	*res = (int)value;
 	return 0;
-}
-
-/* The digits of base at cp, stopping at the first other character. */
-long simple_strtol(const char *cp, char **endp, unsigned int base)
-{
-	bool negative = *cp == '-';
-	unsigned long value = 0;
-
-	if (negative)
-		cp++;
-	if (!base)
-		base = hex_prefix(cp) ? 16 : *cp == '0' ? 8 : 10;
-	if (base == 16 && hex_prefix(cp))
-		cp += 2;
-	for (; digit(*cp) < base; cp++)
-		value = value * base + digit(*cp);
-	if (endp)
-		*endp = (char *)cp;
-	return negative ? -(long)value : (long)value;
 }
 
 int kstrtou16(const char *s, unsigned int base, u16 *res)

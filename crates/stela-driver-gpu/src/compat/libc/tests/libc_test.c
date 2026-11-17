@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* The C library against the C standard's answers, as a static Linux program:
  * `cargo xtask gpu nvk` builds and runs it. */
+#include <ctype.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fenv.h>
+#include <inttypes.h>
+#include <link.h>
+#include <linux/futex.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -19,8 +24,11 @@
 #include <wchar.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/inotify.h>
+#include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <stela/host.h>
 #include "host.h"
@@ -250,6 +258,10 @@ static void test_meminfo(void)
 	CHECK(!close(file) && read(file, text, 1) == -1 && errno == EBADF);
 	errno = 0;
 	CHECK(open("/proc/cpuinfo", O_RDONLY) == -1 && errno == ENOENT);
+	/* A NULL path is outside the process, as Linux answers it. */
+	const char *volatile none = NULL;
+	CHECK(open(none, O_RDONLY) == -1 && errno == EFAULT);
+	CHECK(stat(none, &status) == -1 && errno == EFAULT);
 }
 
 static void test_refusals(void)
@@ -258,6 +270,81 @@ static void test_refusals(void)
 	errno = 0;
 	CHECK(poll(&file, 1, 0) == -1);
 	CHECK(errno == ENOSYS);
+	errno = 0;
+	CHECK(mkfifoat(AT_FDCWD, "control", 0600) == -1 && errno == EACCES);
+	errno = 0;
+	CHECK(openat(AT_FDCWD, "control", O_RDONLY | O_NONBLOCK) == -1 && errno == ENOENT);
+	errno = 0;
+	CHECK(openat(3, "control", O_RDONLY) == -1 && errno == EBADF);
+	CHECK(imaxabs(-INTMAX_MAX) == INTMAX_MAX);
+}
+
+static void test_futex(void)
+{
+	uint32_t word = 0;
+	unsigned int before = waits, woken = wakes;
+	/* A word that no longer holds the value is not waited on. */
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL,
+		      FUTEX_BITSET_MATCH_ANY) == -1 && errno == EAGAIN);
+	CHECK(waits == before);
+	/* A wait returns once another processor changes the word. */
+	waited_word = (volatile unsigned int *)&word;
+	waited_value = 1;
+	CHECK(!syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, 0, NULL, NULL,
+		       FUTEX_BITSET_MATCH_ANY));
+	CHECK(waits == before + 1 && word == 1);
+	waited_word = NULL;
+	/* A deadline that passed with the word unchanged is a timeout, absolute
+	 * for a bitset wait and relative for a plain one. */
+	struct timespec now, none = {0, 0};
+	CHECK(!clock_gettime(CLOCK_MONOTONIC, &now));
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET, 1, &now, NULL, FUTEX_BITSET_MATCH_ANY) ==
+		      -1 && errno == ETIMEDOUT);
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT, 1, &none) == -1 && errno == ETIMEDOUT);
+	CHECK(!syscall(SYS_futex, &word, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, INT32_MAX));
+	CHECK(wakes == woken + 1);
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET, 1, NULL, NULL, 0) == -1 && errno == EINVAL);
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME, 1, NULL, NULL,
+		      FUTEX_BITSET_MATCH_ANY) == -1 && errno == ENOTSUP);
+	/* FUTEX_WAKE_OP, which no caller of the image uses. */
+	errno = 0;
+	CHECK(syscall(SYS_futex, &word, 5, 1) == -1 && errno == ENOSYS);
+}
+
+static int objects;
+
+static int count_object(struct dl_phdr_info *info, size_t size, void *data)
+{
+	(void)info;
+	(void)size;
+	(void)data;
+	return ++objects;
+}
+
+static void test_loading(void)
+{
+	Dl_info info;
+	CHECK(!dlopen("libvulkan.so.1", RTLD_NOW));
+	CHECK(!dladdr((const void *)test_loading, &info));
+	/* No ELF object, so no callback. */
+	CHECK(!dl_iterate_phdr(count_object, NULL) && !objects);
+}
+
+/* No stream has bytes to read, so getline reads no line and leaves the
+ * caller's buffer as it was. */
+static void test_lines(void)
+{
+	char *line = NULL;
+	size_t size = 0;
+	CHECK(getline(&line, &size, stdin) == -1);
+	CHECK(line == NULL && size == 0);
+	errno = 0;
+	CHECK(getdelim(&line, NULL, '\n', stdin) == -1 && errno == EINVAL);
 }
 
 static void test_division(void)
@@ -279,6 +366,17 @@ static void test_system(void)
 	CHECK(opendir("/") == NULL);
 	struct passwd entry, *found = &entry;
 	CHECK(getpwuid_r(0, &entry, path, sizeof(path), &found) == 0 && found == NULL);
+	errno = 0;
+	CHECK(inotify_init1(IN_NONBLOCK) == -1 && errno == ENOSYS);
+	CHECK(inotify_add_watch(0, "/", IN_MODIFY) == -1);
+	struct utsname name;
+	errno = 0;
+	CHECK(uname(&name) == -1 && errno == ENOSYS);
+	CHECK(system(NULL) == 0);
+	CHECK(system("true") == -1 && errno == ENOSYS);
+	CHECK(isblank(' ') && isblank('\t') && !isblank('\n') && !isblank('a'));
+	CHECK(ENODATA == 61);
+	CHECK(!__builtin_cpu_supports("avx2"));
 }
 
 static void test_wide(void)
@@ -658,6 +756,9 @@ int main(void)
 	test_anonymous_files();
 	test_meminfo();
 	test_refusals();
+	test_loading();
+	test_futex();
+	test_lines();
 	test_division();
 	test_system();
 	test_wide();

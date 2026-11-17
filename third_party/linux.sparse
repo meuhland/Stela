@@ -1,10 +1,26 @@
-# nouveau, shared DRM helpers, ACPICA and kernel headers; not a
-# buildable kernel tree. netfilter's headers differ only in case, which a
-# case-insensitive file system cannot check out.
+# nouveau, xe with the i915 tree it shares display code and headers with,
+# shared DRM helpers, ACPICA and kernel headers; not a buildable kernel tree.
+# netfilter's headers differ only in case, which a case-insensitive file
+# system cannot check out.
 /drivers/acpi/acpica/
 /drivers/base/map.c
 /drivers/base/property.c
+/drivers/base/devres.c
+/drivers/base/base.h
+/drivers/base/trace.h
 /drivers/gpu/drm/nouveau/
+/drivers/gpu/drm/xe/
+/drivers/gpu/drm/i915/
+/drivers/gpu/buddy.c
+/drivers/base/auxiliary.c
+/drivers/base/base.h
+/lib/bsearch.c
+/lib/interval_tree.c
+/lib/llist.c
+/lib/math/int_sqrt.c
+/lib/seq_buf.c
+/mm/mempool.c
+/mm/mmu_notifier.c
 /drivers/gpu/drm/display/
 /drivers/gpu/drm/ttm/
 /drivers/gpu/drm/scheduler/
@@ -356,3 +372,32 @@
 /security/Makefile
 /security/commoncap.c
 /security/commoncap_ptrace.c
+/kernel/irq/irqdesc.c
+/kernel/irq/handle.c
+/kernel/irq/chip.c
+/kernel/irq/dummychip.c
+/kernel/irq/irqdomain.c
+/kernel/irq/msi.c
+/kernel/irq/resend.c
+/kernel/irq/spurious.c
+/kernel/irq/internals.h
+/kernel/irq/debug.h
+/kernel/irq/settings.h
+/kernel/irq/debugfs.h
+/kernel/irq/proc.h
+/drivers/gpu/drm/amd/
+/lib/kfifo.c
+/lib/math/gcd.c
+/mm/mempool.c
+/kernel/time/timeconv.c
+/kernel/locking/semaphore.c
+/drivers/gpu/buddy.c
+/lib/vsscanf.c
+/lib/vsprintf_atoi.h
+/drivers/gpu/drm/drm_client.c
+/drivers/gpu/drm/drm_client_event.c
+/drivers/gpu/drm/drm_client_modeset.c
+/drivers/gpu/drm/drm_client_sysrq.c
+/drivers/gpu/drm/drm_panel_backlight_quirks.c
+/drivers/video/backlight/backlight.c
+/drivers/hwmon/hwmon.c

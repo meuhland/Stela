@@ -6,7 +6,8 @@
 //! one boot kernel collection. The Metal plugin links here, into
 //! `target/guest/StelaGPU.bundle`. No released `ld64.lld` links arm64e's
 //! authenticated pointers, so `stela-loader` links both. The kext also
-//! carries Stela.app when a built package is present ([`app`]).
+//! carries Stela.app when a built package is present ([`app`]), and the job
+//! that tells CoreVideo the guest has no buffer compression ([`compression`]).
 use crate::tools::{self, exec};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -17,6 +18,7 @@ use std::{
 use stela_loader::{aux_kc::TRUSTED_CODE_FILE, trust_cache::CodeHash};
 
 pub mod app;
+pub mod compression;
 pub mod sdk;
 pub mod wire;
 
@@ -51,6 +53,7 @@ pub fn run() -> Result<()> {
         sandbox_patch_header(&patcher, &component.join("sandbox").join(SANDBOX_PATCH_JOB))?,
     )?;
     fs::write(include.join("stela/app.h"), app_header(root)?)?;
+    fs::write(include.join("stela/compression.h"), compression::header()?)?;
     let kext = build_kext(&component, &output, &xnu, &include)?;
     let code = stela_loader::plugin::code_hashes(&fs::read(bundle.join(BUNDLE_EXECUTABLE))?)?;
     fs::write(kext.join(TRUSTED_CODE_FILE), code.concat())?;
@@ -100,6 +103,7 @@ fn build_bundle(component: &Path, output: &Path, include: &Path) -> Result<PathB
         resources.status.success(),
         "clang names no resource directory"
     );
+    let stubs = selector_stub_flags(clang);
     let resources = PathBuf::from(String::from_utf8(resources.stdout)?.trim());
     let mut sources = Vec::new();
     for entry in fs::read_dir(&source)? {
@@ -121,6 +125,7 @@ fn build_bundle(component: &Path, output: &Path, include: &Path) -> Result<PathB
             let mut command = Command::new(clang);
             command
                 .args(BUNDLE_FLAGS)
+                .args(stubs)
                 .arg(format!("--target={target}"))
                 .arg("-isystem")
                 .arg(resources.join("include"))
@@ -167,6 +172,34 @@ const BUNDLE_FLAGS: &[&str] = &[
     "-fno-asynchronous-unwind-tables",
     "-nostdinc",
 ];
+
+/// Flags that keep Objective-C calls on `objc_msgSend` itself, for a Clang
+/// that would otherwise call `objc_msgSend$<selector>` and
+/// `objc_msgSendClass$<selector>$<class>` stubs: Apple's Clang and LLVM's
+/// from 23 do by default, for a macOS 13 or later target. Those stubs are
+/// the linker's to synthesize, which ld64 does and `plugin::link` does not,
+/// so the plugin left `dlopen` an undefined `_objc_msgSend$...` and
+/// WindowServer stopped. Clang 22 and earlier emit no stubs and take no
+/// such flags, so they are passed only to a Clang that accepts them.
+fn selector_stub_flags(clang: &Path) -> &'static [&'static str] {
+    const FLAGS: &[&str] = &[
+        "-fno-objc-msgsend-selector-stubs",
+        "-fno-objc-msgsend-class-selector-stubs",
+    ];
+    let accepted = Command::new(clang)
+        .args([
+            "--no-default-config",
+            "-xobjective-c",
+            "-fsyntax-only",
+            "-Werror",
+        ])
+        .args(FLAGS)
+        .arg("-")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if accepted { FLAGS } else { &[] }
+}
 
 /// Compiles each source of `<component>/kext` into `<output>/StelaGPU.kext`
 /// beside its `Info.plist`.

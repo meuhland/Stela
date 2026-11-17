@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kiki <duarduar707@gmail.com>
+Date: Mon, 16 Nov 2026 16:58:20 +0000
+Subject: [PATCH] fix(nouveau): an eDP panel on GSP-RM gets backlight control
+ through nvkm's backlight hooks on its DP output, where r535_dp had none and
+ nouveau registered no backlight for it
+
+---
+ drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c
+index f5f22173fc2c123cf670ffeab205205d4178bc5a..21a2675868e38e8a42f416d73bc3fcab62507f95 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c
+@@ -1158,6 +1158,14 @@ r535_dp = {
+ 	.dp.rates = r535_dp_rates,
+ 	.dp.train = r535_dp_train,
+ 	.dp.drive = r535_dp_drive,
++	/*
++	 * An eDP panel's backlight goes through GSP-RM's
++	 * NV0073_CTRL_CMD_SPECIFIC_{GET,SET}_BACKLIGHT_BRIGHTNESS, which
++	 * r535_sor_bl already sends; without these the panel had no backlight
++	 * control and stayed dark after a function-level reset.
++	 */
++	.bl.get = nvkm_outp_bl_get,
++	.bl.set = nvkm_outp_bl_set,
+ };
+ 
+ static int

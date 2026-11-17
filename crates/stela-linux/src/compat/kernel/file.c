@@ -248,6 +248,21 @@ long stela_linux_fd_device(int fd)
 	return device;
 }
 
+long long stela_linux_fd_seek(int fd, long long offset, int whence)
+{
+	struct file *file = fget((unsigned int)fd);
+	long long result;
+
+	if (!file)
+		return -EBADF;
+	if (file->f_op && file->f_op->llseek)
+		result = file->f_op->llseek(file, offset, whence);
+	else
+		result = -ESPIPE;
+	fput(file);
+	return result;
+}
+
 static DECLARE_WAIT_QUEUE_HEAD(stela_linux_waiters);
 
 void stela_linux_wait(const volatile unsigned int *word, unsigned int value, u64 nanoseconds)
@@ -314,6 +329,23 @@ int stela_linux_open(dev_t device, unsigned int flags)
 		fput(file);
 	else
 		fd_install((unsigned int)fd, file);
+	return fd;
+}
+
+/* A new anonymous file under a new descriptor, as fs/anon_inodes.c. */
+int anon_inode_getfd(const char *name, const struct file_operations *fops, void *priv, int flags)
+{
+	int fd = get_unused_fd_flags((unsigned int)flags);
+
+	if (fd < 0)
+		return fd;
+	struct file *file = anon_inode_getfile(name, fops, priv, flags);
+
+	if (IS_ERR(file)) {
+		put_unused_fd((unsigned int)fd);
+		return (int)PTR_ERR(file);
+	}
+	fd_install((unsigned int)fd, file);
 	return fd;
 }
 

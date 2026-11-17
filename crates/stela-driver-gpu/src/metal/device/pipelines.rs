@@ -14,6 +14,7 @@ use super::{
 use crate::metal::{
     abi::{ConversionRounding, DataType, FunctionType, PrimitiveTopologyClass},
     command_buffer::{BoundPipeline, ComputePipelineState, IndirectCompute, RenderPipelineState},
+    compiler::DEFERRED,
     error::{Error, Result, ensure, require},
     library::{self, Function, Header, Library},
     pipeline::{
@@ -757,11 +758,25 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         sources: &Sources,
         mut create: impl FnMut(&mut B, PipelineSource) -> Result<Pipeline>,
     ) -> Result<Pipeline> {
+        // A lookup left to a job answers when the call runs again: the
+        // other archives are looked in now too, which changes nothing, so
+        // their jobs run before that. Nothing past the archives runs, which
+        // would compile, or add to an archive, what one may hold.
+        let mut deferred = false;
         for &cache in &sources.searched {
-            match create(&mut self.backend, PipelineSource::Archived(cache)) {
-                Err(Error::NotArchived) => {}
-                created => return created,
+            let looked = create(&mut self.backend, PipelineSource::Archived(cache));
+            match (looked, deferred) {
+                (Err(Error::NotArchived), _) => {}
+                (Err(DEFERRED), _) => deferred = true,
+                (looked, false) => return looked,
+                // Found after a lookup that waits for its job: the call runs
+                // again and looks once more.
+                (Ok(pipeline), true) => self.backend.destroy(Object::Pipeline(pipeline)),
+                (Err(_), true) => {}
             }
+        }
+        if deferred {
+            return Err(DEFERRED);
         }
         if sources.required {
             return Err(Error::NotArchived);
@@ -1197,10 +1212,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     /// Compiles and creates pipelines in the call from here on: the call
-    /// changed what a second run would change again.
-    pub fn stop_deferring(&mut self) {
+    /// changes what a second run would change again. A call that left a job
+    /// already runs again: it fails with `DEFERRED` and changes nothing.
+    pub fn stop_deferring(&mut self) -> Result<()> {
+        if self.deferred() {
+            return Err(DEFERRED);
+        }
         self.compiler.stop_deferring();
         self.backend.stop_deferring();
+        Ok(())
     }
 
     /// `newRenderPipelineStateWithDescriptor:`. A post-tessellation vertex
@@ -1232,8 +1252,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let vertex_linked = self.link(&request.vertex_linked_functions, true)?;
         let fragment_linked = self.link(&request.fragment_linked_functions, true)?;
         let linkings = [&vertex_linked.linking, &fragment_linked.linking];
+        // Only a driver whose execution sets switch render pipelines gets
+        // them bindable: RADV's switch compute pipelines alone.
         let generated = self.backend.physical_device().limits.generated_commands;
-        let indirect_bindable = request.support_indirect_command_buffers && generated.is_some();
+        let indirect_bindable = request.support_indirect_command_buffers
+            && generated.is_some_and(|limits| {
+                limits
+                    .pipeline_stages
+                    .contains(ShaderStages::VERTEX | ShaderStages::FRAGMENT)
+            });
         // GPU-encoded commands bind no variants: the pipeline reads each
         // sampler's filter once its process has bicubic samplers.
         let bicubic = if indirect_bindable {

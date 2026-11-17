@@ -18,6 +18,49 @@ fn report_ecam_conflict(line: core::fmt::Arguments<'_>) {
     }
 }
 
+/// Log the MCFG windows and the root bridges' bus grants the census works
+/// from, once per boot, so a refusal can be read against them.
+fn report_ecam_geometry(windows: &[EcamWindow], roots: &[stela_boot_core::ecam::RootWindow]) {
+    use core::fmt::Write;
+    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut line = alloc::string::String::from("HOST PCI ECAM");
+    for (at, window) in windows.iter().enumerate() {
+        let _ = write!(
+            line,
+            "{} {:04x}:{:02x}-{:02x} at {:#x}",
+            if at == 0 { "" } else { "," },
+            window.segment,
+            window.start_bus,
+            window.end_bus,
+            window.base
+        );
+    }
+    if windows.is_empty() {
+        line.push_str(" none");
+    }
+    line.push_str("; root bridge buses");
+    let mut grants = 0;
+    for root in roots.iter().filter(|root| root.space == 2) {
+        let _ = write!(
+            line,
+            "{} {:04x}:{:02x}-{:02x}",
+            if grants == 0 { "" } else { "," },
+            root.segment,
+            root.minimum,
+            root.maximum
+        );
+        grants += 1;
+    }
+    if grants == 0 {
+        line.push_str(" none");
+    }
+    line.push('\n');
+    crate::output::arguments(format_args!("{line}"));
+}
+
 /// Log a census oddity that leaves the segment usable, the first time
 /// each kind is seen this boot.
 fn report_oddity(oddity: census::Oddity, address: Address) {
@@ -43,6 +86,18 @@ impl ConfigScope {
     /// # Safety
     /// The caller holds this original configuration extent and exclusion.
     unsafe fn open(source: &Source, span: PhysicalSpan) -> Result<Self, Error> {
+        // SAFETY: forwarded.
+        unsafe { Self::open_as(source, span, Protection::ReadOnly) }
+    }
+
+    /// # Safety
+    /// As [`Self::open`]; a writable scope also excludes every observer of
+    /// the extent that a write could invalidate.
+    unsafe fn open_as(
+        source: &Source,
+        span: PhysicalSpan,
+        protection: Protection,
+    ) -> Result<Self, Error> {
         let bytes = usize::try_from(span.bytes()).map_err(|_| Error::InvalidRange)?;
         let (resource, assignment) = source.reservation(span, ResourceKind::Registers)?;
         let close = assignment.admission_close();
@@ -54,14 +109,34 @@ impl ConfigScope {
             })),
             close: Some(close),
         };
-        scope.pending.mapping = Some(source.authority.map(
-            resource,
-            0,
-            bytes,
-            CacheAttribute::Uncached,
-            Protection::ReadOnly,
-        )?);
+        scope.pending.mapping =
+            Some(
+                source
+                    .authority
+                    .map(resource, 0, bytes, CacheAttribute::Uncached, protection)?,
+            );
         Ok(scope)
+    }
+
+    /// Write `width` bytes of `value` at `offset` of a writable scope.
+    fn write(&self, offset: usize, width: u16, value: u32) -> Result<(), Error> {
+        let mapping = self.pending.mapping.as_ref().ok_or(Error::Unavailable)?;
+        if !offset.is_multiple_of(usize::from(width)) || !matches!(width, 1 | 2 | 4) {
+            return Err(Error::InvalidRange);
+        }
+        let address = mapping.address(offset, usize::from(width))?;
+        // SAFETY: the live writable map covers these naturally aligned bytes.
+        unsafe {
+            match width {
+                1 => address.as_ptr().write_volatile(value as u8),
+                2 => address
+                    .cast::<u16>()
+                    .as_ptr()
+                    .write_volatile((value as u16).to_le()),
+                _ => address.cast::<u32>().as_ptr().write_volatile(value.to_le()),
+            }
+        }
+        Ok(())
     }
 
     fn read(&self, offset: usize, width: u16) -> Result<u32, Error> {
@@ -209,29 +284,23 @@ impl ConfigInventory<'_> {
         scope.read(offset, width)
     }
 
-    /// Check a bridge's buses against its root grant and the ECAM windows,
-    /// returning the buses it forwards. The primary field routes nothing;
-    /// like Linux, a wrong one is kept.
+    /// Check a bridge's buses against its root grant, the ECAM windows and
+    /// the bridges `admitted` before it (`census::admit`), returning the
+    /// buses it forwards. The primary field routes nothing; like Linux, a
+    /// wrong one is kept.
     pub(crate) fn check_bridge(
         &self,
         address: Address,
         buses: u32,
-    ) -> Result<Option<RangeInclusive<u8>>, Error> {
-        match census::route(address.bus, buses) {
-            census::Route::Unconfigured => Ok(None),
-            census::Route::Invalid => Err(Error::InvalidPlatformReply),
-            census::Route::Forwards { buses, primary } => {
-                self.geometry.check_bridge(
-                    self.source.platform.wire().roots(),
-                    address,
-                    buses.clone(),
-                )?;
-                if !primary {
-                    report_oddity(census::Oddity::PrimaryBus, address);
-                }
-                Ok(Some(buses))
-            }
+        admitted: &[(Address, RangeInclusive<u8>)],
+    ) -> Result<Option<RangeInclusive<u8>>, census::Misconfigured> {
+        let roots = self.source.platform.wire().roots();
+        let within = |range| self.geometry.check_bridge(roots, address, range).is_ok();
+        let forwarded = census::admit(address, buses, within, admitted)?;
+        if forwarded.is_some() && buses as u8 != address.bus {
+            report_oddity(census::Oddity::PrimaryBus, address);
         }
+        Ok(forwarded)
     }
 
     fn withdraw(&mut self) -> Result<(), Error> {
@@ -263,29 +332,45 @@ impl Source {
         body: impl FnOnce(&[EcamWindow], &mut ConfigInventory<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
         let wire = self.platform.wire();
-        let windows = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
-        if windows.is_empty() {
+        let mcfg = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
+        report_ecam_geometry(&mcfg, wire.roots());
+        if mcfg.is_empty() {
             return Err(Error::Unavailable.into());
         }
         let bits = self.platform.space.physical_bits;
-        let original = EcamInventory::validate(&windows, bits)?;
+        let original = EcamInventory::validate(&mcfg, bits)?;
         let windows = original.root_windows(wire.roots())?;
         let geometry = EcamInventory::validate(&windows, bits)?;
-        for (index, window) in windows.iter().enumerate() {
-            for bus in window.start_bus..=window.end_bus {
-                let (_, span) = geometry.subset(index, bus..=bus, wire.roots())?;
-                if let Some((start, end, kind)) = wire.memory_conflict(span.start(), span.end()) {
-                    report_ecam_conflict(format_args!(
-                        "HOST PCI configuration space of bus {:04x}:{bus:02x} at {:#x} lies in \
-                         the firmware memory map's {} at {start:#x}-{end:#x}; it must be \
-                         reserved or MMIO, so Stela does not map it\n",
-                        window.segment,
-                        span.start(),
-                        stela_boot_core::firmware_map::kind_name(kind),
-                    ));
-                    return Err(Error::OutsideResource.into());
-                }
-            }
+        // Only the buses a root bridge grants are mapped and checked.
+        for granted in &windows {
+            let entries = wire.memory().iter().map(|r| (r.start, r.end, r.kind));
+            let Some(conflict) = stela_boot_core::ecam::memory_conflict(*granted, bits, entries)?
+            else {
+                continue;
+            };
+            let (start, end, kind) = conflict.entry;
+            let window = mcfg
+                .iter()
+                .find(|window| {
+                    window.segment == granted.segment
+                        && (window.start_bus..=window.end_bus).contains(&conflict.bus)
+                })
+                .unwrap_or(granted);
+            report_ecam_conflict(format_args!(
+                "HOST PCI configuration space of bus {:04x}:{:02x} at {:#x}, in the MCFG \
+                 window {:04x}:{:02x}-{:02x} at {:#x}, lies in the firmware memory map's {} at \
+                 {start:#x}-{end:#x}; Stela maps ECAM only where the map reserves it, marks it \
+                 MMIO or lists nothing, so PCI containment is off\n",
+                granted.segment,
+                conflict.bus,
+                conflict.span.start(),
+                window.segment,
+                window.start_bus,
+                window.end_bus,
+                window.base,
+                stela_boot_core::firmware_map::kind_name(kind),
+            ));
+            return Err(Error::OutsideResource.into());
         }
         let mut reader = ConfigInventory {
             source: self,
@@ -314,6 +399,10 @@ impl Source {
 
     /// Read an AML PCI operation through a scoped UC map without lending a
     /// writable address or letting the provider change the physical function.
+    /// A bridge whose forwarding is restored is read through the owner that
+    /// keeps its page. A bus no root bridge forwards reads all ones, as the
+    /// root complex completes such a request
+    /// (`stela_boot_core::ecam::ends_at_root_complex`).
     pub(crate) fn read_firmware_config(
         &self,
         address: Address,
@@ -323,8 +412,18 @@ impl Source {
         if !matches!(width, 1 | 2 | 4)
             || offset > PAGE as u16 - width
             || !offset.is_multiple_of(width)
+            || address.device >= 32
+            || address.function >= 8
         {
             return Err(Error::InvalidRange);
+        }
+        let wire = self.platform.wire();
+        let windows = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
+        if stela_boot_core::ecam::ends_at_root_complex(&windows, wire.roots(), address, offset) {
+            return Ok(u32::MAX >> (32 - u32::from(width) * 8));
+        }
+        if let Some(value) = self.read_forwarding_bridge(address, offset, width) {
+            return value;
         }
         let (_, span) = self.config_page(address)?;
         // SAFETY: the original capture supplies this function extent. This
@@ -334,6 +433,51 @@ impl Source {
         // SAFETY: the only reader was the synchronous scalar access above.
         unsafe { scope.retire() }?;
         value
+    }
+
+    /// Whether nothing has taken the PCI census yet ([`Self::contain_pci`]).
+    pub(crate) fn before_census(&self) -> bool {
+        self.pci_slots.unclaimed()
+    }
+
+    /// Write one register of `address` through a scoped writable map, for
+    /// what powers PCI ports on before the census: the firmware's AML and
+    /// Linux's `pci_power_up`. No function is observed or parked yet, so
+    /// the census and containment read what these writes leave as they read
+    /// what firmware left. Refused once the census has begun. A write to a
+    /// bus no root bridge forwards ends at the root complex, as there.
+    pub(crate) fn write_before_census(
+        &self,
+        address: Address,
+        offset: u16,
+        width: u16,
+        value: u32,
+    ) -> Result<(), Error> {
+        if !self.before_census() {
+            return Err(Error::Busy);
+        }
+        if !matches!(width, 1 | 2 | 4)
+            || offset > PAGE as u16 - width
+            || !offset.is_multiple_of(width)
+            || address.device >= 32
+            || address.function >= 8
+        {
+            return Err(Error::InvalidRange);
+        }
+        let wire = self.platform.wire();
+        let windows = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
+        if stela_boot_core::ecam::ends_at_root_complex(&windows, wire.roots(), address, offset) {
+            return Ok(());
+        }
+        let (_, span) = self.config_page(address)?;
+        // SAFETY: the original capture supplies this function extent, and
+        // before the census no other owner observes or maps it. This
+        // synchronous BSP call lends no mapping.
+        let mut scope = unsafe { ConfigScope::open_as(self, span, Protection::ReadWrite) }?;
+        let written = scope.write(usize::from(offset), width, value);
+        // SAFETY: the only access was the synchronous scalar write above.
+        unsafe { scope.retire() }?;
+        written
     }
 
     /// Map one exact read-only function for a kept native observer.

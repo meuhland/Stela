@@ -1,10 +1,12 @@
 //! Vendor firmware provisioning for a native-driver requirement inventory.
 //! Network/cache policy stays in the CLI; the loader validates pins/packages.
+mod nvidia;
+
 use anyhow::{Context, Result, ensure};
 use reqwest::{blocking::Client, header, redirect::Policy};
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::Path,
     time::Duration,
 };
@@ -63,6 +65,9 @@ enum Answer {
     Cut(String, bool),
     /// An answer asking again would not change.
     Final(String),
+    /// The source no longer has the pinned file: it answered 404 or 410, or
+    /// holds a file of another length under the name.
+    Gone(String),
 }
 
 /// The pause a `Retry-After` header asks for, in seconds; an HTTP date is
@@ -106,18 +111,27 @@ fn mib(bytes: usize) -> String {
     format!("{:.1}", bytes as f64 / MIB as f64)
 }
 
-/// Ask `url` for `artifact`, going on from the `part` of it earlier
-/// requests brought with a Range request. On success `part` holds the
-/// checked file; after a cut it holds what arrived, for the next request.
+/// Ask `url` for `artifact` (or its bounded `slice` `(offset, total)`), going
+/// on from the `part` of it earlier requests brought with a Range request. On
+/// success `part` holds the checked file; after a cut it holds what arrived,
+/// for the next request.
 fn request(
     client: &Client,
     url: &str,
     artifact: &Artifact,
+    slice: Option<(u64, u64)>,
     part: &mut Vec<u8>,
 ) -> Result<(), Answer> {
     let had = part.len();
+    let length = artifact.length as u64;
     let mut get = client.get(url).header(header::ACCEPT_ENCODING, "identity");
-    if had > 0 {
+    if let Some((offset, _)) = slice {
+        let end = offset + length - 1;
+        get = get.header(
+            header::RANGE,
+            format!("bytes={}-{end}", offset + had as u64),
+        );
+    } else if had > 0 {
         get = get.header(header::RANGE, format!("bytes={had}-"));
     }
     let mut response = match get.send() {
@@ -128,11 +142,27 @@ fn request(
         Err(error) => return Err(Answer::Final(crate::net::explain(&error))),
     };
     let status = response.status();
-    let length = artifact.length as u64;
-    let start = match status.as_u16() {
+    let start = match (status.as_u16(), slice) {
         // The whole file: a server without ranges sends it again.
-        200 => 0,
-        206 if had > 0 => {
+        (200, None) => 0,
+        (206, Some((offset, total))) => {
+            let expected = (offset + had as u64, offset + length - 1, total);
+            let sent = content_range(&response);
+            if let Some((_, _, other)) = sent.filter(|&(_, _, other)| other != total) {
+                part.clear();
+                return Err(Answer::Gone(format!(
+                    "holds a file of {other} bytes there, not the pinned one of {total}"
+                )));
+            }
+            if sent != Some(expected) {
+                part.clear();
+                return Err(Answer::Transient(
+                    "sent a range other than the one asked for".into(),
+                ));
+            }
+            had
+        }
+        (206, None) if had > 0 => {
             if content_range(&response) != Some((had as u64, length - 1, length)) {
                 part.clear();
                 return Err(Answer::Transient(
@@ -141,11 +171,17 @@ fn request(
             }
             had
         }
-        416 if had > 0 => {
+        (200, Some(_)) => {
+            return Err(Answer::Final(
+                "sent the whole file, not the part of it asked for".into(),
+            ));
+        }
+        (404 | 410, _) => return Err(Answer::Gone(format!("answered {status}"))),
+        (416, _) if had > 0 => {
             part.clear();
             return Err(Answer::Transient(format!("answered {status} to a resume")));
         }
-        429 | 503 => {
+        (429 | 503, _) => {
             let after = retry_after(&response);
             let asked = match after {
                 Some(after) if after != Duration::MAX => {
@@ -203,7 +239,40 @@ fn host_of(url: &str) -> &str {
 }
 
 fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
+    if let Some(bytes) = nvidia::carried(artifact) {
+        artifact.verify(bytes)?;
+        return Ok(bytes.to_vec());
+    }
+    if let Some(spec) = nvidia::spec(artifact) {
+        let wire = download_slice(
+            client,
+            spec.wire,
+            spec.slice,
+            &spec.wire.urls(),
+            &mut std::thread::sleep,
+        )?;
+        // The download matched its pin, so a failure here is Stela's.
+        let bytes = spec
+            .extract(&wire)
+            .and_then(|bytes| Ok(artifact.verify(&bytes).map(|()| bytes)?))
+            .with_context(|| {
+                format!(
+                    "cannot build {} from NVIDIA's {}",
+                    artifact.member, spec.wire.member
+                )
+            })?;
+        return Ok(bytes);
+    }
     download_from(client, artifact, &artifact.urls(), &mut std::thread::sleep)
+}
+
+fn download_from(
+    client: &Client,
+    artifact: &Artifact,
+    urls: &[String],
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<Vec<u8>> {
+    download_slice(client, artifact, None, urls, sleep)
 }
 
 /// Download `artifact` from the first of `urls` that sends its pinned
@@ -212,22 +281,25 @@ fn download(client: &Client, artifact: &Artifact) -> Result<Vec<u8>> {
 /// [`WAIT_BUDGET`]; past it, or after [`ATTEMPTS`] requests that bring
 /// nothing, the next source is asked at once. The error names the file and
 /// what each source answered.
-fn download_from(
+fn download_slice(
     client: &Client,
     artifact: &Artifact,
+    slice: Option<(u64, u64)>,
     urls: &[String],
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<Vec<u8>> {
     let mut waited = Duration::ZERO;
     let mut answers = Vec::new();
+    let mut all_gone = !urls.is_empty();
     for url in urls {
         let host = host_of(url);
         let mut part = Vec::with_capacity(artifact.length);
         let mut backoff = Duration::from_secs(1);
         let mut attempt = 1;
         let mut resumes = 0;
+        let mut gone = false;
         let last = loop {
-            let pause = match request(client, url, artifact, &mut part) {
+            let pause = match request(client, url, artifact, slice, &mut part) {
                 Ok(()) => return Ok(part),
                 Err(Answer::Cut(what, true)) if resumes < RESUMES => {
                     eprintln!(
@@ -244,6 +316,10 @@ fn download_from(
                     (Some(backoff), what)
                 }
                 Err(Answer::Final(what)) => (None, what),
+                Err(Answer::Gone(what)) => {
+                    gone = true;
+                    (None, what)
+                }
             };
             match pause {
                 (Some(pause), what)
@@ -267,11 +343,18 @@ fn download_from(
             eprintln!("note: {} from {host}: {last}", artifact.member);
         }
         answers.push(format!("{host} {last}"));
+        all_gone &= gone;
     }
     anyhow::bail!(
-        "cannot download {}: {}",
+        "cannot download {}: {}{}",
         artifact.member,
-        answers.join("; ")
+        answers.join("; "),
+        if all_gone {
+            ". The file has moved or changed where it is published, so this Stela cannot get \
+             it; a newer Stela can"
+        } else {
+            ""
+        }
     )
 }
 
@@ -304,15 +387,15 @@ fn store(directory: &Path, artifact: &Artifact, bytes: &[u8]) -> Result<Vec<u8>>
     read_cached(&path, artifact)
 }
 
-/// Notes about this computer's NVIDIA GPUs, for information only: the USB
+/// Notes about this computer's NVIDIA GPUs, for information only: the stick
 /// holds every supported GPU's firmware whatever this computer has.
 pub(super) fn host_notes(host: &dyn super::host::Host) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     for device in host.nvidia_gpus()? {
         if recipes::nvidia_chip(device).is_none() {
             notes.push(format!(
-                "this computer's NVIDIA GPU (device {device:04x}) is not one Stela supports \
-                 ({}); the USB still works on a PC that has one",
+                "This computer's NVIDIA GPU is not supported. The stick still works on a PC with \
+                 {}.",
                 stela_boot_core::gpu_status::SUPPORTED
             ));
         }
@@ -322,9 +405,9 @@ pub(super) fn host_notes(host: &dyn super::host::Host) -> Result<Vec<String>> {
 
 /// The firmware line of a setup plan.
 pub(super) fn bundle_summary() -> String {
-    let (count, bytes) = bundle::size();
+    let (_, bytes) = bundle::size();
     format!(
-        "every supported device: {count} files, {:.1} MiB (each PC loads only its own)",
+        "for every supported device ({:.1} MiB)",
         bytes as f64 / MIB as f64
     )
 }
@@ -347,7 +430,7 @@ pub(super) fn prefetch_bundle(mount_image: &[u8], volume: Option<&Path>) -> Resu
             .as_deref(),
         &mut |artifact| download(&client, artifact),
     )
-    .context("the firmware bundle could not be downloaded, so the USB was left as it was")?;
+    .context("the firmware bundle could not be downloaded, so the stick was left as it was")?;
     Ok(())
 }
 
@@ -383,21 +466,24 @@ fn prefetch(
         return Ok(0);
     }
     let bytes: usize = wanted.iter().map(|(artifact, _)| artifact.length).sum();
-    eprintln!(
-        "Downloading the firmware bundle: {} files, {:.1} MiB",
-        wanted.len(),
-        bytes as f64 / MIB as f64
-    );
-    for (index, (artifact, _)) in wanted.iter().enumerate() {
+    // The bar draws only on a terminal; a redirected run gets one line at
+    // each end of the download instead.
+    let plain = !io::stderr().is_terminal();
+    if plain {
         eprintln!(
-            "  {} ({:.1} MiB), file {} of {}",
-            artifact.member,
-            artifact.length as f64 / MIB as f64,
-            index + 1,
-            wanted.len()
+            "Downloading firmware ({:.1} MiB)",
+            bytes as f64 / MIB as f64
         );
+    }
+    let progress = crate::progress::Phase::bytes("Downloading firmware", bytes as u64);
+    for (artifact, _) in &wanted {
         let bytes = download(artifact)?;
         store(cache, artifact, &bytes)?;
+        progress.advance(artifact.length as u64);
+    }
+    progress.finish();
+    if plain {
+        eprintln!("Firmware downloaded");
     }
     Ok(wanted.len())
 }
@@ -408,7 +494,7 @@ const MARGIN: u64 = 16 * MIB;
 
 /// The bundle's files that go on a volume with `free` bytes left (`None`:
 /// no limit) beside `present` bytes the bundle already holds there, in
-/// [`bundle::FAMILIES`] order, and the files left out.
+/// [`bundle::families`] order, and the files left out.
 pub(super) fn bundle_plan(
     free: Option<u64>,
     present: u64,
@@ -459,22 +545,27 @@ fn present_bytes(directory: &Path) -> u64 {
 
 /// Write `files` and their notices to the bundle on `volume`, each fetched
 /// through `fetch` unless the volume holds it already, then its manifest,
-/// and remove files no longer listed.
-pub(super) fn publish_bundle(
+/// and remove files no longer listed. Returns the files whose image this
+/// wrote.
+pub(super) fn publish_bundle<'a>(
     volume: &Path,
-    files: &[(&Artifact, &Artifact)],
+    files: &[(&'a Artifact, &'a Artifact)],
     fetch: &mut dyn FnMut(&Artifact) -> Result<Vec<u8>>,
-) -> Result<()> {
+) -> Result<Vec<(&'a Artifact, &'a Artifact)>> {
     let directory = volume.join(bundle::DIRECTORY);
     fs::create_dir_all(directory.join("licenses"))?;
     let mut kept = vec![directory.join("bundle.json")];
-    for (object, notice) in files {
+    let mut written = Vec::new();
+    for &(object, notice) in files {
         for (artifact, path) in [
-            (*object, bundle::object_path(object.sha256)),
-            (*notice, bundle::notice_path(notice.sha256)),
+            (object, bundle::object_path(object.sha256)),
+            (notice, bundle::notice_path(notice.sha256)),
         ] {
             let path = directory.join(path);
             if !kept.contains(&path) && !holds(&path, artifact) {
+                if std::ptr::eq(artifact, object) {
+                    written.push((object, notice));
+                }
                 let bytes = fetch(artifact)?;
                 artifact.verify(&bytes)?;
                 let parent = path.parent().context("bundle path has no directory")?;
@@ -502,13 +593,44 @@ pub(super) fn publish_bundle(
             }
         }
     }
-    Ok(())
+    Ok(written)
 }
 
-/// Put the complete bundle on the USB's data volume `volume`, beside the
+/// The licence lines of a run that wrote `written` to the bundle: the
+/// licence of each image NVIDIA publishes only under its driver licence
+/// and where its text is, then where every notice is. None when nothing
+/// was written.
+fn licence_notes(written: &[(&Artifact, &Artifact)]) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut named: Vec<&str> = Vec::new();
+    for (object, notice) in written {
+        if matches!(
+            recipes::nvidia_gsp(object),
+            Some((_, recipes::NvidiaPart::Gsp))
+        ) && !named.contains(&notice.sha256)
+        {
+            named.push(notice.sha256);
+            notes.push(format!(
+                "NVIDIA's GPU firmware is used under the NVIDIA Driver License Agreement; its \
+                 text is in {}/{} on the stick's data partition",
+                bundle::DIRECTORY,
+                bundle::notice_path(notice.sha256)
+            ));
+        }
+    }
+    if !written.is_empty() {
+        notes.push(format!(
+            "firmware licences are in {}/licenses on the stick's data partition",
+            bundle::DIRECTORY
+        ));
+    }
+    notes
+}
+
+/// Put the complete bundle on the stick's data volume `volume`, beside the
 /// EFI partition `esp` whose boot program is `mount_image`, downloading
 /// what the cache lacks. A volume short of room gets what fits, in
-/// [`bundle::FAMILIES`] order, and the notes name what was left out. Once
+/// [`bundle::families`] order, and the notes name what was left out. Once
 /// the bundle holds every file of an older per-PC set on the EFI partition,
 /// that set is removed. Nothing depends on this computer's devices.
 pub(super) fn provision_bundle(
@@ -524,24 +646,24 @@ pub(super) fn provision_bundle(
     let free = host.volume(volume)?.free_bytes;
     let (files, left) = bundle_plan(Some(free), present_bytes(&directory));
     let bytes: usize = files.iter().map(|(object, _)| object.length).sum();
-    eprintln!(
-        "Firmware for every supported device: {} files, {:.1} MiB, to {}",
-        files.len(),
-        bytes as f64 / MIB as f64,
-        directory.display()
-    );
+    eprintln!("Writing firmware ({:.1} MiB)", bytes as f64 / MIB as f64);
     // Every download before the first write to the stick.
     prefetch_bundle(mount_image, Some(volume))?;
     let cache = super::cache_dir().join("firmware");
-    publish_bundle(volume, &files, &mut |artifact| {
+    let written = publish_bundle(volume, &files, &mut |artifact| {
         read_cached(&cache.join(artifact.sha256), artifact)
     })
-    .context("the USB did not get the complete firmware bundle")?;
+    .context("the stick did not get the complete firmware bundle")?;
+    // Once per run, whatever calls this.
+    static LICENCES_NAMED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let mut notes = Vec::new();
+    if !written.is_empty() && !LICENCES_NAMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        notes.extend(licence_notes(&written));
+    }
     if !left.is_empty() {
         notes.push(format!(
-            "{} has no room for {} of the firmware bundle's files, so PCs that need them \
-             lack them: {}",
+            "{} has no room for {} firmware files, so PCs that need them lack them: {}",
             volume.display(),
             left.len(),
             left.iter()
@@ -554,8 +676,15 @@ pub(super) fn provision_bundle(
     Ok(notes)
 }
 
-/// Remove the older per-PC firmware on the EFI partition when the bundle on
-/// another volume holds every one of its files.
+/// Remove the older per-PC firmware on the EFI partition once the bundle on
+/// another volume makes it useless: every image is either in the bundle, or
+/// bound to a request today's recipes answer with a file the bundle holds,
+/// or bound to a request no recipe answers any more (a GSP-RM release nouveau
+/// no longer takes). A boot loads the set's images before the bundle's and
+/// binds them first, so a set left behind costs every boot its reads and
+/// could hold a file older than the bundle's. The set stays while one of its
+/// images is the only copy of a file today's recipes pin, as on a volume short
+/// of room.
 fn remove_superseded(esp: &Path, volume: &Path, files: &[(&Artifact, &Artifact)]) -> Result<()> {
     let old = esp.join(host_firmware::DIRECTORY);
     if esp == volume {
@@ -565,11 +694,24 @@ fn remove_superseded(esp: &Path, volume: &Path, files: &[(&Artifact, &Artifact)]
         return Ok(());
     };
     let manifest = host_firmware::Manifest::parse(&bytes)?;
-    if manifest.images.iter().all(|image| {
-        files
-            .iter()
-            .any(|(object, _)| object.sha256 == image.sha256)
-    }) {
+    let in_bundle = |sha256: &str| files.iter().any(|(object, _)| object.sha256 == sha256);
+    let needed = manifest.images.iter().any(|image| {
+        if in_bundle(image.sha256) {
+            return false;
+        }
+        let request = Request::from(Requirement {
+            name: image.name,
+            target: Target {
+                driver: image.target.driver,
+                hardware: image.target.hardware,
+                revision: image.target.revision,
+                board: image.target.board,
+            },
+            minimum_bytes: 1,
+        });
+        recipes::recipe(&request).is_some_and(|recipe| !in_bundle(recipe.image.sha256))
+    });
+    if !needed {
         fs::remove_dir_all(&old)?;
     }
     Ok(())
@@ -590,10 +732,10 @@ pub(super) fn bundle_status(volume: &Path) -> std::result::Result<String, String
             })
             .count();
         return Err(if present == 0 {
-            "the USB has no firmware bundle".into()
+            "the stick has no firmware".into()
         } else {
             format!(
-                "the firmware bundle is incomplete: {present} of {} files are on the USB",
+                "the firmware on the stick is incomplete: {present} of {} files are there",
                 bundle::size().0
             )
         });
@@ -611,26 +753,11 @@ pub(super) fn bundle_status(volume: &Path) -> std::result::Result<String, String
     let missing = parsed.missing();
     let (count, bytes) = bundle::size();
     if missing.is_empty() && damaged == 0 {
-        return Ok(format!(
-            "complete: {count} files, {:.1} MiB",
-            bytes as f64 / MIB as f64
-        ));
+        return Ok(format!("complete ({:.1} MiB)", bytes as f64 / MIB as f64));
     }
     Err(format!(
-        "the bundle lacks {} of {count} files{}{}",
+        "the firmware on the stick lacks {} of {count} files{}",
         missing.len(),
-        if missing.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " ({})",
-                missing
-                    .iter()
-                    .map(|artifact| artifact.member)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        },
         if damaged == 0 {
             String::new()
         } else {
@@ -725,7 +852,7 @@ impl Requested {
         lines
     }
 
-    /// Download the pinned files and publish them with what the USB's
+    /// Download the pinned files and publish them with what the stick's
     /// firmware on `esp` already holds.
     pub(super) fn provision(&self, esp: &Path, mount_image: &[u8]) -> Result<()> {
         self.plan(
@@ -734,7 +861,7 @@ impl Requested {
             &super::cache_dir().join("firmware"),
             false,
         )
-        .context("the USB did not get the firmware the last boot asked for")?;
+        .context("the stick did not get the firmware the last boot asked for")?;
         Ok(())
     }
 
@@ -762,7 +889,7 @@ impl Requested {
 /// What the newest inventory in the boot log on `esp` asks for that the
 /// USB's firmware lacks, for a boot program `mount_image`. A USB without a
 /// log or without such a line, and a boot program that reads no firmware
-/// from the USB, need nothing.
+/// from the stick, need nothing.
 pub(super) fn requested(esp: &Path, mount_image: &[u8]) -> Result<Requested> {
     if !host_firmware::supports_mount(mount_image) {
         return Ok(Requested::default());
@@ -910,8 +1037,14 @@ mod tests {
         let manifest = bundle::manifest(&files).unwrap();
         let parsed = bundle::Bundle::parse(&manifest).unwrap();
         assert!(parsed.missing().is_empty());
-        assert_eq!(parsed.objects.len(), 86);
-        assert!(bundle_summary().starts_with("every supported device: 86 files, 115.8 MiB"));
+        // A stick for an image with the AMD port also holds its firmware.
+        let (objects, summary) = if cfg!(feature = "amdgpu-port") {
+            (121, "for every supported device (184.9 MiB)")
+        } else {
+            (88, "for every supported device (177.0 MiB)")
+        };
+        assert_eq!(parsed.objects.len(), objects);
+        assert_eq!(bundle_summary(), summary);
         // A volume short of room keeps the small files and leaves the large
         // GPU images out, by name.
         let (files, left) = bundle_plan(Some(MARGIN + 40 * MIB), 0);
@@ -922,6 +1055,10 @@ mod tests {
         );
         let left: Vec<_> = left.iter().map(|artifact| artifact.member).collect();
         assert!(
+            left.contains(&"nvidia/gb202/gsp/gsp-570.211.01.bin"),
+            "{left:?}"
+        );
+        assert!(
             left.contains(&"nvidia/ga102/gsp/gsp-570.144.bin"),
             "{left:?}"
         );
@@ -931,7 +1068,7 @@ mod tests {
         );
         assert!(!left.contains(&"regulatory.db"));
         // Files the volume already holds count as room.
-        let (_, left) = bundle_plan(Some(MARGIN), 200 * MIB);
+        let (_, left) = bundle_plan(Some(MARGIN), 260 * MIB);
         assert!(left.is_empty());
     }
 
@@ -990,6 +1127,50 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_writes_firmware_names_its_licences() {
+        let complete = bundle::complete();
+        let gsp = *complete
+            .iter()
+            .find(|(object, _)| {
+                matches!(
+                    recipes::nvidia_gsp(object),
+                    Some((_, recipes::NvidiaPart::Gsp))
+                )
+            })
+            .unwrap();
+        let other = *complete
+            .iter()
+            .find(|(object, _)| recipes::nvidia_gsp(object).is_none())
+            .unwrap();
+        let summary =
+            "firmware licences are in stela/firmware/licenses on the stick's data partition";
+        let nvidia = format!(
+            "NVIDIA's GPU firmware is used under the NVIDIA Driver License Agreement; its text \
+             is in stela/firmware/licenses/{}.txt on the stick's data partition",
+            &recipes::NVIDIA_DRIVER_570_211_01_LICENSE.sha256[..32]
+        );
+        assert_eq!(
+            gsp.1.sha256,
+            recipes::NVIDIA_DRIVER_570_211_01_LICENSE.sha256
+        );
+        // Nothing written, nothing said.
+        assert!(licence_notes(&[]).is_empty());
+        // Other vendors' files: one summary line, not one per file.
+        assert_eq!(licence_notes(&[other, other]), [summary]);
+        // NVIDIA's GSP-RM image: its licence and file, then the summary.
+        assert_eq!(
+            licence_notes(&[other, gsp, gsp]),
+            [nvidia.as_str(), summary]
+        );
+        // The named file is where publish_bundle stores that notice.
+        assert!(nvidia.contains(&format!(
+            " {}/{} ",
+            bundle::DIRECTORY,
+            bundle::notice_path(gsp.1.sha256)
+        )));
+    }
+
+    #[test]
     fn the_bundle_is_the_same_on_every_computer_and_stores_a_shared_file_once() {
         use super::super::{host::Host, tests::FakeHost};
         let catalog = synthetic();
@@ -1026,11 +1207,17 @@ mod tests {
         for host in [&with as &dyn Host, &without] {
             let dir = tempfile::tempdir().unwrap();
             assert!(host.nvidia_gpus().is_ok());
-            publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            let written = publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            // The alias is the first file's content, written once.
+            assert_eq!(written.len(), 2);
             snapshots.push(snapshot(dir.path()));
-            // A second publication fetches nothing.
+            // A second publication fetches and writes nothing.
             let before = fetches.get();
-            publish_bundle(dir.path(), &files, &mut fetch).unwrap();
+            assert!(
+                publish_bundle(dir.path(), &files, &mut fetch)
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(fetches.get(), before);
         }
         assert_eq!(snapshots[0], snapshots[1]);
@@ -1142,7 +1329,11 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            "the firmware bundle is incomplete: 3 of 86 files are on the USB"
+            if cfg!(feature = "amdgpu-port") {
+                "the firmware on the stick is incomplete: 3 of 121 files are there"
+            } else {
+                "the firmware on the stick is incomplete: 3 of 88 files are there"
+            }
         );
     }
 
@@ -1152,7 +1343,7 @@ mod tests {
         assert!(
             bundle_status(dir.path())
                 .unwrap_err()
-                .contains("no firmware bundle")
+                .contains("has no firmware")
         );
         // A partial bundle: one real recipe's entry, its file not written.
         let first = bundle::complete()[0];
@@ -1164,11 +1355,13 @@ mod tests {
         )
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
-        assert!(status.contains("lacks 85 of 86 files"), "{status}");
-        assert!(
-            status.contains("nvidia/ga102/gsp/gsp-570.144.bin"),
-            "{status}"
-        );
+        let lacks = if cfg!(feature = "amdgpu-port") {
+            "lacks 120 of 121 files"
+        } else {
+            "lacks 87 of 88 files"
+        };
+        assert!(status.contains(lacks), "{status}");
+        assert!(!status.contains("nvidia/"), "{status}");
         assert!(status.contains("1 of its files are damaged"), "{status}");
     }
 
@@ -1203,6 +1396,64 @@ mod tests {
         remove_superseded(&esp, &esp, &files).unwrap();
         assert!(old.exists());
         remove_superseded(&esp, &volume, &files).unwrap();
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn an_older_per_pc_set_of_a_release_nouveau_no_longer_takes_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let esp = dir.path().join("esp");
+        let volume = dir.path().join("volume");
+        let old = esp.join(host_firmware::DIRECTORY);
+        fs::create_dir_all(&old).unwrap();
+        // A 0.3 set for an RTX 5080: GSP-RM 570.144's bootloader, which no
+        // recipe answers since GeForce Blackwell takes 570.211.01, beside a
+        // file today's recipe for its name pins differently.
+        let regdb = recipes::REGULATORY[0].image;
+        let image = |name: &str, driver: &str, hardware: &str, revision: &str, sha256: &str| {
+            serde_json::json!({"name":name, "path":format!("{}.bin", &sha256[..8]),
+                "target":{"driver":driver,"hardware":hardware,"revision":revision,"board":null},
+                "provenance":{"source":"s","revision":"r","member":name,"license":"x"},
+                "length":200812,"sha256":sha256})
+        };
+        let write = |images: Vec<serde_json::Value>| {
+            fs::write(
+                old.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({"schema":1,"images":images})).unwrap(),
+            )
+            .unwrap();
+        };
+        let stale = image(
+            "nvidia/gb203/gsp/bootloader-570.144.bin",
+            "nouveau",
+            "nvidia",
+            "linux-firmware",
+            "d40b48e431d1707dc77af3605db358ed7a32ebfc2830eb74de2eddb4d3025071",
+        );
+        let older = image(
+            "regulatory.db",
+            "wifi-regulatory",
+            "wireless-regdb",
+            "v20",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        write(vec![stale.clone(), older.clone()]);
+        let files = bundle::complete();
+        // A bundle short of the file today's recipe pins for one of them keeps
+        // the set: its copy is the only one.
+        let without: Vec<_> = files
+            .iter()
+            .copied()
+            .filter(|(object, _)| object.sha256 != regdb.sha256)
+            .collect();
+        remove_superseded(&esp, &volume, &without).unwrap();
+        assert!(old.exists());
+        remove_superseded(&esp, &volume, &files).unwrap();
+        assert!(!old.exists());
+        // So does a set holding only the old release.
+        fs::create_dir_all(&old).unwrap();
+        write(vec![stale]);
+        remove_superseded(&esp, &volume, &without).unwrap();
         assert!(!old.exists());
     }
 
@@ -1463,6 +1714,91 @@ mod tests {
     }
 
     #[test]
+    fn a_file_moved_or_replaced_at_every_source_is_named_so() {
+        // NVIDIA put another installer under the name: its length differs.
+        let replaced = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 100-102/900\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+        let (first, first_server) = source(vec![replaced]);
+        let (second, second_server) = source(vec![GONE]);
+        let mut slept = Vec::new();
+        let error = download_slice(
+            &client(),
+            &ABC,
+            Some((100, 500)),
+            &[first, second],
+            &mut |d| slept.push(d),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("holds a file of 900 bytes there, not the pinned one of 500"),
+            "{error}"
+        );
+        assert!(error.contains("answered 404 Not Found"), "{error}");
+        assert!(
+            error.ends_with("The file has moved or changed where it is published, so this Stela cannot get it; a newer Stela can"),
+            "{error}"
+        );
+        // Neither is asked again.
+        assert!(slept.is_empty(), "{slept:?}");
+        assert_eq!(first_server.join().unwrap(), 1);
+        assert_eq!(second_server.join().unwrap(), 1);
+        // A server that ignores the range is not read: 376 MB for 52 MB.
+        let (url, server) = source(vec![OK]);
+        let error = download_slice(&client(), &ABC, Some((100, 500)), &[url], &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("sent the whole file, not the part of it asked for"),
+            "{error}"
+        );
+        assert!(!error.contains("moved or changed"), "{error}");
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn every_nvidia_release_image_has_its_download_and_every_notice_a_source() {
+        for (object, notice) in bundle::complete() {
+            match nvidia::spec(object) {
+                Some(spec) => {
+                    let (release, part) = recipes::nvidia_gsp(object).unwrap();
+                    assert_eq!(spec.wire, release.source(part));
+                    assert_eq!(spec.slice.is_some(), part == recipes::NvidiaPart::Gsp);
+                }
+                None => assert!(recipes::nvidia_gsp(object).is_none()),
+            }
+            // A notice is downloaded, or carried with its pinned bytes.
+            match nvidia::carried(notice) {
+                Some(bytes) => notice.verify(bytes).unwrap(),
+                None => assert!(!notice.urls().is_empty(), "{}", notice.member),
+            }
+        }
+        let gsp = &recipes::GB20X_570_211_01.images[2];
+        assert_eq!(*gsp.license, recipes::NVIDIA_DRIVER_570_211_01_LICENSE);
+        let carried = nvidia::carried(gsp.license).unwrap();
+        assert!(carried.starts_with(b"NVIDIA Driver License Agreement"));
+        // The CLI serves it without a network.
+        let client = super::client().unwrap();
+        assert_eq!(download(&client, gsp.license).unwrap(), carried);
+    }
+
+    #[test]
+    fn a_bounded_slice_requests_and_resumes_exact_byte_ranges() {
+        let cut = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 100-102/500\r\nContent-Length: 3\r\nConnection: close\r\n\r\nab";
+        let rest = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 102-102/500\r\nContent-Length: 1\r\nConnection: close\r\n\r\nc";
+        let (url, server) = scripted(vec![vec![cut], vec![rest]], Duration::ZERO);
+        let mut slept = Vec::new();
+        let bytes = download_slice(&client(), &ABC, Some((100, 500)), &[url], &mut |d| {
+            slept.push(d)
+        })
+        .unwrap();
+        assert_eq!(bytes, b"abc");
+        assert_eq!(slept, [RESUME_PAUSE]);
+        let heads = server.join().unwrap();
+        assert!(heads[0].contains("range: bytes=100-102\r\n"), "{heads:?}");
+        assert!(heads[1].contains("range: bytes=102-102\r\n"), "{heads:?}");
+    }
+
+    #[test]
     fn a_server_without_ranges_sends_the_whole_file_again() {
         let (url, server) = scripted(vec![vec![CUT], vec![OK]], Duration::ZERO);
         let bytes = download_from(&client(), &ABC, &[url], &mut |_| {}).unwrap();
@@ -1648,7 +1984,7 @@ mod tests {
             lines.contains("brcm/synthetic.bin (synthetic-bluetooth pci:14e4:5fa0 c0), which Stela has no pinned source for"),
             "{lines}"
         );
-        // The plan keeps what the USB holds and downloads nothing in a dry run.
+        // The plan keeps what the stick holds and downloads nothing in a dry run.
         let cache = dir.path().join("cache");
         let plan = found.plan(&esp, &image, &cache, true).unwrap().unwrap();
         assert!(plan.contains("2 exact observed bindings"), "{plan}");
@@ -1663,7 +1999,7 @@ mod tests {
         };
         assert!(only.plan(&esp, &image, &cache, true).unwrap().is_none());
         only.provision(&esp, &image).unwrap();
-        // A boot program that reads no firmware from the USB asked for none.
+        // A boot program that reads no firmware from the stick asked for none.
         assert!(requested(&esp, b"no marker").unwrap().is_empty());
         // A line cut short is named, not followed.
         boot_log(&esp, &[&newer[..60]]);
@@ -1763,5 +2099,27 @@ mod tests {
             fs::read(destination.join("manifest.json")).unwrap(),
             manifest_bytes
         );
+    }
+
+    #[test]
+    #[ignore = "oracle: STELA_NVIDIA_570_211_TEST"]
+    fn nvidia_570_211_01_live_provisioning_matches_recipe_pins() {
+        assert!(
+            std::env::var_os("STELA_NVIDIA_570_211_TEST").is_some(),
+            "set STELA_NVIDIA_570_211_TEST=1 to run live NVIDIA 570.211.01 download test"
+        );
+        let http = client();
+        let gb20x: Vec<_> = bundle::complete()
+            .into_iter()
+            .filter(|(object, _)| recipes::nvidia_gsp(object).is_some())
+            .collect();
+        assert_eq!(gb20x.len(), 3);
+        for artifact in gb20x
+            .into_iter()
+            .flat_map(|(object, notice)| [object, notice])
+        {
+            let bytes = download(&http, artifact).unwrap();
+            artifact.verify(&bytes).unwrap();
+        }
     }
 }

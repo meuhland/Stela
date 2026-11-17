@@ -71,6 +71,16 @@ impl RangeSource for Http {
 
     fn note(&mut self, line: core::fmt::Arguments<'_>) {
         output::arguments(line);
+        // The first failed range of the boot also says what the adapter's
+        // registers and rings show then: a stalled receive or transmit path
+        // is told apart from a slow server. Once a boot, so it stays bounded.
+        static STATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        if !STATED.swap(true, core::sync::atomic::Ordering::Relaxed)
+            && let Ok(mut network) = self.network.0.try_borrow_mut()
+            && let Some(state) = network.diagnostic()
+        {
+            output::arguments(format_args!("REMOTE IMAGE adapter state: {state}\n"));
+        }
     }
 }
 
@@ -106,8 +116,9 @@ impl Remote {
         Ok(Self(Ranges::new(http, manifest.source.bytes)))
     }
 
-    /// Have every later read wait for the network at most
-    /// `ranges::BUDGET_MS`: from when the restore host serves on a PE.
+    /// Have the reads from now on wait for the network at most
+    /// `ranges::BUDGET_MS` in all, until the next call: the restore host
+    /// calls it at each of its turns on a PE.
     pub fn bound(&mut self) {
         self.0.bound();
     }

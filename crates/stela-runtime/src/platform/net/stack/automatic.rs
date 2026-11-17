@@ -6,6 +6,11 @@ pub struct Automatic {
     pub dns: Vec<IpAddress>,
 }
 
+/// A unique local address (RFC 4193, fc00::/7): routed within a site only.
+pub(super) fn unique_local(address: Ipv6Addr) -> bool {
+    address.octets()[0] & 0xfe == 0xfc
+}
+
 pub(super) fn link_local(mac: [u8; 6]) -> Ipv6Addr {
     let mut bytes = [0u8; 16];
     bytes[..2].copy_from_slice(&[0xfe, 0x80]);
@@ -49,11 +54,25 @@ impl<L: Link, C: Clock> Stack<L, C> {
         }
         Ok(())
     }
+    /// A default IPv6 route and an admitted address beyond the link: one
+    /// that reaches at least the site.
     pub(super) fn ipv6_ready(&self) -> bool {
+        self.ipv6_admitted(|_| true)
+    }
+    /// [`Self::ipv6_ready`] with a global address, not only a unique local
+    /// one (RFC 4193, fc00::/7). A router may advertise a ULA prefix alone,
+    /// with itself as the default route, on a network whose internet is
+    /// IPv4: a name's global IPv6 address is unreachable from a ULA (RFC
+    /// 6724 gives it a label of its own for that reason), so IPv4 is used.
+    pub(super) fn ipv6_global_ready(&self) -> bool {
+        self.ipv6_admitted(|address| !unique_local(address))
+    }
+    fn ipv6_admitted(&self, kind: impl Fn(Ipv6Addr) -> bool) -> bool {
         self.iface.routes().get_default_ipv6_route().is_some()
             && self.iface.ip_addrs().iter().any(|cidr| match cidr {
                 IpCidr::Ipv6(cidr) => {
                     !cidr.address().is_unicast_link_local()
+                        && kind(cidr.address())
                         && self.phy.approved_ipv6.contains(&cidr.address())
                 }
                 _ => false,
@@ -65,8 +84,10 @@ impl<L: Link, C: Clock> Stack<L, C> {
             IpAddress::Ipv6(address) => {
                 if address.is_unicast_link_local() {
                     self.phy.approved_ipv6.contains(&self.phy.local_ipv6)
-                } else {
+                } else if unique_local(address) {
                     self.ipv6_ready()
+                } else {
+                    self.ipv6_global_ready()
                 }
             }
         }
@@ -187,7 +208,15 @@ impl<L: Link, C: Clock> Stack<L, C> {
         let deadline = self.now()?.saturating_add(DHCP_WAIT_US);
         loop {
             self.poll()?;
-            if self.config.is_some() || self.ipv6_ready() {
+            // IPv4, or IPv6 with a global address, is ready at once. IPv6
+            // with only a unique local address waits for a DHCPv4 lease
+            // until the deadline, and is taken then: before, an install
+            // asked the IPSW's global address from a ULA and every range
+            // timed out while the lease came seconds later.
+            if self.config.is_some()
+                || self.ipv6_global_ready()
+                || (self.ipv6_ready() && self.now()? >= deadline)
+            {
                 return Ok(Automatic {
                     addresses: self
                         .iface
@@ -271,6 +300,8 @@ pub(super) mod tests {
     struct Router {
         frames: VecDeque<Vec<u8>>,
         probes: usize,
+        /// The /64 prefix the router advertises.
+        prefix: &'static str,
     }
     impl Link for Router {
         fn mac(&self) -> stela_drivers::net::Mac {
@@ -282,7 +313,7 @@ pub(super) mod tests {
                     self.probes += 1;
                 }
                 if frame[54] == 133 {
-                    self.frames.push_back(advertisement());
+                    self.frames.push_back(advertisement_with(self.prefix));
                 }
             }
             Ok(())
@@ -292,9 +323,14 @@ pub(super) mod tests {
         }
     }
     pub(crate) fn advertisement() -> Vec<u8> {
+        advertisement_with("2001:db8:1234::")
+    }
+    /// A router advertisement of `prefix`/64, the router being the default
+    /// route, with an RDNSS server in it.
+    fn advertisement_with(prefix: &str) -> Vec<u8> {
         let source: Ipv6Addr = "fe80::1".parse().unwrap();
         let destination: Ipv6Addr = "ff02::1".parse().unwrap();
-        let prefix: Ipv6Addr = "2001:db8:1234::".parse().unwrap();
+        let prefix: Ipv6Addr = prefix.parse().unwrap();
         let dns: Ipv6Addr = "2001:db8:1234::53".parse().unwrap();
         let mut frame = vec![0; 14 + 40 + 72];
         frame[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
@@ -476,6 +512,7 @@ pub(super) mod tests {
         let router = Router {
             frames: VecDeque::new(),
             probes: 0,
+            prefix: "2001:db8:1234::",
         };
         let mut stack = Stack::new(router, ClockStep(core::cell::Cell::new(0)), 7).unwrap();
         let address = core::net::Ipv4Addr::new(192, 168, 1, 20);
@@ -503,6 +540,7 @@ pub(super) mod tests {
         let router = Router {
             frames: VecDeque::new(),
             probes: 0,
+            prefix: "2001:db8:1234::",
         };
         let mut stack = Stack::new(router, ClockStep(core::cell::Cell::new(0)), 7).unwrap();
         let configuration = stack.automatic().unwrap();
@@ -514,5 +552,51 @@ pub(super) mod tests {
                 .contains(&IpAddress::Ipv6("2001:db8:1234::53".parse().unwrap()))
         );
         assert!(stack.phy.link.probes >= 2);
+        // A global address is taken at once, without waiting for DHCPv4.
+        assert!(
+            stack.clock.0.get() < DHCP_WAIT_US,
+            "{}",
+            stack.clock.0.get()
+        );
+    }
+    #[test]
+    fn a_unique_local_prefix_alone_waits_for_dhcpv4_and_is_taken_at_the_deadline() {
+        let router = Router {
+            frames: VecDeque::new(),
+            probes: 0,
+            prefix: "fd12:3456:789a::",
+        };
+        let mut stack = Stack::new(router, ClockStep(core::cell::Cell::new(0)), 7).unwrap();
+        let configuration = stack.automatic().unwrap();
+        // No lease came: the ULA is taken, but only once the wait is over.
+        assert!(
+            stack.clock.0.get() >= DHCP_WAIT_US,
+            "{}",
+            stack.clock.0.get()
+        );
+        assert!(stack.config().is_none());
+        assert!(stack.ipv6_ready() && !stack.ipv6_global_ready());
+        assert!(
+            configuration.addresses.iter().any(
+                |address| matches!(address, IpCidr::Ipv6(cidr) if unique_local(cidr.address()))
+            )
+        );
+        // A name's global address is not reached from the ULA; a site's is.
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let site: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
+        assert!(!stack.address_usable(IpAddress::Ipv6(global)));
+        assert!(stack.address_usable(IpAddress::Ipv6(site)));
+    }
+    #[test]
+    fn unique_local_addresses_are_fc00_slash_7() {
+        for (address, local) in [
+            ("fc00::1", true),
+            ("fd12:3456:789a::1", true),
+            ("fe80::1", false),
+            ("2001:db8::1", false),
+            ("fbff::1", false),
+        ] {
+            assert_eq!(unique_local(address.parse().unwrap()), local, "{address}");
+        }
     }
 }

@@ -96,6 +96,98 @@ pub struct Context {
     regime: Option<u64>,
     /// Whether PACs come from [`keyed`], not QARMA5.
     keyed: bool,
+    /// The regime's layouts worked out ahead ([`Self::with_layouts`]).
+    layouts: Option<Layouts>,
+}
+
+/// Every PAC layout of one translation regime, by domain, by signing or
+/// authentication and by the pointer's bits 55 and 63, which select the
+/// range ([`Context::with_layouts`]): a signing or authentication then looks
+/// its layout up instead of working it out from TCR_EL1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layouts {
+    tcr: u64,
+    table: [policy::Layout; 16],
+}
+
+impl Layouts {
+    /// The layouts of the regime TCR_EL1 `tcr` describes.
+    pub fn new(tcr: u64) -> Self {
+        let mut table = [policy::Domain::Data.layout(); 16];
+        for (index, layout) in table.iter_mut().enumerate() {
+            let domain = if index & 8 != 0 {
+                policy::Domain::Data
+            } else {
+                policy::Domain::Instruction
+            };
+            let pointer = (index as u64 & 2) << 54 | (index as u64 & 1) << 63;
+            *layout = regime_layout(tcr, domain, pointer, index & 4 != 0);
+        }
+        Self { tcr, table }
+    }
+
+    /// The TCR_EL1 the layouts follow.
+    pub fn tcr(&self) -> u64 {
+        self.tcr
+    }
+
+    /// What native code computes `domain`'s signings or authentications
+    /// with (`x86_64::pointer::cipher::Layout`): the one pointer bit their
+    /// layout depends on, and the extension mask with it clear and set.
+    /// `regime_layout` selects TnSZ by that bit (55, or 63 for a signing
+    /// when neither range ignores the top byte) and TBI by bit 55, which it
+    /// ignores when it selects by bit 63, as neither range has TBI then.
+    pub(crate) fn native(&self, data: bool, signing: bool) -> (u32, [u64; 2]) {
+        let domain = if data {
+            policy::Domain::Data
+        } else {
+            policy::Domain::Instruction
+        };
+        let select = self.get(domain, 0, signing).select_shift;
+        (
+            select,
+            [0, 1 << select].map(|pointer| self.get(domain, pointer, signing).extension_mask()),
+        )
+    }
+
+    fn get(&self, domain: policy::Domain, pointer: u64, signing: bool) -> policy::Layout {
+        let index = usize::from(domain == policy::Domain::Data) << 3
+            | usize::from(signing) << 2
+            | ((pointer >> 54) & 2) as usize
+            | (pointer >> 63) as usize;
+        self.table[index]
+    }
+}
+
+/// The PAC field of `pointer` for an `operation` in `domain` under TCR_EL1
+/// `tcr`. Arm `AddPAC` selects the range whose TnSZ bounds the field by bit
+/// 55 when either range ignores the domain's top byte and by bit 63
+/// otherwise; `Auth` and `Strip` always select by bit 55
+/// (`CalculateBottomPACBit(ptr<55>)`), since a signed pointer's bit 63 is PAC
+/// whenever the top byte is not ignored. Only bits 55 and 63 of `pointer`
+/// matter ([`Layouts`]).
+fn regime_layout(tcr: u64, domain: policy::Domain, pointer: u64, signing: bool) -> policy::Layout {
+    // EffectiveTBI selects TBI0/TBI1 by bit 55; TBIDn exempts instructions.
+    let ignores_top_byte = |upper: bool| {
+        let (tbi, tbid) = if upper { (38, 52) } else { (37, 51) };
+        tcr & (1 << tbi) != 0 && !(domain == policy::Domain::Instruction && tcr & (1 << tbid) != 0)
+    };
+    let tbi = ignores_top_byte(pointer & (1 << 55) != 0);
+    let select = if signing && !ignores_top_byte(false) && !ignores_top_byte(true) {
+        63
+    } else {
+        55
+    };
+    let tnsz = if pointer & (1 << select) != 0 {
+        (tcr >> 16) & 63
+    } else {
+        tcr & 63
+    };
+    // CalculateBottomPACBit: an out-of-range TnSZ is CONSTRAINED
+    // UNPREDICTABLE, FORCE or NONE; FORCE to 16..=39 (no FEAT_TTST or
+    // 52-bit VAs), the range the system engine's walker admits.
+    let tnsz = tnsz.clamp(MIN_TNSZ, MAX_TNSZ);
+    policy::Layout::new(64 - tnsz as u32, if tbi { 55 } else { 63 }, select)
 }
 impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -151,6 +243,7 @@ impl Context {
             version,
             regime: None,
             keyed: false,
+            layouts: None,
         }
     }
 
@@ -158,6 +251,15 @@ impl Context {
     /// the system-mode engine requires, instead of the fixed process profile.
     pub fn with_translation_regime(mut self, tcr: u64) -> Self {
         self.regime = Some(tcr);
+        self.layouts = None;
+        self
+    }
+
+    /// [`Self::with_translation_regime`] with that regime's layouts worked
+    /// out ahead, for a context that serves many results.
+    pub fn with_layouts(mut self, layouts: Layouts) -> Self {
+        self.regime = Some(layouts.tcr);
+        self.layouts = Some(layouts);
         self
     }
 
@@ -170,6 +272,7 @@ impl Context {
     }
 
     /// The PAC of `data` and `modifier` under `key`.
+    #[inline]
     fn cipher(&self, data: u64, modifier: u64, key: &[u64; 2]) -> u64 {
         match self.keyed {
             true => keyed::compute(data, modifier, key),
@@ -177,39 +280,13 @@ impl Context {
         }
     }
 
-    /// The PAC field of `pointer` for an `operation` in `domain`. Arm
-    /// `AddPAC` selects the range whose TnSZ bounds the field by bit 55 when
-    /// either range ignores the domain's top byte and by bit 63 otherwise;
-    /// `Auth` and `Strip` always select by bit 55
-    /// (`CalculateBottomPACBit(ptr<55>)`), since a signed pointer's bit 63 is
-    /// PAC whenever the top byte is not ignored.
+    /// The PAC field of `pointer` for an `operation` in `domain`
+    /// ([`regime_layout`]).
+    #[inline]
     fn layout(&self, domain: policy::Domain, pointer: u64, signing: bool) -> policy::Layout {
-        let tcr = self.regime.unwrap_or(PROCESS_TCR);
-        // EffectiveTBI selects TBI0/TBI1 by bit 55; TBIDn exempts instructions.
-        let ignores_top_byte = |upper: bool| {
-            let (tbi, tbid) = if upper { (38, 52) } else { (37, 51) };
-            tcr & (1 << tbi) != 0
-                && !(domain == policy::Domain::Instruction && tcr & (1 << tbid) != 0)
-        };
-        let tbi = ignores_top_byte(pointer & (1 << 55) != 0);
-        let select = if signing && !ignores_top_byte(false) && !ignores_top_byte(true) {
-            63
-        } else {
-            55
-        };
-        let tnsz = if pointer & (1 << select) != 0 {
-            (tcr >> 16) & 63
-        } else {
-            tcr & 63
-        };
-        // CalculateBottomPACBit: an out-of-range TnSZ is CONSTRAINED
-        // UNPREDICTABLE, FORCE or NONE; FORCE to 16..=39 (no FEAT_TTST or
-        // 52-bit VAs), the range the system engine's walker admits.
-        let tnsz = tnsz.clamp(MIN_TNSZ, MAX_TNSZ);
-        policy::Layout {
-            address_bits: 64 - tnsz as u32,
-            top_shift: if tbi { 55 } else { 63 },
-            select_shift: select,
+        match &self.layouts {
+            Some(layouts) => layouts.get(domain, pointer, signing),
+            None => regime_layout(self.regime.unwrap_or(PROCESS_TCR), domain, pointer, signing),
         }
     }
     pub fn version(&self) -> Version {
@@ -239,15 +316,42 @@ impl Context {
     /// PAC bit62 (instruction) or54 (data), following June2026 Arm ASL, rather
     /// than the older Unicorn invalid-extension behavior. Enhanced profiles XOR the PAC field.
     pub fn sign(&self, key: Key, pointer: u64, modifier: u64) -> Result<u64, AuthenticationError> {
-        let words = self.keys.get(key)?;
+        Ok(self.sign_with(key, self.keys.get(key)?, pointer, modifier))
+    }
+
+    /// [`Self::sign`] with `key`'s `words` in hand, for the hot path of a
+    /// service that has already looked them up ([`Self::words`]).
+    #[inline(always)]
+    pub(crate) fn sign_with(&self, key: Key, words: &[u64; 2], pointer: u64, modifier: u64) -> u64 {
         let layout = self.layout(key_domain(key), pointer, true);
         let input = policy::signing_input(layout, pointer);
-        Ok(policy::sign(
+        policy::sign(
             self.version,
             layout,
             pointer,
             self.cipher(input, modifier, words),
-        ))
+        )
+    }
+
+    /// The AES schedule native code computes PACs of the key at tag word
+    /// `index` with (`x86_64::pointer::cipher`): IA, IB, DA, DB, then the
+    /// generic key. `None` when the context lacks the key or its cipher is
+    /// not the AES rounds native code runs ([`keyed::native`]).
+    pub(crate) fn native_schedule(&self, index: usize) -> Option<[[u64; 2]; keyed::SCHEDULE]> {
+        if !self.keyed || !keyed::native() {
+            return None;
+        }
+        let words = match index {
+            4 => self.keys.generic.as_ref(),
+            index => self.keys.words.get(index)?.as_ref(),
+        }?;
+        Some(keyed::schedule(words))
+    }
+
+    /// The words of `key`, when the context has it.
+    #[inline]
+    pub(crate) fn words(&self, key: Key) -> Option<&[u64; 2]> {
+        self.keys.words[key.index()].as_ref()
     }
 
     /// Standalone AUT policy; combined loads/transfers use authenticate_operation.
@@ -267,11 +371,30 @@ impl Context {
         modifier: u64,
         combined: bool,
     ) -> Result<AuthResult, AuthenticationError> {
-        let words = self.keys.get(key)?;
+        let result = self
+            .authenticate_with(key, self.keys.get(key)?, pointer, modifier, combined)
+            .map_err(|failure| AuthenticationError::Failure { code: failure.code })?;
+        Ok(AuthResult {
+            pointer: result.pointer,
+            authenticated: result.authenticated,
+        })
+    }
+
+    /// [`Self::authenticate_operation`] with `key`'s `words` in hand
+    /// ([`Self::sign_with`]).
+    #[inline(always)]
+    pub(crate) fn authenticate_with(
+        &self,
+        key: Key,
+        words: &[u64; 2],
+        pointer: u64,
+        modifier: u64,
+        combined: bool,
+    ) -> Result<policy::Authentication, policy::Failure> {
         let domain = key_domain(key);
         let layout = self.layout(domain, pointer, false);
         let input = policy::authentication_input(layout, pointer);
-        let result = policy::authenticate(
+        policy::authenticate(
             self.version,
             domain,
             layout,
@@ -284,11 +407,6 @@ impl Context {
             pointer,
             self.cipher(input, modifier, words),
         )
-        .map_err(|failure| AuthenticationError::Failure { code: failure.code })?;
-        Ok(AuthResult {
-            pointer: result.pointer,
-            authenticated: result.authenticated,
-        })
     }
 
     pub fn has_generic_key(&self) -> bool {
@@ -308,6 +426,7 @@ impl Context {
     /// Architectural XPAC: keyless restoration, never an authentication check.
     /// Ia/Ib select instruction layout, Da/Db tagged-data layout; this succeeds
     /// even when that domain's cryptographic key was not provided.
+    #[inline]
     pub fn strip(&self, key: Key, pointer: u64) -> u64 {
         policy::authentication_input(self.layout(key_domain(key), pointer, false), pointer)
     }
@@ -349,7 +468,7 @@ const PROCESS_TCR: u64 = 17 | 17 << 16 | 1 << 37 | 1 << 51;
 const MIN_TNSZ: u64 = 16;
 const MAX_TNSZ: u64 = 39;
 
-mod keyed;
+pub(crate) mod keyed;
 mod qarma;
 use qarma::compute as qarma5;
 

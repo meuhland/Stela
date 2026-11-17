@@ -226,12 +226,33 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).block).write(block as u64);
             core::ptr::addr_of_mut!((*control).hits).write(0);
             core::ptr::addr_of_mut!((*control).linked).write(0);
+            core::ptr::addr_of_mut!((*control).heat).write(0);
+            core::ptr::addr_of_mut!((*control).sampled).write(0);
         }
-        // SAFETY: `set_stamps` stored 0 or the board's table's stamps for
-        // this PE, and its native code does not run.
-        unsafe { chain::next_jump_serial(self.stamps().0) };
         self.budget().store(budget, Ordering::Relaxed);
         self.entered = budget;
+    }
+    /// Let one native run keep up to `bound` paired frames, checked against
+    /// the retire epoch at `epoch` ([`ChainControl::retire_epoch`]), which
+    /// must live through every native call until the next change: 0 and 0
+    /// push none.
+    pub(super) fn set_frames(&mut self, bound: u32, epoch: u64) {
+        let control = self.storage.control.get();
+        // SAFETY: the sole owner writes these non-budget fields outside native execution.
+        unsafe {
+            core::ptr::addr_of_mut!((*control).frame_room).write(if epoch == 0 {
+                0
+            } else {
+                bound.saturating_mul(chain::FRAME_BYTES as u32)
+            });
+            core::ptr::addr_of_mut!((*control).retire_epoch).write(epoch);
+        }
+    }
+    /// What paired frames did since the storage was made
+    /// ([`chain::PairCount`]).
+    pub(super) fn pairs(&self) -> [u64; chain::PAIR_COUNTS] {
+        // SAFETY: native code writes them only within a call of this owner.
+        unsafe { core::ptr::addr_of!((*self.storage.control.get()).pairs).read() }
     }
     /// The block that ended the last native call, the instructions of the
     /// blocks it chained out of, the transfers lookup probes made and the
@@ -255,6 +276,22 @@ impl Owner {
             )
         };
         (block, retired, hits, chained.saturating_sub(hits))
+    }
+    /// The transfers the last native call's cell probes made
+    /// ([`ChainControl::heat`], whose low 32 bits they count in and
+    /// [`Self::begin`] zeroes), and the cell of the last one they named, or
+    /// 0 ([`ChainControl::sampled`]).
+    pub(super) fn cell_probes(&self) -> (u64, u64) {
+        let control = self.storage.control.get();
+        // SAFETY: the synchronous native call has returned; only this
+        // owner's native code writes the fields.
+        let (heat, sampled) = unsafe {
+            (
+                core::ptr::addr_of!((*control).heat).read(),
+                core::ptr::addr_of!((*control).sampled).read(),
+            )
+        };
+        (u64::from(heat as u32), sampled)
     }
     #[cfg(test)]
     pub(super) fn weak_storage(&self) -> alloc::sync::Weak<Storage> {
@@ -288,8 +325,16 @@ impl Owner {
             cells: unsafe { core::ptr::addr_of!((*control).cells).read() },
             // SAFETY: as for `table`; native code adds to it only within a call.
             heat: unsafe { core::ptr::addr_of!((*control).heat).read() },
+            // SAFETY: as for `heat`.
+            sampled: unsafe { core::ptr::addr_of!((*control).sampled).read() },
             loop_entries: self.loops().0,
             loop_iterated: self.loops().1,
+            // SAFETY: as for `table`.
+            frame_room: unsafe { core::ptr::addr_of!((*control).frame_room).read() },
+            reserved: 0,
+            // SAFETY: as for `table`.
+            retire_epoch: unsafe { core::ptr::addr_of!((*control).retire_epoch).read() },
+            pairs: self.pairs(),
         }
     }
 

@@ -46,9 +46,12 @@
 //! extension), its being preferred and the color's sRGB colorimetry (the EDID
 //! declares sRGB its default color space) are Inferred from the EDID the
 //! model serves.
-use super::super::scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode};
+use super::super::scanout::{DEFAULT_REFRESH_MILLIHERTZ, Mode, MonitorId};
 use crate::Result;
+use alloc::format;
 use alloc::string::String;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::fmt::Write;
 use stela_contracts::refuse;
 
@@ -59,6 +62,9 @@ pub const TIMING_ID: u32 = 1;
 /// The color element's ID (a separate namespace: `getVideoDataForIDs` takes
 /// both).
 pub const COLOR_ID: u32 = 2;
+/// The first of the IDs of the timings at the mode's other refresh rates,
+/// one after another, slower rates later.
+pub const OTHER_TIMING_IDS: u32 = 3;
 /// `sizeof(IOAVVideoTimingData)`: the `ElementData` restored copies and
 /// `A364`'s first argument.
 pub const TIMING_BYTES: usize = 0x50;
@@ -130,8 +136,11 @@ type Blanking = (u32, u32, u32);
 /// The pixel clock, in 10 kHz units, of `width` by `height` with `blanking`
 /// at `refresh` millihertz, rounded to the nearest unit.
 fn clock(width: u32, height: u32, (_, h_blank, v_blank): Blanking, refresh: u32) -> u64 {
-    let total = u64::from(width + h_blank) * u64::from(height + v_blank);
-    (total * u64::from(refresh) + 5_000_000) / 10_000_000
+    let total = (u64::from(width) + u64::from(h_blank)) * (u64::from(height) + u64::from(v_blank));
+    total
+        .saturating_mul(u64::from(refresh))
+        .saturating_add(5_000_000)
+        / 10_000_000
 }
 
 /// The blanking of `width` by `height` at `refresh` millihertz: the nominal
@@ -167,11 +176,33 @@ pub fn assumed_size_mm(width: u32, height: u32) -> (u32, u32) {
     (mm(w), mm(h))
 }
 
+/// Whether `mode` at `refresh` millihertz has a pixel clock past a detailed
+/// timing's, so its record is built directly ([`fast_timing`]).
+fn fast(mode: Mode, refresh: u32) -> bool {
+    let (width, height) = (mode.width, mode.height);
+    clock(width, height, blanking(width, height, refresh), refresh) > MAX_CLOCK
+}
+
+/// The timing record of `mode` at `refresh` millihertz: a detailed timing's,
+/// or for a fast mode one built directly.
+fn timing_record(
+    mode: Mode,
+    refresh: u32,
+    size_mm: Option<(u32, u32)>,
+) -> Result<[u8; TIMING_BYTES]> {
+    if fast(mode, refresh) {
+        return record(&fast_timing(mode.width, mode.height, refresh)?);
+    }
+    timing_data(&detailed_timing_sized(mode, refresh, size_mm)?)
+}
+
 /// Whether a mode of this size at `refresh` millihertz can be published to
-/// macOS: everything [`Advertised`] makes for it is made. A mode that cannot,
-/// as 2560x1440 from about 165 Hz or 3840x2160 at 120 Hz with their pixel
-/// clocks past a detailed timing's 655.35 MHz, is not taken: whoever picks
-/// the output's mode takes one that can.
+/// macOS: everything [`Advertised`] makes for it is made. A mode whose pixel
+/// clock passes a detailed timing's 655.35 MHz, as 2560x1440 from about
+/// 165 Hz or 3840x2160 from about 75 Hz, is published with its timing record
+/// built directly ([`fast_timing`]). A mode that cannot be published, as one
+/// wider than 4095 pixels or past the record's 32-bit pixel clock, is not
+/// taken: whoever picks the output's mode takes one that can.
 pub fn advertisable(width: u32, height: u32, refresh: u32) -> bool {
     let mode = Mode {
         width,
@@ -292,14 +323,27 @@ pub fn edid(mode: Mode, refresh: u32) -> Result<[u8; 128]> {
 /// [`edid`] for a monitor whose image is `size_mm` millimetres, as its own
 /// EDID reported, when known.
 pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<[u8; 128]> {
+    edid_of(mode, refresh, size_mm, None)
+}
+
+/// [`edid_sized`] for the monitor `monitor`, when its EDID is known: its
+/// identity goes into the product and serial ([`identity`]).
+fn edid_of(
+    mode: Mode,
+    refresh: u32,
+    size_mm: Option<(u32, u32)>,
+    monitor: Option<MonitorId>,
+) -> Result<[u8; 128]> {
     let size_mm = size_mm.unwrap_or_else(|| assumed_size_mm(mode.width, mode.height));
     let mut e = [0u8; 128];
     e[0..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
-    // Manufacturer "STE" (Stela), product 1, serial 1, week 1, year 2026.
+    // Manufacturer "STE" (Stela), the product and serial of the monitor as
+    // it is presented, week 1, year 2026.
     let man = ((b'S' as u16 - 64) << 10) | ((b'T' as u16 - 64) << 5) | (b'E' as u16 - 64);
     e[8..10].copy_from_slice(&man.to_be_bytes());
-    e[10..12].copy_from_slice(&1u16.to_le_bytes());
-    e[12..16].copy_from_slice(&1u32.to_le_bytes());
+    let (product, serial) = identity(mode, size_mm, monitor);
+    e[10..12].copy_from_slice(&product.to_le_bytes());
+    e[12..16].copy_from_slice(&serial.to_le_bytes());
     e[16] = 1;
     e[17] = 2026u16.wrapping_sub(1990) as u8;
     e[18] = 1; // EDID 1.4
@@ -327,6 +371,51 @@ pub fn edid_sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Resu
     Ok(e)
 }
 
+/// The EDID product code and serial number of `monitor` presented at
+/// native `mode` with an image of `size_mm` millimetres: the same for the
+/// same monitor and presentation on every boot, whatever its refresh, and
+/// different for another monitor ([`MonitorId`]: its own EDID's identity,
+/// a serial alone included), a different native size or a different image
+/// size. Without the monitor's EDID the size alone decides.
+///
+/// macOS keeps each display's chosen mode under its identity
+/// (`/Library/Preferences/com.apple.windowserver.displays.plist`, written
+/// by SkyLight's `CAWSPersistence.mm`: a config's `UUID` and its
+/// `CurrentInfo` `Wide`/`High`/`Scale`) and restores that mode when a display
+/// of that identity offers it again. One fixed identity made a monitor run
+/// at a smaller native size (the firmware framebuffer's 1920 x 1080 on a 4K
+/// panel) and the same monitor at its own native size one display to
+/// macOS, which then restored the small size's 1x mode, a 1920 x 1080
+/// surface stretched over 3840 x 2160, instead of the larger display's
+/// default scaled mode. Serial 1 with product 1, the identity before this
+/// one, is never produced, so a mode saved under it is not restored either.
+fn identity(
+    mode: Mode,
+    (width_mm, height_mm): (u32, u32),
+    monitor: Option<MonitorId>,
+) -> (u16, u32) {
+    // FNV-1a, 64-bit.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for word in [mode.width, mode.height, width_mm, height_mm] {
+        feed(&word.to_le_bytes());
+    }
+    if let Some(monitor) = monitor {
+        feed(&[1]);
+        feed(&monitor.hash().to_le_bytes());
+    }
+    let product = (hash >> 48) as u16;
+    let serial = hash as u32;
+    (
+        if product <= 1 { product + 2 } else { product },
+        serial.max(2),
+    )
+}
+
 fn put(data: &mut [u8], at: usize, value: u32) {
     data[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -335,9 +424,71 @@ fn get(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(data[at..at + 4].try_into().expect("4 bytes"))
 }
 
+/// A detailed timing's fields, as `IOAVVideoTimingElement::
+/// initWithDetailedTiming` decodes them: each axis `[total, active, sync
+/// width, back porch, front porch]` (field lines for an interlaced timing's
+/// vertical axis, already doubled), the pixel clock in Hz and each axis's
+/// sync polarity when the sync is digital.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Detailed {
+    interlaced: u32,
+    horizontal: [u32; 5],
+    vertical: [u32; 5],
+    clock_hz: u32,
+    polarity: Option<(u32, u32)>,
+}
+
+/// The timing of a `width` by `height` mode at `refresh` millihertz whose
+/// pixel clock passes a detailed timing's: CVT reduced blanking (VESA CVT
+/// 2.0 section 5.2: horizontal front porch 8, sync 32, back porch 40;
+/// vertical blanking of at least 460 us), digital separate sync, both
+/// polarities positive, the clock rounded to the nearest kilohertz, as
+/// DisplayID 2.0's type VII timing carries it. The AP reads a mode's timing
+/// only from its record (the model serves no EDID bytes: [`Advertised::
+/// edid`] gives the monitor's identity), so the record is built from these
+/// fields directly. A clock past the record's 32-bit hertz refuses.
+fn fast_timing(width: u32, height: u32, refresh: u32) -> Result<Detailed> {
+    if width == 0 || height == 0 || refresh == 0 {
+        return Err(refuse!("DCP mode has no active area or refresh"));
+    }
+    let k = RB_V_BLANK_NANOS * u64::from(refresh) / 1000;
+    if k >= 1_000_000_000 {
+        return Err(refuse!(
+            "DCP mode's refresh leaves no time for its vertical blanking"
+        ));
+    }
+    let lines = (k * u64::from(height)).div_ceil(1_000_000_000 - k);
+    let v_blank = u32::try_from(lines)
+        .map_err(|_| refuse!("DCP mode's vertical blanking overflows"))?
+        .max(V_FRONT + V_SYNC + 1);
+    let total =
+        (u64::from(width) + u64::from(RB_H_BLANK)) * (u64::from(height) + u64::from(v_blank));
+    let clock_khz = (total * u64::from(refresh) + 500_000) / 1_000_000;
+    let clock_hz = u32::try_from(clock_khz * 1000)
+        .ok()
+        .filter(|&clock| clock != 0)
+        .ok_or(refuse!(
+            "DCP mode's pixel clock does not fit the timing record's 32 bits"
+        ))?;
+    let h_back = RB_H_BLANK - RB_H_FRONT - H_SYNC;
+    let v_back = v_blank - V_FRONT - V_SYNC;
+    Ok(Detailed {
+        interlaced: 0,
+        horizontal: [width + RB_H_BLANK, width, H_SYNC, h_back, RB_H_FRONT],
+        vertical: [height + v_blank, height, V_SYNC, v_back, V_FRONT],
+        clock_hz,
+        polarity: Some((1, 1)),
+    })
+}
+
 /// The `IOAVVideoTimingData` of an EDID detailed timing, decoded as
 /// `IOAVVideoTimingElement::initWithDetailedTiming` does.
 pub fn timing_data(d: &[u8; 18]) -> Result<[u8; TIMING_BYTES]> {
+    record(&decode(d)?)
+}
+
+/// The fields of an EDID detailed timing ([`timing_data`]).
+fn decode(d: &[u8; 18]) -> Result<Detailed> {
     let clock = u32::from(u16::from_le_bytes([d[0], d[1]]));
     let interlaced = u32::from(d[17] >> 7);
     let h_active = u32::from(d[2]) | u32::from(d[4] >> 4) << 8;
@@ -361,37 +512,42 @@ pub fn timing_data(d: &[u8; 18]) -> Result<[u8; TIMING_BYTES]> {
     let v_back = v_blank.checked_sub(v_front + v_sync).ok_or(refuse!(
         "DCP detailed timing's vertical porches exceed its blanking"
     ))?;
-    let mut t = [0u8; TIMING_BYTES];
-    put(&mut t, 0x00, interlaced);
-    for (axis, [total, active, sync, back, front]) in [
-        (
-            0x04,
-            [h_active + h_blank, h_active, h_sync, h_back, h_front],
-        ),
-        (
-            0x24,
-            [v_active + v_blank, v_active, v_sync, v_back, v_front],
-        ),
-    ] {
-        put(&mut t, axis, total);
-        put(&mut t, axis + 0x4, active);
-        put(&mut t, axis + 0x8, sync);
-        put(&mut t, axis + 0xc, back);
-        put(&mut t, axis + 0x10, front);
-    }
     // Digital sync: bit 3 separate (vsync polarity bit 2) or composite.
-    if d[17] & 0x10 != 0 {
+    let polarity = (d[17] & 0x10 != 0).then(|| {
         let h = u32::from(d[17] >> 1 & 1);
         let v = if d[17] & 0x8 == 0 {
             h
         } else {
             u32::from(d[17] >> 2 & 1)
         };
+        (h, v)
+    });
+    Ok(Detailed {
+        interlaced,
+        horizontal: [h_active + h_blank, h_active, h_sync, h_back, h_front],
+        vertical: [v_active + v_blank, v_active, v_sync, v_back, v_front],
+        clock_hz: clock * 10_000,
+        polarity,
+    })
+}
+
+/// The `IOAVVideoTimingData` of a timing's fields.
+fn record(d: &Detailed) -> Result<[u8; TIMING_BYTES]> {
+    let mut t = [0u8; TIMING_BYTES];
+    put(&mut t, 0x00, d.interlaced);
+    for (axis, [total, active, sync, back, front]) in [(0x04, d.horizontal), (0x24, d.vertical)] {
+        put(&mut t, axis, total);
+        put(&mut t, axis + 0x4, active);
+        put(&mut t, axis + 0x8, sync);
+        put(&mut t, axis + 0xc, back);
+        put(&mut t, axis + 0x10, front);
+    }
+    if let Some((h, v)) = d.polarity {
         put(&mut t, 0x1c, h);
         put(&mut t, 0x3c, v);
     }
     // _IOAVVideoTimingSetPixelClock, then _IOAVVideoTimingUpdateSyncRates.
-    let pixel_clock = clock * 10_000;
+    let pixel_clock = d.clock_hz;
     put(&mut t, 0x44, pixel_clock);
     let line = u64::from(get(&t, 0x04)) * u64::from(get(&t, 0x20) + 1);
     let frame = u64::from(get(&t, 0x24)) * line;
@@ -401,12 +557,12 @@ pub fn timing_data(d: &[u8; 18]) -> Result<[u8; TIMING_BYTES]> {
     let q16 = u64::from(pixel_clock) << 16;
     let h_rate = (q16 + line * 500) / (line * 1000);
     let mut v_rate = (q16 + frame / 2) / frame;
-    if interlaced != 0 {
+    if d.interlaced != 0 {
         v_rate *= 2;
     }
     put(&mut t, 0x18, h_rate as u32);
     put(&mut t, 0x38, v_rate as u32);
-    if v_rate == 0 || h_active == 0 || v_active == 0 {
+    if v_rate == 0 || d.horizontal[1] == 0 || d.vertical[1] == 0 {
         return Err(refuse!("DCP detailed timing has no active area or refresh"));
     }
     let ratio = aspect_ratio(precise_aspect_ratio(&t));
@@ -460,8 +616,6 @@ const COLOR_SCORE: u32 = (200 + 40 + 2) * 1000 + 999;
 
 /// The manufacturer the EDID encodes.
 const MANUFACTURER: &str = "STE";
-/// `IOMFBUUID`: one fixed monitor, so its settings persist across boots.
-const UUID: &str = "53544c41-0001-4000-8000-000000000001";
 
 /// An OSUnserializeXML document under construction.
 struct Xml(String);
@@ -562,9 +716,19 @@ fn axis_dict(xml: &mut Xml, t: &[u8; TIMING_BYTES], axis: usize) {
 /// The advertised mode: its EDID, records and published properties.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertised {
+    /// The EDID base block, the monitor's identity: its detailed timing is
+    /// the mode's when the mode's clock fits one, else the size at 60 Hz.
     pub edid: [u8; 128],
     pub timing: [u8; TIMING_BYTES],
     pub color: [u8; COLOR_BYTES],
+    /// The refresh in millihertz of [`Self::timing`], the preferred mode.
+    refresh: u32,
+    /// The same size at the monitor's other rates: each one's refresh and
+    /// timing record, IDs from [`OTHER_TIMING_IDS`] on.
+    others: Vec<(u32, [u8; TIMING_BYTES])>,
+    /// The identity is the monitor's own EDID's with the size, not the
+    /// size alone.
+    from_monitor: bool,
 }
 
 impl Advertised {
@@ -582,20 +746,100 @@ impl Advertised {
 
     /// [`Self::at`] for a monitor whose image is `size_mm` millimetres,
     /// when its own EDID said.
+    ///
+    /// A mode whose pixel clock passes a detailed timing's has its record
+    /// built from [`fast_timing`], and its EDID, which gives only the
+    /// monitor's identity ([`Self::display_attributes`]), holds the same
+    /// size at 60 Hz, as a monitor's base block often does for its fast
+    /// modes, which it lists in an extension.
     pub fn sized(mode: Mode, refresh: u32, size_mm: Option<(u32, u32)>) -> Result<Self> {
-        let edid = edid_sized(mode, refresh, size_mm)?;
+        Self::of_monitor(mode, refresh, size_mm, None)
+    }
+
+    /// [`Self::sized`] for `monitor`, the identity of the real monitor
+    /// the scanout shows on, when its EDID is known: the published product,
+    /// serial and UUID follow it as well as the size ([`identity`]).
+    pub fn of_monitor(
+        mode: Mode,
+        refresh: u32,
+        size_mm: Option<(u32, u32)>,
+        monitor: Option<MonitorId>,
+    ) -> Result<Self> {
+        let from_monitor = monitor.is_some();
+        if fast(mode, refresh) {
+            return Ok(Self {
+                edid: edid_of(mode, DEFAULT_REFRESH_MILLIHERTZ, size_mm, monitor)?,
+                timing: timing_record(mode, refresh, size_mm)?,
+                color: color_data(),
+                refresh,
+                others: Vec::new(),
+                from_monitor,
+            });
+        }
+        let edid = edid_of(mode, refresh, size_mm, monitor)?;
         let dtd: [u8; 18] = edid[54..72].try_into().expect("18 bytes");
         Ok(Self {
             edid,
             timing: timing_data(&dtd)?,
             color: color_data(),
+            refresh,
+            others: Vec::new(),
+            from_monitor,
         })
     }
 
-    /// The video records for `(timing, color)` IDs, when both are the
+    /// Whether the identity follows the monitor's own EDID
+    /// ([`Self::of_monitor`]) rather than the size alone.
+    pub fn from_monitor(&self) -> bool {
+        self.from_monitor
+    }
+
+    /// This mode also at each of `rates` (millihertz) other than its own
+    /// whose timing can be published, slower ones after faster: macOS
+    /// offers them in Displays settings and sets one with
+    /// `set_digital_out_mode`.
+    pub fn with_rates(mut self, rates: &[u32], size_mm: Option<(u32, u32)>) -> Self {
+        let mode = Mode {
+            width: get(&self.timing, 0x08),
+            height: get(&self.timing, 0x28),
+            format: super::super::scanout::PixelFormat::Bgra8888,
+        };
+        let mut rates: Vec<u32> = rates
+            .iter()
+            .copied()
+            .filter(|&r| r != self.refresh)
+            .collect();
+        rates.sort_unstable_by(|a, b| b.cmp(a));
+        rates.dedup();
+        self.others = rates
+            .into_iter()
+            .filter_map(|rate| Some((rate, timing_record(mode, rate, size_mm).ok()?)))
+            .collect();
+        self
+    }
+
+    /// Each timing's ID, refresh in millihertz and record, the preferred
+    /// one first.
+    fn timings(&self) -> impl Iterator<Item = (u32, u32, &[u8; TIMING_BYTES])> {
+        core::iter::once((TIMING_ID, self.refresh, &self.timing)).chain(
+            (OTHER_TIMING_IDS..)
+                .zip(&self.others)
+                .map(|(id, (rate, timing))| (id, *rate, timing)),
+        )
+    }
+
+    /// The refresh in millihertz of the advertised timing `timing`.
+    pub fn refresh_of(&self, timing: u32) -> Option<u32> {
+        self.timings()
+            .find(|&(id, _, _)| id == timing)
+            .map(|(_, rate, _)| rate)
+    }
+
+    /// The video records for `(timing, color)` IDs, when both are
     /// advertised ones.
     pub fn video_data(&self, timing: u32, color: u32) -> Option<(&[u8], &[u8])> {
-        (timing == TIMING_ID && color == COLOR_ID).then_some((&self.timing[..], &self.color[..]))
+        let (_, _, record) = self.timings().find(|&(id, _, _)| id == timing)?;
+        (color == COLOR_ID).then_some((&record[..], &self.color[..]))
     }
 
     /// The monitor's `DisplayAttributes`, the EDID's identity as WindowServer
@@ -664,44 +908,36 @@ impl Advertised {
         xml.0
     }
 
-    /// The display's fixed identity across boots, as a plist string.
-    pub fn uuid() -> String {
-        let mut xml = Xml(String::new());
-        let _ = write!(xml.0, "<string>{UUID}</string>");
-        xml.0
+    /// `IOMFBUUID`, the display's identity as a plist string: its EDID
+    /// product and serial ([`identity`]), so the same monitor presented the
+    /// same way keeps its settings across boots and a different
+    /// presentation is a different display.
+    pub fn uuid(&self) -> String {
+        format!("<string>{}</string>", self.display_uuid())
+    }
+
+    /// The UUID [`Self::uuid`] publishes.
+    pub fn display_uuid(&self) -> String {
+        let e = &self.edid;
+        let product = u16::from_le_bytes([e[10], e[11]]);
+        let serial = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+        format!("53544c41-{product:04x}-4000-8000-0000{serial:08x}")
+    }
+
+    /// The native size, the size of the preferred timing.
+    pub fn native(&self) -> (u32, u32) {
+        (get(&self.timing, 0x08), get(&self.timing, 0x28))
     }
 
     /// The `TimingElements` array (`IOAVVideoTimingElement::copyProperties`
-    /// of the one timing, its `ColorModes` the one color element).
+    /// of each timing, the preferred one first, each one's `ColorModes` the
+    /// one color element).
     pub fn timing_elements(&self) -> String {
-        let t = &self.timing;
-        let mut xml = Xml(String::new());
-        xml.raw("<array><dict>")
-            .int("Score", u64::from(timing_score(t)), 32)
-            .int("ID", u64::from(TIMING_ID), 64)
-            .bool("IsVirtual", false)
-            .int("ElementType", u64::from(TIMING_ELEMENT), 32)
-            .data("ElementData", t)
-            .key("ColorModes")
-            .raw("<array>");
-        color_dict(&mut xml);
-        xml.raw("</array>")
-            .bool("IsInterlaced", get(t, 0) & 1 != 0)
-            .bool("IsSplit", get(t, 0) & 2 != 0)
-            .bool("IsOverscanned", get(t, 0x4c) == 1)
-            .bool("IsPreferred", true)
-            .bool("IsPromoted", false)
-            .int("ScanInformation", u64::from(get(t, 0x4c)), 32)
-            .int("ValidPixelEncodings", 1 << RGB_444, 32)
-            .int("StandardType", u64::from(VESA), 32)
-            .int("TimingType", u64::from(DETAILED), 32)
-            .int("AspectRatio", u64::from(get(t, 0x48)), 32)
-            .int("PreciseAspectRatio", u64::from(precise_aspect_ratio(t)), 32)
-            .key("HorizontalAttributes");
-        axis_dict(&mut xml, t, 0x04);
-        xml.key("VerticalAttributes");
-        axis_dict(&mut xml, t, 0x24);
-        xml.raw("</dict></array>");
+        let mut xml = Xml(String::from("<array>"));
+        for (id, _, t) in self.timings() {
+            timing_element(&mut xml, id, t, id == TIMING_ID);
+        }
+        xml.raw("</array>");
         xml.0
     }
 
@@ -714,11 +950,94 @@ impl Advertised {
     }
 }
 
+/// One timing's dictionary of the `TimingElements` array.
+fn timing_element(xml: &mut Xml, id: u32, t: &[u8; TIMING_BYTES], preferred: bool) {
+    xml.raw("<dict>")
+        .int("Score", u64::from(timing_score(t)), 32)
+        .int("ID", u64::from(id), 64)
+        .bool("IsVirtual", false)
+        .int("ElementType", u64::from(TIMING_ELEMENT), 32)
+        .data("ElementData", t)
+        .key("ColorModes")
+        .raw("<array>");
+    color_dict(xml);
+    xml.raw("</array>")
+        .bool("IsInterlaced", get(t, 0) & 1 != 0)
+        .bool("IsSplit", get(t, 0) & 2 != 0)
+        .bool("IsOverscanned", get(t, 0x4c) == 1)
+        .bool("IsPreferred", preferred)
+        .bool("IsPromoted", false)
+        .int("ScanInformation", u64::from(get(t, 0x4c)), 32)
+        .int("ValidPixelEncodings", 1 << RGB_444, 32)
+        .int("StandardType", u64::from(VESA), 32)
+        .int("TimingType", u64::from(DETAILED), 32)
+        .int("AspectRatio", u64::from(get(t, 0x48)), 32)
+        .int("PreciseAspectRatio", u64::from(precise_aspect_ratio(t)), 32)
+        .key("HorizontalAttributes");
+    axis_dict(xml, t, 0x04);
+    xml.key("VerticalAttributes");
+    axis_dict(xml, t, 0x24);
+    xml.raw("</dict>");
+}
+
+/// The `IOMFBDisplayRefresh` dictionary for a display that refreshes every
+/// `period` ticks of a `counter_hz` counter, at that one rate. The kernel's
+/// own builder of it (`IOMobileFramebufferLegacy::setDisplayRefreshProperties`
+/// 0xfffffe000adb0b58, 26A434 kernelcache) sets these six keys in this order,
+/// each a 64-bit number: an interval in 32.32 fixed-point seconds (60 Hz is
+/// 0x04444444), then the same interval in counter ticks. A fixed-rate mode
+/// has its shortest interval equal to its longest (the kernel's fixed-rate
+/// branch also sets both to one value) and no step between rates (step 0,
+/// which the kernel also sets). Core Animation reads
+/// `displayRefreshStepMachTime` when it is nonzero and otherwise
+/// `displayMinRefreshInterval` for its shortest frame interval (QuartzCore
+/// 0x18ddc4e8c), with 1/60 s when the dictionary is missing.
+pub fn display_refresh(period: u64, counter_hz: u64) -> String {
+    let seconds = (u128::from(period) << 32) / u128::from(counter_hz.max(1));
+    let seconds = u64::try_from(seconds).unwrap_or(u64::MAX);
+    let mut xml = Xml(String::new());
+    xml.raw("<dict>")
+        .int("displayMinRefreshInterval", seconds, 64)
+        .int("displayMinRefreshIntervalMachTime", period, 64)
+        .int("displayMaxRefreshInterval", seconds, 64)
+        .int("displayMaxRefreshIntervalMachTime", period, 64)
+        .int("displayRefreshStep", 0, 64)
+        .int("displayRefreshStepMachTime", 0, 64)
+        .raw("</dict>");
+    xml.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::scanout::PixelFormat;
     use super::*;
     use alloc::format;
+
+    #[test]
+    fn the_refresh_dictionary_has_the_kernels_keys_order_and_units() {
+        // 60 Hz on a 24 MHz counter: the kernel's own 1/60 s word.
+        assert_eq!(
+            display_refresh(400_000, 24_000_000),
+            "<dict>\
+             <key>displayMinRefreshInterval</key><integer size=\"64\">71582788</integer>\
+             <key>displayMinRefreshIntervalMachTime</key><integer size=\"64\">400000</integer>\
+             <key>displayMaxRefreshInterval</key><integer size=\"64\">71582788</integer>\
+             <key>displayMaxRefreshIntervalMachTime</key><integer size=\"64\">400000</integer>\
+             <key>displayRefreshStep</key><integer size=\"64\">0</integer>\
+             <key>displayRefreshStepMachTime</key><integer size=\"64\">0</integer>\
+             </dict>"
+        );
+        assert_eq!(71_582_788, 0x0444_4444);
+        // 144 Hz: 1/144 s in 32.32 and the counter's own period.
+        let fast = display_refresh(166_667, 24_000_000);
+        let seconds = (166_667u128 << 32) / 24_000_000;
+        assert!(fast.contains(&format!(
+            "<key>displayMinRefreshInterval</key><integer size=\"64\">{seconds}</integer>"
+        )));
+        assert!(fast.contains(
+            "<key>displayMaxRefreshIntervalMachTime</key><integer size=\"64\">166667</integer>"
+        ));
+    }
 
     #[test]
     fn a_fast_modes_rates_past_255_are_stored_with_their_offsets() {
@@ -787,8 +1106,11 @@ mod tests {
             );
         }
         assert!(advertisable(2560, 1440, 144_000));
-        assert!(!advertisable(2560, 1440, 180_000));
-        assert!(!advertisable(3840, 2160, 120_000));
+        assert!(advertisable(2560, 1440, 180_000));
+        assert!(advertisable(3840, 2160, 120_000));
+        assert!(advertisable(3840, 2160, 240_000));
+        assert!(!advertisable(5120, 2880, 60_000), "wider than 4095");
+        assert!(!advertisable(3840, 2160, 600_000), "past 4.29 GHz");
     }
 
     const FULL_HD: Mode = Mode {
@@ -901,6 +1223,57 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_at_several_rates_publishes_a_timing_for_each_the_preferred_first() {
+        let qhd = Mode {
+            width: 2560,
+            height: 1440,
+            format: crate::scanout::PixelFormat::Bgra8888,
+        };
+        // 7000 Hz passes the record's 32-bit pixel clock: left out.
+        let rates = [144_000, 60_000, 240_000, 120_000, 60_000, 7_000_000];
+        let a = Advertised::at(qhd, 144_000)
+            .unwrap()
+            .with_rates(&rates, None);
+        let ids = [
+            TIMING_ID,
+            OTHER_TIMING_IDS,
+            OTHER_TIMING_IDS + 1,
+            OTHER_TIMING_IDS + 2,
+        ];
+        assert_eq!(
+            ids.map(|id| a.refresh_of(id)),
+            [Some(144_000), Some(240_000), Some(120_000), Some(60_000)]
+        );
+        assert_eq!(a.refresh_of(OTHER_TIMING_IDS + 3), None);
+        let rate_of = |id| {
+            let (timing, color) = a.video_data(id, COLOR_ID).unwrap();
+            assert_eq!(color, &a.color[..]);
+            (get(timing, 0x38) + 0x8000) >> 16
+        };
+        assert_eq!(ids.map(rate_of), [144, 240, 120, 60]);
+        assert!(a.video_data(OTHER_TIMING_IDS, TIMING_ID).is_none());
+        // The 240 Hz record is built directly, the others from detailed
+        // timings; the EDID stays the preferred mode's.
+        assert_eq!(&a.edid[..], &edid(qhd, 144_000).unwrap()[..]);
+        let elements = a.timing_elements();
+        assert_eq!(
+            elements.matches("<key>HorizontalAttributes</key>").count(),
+            4
+        );
+        assert_eq!(elements.matches("<key>IsPreferred</key><true/>").count(), 1);
+        let first = elements.find("<key>IsPreferred</key><true/>").unwrap();
+        let second = elements.find("<key>IsPreferred</key><false/>").unwrap();
+        assert!(first < second);
+        assert!(elements.starts_with("<array><dict><key>Score</key>"));
+        assert!(elements.ends_with("</dict></array>"));
+        // One rate alone publishes the one element as before.
+        let alone = Advertised::at(qhd, 144_000)
+            .unwrap()
+            .with_rates(&[144_000], None);
+        assert_eq!(alone, Advertised::at(qhd, 144_000).unwrap());
+    }
+
+    #[test]
     fn a_fast_monitor_is_advertised_at_its_refresh() {
         let qhd = Mode {
             width: 2560,
@@ -925,15 +1298,67 @@ mod tests {
         assert_eq!(hertz(&a), 144);
         assert_eq!((get(&a.timing, 0x04), get(&a.timing, 0x24)), (2640, 1714));
         assert_eq!([get(&a.timing, 0x14), get(&a.timing, 0x10)], [8, 40]);
-        // Without it the clock would not fit, and 4K at 120 Hz does not even
-        // with it.
+        // Without it the clock would not fit. 4K at 120 Hz does not fit a
+        // detailed timing even with it, so its record is built directly.
         let uhd = Mode {
             width: 3840,
             height: 2160,
             ..FULL_HD
         };
         assert_eq!(hertz(&Advertised::at(uhd, 60_000).unwrap()), 60);
-        assert!(Advertised::at(uhd, 120_000).is_err());
+        assert_eq!(hertz(&Advertised::at(uhd, 120_000).unwrap()), 120);
+    }
+
+    #[test]
+    fn a_mode_past_a_detailed_timings_clock_gets_a_reduced_blanking_record() {
+        let uhd = Mode {
+            width: 3840,
+            height: 2160,
+            ..FULL_HD
+        };
+        let a = Advertised::at(uhd, 240_000).unwrap();
+        // 3920 by 2429: 80 pixels of blanking, and 269 lines for 460 us at
+        // 240 Hz (0.1104 of a frame: 2160 x 0.1104 / 0.8896 = 268.06, up).
+        assert_eq!((get(&a.timing, 0x04), get(&a.timing, 0x08)), (3920, 3840));
+        assert_eq!((get(&a.timing, 0x24), get(&a.timing, 0x28)), (2429, 2160));
+        // Front porch 8, sync 32, back porch 40; vertical 3, 10, the rest.
+        assert_eq!(
+            [
+                get(&a.timing, 0x14),
+                get(&a.timing, 0x0c),
+                get(&a.timing, 0x10)
+            ],
+            [8, 32, 40]
+        );
+        assert_eq!(
+            [
+                get(&a.timing, 0x34),
+                get(&a.timing, 0x2c),
+                get(&a.timing, 0x30)
+            ],
+            [3, 10, 256]
+        );
+        // 3920 x 2429 x 240 Hz = 2285.2 MHz, to the kilohertz.
+        assert_eq!(get(&a.timing, 0x44), 2_285_203_000);
+        assert_eq!(hertz(&a), 240);
+        assert_eq!([get(&a.timing, 0x1c), get(&a.timing, 0x3c)], [1, 1]);
+        assert_eq!(get(&a.timing, 0x48), aspect_ratio(0x1c71c), "16:9");
+        // The identity block holds the size at 60 Hz, which a detailed
+        // timing holds, and the published element carries the fast rate.
+        assert_eq!(&a.edid[..], &edid(uhd, 60_000).unwrap()[..]);
+        let elements = a.timing_elements();
+        assert!(elements.contains(&format!(
+            "<key>PreciseSyncRate</key><integer size=\"32\">{}</integer>",
+            get(&a.timing, 0x38)
+        )));
+        // 2560x1440 at 240 Hz and 1920x1080 at 500 Hz the same way.
+        let qhd = Mode {
+            width: 2560,
+            height: 1440,
+            ..FULL_HD
+        };
+        assert_eq!(hertz(&Advertised::at(qhd, 240_000).unwrap()), 240);
+        assert_eq!(hertz(&Advertised::at(FULL_HD, 500_000).unwrap()), 500);
     }
 
     #[test]
@@ -1039,6 +1464,11 @@ mod tests {
             (qhd, None, 1),
             (FULL_HD, None, 1),
             (uhd, None, 2),
+            // A 27" 4K monitor (EDID 699 x 395 mm) at its native size, and
+            // at the firmware framebuffer's 1920 x 1080 when it hangs off
+            // another display adapter.
+            (uhd, Some((699, 395)), 2),
+            (FULL_HD, Some((699, 395)), 1),
         ] {
             let a = Advertised::sized(mode, 60_000, size).unwrap();
             let attributes = a.display_attributes();
@@ -1083,6 +1513,138 @@ mod tests {
             // them depends on when they are asked.
             assert_eq!(Advertised::sized(mode, 60_000, size).unwrap(), a);
         }
+    }
+
+    fn product_and_serial(xml: &str) -> (u64, u64) {
+        (integer(xml, "ProductID"), integer(xml, "SerialNumber"))
+    }
+
+    #[test]
+    fn a_monitor_at_another_native_size_is_another_display_to_macos() {
+        let uhd = Mode {
+            width: 3840,
+            height: 2160,
+            ..FULL_HD
+        };
+        let size = Some((699, 395));
+        // The same 4K monitor shown through the firmware framebuffer at
+        // 1920 x 1080 and on its own GPU output at 3840 x 2160: macOS must
+        // not restore the first one's 1x 1920 x 1080 on the second.
+        let copied = Advertised::sized(FULL_HD, 60_000, size).unwrap();
+        let native = Advertised::sized(uhd, 60_000, size).unwrap();
+        assert_ne!(copied.uuid(), native.uuid());
+        assert_ne!(
+            product_and_serial(&copied.display_attributes()),
+            product_and_serial(&native.display_attributes())
+        );
+        // Another image size at the same resolution is another monitor.
+        let smaller = Advertised::sized(uhd, 60_000, Some((597, 336))).unwrap();
+        assert_ne!(smaller.uuid(), native.uuid());
+        // The identity before this one is never given again.
+        let old = "<string>53544c41-0001-4000-8000-000000000001</string>";
+        for a in [&copied, &native, &smaller] {
+            assert_ne!(a.uuid(), old);
+            let (product, serial) = product_and_serial(&a.display_attributes());
+            assert!(product > 1 && serial > 1);
+            // The UUID names the EDID's product and serial.
+            assert_eq!(
+                a.uuid(),
+                format!("<string>53544c41-{product:04x}-4000-8000-0000{serial:08x}</string>")
+            );
+            assert_eq!(a.edid.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0);
+        }
+        // The same presentation keeps its identity, whatever its refresh, so
+        // a mode chosen for it is kept across boots and rate changes.
+        let fast = Advertised::sized(uhd, 120_000, size)
+            .unwrap()
+            .with_rates(&[120_000, 60_000], size);
+        assert_eq!(fast.uuid(), native.uuid());
+        assert_eq!(
+            product_and_serial(&fast.display_attributes()),
+            product_and_serial(&native.display_attributes())
+        );
+        assert_eq!(
+            Advertised::sized(uhd, 60_000, size).unwrap().uuid(),
+            native.uuid()
+        );
+        // An unreported size is the assumed one, consistently.
+        assert_eq!(
+            Advertised::sized(uhd, 60_000, None).unwrap().uuid(),
+            Advertised::sized(uhd, 60_000, Some(assumed_size_mm(3840, 2160)))
+                .unwrap()
+                .uuid()
+        );
+    }
+
+    /// A real monitor's EDID base block: manufacturer, product, `serial`,
+    /// week and year, and a serial-number descriptor `text` and a name.
+    fn monitor_edid(serial: u32, text: &[u8]) -> [u8; 128] {
+        let mut e = [0u8; 128];
+        e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        e[8..12].copy_from_slice(&[0x10, 0xac, 0x34, 0x12]);
+        e[12..16].copy_from_slice(&serial.to_le_bytes());
+        e[16..18].copy_from_slice(&[12, 33]);
+        e[72 + 3] = 0xff;
+        e[72 + 5..72 + 5 + text.len()].copy_from_slice(text);
+        e[90 + 3] = 0xfc;
+        e[90 + 5..90 + 12].copy_from_slice(b"Monitor");
+        e
+    }
+
+    #[test]
+    fn a_monitors_own_edid_identity_reaches_the_published_identity() {
+        let uhd = Mode {
+            width: 3840,
+            height: 2160,
+            ..FULL_HD
+        };
+        let size = Some((699, 395));
+        let one = MonitorId::from_edid(&monitor_edid(7, b"AB01\n")).unwrap();
+        let shown =
+            |mode, refresh, monitor| Advertised::of_monitor(mode, refresh, size, monitor).unwrap();
+        let native = shown(uhd, 60_000, Some(one));
+        assert!(native.from_monitor());
+        // The same monitor on the same path: the same identity on every
+        // boot and at every refresh.
+        assert_eq!(shown(uhd, 60_000, Some(one)), native);
+        let fast = shown(uhd, 120_000, Some(one)).with_rates(&[120_000, 60_000], size);
+        assert_eq!(fast.uuid(), native.uuid());
+        assert_eq!(
+            product_and_serial(&fast.display_attributes()),
+            product_and_serial(&native.display_attributes())
+        );
+        // Two monitors that differ only in their serial number, in the
+        // base block or in the serial descriptor, are two displays.
+        for other in [monitor_edid(8, b"AB01\n"), monitor_edid(7, b"AB02\n")] {
+            let other = MonitorId::from_edid(&other).unwrap();
+            assert_ne!(other, one);
+            assert_ne!(shown(uhd, 60_000, Some(other)).uuid(), native.uuid());
+        }
+        // The same monitor at another native size stays another display.
+        assert_ne!(shown(FULL_HD, 60_000, Some(one)).uuid(), native.uuid());
+        // Without its EDID the size alone decides, exactly as before, and
+        // that identity is not the monitor's.
+        let unknown = shown(uhd, 60_000, None);
+        assert!(!unknown.from_monitor());
+        assert_eq!(unknown, Advertised::sized(uhd, 60_000, size).unwrap());
+        assert_ne!(unknown.uuid(), native.uuid());
+        // What is not an EDID base block gives no identity.
+        let mut broken = monitor_edid(7, b"AB01\n");
+        broken[1] = 0;
+        assert_eq!(MonitorId::from_edid(&broken), None);
+        assert_eq!(MonitorId::from_edid(&monitor_edid(7, b"")[..127]), None);
+        // A bad checksum is tolerated: the identity bytes are read as they are.
+        let mut unsealed = monitor_edid(7, b"AB01\n");
+        unsealed[127] ^= 1;
+        assert_eq!(MonitorId::from_edid(&unsealed), Some(one));
+        // Bytes outside the identity fields do not change it.
+        let mut resized = monitor_edid(7, b"AB01\n");
+        resized[21] = 70;
+        assert_eq!(MonitorId::from_edid(&resized), Some(one));
+        // Printing the identity shows none of its fields.
+        assert_eq!(format!("{one:?}"), "MonitorId(..)");
+        // The published EDID stays well formed.
+        assert_eq!(native.edid.iter().fold(0u8, |s, b| s.wrapping_add(*b)), 0);
     }
 
     #[test]

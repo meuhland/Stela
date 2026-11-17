@@ -1122,6 +1122,33 @@ fn a_host_call_ends_a_run_and_wakes_a_sleeping_pe() {
     hub.inboxes[1].sleeping.store(false, Ordering::SeqCst);
 }
 
+/// Host work for an idle core calls a PE that sleeps waiting for an
+/// interrupt, never the one skipped and never one asleep in WFE; with none,
+/// nobody is called.
+#[test]
+fn host_work_for_an_idle_core_calls_a_pe_that_sleeps_waiting_for_an_interrupt() {
+    let (hub, kicks) = hub(3);
+    // Nobody sleeps.
+    assert!(!hub.call_sleeping_server(0));
+    // PE 0 sleeps serving, but is skipped; PE 2 sleeps in WFE.
+    hub.inboxes[0].sleeping.store(true, Ordering::SeqCst);
+    hub.inboxes[0].serves.store(true, Ordering::SeqCst);
+    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    assert!(!hub.call_sleeping_server(0));
+    assert_eq!(kicks.load(Ordering::Relaxed), 0);
+    assert!(!hub.take_host_call(0) && !hub.take_host_call(2));
+    // PE 2 now waits for an interrupt: it is called and woken.
+    hub.inboxes[2].serves.store(true, Ordering::SeqCst);
+    assert!(hub.call_sleeping_server(0));
+    assert_eq!(kicks.load(Ordering::Relaxed), 1);
+    assert!(!hub.take_host_call(0));
+    assert!(hub.take_host_call(2), "its wait ends as for a host call");
+    for pe in [0, 2] {
+        hub.inboxes[pe].sleeping.store(false, Ordering::SeqCst);
+        hub.inboxes[pe].serves.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A line change publishes the receiver's pins before it moves the
 /// receiver's epoch, so a running receiver reads them at once; a sleeping
 /// one is kicked only after the producer releases the board lock, which no
@@ -1202,12 +1229,17 @@ struct Pending {
     starts: Vec<Start>,
     service: bool,
     register_calls: usize,
+    /// Each release of the board's lock: what its call waited and held.
+    released: Vec<(u64, u64)>,
 }
 
 /// The one IMPLEMENTATION DEFINED register [`Pending`] serves.
 const SERVED: Encoding = Encoding::new(3, 5, 15, 0, 1);
 
 impl Devices for Pending {
+    fn lock_released(&mut self, waited: u64, held: u64) {
+        self.released.push((waited, held));
+    }
     fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
         Ok(0)
     }
@@ -1428,6 +1460,47 @@ fn a_handle_counts_the_ticks_it_waited_for_the_lock() {
     let (waited, again) = waiter.join().unwrap();
     assert!(waited > 0);
     assert_eq!(again, 0);
+}
+
+/// Each call tells the devices, before it releases the board's lock, the
+/// ticks it waited for it and held it, as the lock's own counts have them,
+/// so a model can count them against what the call touched.
+#[test]
+fn each_call_tells_the_devices_its_lock_wait_and_hold() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let hub = Hub::new(2, Ticks(reads));
+    let home = SharedDevices::new(Pending::default(), hub);
+    let mut worker = home.worker();
+    worker.write(1, 0, 4, 0, 0).unwrap();
+    let released = |home: &SharedDevices<Pending>| home.with(|d| d.released.clone());
+    let access = |home: &SharedDevices<Pending>| home.lock_times()[Call::Access as usize].held;
+    let held = access(&home);
+    assert!(held > 0);
+    assert_eq!(released(&home).last(), Some(&(0, held)), "uncontended");
+    let board = Arc::clone(&home.board);
+    let locked = board.devices.lock().unwrap();
+    let waiter = std::thread::spawn(move || {
+        worker.write(1, 0, 4, 0, 0).unwrap();
+        worker.take_lock_wait()
+    });
+    // Bounded: the waiter blocks on the lock within five seconds.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while board.waits[Call::Access as usize].load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the waiter never waited"
+        );
+        std::thread::yield_now();
+    }
+    drop(locked);
+    let waited = waiter.join().unwrap();
+    assert!(waited > 0);
+    let all = released(&home);
+    assert_eq!(
+        all.last(),
+        Some(&(waited, access(&home) - held)),
+        "its own wait"
+    );
 }
 
 #[test]
@@ -2023,7 +2096,7 @@ fn the_home_machine_sees_any_pes_reset_and_dma_without_the_lock() {
             dma: Some(7),
             ..Pending::default()
         },
-        hub,
+        Arc::clone(&hub),
     );
     let mut worker = home.worker();
     assert_eq!(home.dma_deadline(), Some(7), "as the board was made");
@@ -2032,8 +2105,20 @@ fn the_home_machine_sees_any_pes_reset_and_dma_without_the_lock() {
         (home.dma_deadline(), worker.dma_deadline()),
         (Some(90), None)
     );
+    // Home at work outside its run loop: the other PEs take its DMA, which
+    // a wake would not get it to before that work ends; asleep, it is woken.
+    hub.set_outside(0, true);
+    assert_eq!(worker.dma_deadline(), Some(90));
+    hub.inboxes[0].sleeping.store(true, Ordering::SeqCst);
+    assert_eq!(worker.dma_deadline(), None);
+    hub.inboxes[0].sleeping.store(false, Ordering::SeqCst);
+    hub.set_outside(0, false);
+    assert_eq!(worker.dma_deadline(), None);
     worker.write(1, 0, 4, 0, 0).unwrap();
     assert_eq!(home.dma_deadline(), None);
+    hub.set_outside(0, true);
+    assert_eq!(worker.dma_deadline(), None, "no DMA, none to take");
+    hub.set_outside(0, false);
     // A reset another PE's access requested reaches the home machine
     // once, and never the worker.
     worker.write(1, 0, 4, 1, 0).unwrap();
@@ -2161,6 +2246,121 @@ fn a_pe_advances_the_devices_once_their_deadline_passed_while_home_is_outside() 
     assert_eq!(worker.deadline(60), None);
     assert_eq!(advances(&home), before + 3);
     assert!(worker.lines(1, 60).irq);
+}
+
+/// The host ticks from the first wake that kicks a sleeping PE to the end
+/// of its sleep are counted; a sleep nobody kicked, and a later kick in
+/// the same sleep, add nothing.
+#[test]
+fn a_kicked_sleep_counts_its_wake_latency() {
+    struct Ticking(AtomicU64);
+    impl Kick for Ticking {
+        fn kick(&self, _pe: usize) {}
+        fn ticks(&self) -> u64 {
+            self.0.fetch_add(10, Ordering::Relaxed) + 10
+        }
+    }
+    let hub = Hub::new(2, Ticking(AtomicU64::new(0)));
+    let epoch = hub.lines_epoch(1);
+    // Kicked at tick 10 (and again at 20), awake at 30.
+    hub.sleep(1, epoch, true, || {
+        hub.wake(1);
+        hub.wake(1);
+    });
+    hub.sleep(1, epoch, true, || {});
+    assert_eq!(hub.take_wake_latency(), (1, 20, 20));
+    assert_eq!(hub.take_wake_latency(), (0, 0, 0));
+    // A wake of a PE that does not sleep kicks nothing and counts nothing.
+    hub.wake(1);
+    hub.sleep(1, epoch, true, || {});
+    assert_eq!(hub.take_wake_latency(), (0, 0, 0));
+}
+
+/// A signal armed for a PE that comes due by itself (an Apple deferred fast
+/// IPI) bounds how long that PE's machine trusts its lines, and once due
+/// the PE advances the devices itself, while home runs its own loop: it
+/// fires then, not at home's next advance, which can be milliseconds on.
+#[test]
+fn a_pe_fires_its_own_due_signal_without_waiting_for_home() {
+    struct Own(Arc<AtomicU64>);
+    impl LocalRegisters for Own {
+        fn register(&self, _: Encoding, _: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn storage(&self, _: Encoding) -> Option<u64> {
+            None
+        }
+        fn deadline(&self) -> Option<u64> {
+            let due = self.0.load(Ordering::SeqCst);
+            (due != 0).then_some(due)
+        }
+    }
+    /// PE 1's IRQ rises once an advance passes the armed count.
+    struct Deferred {
+        due: Arc<AtomicU64>,
+        raised: bool,
+        advanced_by: Vec<usize>,
+    }
+    impl Devices for Deferred {
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Ok(0)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn local_registers(&self, _: usize) -> Option<Arc<dyn LocalRegisters>> {
+            Some(Arc::new(Own(Arc::clone(&self.due))))
+        }
+        fn lines_and_deadline(&mut self, cpu: usize, now: u64) -> (Lines, Option<u64>) {
+            self.advanced_by.push(cpu);
+            let due = self.due.load(Ordering::SeqCst);
+            if due != 0 && now >= due {
+                self.due.store(0, Ordering::SeqCst);
+                self.raised = true;
+            }
+            (self.pins(cpu).unwrap_or_default(), None)
+        }
+        fn lines(&mut self, cpu: usize, now: u64) -> Lines {
+            self.lines_and_deadline(cpu, now).0
+        }
+        fn pins(&mut self, pe: usize) -> Option<Lines> {
+            Some(Lines {
+                irq: pe == 1 && self.raised,
+                ..Lines::default()
+            })
+        }
+    }
+    let (hub, _) = hub(2);
+    let due = Arc::new(AtomicU64::new(0));
+    let home = SharedDevices::new(
+        Deferred {
+            due: Arc::clone(&due),
+            raised: false,
+            advanced_by: Vec::new(),
+        },
+        Arc::clone(&hub),
+    );
+    let mut worker = home.worker();
+    let advanced = |home: &SharedDevices<Deferred>| {
+        home.with(|devices| core::mem::take(&mut devices.advanced_by))
+    };
+    advanced(&home);
+    // Nothing armed: the worker looks again in its usual time.
+    let look = worker.lines_and_deadline(1, 10).1.unwrap() - 10;
+    // Armed for count 50: the worker trusts its lines no later than that
+    // and advances nothing before.
+    due.store(50, Ordering::SeqCst);
+    assert_eq!(worker.own_deadline(1), Some(50));
+    let (lines, until) = worker.lines_and_deadline(1, 20);
+    assert_eq!((lines.irq, until), (false, Some(50.min(20 + look))));
+    assert!(advanced(&home).is_empty());
+    // Due, with home in its run loop: the worker advances them as PE 1 and
+    // reads its IRQ at once.
+    assert!(!hub.home_outside());
+    let (lines, _) = worker.lines_and_deadline(1, 50);
+    assert!(lines.irq);
+    assert_eq!(advanced(&home), [1]);
+    assert_eq!(worker.own_deadline(1), None);
 }
 
 #[test]
@@ -2796,21 +2996,12 @@ fn transfers_leave_their_copies_to_run_outside_the_lock() {
     );
 }
 
-/// The word a cell probe counts a transfer through the cell at host
-/// address `cell` in, as [`chain::lookup_dispatcher`]'s does from the
-/// control it runs with: the cell's `heat` word among the control's
-/// stamped cells, or else the control's own `heat`, which nothing reads.
-fn probed_heat(control: &chain::ChainControl, cell: u64) -> Option<*const AtomicU32> {
-    let index = cell.wrapping_sub(control.cells) >> 3;
-    (index < (chain::CELL_LIVE / 8) as u64)
-        .then(|| (control.cells + chain::CELL_HEAT as u64 + index) as *const AtomicU32)
-}
-
-/// A PE gone parallel runs on its hub control: its cell probes count heat
-/// in the board's stamped cells, where the sweep reads it, so a hot exit
-/// out of the page gets a stamped tail, and its stamps are counted.
+/// A PE gone parallel runs on its hub control, with the board's stamped
+/// cells and stamps of the board's table: an exit out of the page whose
+/// cell its cell probes named often gets a stamped cell and a stamped tail,
+/// and its stamps are counted.
 #[test]
-fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
+fn a_parallel_pe_promotes_the_exits_its_cell_probes_named() {
     use super::super::tests::{NATIVE_CODE_STRIDE, machine};
     use stela_compiler::block::ExitKind;
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
@@ -2834,36 +3025,31 @@ fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
     let first = &machine.code.blocks[0];
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
-    let (number, cells, stamps_held) = {
+    let (address, cells, stamps_held) = {
         let mut cache = machine.code.cache();
         let number = cache.targets.site_cell_number(site).expect("a cell");
+        assert!(number as usize >= chain::STAMPED_CELLS);
         let control = machine.chain.snapshot();
         (
-            number,
+            cache.targets.cell_address(number),
             cache.targets.stamped_cells(),
             cache.targets.holds_stamps(control.stamps),
         )
     };
-    assert!((number as usize) < chain::STAMPED_CELLS);
     let control = machine.chain.snapshot();
-    // The cell probe's transfers through the exit's cell.
-    let cell = cells + (number as u64) * size_of::<chain::LookupEntry>() as u64;
     let patches = machine.host.patches.len();
-    for _ in 0..chain::HOT_CELL {
-        if let Some(heat) = probed_heat(&control, cell) {
-            // SAFETY: a heat word of the board's stamped cells, an atomic,
-            // which live while the board does.
-            unsafe { &*heat }.fetch_add(1, Ordering::Relaxed);
-        }
+    // The samples its cell probes take of the exit's cell.
+    for _ in 0..super::super::scheduler::HOT_SAMPLES {
+        machine.cell_samples.push(address);
     }
-    for _ in 0..chain::STAMPED_CELLS / 256 {
-        machine.promote_hot_exits();
-    }
+    machine.promote_hot_exits();
     assert_eq!(machine.host.patches.len(), patches + 2, "a stamped tail");
     assert_eq!(
         machine.host.patches[patches].1.len(),
         chain::STAMPED_TAIL_BYTES
     );
+    let number = machine.code.cache().targets.site_cell_number(site);
+    assert!(number.is_some_and(|number| (number as usize) < chain::STAMPED_CELLS));
     assert_eq!(machine.statistics.stamped_tails, 1);
     assert_eq!(machine.statistics.stamped_in_use, 1);
     assert_eq!(control.cells, cells, "the board's stamped cells");
@@ -2872,24 +3058,24 @@ fn a_parallel_pe_promotes_the_exits_its_cell_probes_made_hot() {
     assert_eq!(machine.chain.stamp_counts(), [0; chain::STAMP_COUNTS]);
 }
 
-/// Every native entry starts the PE's jump cache over (`chain::lookup_tail`):
-/// what its table probes found under the last run's ITLB, contexts and
-/// blocks holds in no later run.
+/// A PE's jump cache holds across native entries (`chain::lookup_tail`):
+/// its entries name the contexts and ITLB drop epoch they were filled
+/// under, which the tails compare, so an entry stays until its table entry
+/// changes.
 #[test]
-fn each_native_entry_moves_the_jump_cache_serial() {
+fn the_jump_cache_holds_across_native_entries() {
     let mut machine = super::super::tests::machine(&[0xd65f_03c0]);
     let stamps = machine.chain.stamps().0;
     assert_ne!(stamps, 0, "every PE's control has stamps before it runs");
-    let at = (stamps as i64 + i64::from(chain::JUMP_SERIAL)) as *const u64;
-    // SAFETY: the serial in front of the PE's live stamps; no native code
-    // runs meanwhile.
-    let serial = || unsafe { at.read() };
-    let before = serial();
-    assert_ne!(before, 0);
+    let pc = 0xffff_fe00_0000_1234_u64;
+    let at = chain::jump_entry(stamps, pc) as *mut u64;
+    // SAFETY: the PC word of an entry of the PE's live jump cache; no
+    // native code runs meanwhile.
+    unsafe { at.write(pc) };
     machine.chain.begin(0, 16);
-    assert_eq!(serial(), before + 1);
     machine.chain.begin(0, 16);
-    assert_eq!(serial(), before + 2);
+    // SAFETY: as above.
+    assert_eq!(unsafe { at.read() }, pc);
 }
 
 /// A PE that joins a board other than the one it was made on takes stamps
@@ -2996,6 +3182,56 @@ fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
     hub.home.store(0, Ordering::Relaxed);
     wfe(&mut machine).unwrap();
     assert_eq!(machine.statistics.short_waits, 0);
+}
+
+/// A WFE that spins on its Exclusives monitor, as XNU's ticket waiters do,
+/// keeps its PE's guest work through the wait passes, so the shared count
+/// waits for it if the host keeps it from them; a store to its granule ends
+/// the wait. A WFE with no monitor armed holds nothing.
+#[test]
+fn a_wfe_spinning_on_its_monitor_keeps_guest_work_through_its_wait() {
+    use super::super::tests::{BASE, machine};
+    use crate::machine::cpu::{RESERVATION_GRANULE, Reservation};
+    const WFE: u32 = 0xd503_205f;
+    const GRANULE: u64 = BASE + 0x800;
+    let wait = |monitor: bool| {
+        let (hub, _) = hub(2);
+        let mut machine = machine(&[]);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        hub.home.store(1, Ordering::Relaxed);
+        machine.host.counter_step = 1;
+        if monitor {
+            let mut bytes = [0; RESERVATION_GRANULE as usize];
+            assert!(machine.host.read_ram(GRANULE, &mut bytes));
+            machine.cpu.monitor = Some(Reservation {
+                granule: GRANULE,
+                bytes,
+            });
+        }
+        machine.cpu.pc = BASE;
+        machine.system_instruction(WFE).unwrap();
+        let _ = machine.schedule();
+        (hub, machine)
+    };
+    let (_hub, mut machine) = wait(true);
+    assert!(machine.waiting.is_some(), "nothing woke it");
+    assert!(machine.clock.has_guest_work(), "a spinner has guest work");
+    // In the kernel its spin is timed from its first pass, and later
+    // passes keep that start.
+    let started = machine.clock.spin_started();
+    assert!(started.is_some(), "a kernel spin publishes its start");
+    let _ = machine.schedule();
+    assert_eq!(machine.clock.spin_started(), started);
+    // Another core's store to the granule (the ticket's turn) wakes it.
+    assert!(machine.host.write_ram(GRANULE, &[1]));
+    let _ = machine.schedule();
+    assert!(machine.waiting.is_none());
+    assert_eq!(machine.cpu.pc, BASE + 4);
+    assert!(machine.clock.has_guest_work());
+    let (_hub, machine) = wait(false);
+    assert!(machine.waiting.is_some());
+    assert!(!machine.clock.has_guest_work(), "a plain WFE holds nothing");
+    assert_eq!(machine.clock.spin_started(), None);
 }
 
 /// A device whose IRQ rises at `irq_at`, which a write sets; counts its
@@ -3775,4 +4011,447 @@ fn events_raised_while_their_register_is_served_plain_are_never_lost_or_late() {
     raising.join().unwrap();
     assert_eq!(reader.read_scalar(1, 0x40, 4, 0), ScalarRead::Served(Ok(0)));
     assert_eq!(home.with(|devices| devices.pending), 0);
+}
+
+/// Counts its kicks and reads a counter the test moves, as a host's
+/// doorbells and its 24 MHz count do.
+struct Served {
+    kicks: Arc<AtomicUsize>,
+    host: Arc<AtomicU64>,
+}
+impl Kick for Served {
+    fn kick(&self, _pe: usize) {
+        self.kicks.fetch_add(1, Ordering::SeqCst);
+    }
+    fn count(&self) -> Option<u64> {
+        Some(self.host.load(Ordering::SeqCst))
+    }
+}
+
+/// A counter frequency at which the stall limit is 1200 counts.
+const SERVED_FREQUENCY: u64 = 24_000;
+const SERVED_STALL: u64 = SERVED_FREQUENCY * super::super::clock::STALL_MILLIS / 1000;
+
+type Clock = super::super::clock::Clock;
+
+/// Two PEs on a hub whose shared count follows a host counter from 1000,
+/// each with its own reader; both run.
+fn serving_pair() -> (Arc<Hub>, Arc<AtomicUsize>, Arc<AtomicU64>, Clock, Clock) {
+    let kicks = Arc::new(AtomicUsize::new(0));
+    let host = Arc::new(AtomicU64::new(1000));
+    let hub = Hub::new(
+        2,
+        Served {
+            kicks: Arc::clone(&kicks),
+            host: Arc::clone(&host),
+        },
+    );
+    for pe in 0..2 {
+        hub.set_live(pe, true);
+    }
+    Clock::default().seed(&hub.clock, 1000, SERVED_FREQUENCY);
+    let (mut first, mut second) = (Clock::default(), Clock::default());
+    first.attach(Arc::clone(&hub.clock), 0);
+    second.attach(Arc::clone(&hub.clock), 1);
+    (hub, kicks, host, first, second)
+}
+
+/// The reported shape: PE 1's guest waits for an interrupt and its core
+/// serves the host in a part that takes seconds, while PE 0 runs and sends
+/// it a fast IPI. The IPI kicks its core at once, the service sees it at
+/// its next part, and the count PE 0 reads goes on at most a stall limit
+/// past the IPI however long the part takes: PE 0's XNU never sees PE 1
+/// leave an IPI unanswered for longer. Once PE 1 looks again, the count
+/// goes on from there and the held time is lag the slew repays.
+#[test]
+fn an_ipi_to_a_pe_that_serves_the_host_kicks_it_and_holds_the_count_for_it() {
+    let (hub, kicks, host, mut first, mut second) = serving_pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    // PE 1 starts a service turn with nothing pending.
+    let epoch = hub.lines_epoch(1);
+    assert_eq!(hub.set_serving(1, Some(epoch)), None);
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, None);
+    assert_eq!(watch.pending(1000), None);
+    // A wake with no guest work for it (a SEV, which a WFI does not take)
+    // neither kicks nor marks it.
+    hub.event(0);
+    assert_eq!(kicks.load(Ordering::SeqCst), 0);
+    // PE 0's fast IPI at host 2000: one kick, and the turn's next look
+    // finds it.
+    host.store(2000, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1, "the serving PE is kicked");
+    assert_eq!(watch.pending(2000), Some(super::Pending::Lines));
+    // A second IPI meanwhile kicks it no more.
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
+    // PE 1 stays out for five seconds of host time; PE 0 runs and marks
+    // its progress every 10 counts.
+    let ipi = 2000;
+    let mut retired = 0;
+    let end = 2000 + 5 * SERVED_FREQUENCY;
+    for now in (2010..end).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+        let count = first.read(|| now);
+        assert!(count <= ipi + SERVED_STALL, "at {now}: count {count}");
+    }
+    assert_eq!(
+        first.read(|| end),
+        ipi + SERVED_STALL,
+        "held a stall limit on"
+    );
+    assert_eq!(
+        watch.waited(end),
+        Some((super::Pending::Lines, Some(end - ipi))),
+        "the wait is measured from the first wake"
+    );
+    // PE 1 is back in its loop: the count goes on from where it held.
+    assert_eq!(hub.set_serving(1, None), Some(epoch));
+    second.idle(|| end, 0, None);
+    first.mark(|| end + 10, retired + 100, None);
+    assert_eq!(first.read(|| end + 10), ipi + SERVED_STALL + 10);
+    assert_eq!(hub.clock.take_stalled(), end - (ipi + SERVED_STALL));
+    // A PE that neither serves nor sleeps is not kicked: it reads its
+    // lines at its next return to the engine.
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1);
+}
+
+/// PE 1's own timer comes due while it serves: the service sees it at its
+/// next part, and the count holds a stall limit past the deadline, as for
+/// an IPI. Its next wait pass clears the mark.
+#[test]
+fn a_timer_due_on_a_pe_that_serves_the_host_ends_its_service_and_holds_the_count() {
+    let (hub, kicks, _host, mut first, mut second) = serving_pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    let deadline = 3000;
+    second.serving(Some(deadline));
+    let epoch = hub.lines_epoch(1);
+    hub.set_serving(1, Some(epoch));
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, Some(deadline));
+    assert_eq!(watch.pending(2999), None);
+    assert_eq!(watch.pending(3000), Some(super::Pending::Timer));
+    assert_eq!(watch.waited(3500), Some((super::Pending::Timer, Some(500))));
+    // Before its deadline it holds nothing; past it a stall limit on.
+    let mut retired = 0;
+    for now in (1010..10_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+        assert_eq!(
+            first.read(|| now),
+            now.min(deadline + SERVED_STALL),
+            "at {now}"
+        );
+    }
+    assert_eq!(
+        kicks.load(Ordering::SeqCst),
+        0,
+        "its own timer needs no kick"
+    );
+    hub.set_serving(1, None);
+    second.look(|| 10_000);
+    first.mark(|| 10_010, retired + 100, None);
+    assert_eq!(first.read(|| 10_010), deadline + SERVED_STALL + 10);
+}
+
+/// A line change for a serving PE that accepts no line (it runs with IRQ
+/// and FIQ masked) is no guest work: no kick, no mark, its service goes
+/// on. A host call ends the service but holds no count: no guest waits
+/// for it.
+#[test]
+fn only_guest_work_a_serving_pe_would_take_holds_the_count() {
+    let (hub, kicks, host, mut first, mut second) = serving_pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    second.idle(|| 1000, 0, None);
+    let epoch = hub.lines_epoch(1);
+    hub.set_accepts(1, Lines::default());
+    hub.set_serving(1, Some(epoch));
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, None);
+    host.store(2000, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 0, "not kicked");
+    assert_eq!(watch.pending(2000), None, "its service goes on");
+    hub.inboxes[1].host_call.store(true, Ordering::SeqCst);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 1, "a host call kicks it");
+    assert_eq!(
+        watch.waited(2100),
+        Some((super::Pending::HostCall, Some(100)))
+    );
+    let mut retired = 0;
+    for now in (2010..10_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+        assert_eq!(first.read(|| now), now, "nothing holds the count");
+    }
+    hub.set_serving(1, None);
+    // Accepting the FIQ alone, a line change is guest work again.
+    hub.inboxes[1].host_call.store(false, Ordering::SeqCst);
+    let epoch = hub.lines_epoch(1);
+    hub.set_accepts(
+        1,
+        Lines {
+            irq: false,
+            fiq: true,
+        },
+    );
+    hub.set_serving(1, Some(epoch));
+    host.store(10_000, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.wake(1);
+    assert_eq!(kicks.load(Ordering::SeqCst), 2);
+    for now in (10_000..20_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+    }
+    assert_eq!(first.read(|| 20_000), 10_000 + SERVED_STALL);
+}
+
+/// Guest work already there when a PE begins to serve marks the count, as
+/// a wake would, without kicking its own core; a forwarded access waits
+/// only for the home machine, a stop only for the others.
+#[test]
+fn guest_work_before_a_service_begins_marks_the_count_without_a_kick() {
+    let (hub, kicks, host, _first, mut second) = serving_pair();
+    second.idle(|| 1000, 0, None);
+    let epoch = hub.lines_epoch(1);
+    host.store(1500, Ordering::SeqCst);
+    hub.lines_changed_unwoken(1);
+    hub.set_serving(1, Some(epoch));
+    assert_eq!(kicks.load(Ordering::SeqCst), 0);
+    let watch = GuestWatch::new(Some(Arc::clone(&hub)), 1, epoch, None);
+    assert_eq!(watch.waited(1600), Some((super::Pending::Lines, Some(100))));
+    hub.set_serving(1, None);
+    let epoch = hub.lines_epoch(1);
+    hub.requested.store(true, Ordering::SeqCst);
+    assert_eq!(hub.guest_pending(1, epoch), None, "PE 1 is not home");
+    assert_eq!(
+        hub.guest_pending(0, hub.lines_epoch(0)),
+        Some(super::Pending::Forward)
+    );
+    hub.requested.store(false, Ordering::SeqCst);
+    hub.stopped.store(true, Ordering::SeqCst);
+    assert_eq!(hub.guest_pending(1, epoch), Some(super::Pending::Stop));
+    assert_eq!(
+        hub.guest_pending(0, hub.lines_epoch(0)),
+        None,
+        "home runs on"
+    );
+}
+
+/// A serving PE's line changes are guest work only while it takes a line:
+/// running with IRQ and FIQ masked it takes none, waiting it is woken by
+/// either.
+#[test]
+fn a_serving_pe_waits_for_a_line_change_only_while_it_takes_a_line() {
+    use super::super::tests::serving_timer;
+    use crate::machine::exception::{DAIF_F, DAIF_I};
+    struct NoKick;
+    impl Kick for NoKick {
+        fn kick(&self, _pe: usize) {}
+    }
+    for (daif, wait, expected) in [
+        (DAIF_I | DAIF_F, false, None),
+        (DAIF_I, false, Some(super::Pending::Lines)),
+        (0, false, Some(super::Pending::Lines)),
+        (DAIF_I | DAIF_F, true, Some(super::Pending::Lines)),
+    ] {
+        let mut machine = serving_timer(0, 0, daif);
+        let hub = Hub::new(1, NoKick);
+        hub.set_live(0, true);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        if wait {
+            machine.system_instruction(0xd503_207f).unwrap(); // wfi
+            assert!(machine.waiting.is_some());
+        }
+        let pending = machine.serve_host(|machine| {
+            let watch = machine.guest_watch();
+            hub.lines_changed_unwoken(0);
+            watch.pending(machine.host.now)
+        });
+        assert_eq!(pending, expected, "DAIF {daif:#x}, waiting {wait}");
+    }
+}
+
+/// Registers at [`OWN`] served under their own lock: a read gives how many
+/// writes came before it; a write of 1 raises PE 1's IRQ and of 0 lowers
+/// it, each change queued for the board.
+const OWN: u64 = 0x9000;
+
+#[derive(Default)]
+struct OwnRegisters {
+    writes: AtomicU64,
+    queued: std::sync::Mutex<Vec<bool>>,
+}
+
+impl super::super::OwnLockRegisters for OwnRegisters {
+    fn serves(&self, physical: u64) -> bool {
+        (OWN..OWN + 0x100).contains(&physical)
+    }
+    fn read(&self, _: usize, _: u64, _: u8, _: u64) -> super::super::OwnLockAccess<u64> {
+        super::super::OwnLockAccess {
+            result: Ok(self.writes.load(Ordering::SeqCst)),
+            queued: false,
+        }
+    }
+    fn write(
+        &self,
+        _: usize,
+        _: u64,
+        _: u8,
+        value: u64,
+        _: u64,
+    ) -> super::super::OwnLockAccess<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.queued.lock().unwrap().push(value == 1);
+        super::super::OwnLockAccess {
+            result: Ok(()),
+            queued: true,
+        }
+    }
+}
+
+/// A board whose only interrupt is [`OwnRegisters`]'s, to PE 1.
+struct OwnBoard {
+    own: Arc<OwnRegisters>,
+    irq: bool,
+    deliveries: usize,
+}
+
+impl Devices for OwnBoard {
+    fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+        Ok(0)
+    }
+    fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+        Ok(())
+    }
+    fn lines(&mut self, pe: usize, _: u64) -> Lines {
+        Lines {
+            irq: pe == 1 && self.irq,
+            ..Lines::default()
+        }
+    }
+    fn own_lock_registers(&self) -> Option<Arc<dyn super::super::OwnLockRegisters>> {
+        Some(Arc::clone(&self.own) as Arc<dyn super::super::OwnLockRegisters>)
+    }
+    fn deliver_own(&mut self) -> Result<bool, DeviceError> {
+        let queued = core::mem::take(&mut *self.own.queued.lock().unwrap());
+        let Some(&last) = queued.last() else {
+            return Ok(false);
+        };
+        self.irq = last;
+        self.deliveries += 1;
+        Ok(true)
+    }
+}
+
+fn own_board() -> (SharedDevices<OwnBoard>, Arc<OwnRegisters>) {
+    let (hub, _) = hub(2);
+    let own = Arc::new(OwnRegisters::default());
+    let home = SharedDevices::new(
+        OwnBoard {
+            own: Arc::clone(&own),
+            irq: false,
+            deliveries: 0,
+        },
+        hub,
+    );
+    (home, own)
+}
+
+/// An access under its device's own lock that changes no line takes no
+/// board lock: it completes while another PE holds the board. One that
+/// queues a line change waits for the board, which hands the change on and
+/// tells the PE it reached before the access completes.
+#[test]
+fn an_own_lock_access_takes_the_board_only_to_hand_on_a_line_change() {
+    let (home, own) = own_board();
+    let mut worker = home.worker();
+    let board = Arc::clone(&home.board);
+    let hub = Arc::clone(home.hub());
+    let held = board.devices.lock().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let read = worker.read_scalar(0, OWN, 4, 10);
+        sent.send(matches!(read, ScalarRead::Served(Ok(0))))
+            .unwrap();
+        let written = worker.write_own(0, OWN + 4, 4, 1, 20);
+        sent.send(written == Some(Ok(()))).unwrap();
+        worker
+    });
+    let bound = std::time::Duration::from_secs(5);
+    assert_eq!(
+        received.recv_timeout(bound),
+        Ok(true),
+        "read beside the held board"
+    );
+    // Bounded: the write queues its change within five seconds, then waits.
+    let deadline = std::time::Instant::now() + bound;
+    while own.writes.load(Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the write never ran");
+        std::thread::yield_now();
+    }
+    assert!(
+        received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "the write waits for the board to hand its change on"
+    );
+    let epoch = hub.inboxes[1].lines.load(Ordering::SeqCst);
+    drop(held);
+    assert_eq!(received.recv_timeout(bound), Ok(true));
+    let mut worker = waiter.join().unwrap();
+    assert!(
+        hub.inboxes[1].lines.load(Ordering::SeqCst) > epoch,
+        "PE 1 told"
+    );
+    assert_eq!(
+        home.with(|devices| (devices.irq, devices.deliveries)),
+        (true, 1)
+    );
+    // A read changes nothing on the board; a lowering write hands on again.
+    assert!(matches!(
+        worker.read_scalar(0, OWN, 4, 30),
+        ScalarRead::Served(Ok(1))
+    ));
+    assert_eq!(worker.write(0, OWN + 4, 4, 0, 40), Ok(()));
+    assert_eq!(
+        home.with(|devices| (devices.irq, devices.deliveries)),
+        (false, 2)
+    );
+    // Another address takes the board's own path.
+    assert_eq!(worker.write_own(0, 0x40, 4, 1, 50), None);
+}
+
+/// Every hold of the board's lock begins by handing on what own-lock
+/// accesses queued, and tells the PEs it reached, whatever its call: a
+/// change queued before any other call is seen by that call.
+#[test]
+fn every_board_hold_hands_on_queued_line_changes_first() {
+    let (home, own) = own_board();
+    let hub = Arc::clone(home.hub());
+    // Queued by the device directly, as an access that has not reached
+    // the board yet would leave it.
+    own.queued.lock().unwrap().push(true);
+    let epoch = hub.inboxes[1].lines.load(Ordering::SeqCst);
+    assert_eq!(
+        home.with(|devices| (devices.irq, devices.deliveries)),
+        (true, 1)
+    );
+    assert!(
+        hub.inboxes[1].lines.load(Ordering::SeqCst) > epoch,
+        "PE 1 told"
+    );
+    // Nothing waits now: a hold hands on nothing.
+    assert_eq!(home.with(|devices| devices.deliveries), 1);
 }

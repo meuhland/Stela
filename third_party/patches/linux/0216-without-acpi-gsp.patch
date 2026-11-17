@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kiki <duarduar707@gmail.com>
+Date: Tue, 17 Nov 2026 00:37:09 +0700
+Subject: [PATCH] fix(nouveau): without ACPI, GSP-RM gets the backlight table
+ boot read from the GPU's NBCI or NVHG _DSM function 0x14, where it got none
+ and refused every brightness control with NV_ERR_NOT_SUPPORTED
+
+---
+ .../nouveau/nvkm/subdev/gsp/rm/r535/disp.c    | 40 +++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c
+index 21a2675868e38e8a42f416d73bc3fcab62507f95..98c18ffbd7fc17ef60b485175d9e00e398641341 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/disp.c
+@@ -38,6 +38,12 @@
+ 
+ #include <nvhw/drf.h>
+ 
++#if !(defined(CONFIG_ACPI) && defined(CONFIG_X86))
++#include <core/pci.h>
++#include <linux/pci.h>
++#include <stela/backlight.h>
++#endif
++
+ #include "nvrm/disp.h"
+ 
+ #include <linux/acpi.h>
+@@ -1587,6 +1593,40 @@ r535_disp_oneinit(struct nvkm_disp *disp)
+ 			}
+ 		}
+ 
++		ret = nvkm_gsp_rm_ctrl_wr(subdevice, ctrl);
++		if (ret)
++			return ret;
++#else
++		/*
++		 * No ACPI here: boot evaluated the GPU's NBCI or NVHG _DSM
++		 * function 0x14 itself before the GPU started. GSP-RM gets its
++		 * package as upstream sends it, each integer as 4 bytes, or 8
++		 * past 32 bits, else it refuses every brightness control.
++		 */
++		NV2080_CTRL_INTERNAL_INIT_BRIGHTC_STATE_LOAD_PARAMS *ctrl;
++		struct nvkm_gsp_object *subdevice = &disp->rm.client.gsp->internal.device.subdevice;
++		struct pci_dev *pdev = device->func->pci ? device->func->pci(device)->pdev : NULL;
++		const u8 *data = NULL;
++		size_t size = 0;
++		int found = pdev ? stela_linux_gpu_backlight_data(pci_domain_nr(pdev->bus),
++								  pdev->bus->number, pdev->devfn,
++								  &data, &size) : -ENODEV;
++
++		ctrl = nvkm_gsp_rm_ctrl_get(subdevice,
++					    NV2080_CTRL_CMD_INTERNAL_INIT_BRIGHTC_STATE_LOAD,
++					    sizeof(*ctrl));
++		if (IS_ERR(ctrl))
++			return PTR_ERR(ctrl);
++
++		ctrl->status = 0x56; /* NV_ERR_NOT_SUPPORTED */
++		if (!found && size <= sizeof(ctrl->backLightData)) {
++			memcpy(ctrl->backLightData, data, size);
++			ctrl->backLightDataSize = size;
++			ctrl->status = 0;
++		}
++		nvkm_info(&disp->engine.subdev, "backlight data from ACPI: %d, %zu bytes\n",
++			  found, size);
++
+ 		ret = nvkm_gsp_rm_ctrl_wr(subdevice, ctrl);
+ 		if (ret)
+ 			return ret;

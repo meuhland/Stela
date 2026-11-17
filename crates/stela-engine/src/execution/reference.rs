@@ -95,6 +95,9 @@ global_asm!(
     "push r14",
     "push r15",
     "mov [rdx], rsp",
+    // Every exit reloads RSP from here (`chain::EXIT_RETURN`).
+    "lea r11, [rsp - 8]",
+    "mov [rdi + {exit_rsp}], r11",
     "call rsi",
     "pop r15",
     "pop r14",
@@ -115,6 +118,7 @@ global_asm!(
     "xor eax, eax",
     "mov edx, 0xffff",
     "ret",
+    exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
 );
 unsafe extern "sysv64" {
     fn stela_reference_enter(

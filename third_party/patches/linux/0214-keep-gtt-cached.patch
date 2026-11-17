@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sat, 14 Nov 2026 20:30:39 +0000
+Subject: [PATCH] fix(amdgpu): keep GTT cached and snooped, as Stela's build
+ leaves every page's kernel mapping write-back
+
+TTM's pool makes a write-combined page's kernel mapping write-combined
+(set_pages_array_wc) only under CONFIG_X86, which Stela's build does not
+set. A USWC BO's client mapping then aliases a write-back kernel mapping
+holding the lines the page's zeroing left in the CPU's caches, while the
+GPU reads and writes the page unsnooped. Offer no USWC, as amdgpu does
+where write-combining cannot work.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_object.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 718937777e5323723a96f33492cf7e3594914269..483c6fa5bb23a2a7bb688e73900f406a02d0eee7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -582,6 +582,17 @@ static bool amdgpu_bo_validate_size(struct amdgpu_device *adev,
+ 
+ bool amdgpu_bo_support_uswc(u64 bo_flags)
+ {
++	/* Stela: TTM's pool makes a write-combined page's kernel mapping
++	 * write-combined too (set_pages_array_wc) only under CONFIG_X86, which
++	 * Stela's build does not set: every page keeps its write-back kernel
++	 * mapping, with the lines its zeroing left in the CPU's caches. A
++	 * write-combined client mapping of such a page aliases that mapping,
++	 * and the GPU reads and writes the page unsnooped, so neither the
++	 * CPU's view nor the GPU's is the page's. Keep GTT cached and snooped,
++	 * as a kernel that cannot change a page's caching does. */
++	if (bo_flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC)
++		DRM_INFO_ONCE("Stela: GTT stays cached and snooped; USWC is not offered\n");
++	return false;
+ 
+ #ifdef CONFIG_X86_32
+ 	/* XXX: Write-combined CPU mappings of GTT seem broken on 32-bit

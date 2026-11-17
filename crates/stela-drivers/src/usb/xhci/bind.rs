@@ -15,8 +15,24 @@ fn audio_unsupported<'a>(
     })
 }
 
+/// Why a device that arrived after boot is not started: the running system
+/// takes only input devices, and a disk, network adapter, audio function or
+/// Bluetooth controller starts at the next boot.
+pub(crate) const AFTER_BOOT: &str =
+    "added after boot, kept unused and not started until the next boot";
+
+/// Why a phone's USB tethering is not used ([`Device::offers_tethering`]).
+/// Linux's `ipheth` drives the interface only with userspace that pairs
+/// the phone first (its Kconfig says so): the phone gives the link no
+/// carrier until it trusts the computer, and that pairing protocol is not
+/// implemented here.
+pub(crate) const TETHERING: &str = "phone USB tethering (vendor class ff/fd/01, Linux ipheth) \
+     is not supported: the phone enables it only after pairing with the computer, which Stela \
+     does not do; use wired Ethernet or a USB Ethernet adapter";
+
 /// Binds every interface of `device` a driver here takes: one
-/// configuration, its endpoints configured together.
+/// configuration, its endpoints configured together. A Bulk-Only disk is
+/// discovered after its settle time, waited for here.
 #[cfg(test)]
 pub(crate) fn bind(shared: &Shared, device: Device, dma: &mut dyn DmaAllocator, found: &mut Found) {
     bind_with_provider(
@@ -26,6 +42,10 @@ pub(crate) fn bind(shared: &Shared, device: Device, dma: &mut dyn DmaAllocator, 
         found,
         &crate::firmware::HandoffProvider::new(None),
     );
+    if !found.settling.is_empty() && crate::test_clock::read().is_some() {
+        crate::test_clock::advance(shared.borrow().clock, settle::SETTLE_US);
+    }
+    found.settle(dma);
 }
 
 #[expect(
@@ -46,14 +66,32 @@ pub(crate) fn bind_with_provider(
         ));
         return;
     }
+    // Said once per device, whichever configuration offers it.
+    if device.offers_tethering() {
+        found
+            .unused
+            .push((format!("{} {}", device.location, device.name()), TETHERING));
+    }
     let all = interfaces(&device.configuration);
     let mut endpoints = Vec::new();
     let mut plans = Vec::new();
     let mut selected_settings = Vec::new();
+    let after_boot = shared.borrow().after_boot;
     for interface in all.iter().filter(|i| configuration::primary(i)) {
         let plan =
             configuration::plan_with_controller(&device, interface, &all, Some(&shared.borrow()));
         match plan {
+            // Nothing of a class the running system does not take starts
+            // after boot: no configuration, transfer, firmware or wait.
+            Ok(plan) if after_boot && !matches!(plan, Plan::Hid(..)) => found.unused.push((
+                format!("{} interface {}", device.location, interface.number),
+                AFTER_BOOT,
+            )),
+            // A vendor adapter's chip was not asked for its revision.
+            Err(_) if after_boot && ethernet::listed(&device.descriptor) => found.unused.push((
+                format!("{} interface {}", device.location, interface.number),
+                AFTER_BOOT,
+            )),
             Ok(plan) => {
                 selected_settings.extend(plan.settings(interface.number));
                 if !matches!(&plan, Plan::Storage(binding) if binding.uas()) {
@@ -118,12 +156,14 @@ pub(crate) fn bind_with_provider(
         ));
         return;
     }
+    let configured = settle::configured(shared.borrow().clock);
     let mut hid_inputs = Vec::new();
     for (interface, plan) in plans {
         let location = format!("{} interface {}", device.location, interface.number);
         crate::working(&location);
         let result = match plan {
-            Plan::Storage(binding) => storage::discover_binding(
+            // UAS has no settle time.
+            Plan::Storage(binding) if binding.uas() => storage::discover_binding(
                 shared.clone(),
                 &device,
                 binding,
@@ -134,6 +174,16 @@ pub(crate) fn bind_with_provider(
                 found.storage.push(owner);
                 found.disks.extend(disks);
             }),
+            Plan::Storage(binding) => {
+                let interface = settle::Configured::Xhci {
+                    shared: shared.clone(),
+                    device: device.clone(),
+                    binding,
+                };
+                let entry = settle::Settling::new(configured, location.clone(), interface);
+                found.settling.push(entry);
+                Ok(())
+            }
             Plan::Hid(endpoint, _) => {
                 hid::UsbInput::new(shared.clone(), &device, &interface, endpoint, dma).map(
                     |input| match input {
@@ -182,6 +232,190 @@ pub(crate) fn bind_with_provider(
             .push((format!("{} HID++ receiver", device.location), error));
     }
     found.inputs.extend(hid_inputs);
+}
+
+/// [`bind_with_provider`] for a device that arrived after boot, in steps:
+/// only its input interfaces start, each request a step's control transfer,
+/// and the storage device of a disk in use (`kept`) that left the bus and
+/// came back ([`storage::resume`]); every other interface is reported unused.
+pub(super) async fn bind_after_boot_with(
+    a: &Access<'_>,
+    device: &Device,
+    found: &mut Found,
+    kept: &[storage::UsbStorage],
+) {
+    let Some(shared) = a.shared().cloned() else {
+        return;
+    };
+    if device.slot != device.id.hardware_slot() {
+        found.failures.push((
+            device.location.clone(),
+            BlockError::Unsupported("USB bind descriptor slot identity mismatch"),
+        ));
+        return;
+    }
+    match a.with(|c| storage::resume::returning(kept, c, device)) {
+        storage::resume::Return::Other => {}
+        storage::resume::Return::Resume(returning) => {
+            return resume_storage(a, shared, device, returning, found).await;
+        }
+        storage::resume::Return::Unused(why) => {
+            found.unused.push((device.location.clone(), why));
+            return;
+        }
+    }
+    let all = interfaces(&device.configuration);
+    let mut endpoints = Vec::new();
+    let mut inputs = Vec::new();
+    for interface in all.iter().filter(|i| configuration::primary(i)) {
+        let plan =
+            a.with(|c| configuration::plan_with_controller(device, interface, &all, Some(c)));
+        let location = format!("{} interface {}", device.location, interface.number);
+        match plan {
+            Ok(Plan::Hid(input, output)) => {
+                endpoints.extend([Some(input), output].into_iter().flatten());
+                inputs.push((interface.clone(), input));
+            }
+            Ok(_) => found.unused.push((location, AFTER_BOOT)),
+            Err(_) if ethernet::listed(&device.descriptor) => {
+                found.unused.push((location, AFTER_BOOT))
+            }
+            Err(why) => found.unused.push((
+                format!(
+                    "{location} ({:02x}/{:02x}/{:02x})",
+                    interface.class, interface.subclass, interface.protocol
+                ),
+                why,
+            )),
+        }
+    }
+    if inputs.is_empty() {
+        return;
+    }
+    let configured = async {
+        let slot = during(
+            "claim native USB device",
+            a.with(|c| {
+                c.claim_native(device.id)?;
+                c.validate_id(device.id)
+            }),
+        )?;
+        let value = device.configuration_value();
+        during(
+            format!("slot {slot} EP0 SET_CONFIGURATION value={value}"),
+            Controller::set_configuration_with(a, slot, value).await,
+        )?;
+        during(
+            format!("slot {slot} Configure Endpoint"),
+            Controller::configure_with(a, slot, &endpoints, None).await,
+        )
+    }
+    .await;
+    if let Err((operation, error)) = configured {
+        found.failures.push((
+            format!("{} {} {operation}", device.location, device.name()),
+            error,
+        ));
+        return;
+    }
+    let mut hid_inputs = Vec::new();
+    for (interface, endpoint) in inputs {
+        let location = format!("{} interface {}", device.location, interface.number);
+        let negotiated = hid::UsbInput::negotiate(&interface, async |request| {
+            a.device_control(device.id, request, &[]).await
+        })
+        .await;
+        let started = negotiated.and_then(|negotiated| {
+            a.with_dma(|_, dma| {
+                hid::UsbInput::start(
+                    shared.clone(),
+                    device,
+                    &interface,
+                    endpoint,
+                    negotiated,
+                    dma,
+                )
+            })?
+        });
+        match started {
+            Ok(Some(input)) => hid_inputs.push(input),
+            Ok(None) => found.unused.push((location, hid::NO_REPORTS)),
+            Err(error) => found.failures.push((location, error)),
+        }
+    }
+    if let Err(error) = hid::receiver::transport::attach_group(&shared, device, &mut hid_inputs) {
+        found
+            .failures
+            .push((format!("{} HID++ receiver", device.location), error));
+    }
+    found.inputs.extend(hid_inputs);
+}
+
+/// Configure the storage device of a disk in use that came back after
+/// boot with its Bulk-Only setting, each request a step's command or
+/// control transfer, and start it again for the disk ([`storage::resume`]).
+async fn resume_storage(
+    a: &Access<'_>,
+    shared: Shared,
+    device: &Device,
+    returning: storage::resume::Returning,
+    found: &mut Found,
+) {
+    let configured = async {
+        let slot = during(
+            "claim native USB device",
+            a.with(|c| {
+                c.claim_native(device.id)?;
+                c.validate_id(device.id)
+            }),
+        )?;
+        let value = device.configuration_value();
+        during(
+            format!("slot {slot} EP0 SET_CONFIGURATION value={value}"),
+            Controller::set_configuration_with(a, slot, value).await,
+        )?;
+        during(
+            format!("slot {slot} Configure Endpoint"),
+            Controller::configure_with(a, slot, &returning.endpoints, None).await,
+        )?;
+        let setting = &returning.interface;
+        if setting.alternate != 0 {
+            let request = setup(
+                RECIPIENT_INTERFACE,
+                SET_INTERFACE,
+                u16::from(setting.alternate),
+                u16::from(setting.number),
+                0,
+            );
+            during(
+                format!("slot {slot} SET_INTERFACE"),
+                a.device_control(device.id, request, &[]).await,
+            )?;
+        }
+        during(
+            "Bulk-Only buffers",
+            a.with_dma(|_, dma| storage::resume::buffers(dma))
+                .and_then(|buffers| buffers),
+        )
+    }
+    .await;
+    let buffers = match configured {
+        Ok(buffers) => buffers,
+        Err((operation, error)) => {
+            found.failures.push((
+                format!("{} {} {operation}", device.location, device.name()),
+                error,
+            ));
+            return;
+        }
+    };
+    match storage::resume::resume(shared, device, returning, buffers).await {
+        Ok(Ok(units)) => found.resumed.push((device.location.clone(), units)),
+        Ok(Err(why)) => found.unused.push((device.location.clone(), why)),
+        Err((operation, error)) => found
+            .failures
+            .push((format!("{} {operation}", device.location), error)),
+    }
 }
 
 /// What a class driver will use of an interface.

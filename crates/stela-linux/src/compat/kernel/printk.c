@@ -6,8 +6,18 @@
 #include <linux/irqflags.h>
 #include <linux/limits.h>
 #include <linux/printk.h>
+#include <linux/ratelimit.h>
 #include <linux/sprintf.h>
 #include <stela/linux.h>
+
+/* printk_ratelimit()'s shared budget, as kernel/printk/printk.c sets it: ten
+ * messages in five seconds. */
+DEFINE_RATELIMIT_STATE(printk_ratelimit_state, 5 * HZ, 10);
+
+int __printk_ratelimit(const char *func)
+{
+	return ___ratelimit(&printk_ratelimit_state, func);
+}
 
 /* The level a message's prefixes give, after which its text starts. */
 static int level_of(const char **fmt)

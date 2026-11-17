@@ -20,7 +20,7 @@ const STOPPED_TRANSFER: u32 = 26;
 const STOPPED_SHORT_PACKET: u32 = 28;
 const INCOMPATIBLE_DEVICE: u32 = 22;
 const EVENT_DATA: u32 = 1 << 2;
-pub(super) use queue::Queue;
+pub(super) use queue::{Failed, Queue, Rings};
 
 /// Linux process_bulk_intr_td's test for a transaction error: never retried
 /// with XHCI_NO_SOFT_RETRY (err_count untouched); otherwise counted, and
@@ -35,33 +35,116 @@ pub(super) fn retry_in_place(errors: &mut u32, no_soft_retry: bool, tt_info: u32
 }
 
 impl Controller {
-    /// Linux xhci_handle_halted_endpoint(EP_SOFT_RESET): Reset Endpoint with
-    /// TSP keeps the halted TD in place, and its completion rings every
-    /// pending ring again (ring_doorbell_for_active_rings). Like
-    /// xhci_handle_cmd_reset_ep, the completion code is ignored; only a
-    /// command the controller never completed is an error.
-    pub(super) fn soft_reset(
+    /// Linux xhci_handle_halted_endpoint: xhci_reset_halted_ep queues Reset
+    /// Endpoint, with TSP for EP_SOFT_RESET to keep the halted TD in place,
+    /// and its completion rings the pending rings again
+    /// (ring_doorbell_for_active_rings). As Linux queues the command and
+    /// handles its completion apart, it is started here and stepped by the
+    /// owner's polls ([`Self::step_recovery_reset`]), under the command's
+    /// own deadline and timeout handling, never waited for in one call.
+    /// `None` while it runs.
+    pub(super) fn begin_recovery_reset(
         &mut self,
         slot: u8,
         dci: u8,
-        doorbells: &[u32],
-    ) -> Result<(), BlockError> {
-        self.reset_halted(slot, dci, TSP)?;
+        flags: u32,
+        rings: Rings,
+        failed: Failed,
+    ) -> Option<Result<(), BlockError>> {
+        let reset = queue::Reset {
+            command: None,
+            flags,
+            rings,
+            failed,
+        };
+        match self.recovery_queue(slot, dci) {
+            Some(queue) => queue.begin_reset(reset),
+            None => return Some(Err(BlockError::Unsupported("xHCI endpoint not configured"))),
+        }
+        self.step_recovery_reset(slot, dci)
+    }
+
+    /// One step of the endpoint's recovery Reset Endpoint: `Some(Ok)` once
+    /// none runs, `None` while it does. Like xhci_handle_cmd_reset_ep, the
+    /// completion code is ignored; only a command the controller never
+    /// completed is an error, left where the reset's `failed` says.
+    pub(super) fn step_recovery_reset(
+        &mut self,
+        slot: u8,
+        dci: u8,
+    ) -> Option<Result<(), BlockError>> {
+        let Some(&mut queue::Reset {
+            mut command, flags, ..
+        }) = self.recovery_queue(slot, dci).and_then(Queue::reset)
+        else {
+            return Some(Ok(()));
+        };
+        let target = u32::from(slot) << 24 | u32::from(dci) << 16;
+        let result = self.step_command(&mut command, 0, 0, RESET_ENDPOINT << 10 | flags | target);
+        // An endpoint that went away meanwhile has no reset left to run.
+        let Some(queue) = self.recovery_queue(slot, dci) else {
+            return Some(Ok(()));
+        };
+        let Some(result) = result else {
+            if let Some(reset) = queue.reset() {
+                reset.command = command;
+            }
+            return None;
+        };
+        let Some(reset) = queue.take_reset() else {
+            return Some(Ok(()));
+        };
+        match result {
+            Ok(_) => {}
+            Err(BlockError::Device { .. }) if !self.command_poisoned => {}
+            Err(error) => {
+                self.recovery_failed(slot, dci, reset.failed, &error);
+                return Some(Err(error));
+            }
+        }
+        let doorbells = match reset.rings {
+            Rings::Endpoint => vec![u32::from(dci)],
+            Rings::Streams => self
+                .slot(slot)
+                .ok()
+                .and_then(|state| state.endpoints[usize::from(dci)].as_ref())
+                .and_then(|endpoint| endpoint.streams.as_ref())
+                .map_or_else(Vec::new, |streams| streams.active_doorbells(dci)),
+            Rings::None => Vec::new(),
+        };
+        // The doorbells below may restart the endpoint.
+        self.rang(slot, dci);
         fence(Ordering::SeqCst);
         for value in doorbells {
             self.registers
-                .write32(self.doorbells + 4 * usize::from(slot), *value);
+                .write32(self.doorbells + 4 * usize::from(slot), value);
         }
-        Ok(())
+        Some(Ok(()))
     }
 
-    /// Linux xhci_reset_halted_ep: Reset Endpoint, with TSP for a soft reset.
-    pub(super) fn reset_halted(&mut self, slot: u8, dci: u8, flags: u32) -> Result<(), BlockError> {
-        let target = u32::from(slot) << 24 | u32::from(dci) << 16;
-        match self.command(0, 0, RESET_ENDPOINT << 10 | flags | target) {
-            Ok(_) => Ok(()),
-            Err(BlockError::Device { .. }) if !self.command_poisoned => Ok(()),
-            Err(error) => Err(error),
+    fn recovery_queue(&mut self, slot: u8, dci: u8) -> Option<&mut Queue> {
+        let endpoint = self.slot(slot).ok()?.endpoints.get_mut(usize::from(dci))?;
+        Some(&mut endpoint.as_mut()?.ring.normal)
+    }
+
+    fn recovery_failed(&mut self, slot: u8, dci: u8, failed: Failed, error: &BlockError) {
+        let Some(endpoint) = self
+            .slot(slot)
+            .ok()
+            .and_then(|state| state.endpoints[usize::from(dci)].as_mut())
+        else {
+            return;
+        };
+        match failed {
+            Failed::Td(event) => {
+                let _ = endpoint.ring.normal.event(event);
+            }
+            Failed::Stream(stream) => {
+                if let Some(streams) = &mut endpoint.streams {
+                    streams.reset_failed(stream, error);
+                }
+            }
+            Failed::Endpoint => {}
         }
     }
 
@@ -210,7 +293,23 @@ impl Controller {
         request: [u8; 8],
         out: &[u8],
     ) -> Result<Control, BlockError> {
-        self.live_slot(slot)?;
+        block_on(Self::start_control_owned_with(
+            &Access::blocking(self, None),
+            slot,
+            request,
+            out,
+        ))
+    }
+
+    /// [`Self::start_control_owned`], its hub status reads for the current
+    /// a PORT_POWER or SET_CONFIGURATION request reserves made through `a`.
+    pub(super) async fn start_control_owned_with(
+        a: &Access<'_>,
+        slot: u8,
+        request: [u8; 8],
+        out: &[u8],
+    ) -> Result<Control, BlockError> {
+        a.with(|c| c.live_slot(slot))?;
         // Any raw class requester must acquire the same physical-port current
         // reservation as enumeration before publishing a PORT_POWER request.
         if request[0] == 0x23 && request[2..4] == PORT_POWER.to_le_bytes() {
@@ -225,7 +324,8 @@ impl Controller {
                         "invalid USB hub PORT_POWER request",
                     ));
                 }
-                self.prepare_port_current(slot, request[4])?;
+                // Boxed: its status reads are controls of their own.
+                Box::pin(Self::prepare_port_current_with(a, slot, request[4])).await?;
             }
         }
         let configuration = request[0] == 0 && request[1] == SET_CONFIGURATION;
@@ -233,7 +333,9 @@ impl Controller {
             if request[3..] != [0; 5] || !out.is_empty() {
                 return Err(BlockError::Unsupported("invalid SET_CONFIGURATION request"));
             }
-            if self.slot(slot)?.endpoints[2..].iter().any(Option::is_some) {
+            if a.with(|c| {
+                Ok::<_, BlockError>(c.slot(slot)?.endpoints[2..].iter().any(Option::is_some))
+            })? {
                 return Err(BlockError::Unsupported(
                     "USB configuration change requires endpoint teardown",
                 ));
@@ -241,15 +343,21 @@ impl Controller {
         }
         // A timeout may occur after the device accepted the request; do not
         // preserve the old value or infer success from cancellation of EP0.
-        self.endpoint_ready_owned(slot, 1)?;
+        a.with(|c| c.endpoint_ready_owned(slot, 1))?;
         let configuration = if configuration {
-            let demand = self.prepare_current_configuration(slot, request[2])?;
-            self.slot(slot)?.current_configuration = None;
+            let demand = Box::pin(Self::prepare_current_configuration_with(
+                a, slot, request[2],
+            ))
+            .await?;
+            a.with(|c| {
+                c.slot(slot)?.current_configuration = None;
+                Ok::<_, BlockError>(())
+            })?;
             Some((request[2], demand))
         } else {
             None
         };
-        self.start_control(slot, request, out, configuration)
+        a.with(|c| c.start_control(slot, request, out, configuration))
     }
 
     /// Only the topology owner can mint this capability, after every old alias
@@ -297,25 +405,33 @@ impl Controller {
         self.run_control(control)
     }
 
-    pub(super) fn descriptor(
-        &mut self,
+    pub(super) async fn descriptor_with(
+        a: &Access<'_>,
         slot: u8,
         kind: u8,
         index: u8,
         length: u16,
     ) -> Result<Vec<u8>, BlockError> {
         let value = u16::from(kind) << 8 | u16::from(index);
-        self.control_owned(
+        a.control(
             slot,
             setup(DEVICE_TO_HOST, GET_DESCRIPTOR, value, 0, length),
             &[],
         )
+        .await
     }
 
     /// Linux `usb_get_langid`: the first language string descriptor 0 lists,
     /// English when it lists none, and no strings when it cannot be read.
+    #[cfg(test)]
     pub(super) fn language(&mut self, slot: u8) -> Option<u16> {
-        let bytes = self.descriptor(slot, STRING_DESCRIPTOR, 0, 255).ok()?;
+        block_on(Self::language_with(&Access::blocking(self, None), slot))
+    }
+
+    pub(super) async fn language_with(a: &Access<'_>, slot: u8) -> Option<u16> {
+        let bytes = Self::descriptor_with(a, slot, STRING_DESCRIPTOR, 0, 255)
+            .await
+            .ok()?;
         if bytes.get(1).is_some_and(|kind| *kind != STRING_DESCRIPTOR) {
             return Some(LANGUAGE_EN_US);
         }
@@ -338,12 +454,26 @@ impl Controller {
     }
 
     pub(super) fn string_owned(&mut self, slot: u8, language: u16, index: u8) -> Option<String> {
+        block_on(Self::string_with(
+            &Access::blocking(self, None),
+            slot,
+            language,
+            index,
+        ))
+    }
+
+    pub(super) async fn string_with(
+        a: &Access<'_>,
+        slot: u8,
+        language: u16,
+        index: u8,
+    ) -> Option<String> {
         if index == 0 {
             return None;
         }
         let value = u16::from(STRING_DESCRIPTOR) << 8 | u16::from(index);
         let request = setup(DEVICE_TO_HOST, GET_DESCRIPTOR, value, language, 255);
-        let bytes = self.control_owned(slot, request, &[]).ok()?;
+        let bytes = a.control(slot, request, &[]).await.ok()?;
         if bytes.len() < 2 || bytes[1] != STRING_DESCRIPTOR {
             return None;
         }

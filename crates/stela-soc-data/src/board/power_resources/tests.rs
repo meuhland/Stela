@@ -504,6 +504,32 @@ fn positive_admission_is_atomic_and_preserves_independent_hardware_obligations()
 }
 
 #[test]
+fn a_retired_nonce_entanglement_claim_is_a_valid_preparation_note() {
+    let defaults = |claimed: bool| {
+        let properties: &[(&str, &[u8])] = if claimed {
+            &[("name", b"defaults"), ("entangle-nonce", b"\x01\0\0\0")]
+        } else {
+            &[("name", b"defaults")]
+        };
+        encode(properties, &[])
+    };
+    let watched = encode(&[("name", b"watchdog"), ("clock-gates", &words(&[1]))], &[]);
+    let note = ["/defaults entangle-nonce".into()];
+    for (claimed, admitted) in [(false, true), (true, false)] {
+        let io = tree(&[(1, Some(0), [0, 0])], core::slice::from_ref(&watched));
+        let bytes = encode(&[("name", b"device-tree")], &[defaults(claimed), io]);
+        let mut states = power_states(
+            &Node::root(&bytes).unwrap(),
+            &flat_fixture_extent(&Some),
+            0x8112,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(states.apply_admission(&bytes, &note).is_ok(), admitted);
+    }
+}
+
+#[test]
 fn preparation_notes_are_validated_without_retiring_resources() {
     let watched = encode(
         &[

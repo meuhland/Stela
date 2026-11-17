@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sun, 15 Nov 2026 17:45:50 +0000
+Subject: [PATCH] radv: fail only a submission the kernel refused short of
+ losing the context, make its signals and keep the failure for the caller
+
+A submission amdgpu_cs refused with an error other than ECANCELED, ENODATA
+or ETIME (which RADV answers VK_ERROR_DEVICE_LOST), or whose preambles could
+not be made, lost the device: every client of it then saw
+VK_ERROR_DEVICE_LOST. Its signals are now made by a submission of no commands
+with the same waits on the same context and ring, and its failure is kept,
+named by those signals, for the caller to take, as NVK keeps one. A context
+the kernel lost still loses the device.
+---
+ src/amd/vulkan/radv_queue.c | 160 +++++++++++++++++++++++++++++++++++-
+ src/amd/vulkan/radv_queue.h |  36 ++++++++
+ 2 files changed, 195 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index 44090de..9c84c6f 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -18,12 +18,16 @@
+ #include "radv_device_memory.h"
+ #include "radv_image.h"
+ #include "vk_common_entrypoints.h"
++#include "vk_enum_to_str.h"
+ #include "vk_semaphore.h"
+ #include "vk_sync.h"
+ 
+ #include "ac_cmdbuf.h"
+ #include "ac_debug.h"
+ #include "ac_descriptors.h"
++#include "util/u_atomic.h"
++
++#include <stdio.h>
+ 
+ enum radeon_ctx_priority
+ radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj)
+@@ -1902,6 +1906,148 @@ fail:
+    return result;
+ }
+ 
++/* Keeps a failure for the caller under the submission's signals; one with
++ * none waits for the next submission that signals.
++ */
++static void
++radv_queue_name_failure(struct radv_queue *queue, struct vk_queue_submit *submission, VkResult result)
++{
++   if (result == VK_SUCCESS) {
++      if (likely(queue->unnamed_failure == VK_SUCCESS))
++         return;
++      result = queue->unnamed_failure;
++   }
++
++   if (submission->signal_count == 0) {
++      /* Stela's device ends every submission with a signal, so a refused
++       * submission without one is an earlier part of the same command
++       * buffer: its next signalling submission names it.
++       */
++      if (queue->unnamed_failure == VK_SUCCESS)
++         fprintf(stderr,
++                 "radv: a refused submission signals nothing; the next one that signals carries its failure (%s)\n",
++                 vk_Result_to_str(result));
++      queue->unnamed_failure = result;
++      return;
++   }
++   queue->unnamed_failure = VK_SUCCESS;
++
++   simple_mtx_lock(&queue->failures_mutex);
++   for (uint32_t i = 0; i < submission->signal_count; i++) {
++      uint32_t count = queue->failure_count;
++      /* The oldest goes when nobody asked for it; the next take that finds
++       * no record reports it. Only one is kept so: a second is lost with
++       * its count, and said so.
++       */
++      if (count == RADV_QUEUE_MAX_FAILURES) {
++         const VkResult oldest = queue->failures[0].result;
++         memmove(&queue->failures[0], &queue->failures[1], (count - 1) * sizeof(queue->failures[0]));
++         count--;
++         if (queue->dropped_failure == VK_SUCCESS) {
++            fprintf(stderr,
++                    "radv: %u refused submissions are unasked; the oldest one's failure (%s) goes to the next "
++                    "take that finds no record\n",
++                    count + 1, vk_Result_to_str(oldest));
++            p_atomic_set((int *)&queue->dropped_failure, oldest);
++         } else {
++            fprintf(stderr,
++                    "radv: %u refused submissions are unasked and one is already dropped; the oldest one's "
++                    "failure (%s) is lost and its command buffer reports success\n",
++                    count + 1, vk_Result_to_str(oldest));
++            if (queue->failures_outstanding != NULL)
++               p_atomic_dec(queue->failures_outstanding);
++         }
++      }
++      if (queue->failures_outstanding != NULL)
++         p_atomic_inc(queue->failures_outstanding);
++      queue->failures[count] = (struct radv_queue_failure){
++         .sync = submission->signals[i].sync,
++         .value = submission->signals[i].signal_value,
++         .result = result,
++      };
++      p_atomic_set(&queue->failure_count, count + 1);
++   }
++   simple_mtx_unlock(&queue->failures_mutex);
++}
++
++/* A submission the kernel refused short of losing the context (amdgpu_cs
++ * answering an error other than ECANCELED, ENODATA or ETIME, which RADV
++ * answers VK_ERROR_DEVICE_LOST, or a preamble that could not be made): what
++ * of it was not submitted is dropped, and its signals are made by a
++ * submission of no commands with the same waits on the same context and
++ * ring, so they come after its waits and whatever of it did run. The
++ * failure is kept for the caller. A context the kernel lost still loses the
++ * device.
++ */
++static VkResult
++radv_queue_refuse(struct radv_queue *queue, struct vk_queue_submit *submission, VkResult failure)
++{
++   if (failure == VK_ERROR_DEVICE_LOST)
++      return failure;
++
++   /* Kept before the signals are made: whoever sees them sees the failure */
++   radv_queue_name_failure(queue, submission, failure);
++   if (submission->signal_count == 0)
++      return VK_SUCCESS;
++
++   VkResult result = radv_queue_submit_empty(queue, submission);
++   if (result != VK_SUCCESS)
++      return result;
++
++   fprintf(stderr, "radv: a submission failed (%s); its signals were made and the queue goes on\n",
++           vk_Result_to_str(failure));
++   return VK_SUCCESS;
++}
++
++/* Drops the kept failures nobody will take and answers how many there were,
++ * which the caller's count still holds.
++ */
++uint32_t
++radv_queue_forget_failures(struct radv_queue *queue)
++{
++   if (likely(p_atomic_read(&queue->failure_count) == 0 &&
++              p_atomic_read((int *)&queue->dropped_failure) == VK_SUCCESS))
++      return 0;
++
++   simple_mtx_lock(&queue->failures_mutex);
++   uint32_t count = queue->failure_count;
++   p_atomic_set(&queue->failure_count, 0);
++   if (queue->dropped_failure != VK_SUCCESS) {
++      p_atomic_set((int *)&queue->dropped_failure, VK_SUCCESS);
++      count++;
++   }
++   simple_mtx_unlock(&queue->failures_mutex);
++   return count;
++}
++
++VkResult
++radv_queue_take_failure(struct radv_queue *queue, struct vk_sync *sync, uint64_t value)
++{
++   if (likely(p_atomic_read(&queue->failure_count) == 0 &&
++              p_atomic_read((int *)&queue->dropped_failure) == VK_SUCCESS))
++      return VK_SUCCESS;
++
++   VkResult result = VK_SUCCESS;
++   bool found = false;
++   simple_mtx_lock(&queue->failures_mutex);
++   const uint32_t count = queue->failure_count;
++   for (uint32_t i = 0; i < count; i++) {
++      if (queue->failures[i].sync != sync || queue->failures[i].value != value)
++         continue;
++      result = queue->failures[i].result;
++      memmove(&queue->failures[i], &queue->failures[i + 1], (count - i - 1) * sizeof(queue->failures[0]));
++      p_atomic_set(&queue->failure_count, count - 1);
++      found = true;
++      break;
++   }
++   if (!found && queue->dropped_failure != VK_SUCCESS) {
++      result = queue->dropped_failure;
++      p_atomic_set((int *)&queue->dropped_failure, VK_SUCCESS);
++   }
++   simple_mtx_unlock(&queue->failures_mutex);
++   return result;
++}
++
+ static VkResult
+ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+ {
+@@ -1915,10 +2061,16 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+    if (!submission->command_buffer_count && !submission->wait_count && !submission->signal_count)
+       return VK_SUCCESS;
+ 
++   /* An earlier failure that signaled nothing is kept under this
++    * submission's signals before they are made.
++    */
++   radv_queue_name_failure(queue, submission, VK_SUCCESS);
+    if (!submission->command_buffer_count) {
+       result = radv_queue_submit_empty(queue, submission);
+    } else {
+       result = radv_queue_submit_normal(queue, submission);
++      if (result != VK_SUCCESS)
++         result = radv_queue_refuse(queue, submission, result);
+    }
+ 
+ fail:
+@@ -1970,9 +2122,13 @@ radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
+    else
+       queue->hw_ctx = device->hw_ctx[queue->priority];
+ 
++   simple_mtx_init(&queue->failures_mutex, mtx_plain);
++
+    VkResult result = vk_queue_init(&queue->vk, &device->vk, create_info, idx);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      simple_mtx_destroy(&queue->failures_mutex);
+       return result;
++   }
+ 
+    queue->state.uses_shadow_regs = device->uses_shadow_regs && queue->state.qf == RADV_QUEUE_GENERAL;
+    if (queue->state.uses_shadow_regs) {
+@@ -2013,6 +2169,7 @@ radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
+    return VK_SUCCESS;
+ fail:
+    vk_queue_finish(&queue->vk);
++   simple_mtx_destroy(&queue->failures_mutex);
+    return result;
+ }
+ 
+@@ -2097,6 +2254,7 @@ radv_queue_finish(struct radv_queue *queue)
+ 
+    radv_queue_state_finish(&queue->state, device);
+    vk_queue_finish(&queue->vk);
++   simple_mtx_destroy(&queue->failures_mutex);
+ }
+ 
+ enum amd_ip_type
+diff --git a/src/amd/vulkan/radv_queue.h b/src/amd/vulkan/radv_queue.h
+index c9865f4..94356b4 100644
+--- a/src/amd/vulkan/radv_queue.h
++++ b/src/amd/vulkan/radv_queue.h
+@@ -12,6 +12,7 @@
+ #define RADV_QUEUE_H
+ 
+ #include "vk_queue.h"
++#include "util/simple_mtx.h"
+ 
+ #include "radv_radeon_winsys.h"
+ 
+@@ -81,6 +82,19 @@ struct radv_queue_state {
+    uint32_t shadow_regs_ib_size_dw;
+ };
+ 
++/* A submission the kernel refused short of losing the context, named by one
++ * of its signals. Its signals were still made, after its waits and the
++ * queue's earlier work, so the queue goes on; the caller asks for the
++ * failure when the signal shows.
++ */
++struct radv_queue_failure {
++   struct vk_sync *sync;
++   uint64_t value;
++   VkResult result;
++};
++
++#define RADV_QUEUE_MAX_FAILURES 16
++
+ struct radv_queue {
+    struct vk_queue vk;
+    struct radeon_winsys_ctx *hw_ctx;
+@@ -93,8 +107,30 @@ struct radv_queue {
+    bool sqtt_present;
+ 
+    VkCommandPool utrace_command_pool;
++
++   simple_mtx_t failures_mutex;
++   /* Read without the lock to skip it while nothing failed */
++   uint32_t failure_count;
++   /* The caller's count of failure records it has not settled, taken ones
++    * too, or NULL: raised before the refused submission's signals are made,
++    * so whoever sees them made sees it raised.
++    */
++   uint32_t *failures_outstanding;
++   struct radv_queue_failure failures[RADV_QUEUE_MAX_FAILURES];
++   /* A refused submission that signaled nothing, given to the next
++    * submission that signals
++    */
++   VkResult unnamed_failure;
++   /* The failure of the oldest record, dropped unasked when the records
++    * were full: the next take that finds no record answers it. One is kept
++    * until then. Under failures_mutex; read without it to skip the lock.
++    */
++   VkResult dropped_failure;
+ };
+ 
++VkResult radv_queue_take_failure(struct radv_queue *queue, struct vk_sync *sync, uint64_t value);
++uint32_t radv_queue_forget_failures(struct radv_queue *queue);
++
+ VK_DEFINE_HANDLE_CASTS(radv_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
+ 
+ static inline struct radv_device *
+-- 
+2.56.1
+

@@ -8,12 +8,14 @@ public struct HostGPU: Codable, Equatable, Sendable {
   public let pciID: String?
   public let vramBytes: UInt64?
 
-  /// The product name for a known PCI device, else NVIDIA's chip name.
+  /// The product name for a known PCI device, else the vendor's chip name:
+  /// AMD's for an `1002:` PCI ID, NVIDIA's otherwise.
   public var name: String? {
     if let pciID, let product = HostInventory.nvidiaProducts[pciID.lowercased()] {
       return "NVIDIA GeForce \(product)"
     }
-    return chip.map { "NVIDIA \($0)" }
+    let vendor = pciID?.lowercased().hasPrefix("1002:") == true ? "AMD" : "NVIDIA"
+    return chip.map { "\(vendor) \($0)" }
   }
 }
 

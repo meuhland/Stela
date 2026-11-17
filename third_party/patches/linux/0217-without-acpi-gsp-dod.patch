@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kiki <duarduar707@gmail.com>
+Date: Tue, 17 Nov 2026 07:43:35 +0700
+Subject: [PATCH] fix(nouveau): without ACPI, GSP-RM's system info gets the
+ _DOD display IDs and JT and NVOP capabilities boot read from the GPU's ACPI
+ companion, where it got none and knew no internal panel
+
+---
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c | 47 +++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
+index a6dbdbb8e008aacd5b3535559332b762d96955bb..7650027f4d84fe3bc65d3b61c79be28110c7983a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
+@@ -14,6 +14,11 @@
+ #include <core/pci.h>
+ #include <subdev/pci/priv.h>
+ 
++#if !(defined(CONFIG_ACPI) && defined(CONFIG_X86))
++#include <linux/pci.h>
++#include <stela/backlight.h>
++#endif
++
+ static u32
+ r570_gsp_sr_data_size(struct nvkm_gsp *gsp)
+ {
+@@ -154,6 +159,48 @@ r570_gsp_acpi_info(struct nvkm_gsp *gsp, ACPI_METHOD_DATA *acpi)
+ 	r535_gsp_acpi_dod(handle, &acpi->dodMethodData);
+ 	r535_gsp_acpi_jt(handle, &acpi->jtMethodData);
+ 	r535_gsp_acpi_caps(handle, &acpi->capsMethodData);
++#else
++	/*
++	 * No ACPI here: boot read the GPU companion's _DOD and its JT and
++	 * NVOP capabilities itself before the GPU started. GSP-RM gets them
++	 * as the ACPI path above fills them; without a _DOD it knows no
++	 * internal panel and refuses its backlight.
++	 */
++	struct pci_dev *pdev = container_of(gsp->subdev.device, struct nvkm_device_pci,
++					    device)->pdev;
++	u32 domain = pci_domain_nr(pdev->bus), bus = pdev->bus->number, devfn = pdev->devfn;
++	DOD_METHOD_DATA *dod = &acpi->dodMethodData;
++	u32 count = 0, value;
++	int dod_ret, jt_ret, caps_ret;
++
++	dod->status = 0xffff;
++	acpi->jtMethodData.status = 0xffff;
++	acpi->capsMethodData.status = 0xffff;
++
++	dod_ret = stela_linux_gpu_acpi_dod(domain, bus, devfn, dod->acpiIdList,
++					   ARRAY_SIZE(dod->acpiIdList), &count);
++	if (!dod_ret) {
++		dod->acpiIdListLen = count * sizeof(dod->acpiIdList[0]);
++		dod->status = 0;
++	}
++
++	jt_ret = stela_linux_gpu_acpi_caps(domain, bus, devfn, 0, &value);
++	if (!jt_ret) {
++		acpi->jtMethodData.status = 0;
++		acpi->jtMethodData.jtCaps = value;
++		acpi->jtMethodData.jtRevId = (value & 0xfff00000) >> 20;
++		acpi->jtMethodData.bSBIOSCaps = 0;
++	}
++
++	caps_ret = stela_linux_gpu_acpi_caps(domain, bus, devfn, 1, &value);
++	if (!caps_ret) {
++		acpi->capsMethodData.status = 0;
++		acpi->capsMethodData.optimusCaps = value;
++	}
++
++	acpi->bValid = !dod_ret || !jt_ret || !caps_ret;
++	nvkm_info(&gsp->subdev, "ACPI from boot: _DOD %d (%u ids), JT %d, NVOP %d\n",
++		  dod_ret, count, jt_ret, caps_ret);
+ #endif
+ }
+ 

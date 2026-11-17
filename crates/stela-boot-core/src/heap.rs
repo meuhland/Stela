@@ -6,10 +6,13 @@
 //!
 //! The system engine allocates and frees small blocks constantly. Blocks of up
 //! to 4 KiB with at most 16-byte alignment are therefore rounded up to a
-//! power-of-two size class and, once freed, kept on that class's LIFO list
-//! for the next allocation of the class instead of returning to the bins.
-//! When the bins cannot serve a request, the class lists return to them, so
-//! blocks of one size never starve a request of another.
+//! power-of-two size class and served from slabs: runs of 16 to 64 KiB, each
+//! carved from the bins at an address aligned to its size and cut into
+//! blocks of one class, with no header per block. A freed block goes back to
+//! its slab, found from its address; a slab whose blocks are all free goes
+//! back to the bins whole, but for one kept per class. Small blocks therefore
+//! take no headers, never lie scattered among large ones, and the memory a
+//! class no longer uses returns to the bins as extents of tens of KiB.
 //!
 //! Every PE on a core of its own allocates at once, so each core the engine
 //! runs on keeps a small cache of free blocks per class ([`Heap::tag_cpu`]),
@@ -19,10 +22,9 @@
 //! counts packed beside other cores' would move their line between the
 //! cores on every allocation and free.
 //!
-//! Small blocks that live for different lengths of time leave holes, and a
-//! long run can hold a fifth of the heap free with no extent of a few MiB, so
-//! the engine keeps the heap's end out of the main bins ([`Heap::reserve_tail`]):
-//! a large request the main bins cannot serve takes it. Linux keeps
+//! Blocks that live for different lengths of time leave holes, so the engine
+//! keeps the heap's end out of the main bins ([`Heap::reserve_tail`]): a
+//! large request the main bins cannot serve takes it. Linux keeps
 //! `ZONE_MOVABLE` and CMA apart from unmovable allocations for the same reason.
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -35,6 +37,7 @@ use core::{
 // Explicit, so the NVIDIA LUT fixture can compile this file by path.
 #[path = "heap/failure.rs"]
 mod failure;
+pub use failure::{FailedHeap, Failure};
 #[path = "heap/tally.rs"]
 pub mod tally;
 
@@ -51,6 +54,25 @@ const PEAK_STEP: usize = 64 << 20;
 /// Sets the hook [`PEAK_HOOK`] calls.
 pub fn set_peak_hook(hook: fn(usize)) {
     PEAK_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Called as each allocation begins, before the heap takes its lock or this
+/// processor's cache: the boot may give a long host job's processor back
+/// there, and the allocation then goes on later, on any processor.
+static ALLOCATION_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the hook [`ALLOCATION_HOOK`] calls.
+pub fn set_allocation_hook(hook: fn()) {
+    ALLOCATION_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn allocation_begins() {
+    let hook = ALLOCATION_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        // SAFETY: only `set_allocation_hook` stores a nonzero value, a `fn()`.
+        let hook: fn() = unsafe { core::mem::transmute(hook) };
+        hook();
+    }
 }
 
 fn passed_peak(carved: usize) {
@@ -188,6 +210,47 @@ struct Small {
 const SMALLEST: usize = 16;
 const CLASSES: usize = 9;
 const SMALL_ALIGNMENT: usize = 16;
+
+/// A slab's bookkeeping, after the boundary tag at its aligned start; its
+/// blocks follow from [`SLAB_FIRST`]. Read and written with the lock held.
+#[repr(C)]
+struct Slab {
+    /// Its neighbours in its class's list of slabs with free blocks.
+    next: *mut Slab,
+    previous: *mut Slab,
+    /// Its freed blocks.
+    free: *mut Small,
+    /// Blocks out of the slab: live, or in a core's cache.
+    used: u32,
+    /// Blocks from this index on were never handed out.
+    fresh: u32,
+    capacity: u32,
+}
+/// Where a slab's first block lies from its aligned start: past its
+/// boundary tag and its [`Slab`].
+const SLAB_FIRST: usize = 64;
+const _: () = assert!(HEADER_BYTES + core::mem::size_of::<Slab>() <= SLAB_FIRST);
+/// Slabs are at least this large, and at most [`SLAB_LARGEST`]: a class's
+/// slab holds 64 of its blocks within those bounds.
+const SLAB_SMALLEST: usize = 16 << 10;
+const SLAB_LARGEST: usize = 64 << 10;
+
+/// The bytes of a slab of `class`, a power of two its slabs are aligned to.
+const fn slab_bytes(class: usize) -> usize {
+    let bytes = (SMALLEST << class) * 64;
+    if bytes < SLAB_SMALLEST {
+        SLAB_SMALLEST
+    } else if bytes > SLAB_LARGEST {
+        SLAB_LARGEST
+    } else {
+        bytes
+    }
+}
+
+/// The slab of `block`, a block of `class`.
+fn slab_of(block: *mut u8, class: usize) -> *mut Slab {
+    ((block as usize & !(slab_bytes(class) - 1)) + HEADER_BYTES) as *mut Slab
+}
 /// Cores with a cache of their own; later ones take the lock every time.
 const CPUS: usize = 64;
 /// Free blocks a core keeps per class, and moves to or from the class list
@@ -340,7 +403,13 @@ struct State {
     pools: [Bins; 2],
     /// Free blocks in the bins.
     extents: usize,
-    small: [*mut Small; CLASSES],
+    /// Each class's slabs with free blocks, the one taken from first at the
+    /// head, and the empty slab it keeps.
+    partial: [*mut Slab; CLASSES],
+    spare: [*mut Slab; CLASSES],
+    /// Slabs carved, and the bytes of their blocks not out of them.
+    slabs: usize,
+    slab_free: usize,
     ready: bool,
     total: usize,
     /// Bytes allocated and not freed, size-class blocks by their class.
@@ -450,6 +519,45 @@ impl State {
         }
     }
 
+    /// Link `slab` of `class` at the head of its class's list: the slab
+    /// taken from next.
+    ///
+    /// # Safety
+    /// The lock is held and `slab` is a slab of `class` in no list.
+    unsafe fn list_slab(&mut self, class: usize, slab: *mut Slab) {
+        let head = self.partial[class];
+        // SAFETY: the caller's slab; `head`, when not null, is a listed one.
+        unsafe {
+            (*slab).next = head;
+            (*slab).previous = ptr::null_mut();
+            if !head.is_null() {
+                (*head).previous = slab;
+            }
+        }
+        self.partial[class] = slab;
+    }
+
+    /// Unlink `slab` of `class` from its class's list.
+    ///
+    /// # Safety
+    /// The lock is held and `slab` is in the list of `class`.
+    unsafe fn unlist_slab(&mut self, class: usize, slab: *mut Slab) {
+        // SAFETY: the caller's listed slab and its listed neighbours.
+        unsafe {
+            let (next, previous) = ((*slab).next, (*slab).previous);
+            if !next.is_null() {
+                (*next).previous = previous;
+            }
+            if previous.is_null() {
+                self.partial[class] = next;
+            } else {
+                (*previous).next = next;
+            }
+            (*slab).next = ptr::null_mut();
+            (*slab).previous = ptr::null_mut();
+        }
+    }
+
     fn count_large(&mut self, bytes: usize, allocated: bool) {
         let (count, total) = &mut self.large[large_bucket(bytes)];
         if allocated {
@@ -473,6 +581,11 @@ pub struct Usage {
     pub largest: usize,
     /// Free blocks in the bins.
     pub extents: usize,
+    /// Size-class slabs carved, and the bytes of their blocks that are
+    /// free in them: what the classes keep beside their live blocks, short
+    /// of the cores' caches.
+    pub slabs: usize,
+    pub slab_free: usize,
     /// Allocations the bins served.
     pub carves: u64,
     /// Live allocations the bins served, as count and bytes by power
@@ -488,9 +601,11 @@ pub struct Heap {
     failures: AtomicU64,
     /// Where the first failed allocation is reported; it must not allocate.
     failure_sink: fn(core::fmt::Arguments<'_>),
-    /// The first failed allocation's bytes and alignment, for a report that
-    /// can no longer ask the heap ([`Heap::first_failure`]).
-    failed: [AtomicUsize; 2],
+    /// The first failed allocation's bytes and alignment, then the heap's
+    /// live, carved, largest free and total bytes when it failed (all zero
+    /// where the metadata was held), for a report that can no longer ask
+    /// the heap ([`Heap::first_failure`]).
+    failed: [AtomicUsize; 6],
     state: UnsafeCell<State>,
     /// Each tagged core's cache and counts.
     cores: [Core; CPUS],
@@ -528,11 +643,9 @@ impl Heap {
         }
     }
 
-    /// The bytes and alignment of the first allocation that found no
-    /// memory, once one has.
-    pub fn first_failure(&self) -> Option<(usize, usize)> {
-        let align = self.failed[1].load(Ordering::Acquire);
-        (align != 0).then(|| (self.failed[0].load(Ordering::Relaxed), align))
+    /// The first allocation that found no memory, once one has.
+    pub fn first_failure(&self) -> Option<Failure> {
+        failure::first(self)
     }
 
     pub const fn new() -> Self {
@@ -541,7 +654,7 @@ impl Heap {
             failure_reported: AtomicBool::new(false),
             failures: AtomicU64::new(0),
             failure_sink: |_| {},
-            failed: [const { AtomicUsize::new(0) }; 2],
+            failed: [const { AtomicUsize::new(0) }; 6],
             cores: [const { Core::new() }; CPUS],
             tagged: AtomicUsize::new(0),
             any_tagged: AtomicBool::new(false),
@@ -557,7 +670,10 @@ impl Heap {
                 floor: 0,
                 pools: [Bins::EMPTY; 2],
                 extents: 0,
-                small: [ptr::null_mut(); CLASSES],
+                partial: [ptr::null_mut(); CLASSES],
+                spare: [ptr::null_mut(); CLASSES],
+                slabs: 0,
+                slab_free: 0,
                 ready: false,
                 total: 0,
                 live: 0,
@@ -836,8 +952,8 @@ impl Heap {
     /// Whether more than three quarters of the heap is allocated, as the
     /// lock and each core's cache last left it, or so nearly all of the main
     /// bins' bytes are out of them that a large request may find no block:
-    /// freed small blocks wait in their classes, and what they free between
-    /// live ones is holes.
+    /// free blocks wait in their slabs and the cores' caches, and what is
+    /// freed between live blocks is holes.
     pub fn low(&self) -> bool {
         let total = self.total.load(Ordering::Relaxed);
         self.live() > total / 4 * 3
@@ -851,8 +967,8 @@ impl Heap {
 
     /// The bytes no block was carved from, the reserve's with the main
     /// bins', as the lock last left them: what a large request can surely
-    /// still find, short of the holes between live blocks and the freed
-    /// small blocks their classes keep. A cache that may grow asks it
+    /// still find, short of the holes between live blocks and the free
+    /// blocks the slabs keep. A cache that may grow asks it
     /// without taking the lock.
     pub fn room(&self) -> usize {
         self.room.load(Ordering::Relaxed)
@@ -927,17 +1043,8 @@ impl Heap {
             // CPU-local cache ownership is already exclusive to this core.
             let state = unsafe { &mut *self.state.get() };
             while cache.counts[class] < BATCH {
-                let head = state.small[class];
-                let block = if head.is_null() {
-                    // SAFETY: the initialized heap is exclusively guarded;
-                    // this class supplies its nonzero extent and alignment.
-                    unsafe { carve_draining(state, SMALLEST << class, SMALL_ALIGNMENT) }
-                } else {
-                    // SAFETY: the guarded class head is a complete free Small
-                    // node previously published by matching deallocation.
-                    state.small[class] = unsafe { (*head).next };
-                    head.cast()
-                };
+                // SAFETY: the initialized heap is exclusively guarded.
+                let block = unsafe { slab_take(state, class) };
                 if block.is_null() {
                     break;
                 }
@@ -971,12 +1078,7 @@ impl Heap {
                 cache.counts[class] -= 1;
                 let freed = cache.blocks[class][cache.counts[class]];
                 // SAFETY: a free block of this class that only the cache held.
-                unsafe {
-                    freed.write(Small {
-                        next: state.small[class],
-                    })
-                };
-                state.small[class] = freed;
+                unsafe { slab_give(state, class, freed.cast()) };
             }
         }
         cache.blocks[class][cache.counts[class]] = block.cast();
@@ -1114,6 +1216,8 @@ impl Heap {
             peak: state.peak,
             largest,
             extents: state.extents,
+            slabs: state.slabs,
+            slab_free: state.slab_free,
             carves: state.carves,
             large: state.large,
         }
@@ -1200,16 +1304,8 @@ unsafe fn allocate_locked(state: &mut State, layout: Layout, class: Option<usize
         }
         return block;
     };
-    let head = state.small[class];
-    let block = if head.is_null() {
-        // SAFETY: guarded initialized state and a validated nonzero class.
-        unsafe { carve_draining(state, SMALLEST << class, SMALL_ALIGNMENT) }
-    } else {
-        // SAFETY: a block of this class that `dealloc` linked and
-        // nothing else owns.
-        state.small[class] = unsafe { (*head).next };
-        head.cast()
-    };
+    // SAFETY: guarded initialized state and a validated class.
+    let block = unsafe { slab_take(state, class) };
     if !block.is_null() {
         state.live += SMALLEST << class;
     }
@@ -1221,6 +1317,7 @@ unsafe fn allocate_locked(state: &mut State, layout: Layout, class: Option<usize
 // the single matching deallocation.
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        allocation_begins();
         let class = class(layout);
         let cpu = self.cpu();
         let block = if let (Some(class), Some(cpu)) = (class, cpu) {
@@ -1272,15 +1369,9 @@ unsafe impl GlobalAlloc for Heap {
         let state = unsafe { &mut *self.state.get() };
         if let Some(class) = class {
             state.live -= SMALLEST << class;
-            let block = pointer.cast::<Small>();
-            // SAFETY: the caller's block of this class, at least 16 bytes
-            // and 16-byte aligned, which it no longer accesses.
-            unsafe {
-                block.write(Small {
-                    next: state.small[class],
-                })
-            };
-            state.small[class] = block;
+            // SAFETY: the caller's block of this class, which it no longer
+            // accesses.
+            unsafe { slab_give(state, class, pointer) };
         } else {
             state.live -= layout.size();
             state.count_large(layout.size(), false);
@@ -1516,7 +1607,8 @@ unsafe fn carve(state: &mut State, pool: usize, size: usize, alignment: usize) -
 }
 
 /// [`carve`] from the main bins, then from the reserve for a large request,
-/// giving the class lists back to the bins and trying both when that fails.
+/// giving the classes' empty slabs back to the bins and trying both when
+/// that fails.
 ///
 /// # Safety
 /// The heap's lock is held and `state` is initialized.
@@ -1530,25 +1622,230 @@ unsafe fn carve_draining(state: &mut State, size: usize, alignment: usize) -> *m
     if !block.is_null() {
         return block;
     }
-    for class in 0..CLASSES {
-        let mut head = core::mem::replace(&mut state.small[class], ptr::null_mut());
-        while !head.is_null() {
-            // SAFETY: a freed block `carve` made for this class, which only
-            // this list owned.
-            unsafe {
-                let next = (*head).next;
-                release(state, head.cast());
-                head = next;
-            }
+    // SAFETY: as above.
+    if unsafe { release_spares(state) } {
+        // SAFETY: as above.
+        let block = unsafe { carve(state, MAIN, size, alignment) };
+        if !block.is_null() {
+            return block;
         }
     }
     // SAFETY: as above.
-    let block = unsafe { carve(state, MAIN, size, alignment) };
-    if !block.is_null() {
-        return block;
-    }
-    // SAFETY: as above.
     unsafe { carve(state, RESERVE, size, alignment) }
+}
+
+/// Give each class's empty slab back to the bins: whether there was any.
+///
+/// # Safety
+/// The heap's lock is held.
+unsafe fn release_spares(state: &mut State) -> bool {
+    let mut released = false;
+    for class in 0..CLASSES {
+        let slab = core::mem::replace(&mut state.spare[class], ptr::null_mut());
+        if !slab.is_null() {
+            // SAFETY: the caller's lock; a slab of this class in no list.
+            unsafe { release_slab(state, class, slab) };
+            released = true;
+        }
+    }
+    released
+}
+
+/// A block of `class` from its slabs, carving a slab when none has a free
+/// block; null when the heap has no room for one.
+///
+/// # Safety
+/// The heap's lock is held and `state` is initialized.
+unsafe fn slab_take(state: &mut State, class: usize) -> *mut u8 {
+    let bytes = SMALLEST << class;
+    let mut slab = state.partial[class];
+    if slab.is_null() {
+        slab = core::mem::replace(&mut state.spare[class], ptr::null_mut());
+        if slab.is_null() {
+            // SAFETY: the caller's lock and initialized state.
+            slab = unsafe { new_slab(state, class) };
+            if slab.is_null() {
+                return ptr::null_mut();
+            }
+        }
+        // SAFETY: the caller's lock; a slab of this class in no list.
+        unsafe { state.list_slab(class, slab) };
+    }
+    // SAFETY: a listed slab, which has a free block: a freed one, or one
+    // never handed out below its capacity.
+    unsafe {
+        let block = if (*slab).free.is_null() {
+            let start = slab as usize - HEADER_BYTES;
+            let block = start + SLAB_FIRST + (*slab).fresh as usize * bytes;
+            (*slab).fresh += 1;
+            block as *mut u8
+        } else {
+            let block = (*slab).free;
+            (*slab).free = (*block).next;
+            block.cast()
+        };
+        (*slab).used += 1;
+        if (*slab).used == (*slab).capacity {
+            state.unlist_slab(class, slab);
+        }
+        state.slab_free -= bytes;
+        block
+    }
+}
+
+/// Return `block` of `class` to its slab, and a slab left empty to the bins
+/// unless its class keeps none.
+///
+/// # Safety
+/// The heap's lock is held and `block` is a block of `class` that
+/// [`slab_take`] handed out and nothing accesses any more.
+unsafe fn slab_give(state: &mut State, class: usize, block: *mut u8) {
+    let slab = slab_of(block, class);
+    // SAFETY: the slab the block was cut from, which holds it.
+    unsafe {
+        if (*slab).used == (*slab).capacity {
+            state.list_slab(class, slab);
+        }
+        let freed = block.cast::<Small>();
+        freed.write(Small { next: (*slab).free });
+        (*slab).free = freed;
+        (*slab).used -= 1;
+        state.slab_free += SMALLEST << class;
+        if (*slab).used == 0 {
+            state.unlist_slab(class, slab);
+            if state.spare[class].is_null() {
+                state.spare[class] = slab;
+            } else {
+                release_slab(state, class, slab);
+            }
+        }
+    }
+}
+
+/// A new, empty slab of `class`, in no list; null when no extent holds one.
+///
+/// # Safety
+/// The heap's lock is held and `state` is initialized.
+unsafe fn new_slab(state: &mut State, class: usize) -> *mut Slab {
+    let bytes = slab_bytes(class);
+    // SAFETY: the caller's lock and initialized state.
+    let mut start = unsafe { carve_slab(state, MAIN, bytes) };
+    // SAFETY: as above.
+    if start == 0 && unsafe { release_spares(state) } {
+        // SAFETY: as above.
+        start = unsafe { carve_slab(state, MAIN, bytes) };
+    }
+    if start == 0 {
+        // SAFETY: as above.
+        start = unsafe { carve_slab(state, RESERVE, bytes) };
+    }
+    if start == 0 {
+        return ptr::null_mut();
+    }
+    let slab = (start + HEADER_BYTES) as *mut Slab;
+    let capacity = (bytes - SLAB_FIRST) / (SMALLEST << class);
+    // SAFETY: the carved block's payload, which begins with the slab.
+    unsafe {
+        slab.write(Slab {
+            next: ptr::null_mut(),
+            previous: ptr::null_mut(),
+            free: ptr::null_mut(),
+            used: 0,
+            fresh: 0,
+            capacity: capacity as u32,
+        });
+    }
+    state.slabs += 1;
+    state.slab_free += capacity * (SMALLEST << class);
+    slab
+}
+
+/// Return empty `slab` of `class` to the bins.
+///
+/// # Safety
+/// The heap's lock is held; `slab` is in no list and none of its blocks is
+/// out of it.
+unsafe fn release_slab(state: &mut State, class: usize, slab: *mut Slab) {
+    // SAFETY: the caller's empty slab, the payload of a carved block.
+    unsafe {
+        state.slabs -= 1;
+        state.slab_free -= (*slab).capacity as usize * (SMALLEST << class);
+        release(state, slab.cast());
+    }
+}
+
+/// The blocks of each bin a slab's search looks at before it splits a
+/// larger extent: a slab freed between live blocks leaves a hole of just its
+/// size, which the next slab should take.
+const SLAB_LOOKS: usize = 8;
+
+/// Where the payload of a slab of `bytes` starts in free `block`: past the
+/// boundary tag at an address aligned to `bytes`, after a gap that is empty
+/// or holds a block of its own.
+///
+/// # Safety
+/// The lock is held and `block` is a free block.
+unsafe fn slab_fit(block: *mut Header, bytes: usize) -> Option<usize> {
+    let base = block as usize;
+    // SAFETY: the caller's free block.
+    let end = base + unsafe { size(block) };
+    let mut start = aligned(base, bytes)?;
+    if start != base && start - base < MIN_BLOCK {
+        start = start.checked_add(bytes)?;
+    }
+    (start.checked_add(bytes)? <= end).then_some(start + HEADER_BYTES)
+}
+
+/// A slab's block of `bytes` from `pool`'s bins, its boundary tag at an
+/// address aligned to `bytes`: that address, or zero when none fits. The
+/// smallest extents that hold it come first.
+///
+/// # Safety
+/// The heap's lock is held and `state` is initialized.
+unsafe fn carve_slab(state: &mut State, pool: usize, bytes: usize) -> usize {
+    state.carves += 1;
+    // SAFETY: binned free blocks, with the caller's guard held.
+    let fits = |block| unsafe { slab_fit(block, bytes) };
+    // Any extent of this size holds a slab, wherever it starts.
+    let surely = 2 * bytes + MIN_BLOCK;
+    let bins = &state.pools[pool];
+    let (first_level, first_sub) = bin(bytes);
+    let (last_level, last_sub) = bin(surely);
+    let mut found = ptr::null_mut();
+    'search: for level in first_level..=last_level.min(LEVELS - 1) {
+        let mut subs = u32::from(bins.bins[level]);
+        if level == first_level {
+            subs &= u32::MAX << first_sub;
+        }
+        if level == last_level {
+            subs &= (1u32 << (last_sub + 1)) - 1;
+        }
+        while subs != 0 {
+            let sub = subs.trailing_zeros() as usize;
+            subs &= subs - 1;
+            // SAFETY: the caller's guard.
+            for block in unsafe { bin_blocks(bins.heads[level][sub]) }.take(SLAB_LOOKS) {
+                if fits(block).is_some() {
+                    found = block;
+                    break 'search;
+                }
+            }
+        }
+    }
+    if found.is_null() {
+        // SAFETY: the caller's guard.
+        found = unsafe { bins.find(surely, |block| fits(block).is_some()) };
+    }
+    let Some(user) = (!found.is_null()).then(|| fits(found)).flatten() else {
+        return 0;
+    };
+    // SAFETY: the guard; `found` is binned and `slab_fit` placed the slab
+    // in it.
+    unsafe {
+        state.remove(found);
+        take(state, found, user, bytes - HEADER_BYTES);
+    }
+    user - HEADER_BYTES
 }
 
 /// Page selection inside a CPU interval: the lowest payload address that

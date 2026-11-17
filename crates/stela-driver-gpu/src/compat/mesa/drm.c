@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* libdrm, as far as NVK reaches it: thin wrappers of DRM's ioctls, with the
- * entry points of xf86drm.h. Devices come from the host, not from /sys. */
+/* libdrm, as far as the Vulkan drivers and libdrm_amdgpu reach it: thin
+ * wrappers of DRM's ioctls, with the entry points of xf86drm.h. Devices come
+ * from the host, not from /sys, and each is a render node. */
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,7 +136,7 @@ static drmDevicePtr device_at(unsigned int index)
 		return NULL;
 	stela_libc_drm_device(index, &host);
 	snprintf(block->render, sizeof(block->render), DRM_DIR_NAME "/renderD%u",
-		 RENDER_MINOR + index);
+		 RENDER_MINOR + host.minor);
 	block->nodes[DRM_NODE_RENDER] = block->render;
 	block->bus = (drmPciBusInfo){
 		.domain = host.segment,
@@ -183,14 +185,22 @@ int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max)
 	return count;
 }
 
+/* The device whose render node is `id`: devices are listed in the host's
+ * order, which need not be their minors'. */
 int drmGetDeviceFromDevId(dev_t id, uint32_t flags, drmDevicePtr *device)
 {
 	(void)flags;
-	unsigned int index = minor(id) - RENDER_MINOR;
-	if (major(id) != DRM_MAJOR || index >= stela_libc_drm_devices())
+	if (major(id) != DRM_MAJOR || minor(id) < RENDER_MINOR)
 		return -ENODEV;
-	*device = device_at(index);
-	return *device ? 0 : -ENOMEM;
+	for (unsigned int index = 0; index < stela_libc_drm_devices(); index++) {
+		struct stela_libc_drm_device host;
+		stela_libc_drm_device(index, &host);
+		if (RENDER_MINOR + host.minor == minor(id)) {
+			*device = device_at(index);
+			return *device ? 0 : -ENOMEM;
+		}
+	}
+	return -ENODEV;
 }
 
 int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
@@ -213,6 +223,49 @@ void drmFreeDevices(drmDevicePtr devices[], int count)
 {
 	for (int index = 0; index < count; index++)
 		drmFreeDevice(&devices[index]);
+}
+
+int drmGetNodeTypeFromFd(int fd)
+{
+	struct stat status;
+	if (fstat(fd, &status))
+		return -1;
+	if (major(status.st_rdev) != DRM_MAJOR || minor(status.st_rdev) < RENDER_MINOR) {
+		errno = EINVAL;
+		return -1;
+	}
+	return DRM_NODE_RENDER;
+}
+
+/* The host offers render nodes only, so no device has a primary node. */
+char *drmGetPrimaryDeviceNameFromFd(int fd)
+{
+	(void)fd;
+	return NULL;
+}
+
+/* A format modifier's name, for debug prints only. libdrm spells out each
+ * vendor's fields from its tables; here every modifier is named by its
+ * value, which identifies it as well. NULL, libdrm's answer when out of
+ * memory, is left for that case. */
+char *drmGetFormatModifierName(uint64_t modifier)
+{
+	char *name = malloc(sizeof("0x0123456789abcdef"));
+	if (name)
+		snprintf(name, sizeof("0x0123456789abcdef"), "0x%016llx", (unsigned long long)modifier);
+	return name;
+}
+
+/* libdrm's debug messages, which it prints only when LIBGL_DEBUG asks. */
+void drmMsg(const char *format, ...)
+{
+	const char *debug = getenv("LIBGL_DEBUG");
+	if (!debug || !strstr(debug, "verbose"))
+		return;
+	va_list arguments;
+	va_start(arguments, format);
+	vfprintf(stderr, format, arguments);
+	va_end(arguments);
 }
 
 int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
@@ -342,6 +395,11 @@ int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t count
 		.flags = flags,
 	};
 	return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &array);
+}
+
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count)
+{
+	return drmSyncobjQuery2(fd, handles, points, count, 0);
 }
 
 int drmSyncobjTransfer(int fd, uint32_t destination, uint64_t destination_point, uint32_t source,

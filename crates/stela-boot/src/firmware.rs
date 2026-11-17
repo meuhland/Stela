@@ -37,6 +37,7 @@ pub(crate) mod entries;
 mod tsc;
 pub(crate) use pe::loaded_extent;
 use stela_boot_core::pe;
+pub(crate) use tsc::identity_mapped;
 pub use tsc::{TscSource, adopt as adopt_tsc, tsc_hz, tsc_source, tsc_tolerance_ppm};
 
 /// What the host storage check runs with after boot services end.
@@ -452,11 +453,11 @@ pub fn take_over(
     let screen = Framebuffer::from_firmware();
     let mut tables = tables(&image, [0, guard], screen.as_ref())?;
     storage.map(&mut tables)?;
+    let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
-    let map = unsafe { boot::exit_boot_services(None) };
-    core::mem::forget(map);
+    let _ = unsafe { crate::boot_exit::exit(final_map) };
     Ok((
         Handoff {
             active_tables: None,

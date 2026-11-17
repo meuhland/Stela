@@ -54,10 +54,20 @@ fn fixture(memory: &mut [u64], speed: u8, context: usize, streams: u16) -> Fixtu
     (host, hardware, dma)
 }
 fn geometry(host: &Host) -> [(u64, usize); 3] {
-    [&host.engine.command, &host.engine.status, &host.engine.data].map(|b| (b.physical(), b.len()))
+    [
+        &host.engine.lanes[0].command,
+        &host.engine.lanes[0].status,
+        &host.engine.lanes[0].data,
+    ]
+    .map(|b| (b.physical(), b.len()))
 }
 fn contents(host: &Host) -> [Vec<u8>; 3] {
-    [&host.engine.command, &host.engine.status, &host.engine.data].map(|b| b.bytes().to_vec())
+    [
+        &host.engine.lanes[0].command,
+        &host.engine.lanes[0].status,
+        &host.engine.lanes[0].data,
+    ]
+    .map(|b| b.bytes().to_vec())
 }
 fn fenced(host: &mut Host, hardware: &Rc<RefCell<model::ResetHardware>>, native_quarantine: bool) {
     assert!(host.requires_rebind());
@@ -111,7 +121,7 @@ fn native_abort_task_requires_response_and_separate_pending_data_retirement() {
                 );
                 assert_eq!(geometry(&host), original);
                 assert_eq!(dma.remaining(), remaining);
-                assert!(host.engine.pending.iter().all(Option::is_none));
+                assert!(host.engine.lanes[0].pending.iter().all(Option::is_none));
                 let peer = hardware.borrow();
                 assert_eq!(
                     peer.uas_abort_requests(),
@@ -134,7 +144,7 @@ fn native_abort_task_requires_response_and_separate_pending_data_retirement() {
                 }
                 drop(peer);
                 assert_eq!(
-                    &host.engine.data.bytes()[..512],
+                    &host.engine.lanes[0].data.bytes()[..512],
                     if input { &[0; 512] } else { &[0xb7; 512] }
                 );
                 fenced(&mut host, &hardware, false);
@@ -174,8 +184,8 @@ fn native_abort_task_negative_short_old_tag_and_missing_responses_keep_original_
             );
             assert_eq!(geometry(&host), original);
             assert_eq!(dma.remaining(), remaining);
-            assert!(host.engine.pending[Pipe::Output.index()].is_some());
-            assert_eq!(&host.engine.data.bytes()[..512], &[0xb7; 512]);
+            assert!(host.engine.lanes[0].pending[Pipe::Output.index()].is_some());
+            assert_eq!(&host.engine.lanes[0].data.bytes()[..512], &[0xb7; 512]);
             assert_eq!(hardware.borrow().uas_pending_data(), 1);
             assert!(hardware.borrow().device_task);
             assert_eq!(
@@ -203,10 +213,10 @@ fn native_abort_device_ack_does_not_hide_failed_host_data_stop_or_dequeue() {
                 result.abort,
                 Some(AbortTaskOutcome::Acknowledged { retirement: Err(_) })
             ));
-            assert!(host.engine.pending[Pipe::Output.index()].is_some());
+            assert!(host.engine.lanes[0].pending[Pipe::Output.index()].is_some());
             assert_eq!(geometry(&host), original);
             assert_eq!(dma.remaining(), remaining);
-            assert_eq!(&host.engine.data.bytes()[..512], &[0xb7; 512]);
+            assert_eq!(&host.engine.lanes[0].data.bytes()[..512], &[0xb7; 512]);
             assert!(!hardware.borrow().device_task);
             assert_eq!(
                 hardware.borrow().uas_abort_pending_observations(),
@@ -229,8 +239,8 @@ fn native_abort_refuses_before_tmf_when_original_command_receipt_is_missing() {
             Some(AbortTaskOutcome::NotAcknowledged(_))
         ));
         assert!(hardware.borrow().uas_abort_requests().is_empty());
-        assert!(host.engine.pending[Pipe::Command.index()].is_some());
-        assert_eq!(host.engine.command.bytes()[0], COMMAND_IU);
+        assert!(host.engine.lanes[0].pending[Pipe::Command.index()].is_some());
+        assert_eq!(host.engine.lanes[0].command.bytes()[0], COMMAND_IU);
         assert!(
             !hardware
                 .borrow()
@@ -298,39 +308,63 @@ fn outstanding(host: &mut Host, hardware: &Rc<RefCell<model::ResetHardware>>) {
     hardware.borrow_mut().hang_next = true;
     let engine = &mut host.engine;
     engine.io.ready().unwrap();
-    engine.tag = 1;
+    engine.lanes[0].tag = 1;
     let iu = command_iu(1, LUN, &WRITE);
-    engine.command.bytes_mut()[..iu.len()].copy_from_slice(&iu);
-    engine.status.bytes_mut().fill(0);
-    engine.data.bytes_mut()[..512].fill(0xb7);
+    engine.lanes[0].command.bytes_mut()[..iu.len()].copy_from_slice(&iu);
+    engine.lanes[0].status.bytes_mut().fill(0);
+    engine.lanes[0].data.bytes_mut()[..512].fill(0xb7);
     engine
-        .post(Pipe::Status, engine.status.physical(), IU_BUFFER_BYTES)
+        .post(
+            0,
+            Pipe::Status,
+            engine.lanes[0].status.physical(),
+            IU_BUFFER_BYTES,
+        )
         .unwrap();
     if engine.io.streams().is_some() {
         engine
-            .post(Pipe::Output, engine.data.physical(), 512)
+            .post(0, Pipe::Output, engine.lanes[0].data.physical(), 512)
             .unwrap();
     }
     engine
-        .post(Pipe::Command, engine.command.physical(), iu.len())
+        .post(
+            0,
+            Pipe::Command,
+            engine.lanes[0].command.physical(),
+            iu.len(),
+        )
         .unwrap();
-    let command = engine.pending[Pipe::Command.index()].as_ref().unwrap();
+    let command = engine.lanes[0].pending[Pipe::Command.index()]
+        .as_ref()
+        .unwrap();
     assert_eq!(engine.io.completed(command), Some(Ok(iu.len())));
-    engine.pending[Pipe::Command.index()] = None;
+    engine.lanes[0].pending[Pipe::Command.index()] = None;
     if engine.io.streams().is_none() {
-        let status = engine.pending[Pipe::Status.index()].as_ref().unwrap();
+        let status = engine.lanes[0].pending[Pipe::Status.index()]
+            .as_ref()
+            .unwrap();
         assert_eq!(engine.io.completed(status), Some(Ok(4)));
-        assert_eq!(&engine.status.bytes()[..4], &[WRITE_READY_IU, 0, 0, 1]);
-        engine.pending[Pipe::Status.index()] = None;
+        assert_eq!(
+            &engine.lanes[0].status.bytes()[..4],
+            &[WRITE_READY_IU, 0, 0, 1]
+        );
+        engine.lanes[0].pending[Pipe::Status.index()] = None;
         engine
-            .post(Pipe::Status, engine.status.physical(), IU_BUFFER_BYTES)
+            .post(
+                0,
+                Pipe::Status,
+                engine.lanes[0].status.physical(),
+                IU_BUFFER_BYTES,
+            )
             .unwrap();
         engine
-            .post(Pipe::Output, engine.data.physical(), 512)
+            .post(0, Pipe::Output, engine.lanes[0].data.physical(), 512)
             .unwrap();
     }
     assert_eq!(hardware.borrow().uas_pending_data(), 1);
-    let data = engine.pending[Pipe::Output.index()].as_ref().unwrap();
+    let data = engine.lanes[0].pending[Pipe::Output.index()]
+        .as_ref()
+        .unwrap();
     assert_eq!(engine.io.completed(data), None);
     engine.poisoned = true;
 }
@@ -346,14 +380,14 @@ fn native_abort_status_drain_failure_preserves_both_iu_buffers_and_original_data
             let remaining = dma.remaining();
             hardware.borrow_mut().fault = fault;
             assert!(matches!(
-                host.engine.abort_task(LUN),
+                host.engine.abort_task(0, LUN),
                 AbortTaskOutcome::NotAcknowledged(_)
             ));
             assert_eq!(contents(&host), before);
             assert_eq!(geometry(&host), original);
             assert_eq!(dma.remaining(), remaining);
-            assert!(host.engine.pending[Pipe::Status.index()].is_some());
-            assert!(host.engine.pending[Pipe::Output.index()].is_some());
+            assert!(host.engine.lanes[0].pending[Pipe::Status.index()].is_some());
+            assert!(host.engine.lanes[0].pending[Pipe::Output.index()].is_some());
             assert_eq!(hardware.borrow().uas_pending_data(), 1);
             assert!(hardware.borrow().uas_abort_requests().is_empty());
             host.quarantine();
@@ -369,11 +403,9 @@ fn native_abort_stale_generation_refuses_before_mmio_and_dma_rewrite() {
     let controller = host.engine.io.controller.clone();
     // SAFETY: this fixture owns the sole UAS interface and all its DCIs.
     let fresh = unsafe {
-        controller.borrow_mut().reset_and_reuse_root(
-            &host.device,
-            &host.binding.endpoints(),
-            &mut dma,
-        )
+        controller
+            .borrow_mut()
+            .reset_and_reuse(&host.device, &host.binding.endpoints(), &mut dma)
     }
     .unwrap();
     assert_ne!(fresh.id, host.device.id);
@@ -381,14 +413,14 @@ fn native_abort_stale_generation_refuses_before_mmio_and_dma_rewrite() {
     let accesses = hardware.borrow().accesses;
     hardware.borrow_mut().trap_mmio = true;
     assert!(matches!(
-        host.engine.abort_task(LUN),
+        host.engine.abort_task(0, LUN),
         AbortTaskOutcome::NotAcknowledged(_)
     ));
     hardware.borrow_mut().trap_mmio = false;
     assert_eq!(hardware.borrow().accesses, accesses);
     assert_eq!(contents(&host), snapshot);
     assert!(hardware.borrow().uas_abort_requests().is_empty());
-    assert!(host.engine.pending[Pipe::Output.index()].is_some());
+    assert!(host.engine.lanes[0].pending[Pipe::Output.index()].is_some());
 }
 #[test]
 fn native_abort_foreign_controller_identity_refuses_before_mmio_and_dma_rewrite() {
@@ -404,14 +436,14 @@ fn native_abort_foreign_controller_identity_refuses_before_mmio_and_dma_rewrite(
     let accesses = hardware.borrow().accesses;
     hardware.borrow_mut().trap_mmio = true;
     assert!(matches!(
-        host.engine.abort_task(LUN),
+        host.engine.abort_task(0, LUN),
         AbortTaskOutcome::NotAcknowledged(_)
     ));
     hardware.borrow_mut().trap_mmio = false;
     assert_eq!(hardware.borrow().accesses, accesses);
     assert_eq!(contents(&host), snapshot);
     assert!(hardware.borrow().uas_abort_requests().is_empty());
-    assert!(host.engine.pending[Pipe::Output.index()].is_some());
+    assert!(host.engine.lanes[0].pending[Pipe::Output.index()].is_some());
 }
 
 #[test]
@@ -424,7 +456,7 @@ fn native_abort_wrong_original_lun_refuses_before_status_drain_or_dma_rewrite() 
     let mut wrong = LUN;
     wrong[1] += 1;
     assert_eq!(
-        host.engine.abort_task(wrong),
+        host.engine.abort_task(0, wrong),
         AbortTaskOutcome::NotAcknowledged(BlockError::Unsupported(
             "UAS abort original task identity"
         ))
@@ -432,8 +464,8 @@ fn native_abort_wrong_original_lun_refuses_before_status_drain_or_dma_rewrite() 
     assert_eq!(contents(&host), snapshot);
     assert_eq!(hardware.borrow().commands_seen, commands);
     assert!(hardware.borrow().uas_abort_requests().is_empty());
-    assert!(host.engine.pending[Pipe::Status.index()].is_some());
-    assert!(host.engine.pending[Pipe::Output.index()].is_some());
+    assert!(host.engine.lanes[0].pending[Pipe::Status.index()].is_some());
+    assert!(host.engine.lanes[0].pending[Pipe::Output.index()].is_some());
 }
 
 #[test]

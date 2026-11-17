@@ -84,6 +84,7 @@ struct Services {
     xart: Xart,
     keystore: KeyStore,
     boot_policy: BootPolicy,
+    credentials: credentials::Credentials,
 }
 
 /// The SEP page that scales discovery capacities: 16 KiB, since
@@ -137,6 +138,7 @@ impl SepOs {
             xart: Xart::new(store),
             keystore,
             boot_policy: BootPolicy::new(kexts),
+            credentials: credentials::Credentials::default(),
         });
         Ok(self)
     }
@@ -183,6 +185,7 @@ impl SepOs {
             .unwrap_or_default();
         if let Some(services) = self.services.as_mut() {
             lines.extend(services.keystore.diagnostics());
+            lines.extend(services.credentials.diagnostics());
         }
         lines
     }
@@ -277,17 +280,27 @@ impl SepOs {
             read: 0,
         };
         let result = match frame.service {
-            keystore::ID if deferred.is_some() => match services.keystore.resume(&mut payload) {
+            keystore::ID if deferred.is_some() => match services
+                .keystore
+                .resume(&mut payload, &mut services.credentials)
+            {
                 Some(result) => result,
                 None => return Ok(()),
             },
             xart::MASTER_ID | xart::SLAVE_ID => services.xart.request(frame, &mut payload, entropy),
-            keystore::ID => match services.keystore.begin(frame, &mut payload, entropy) {
+            keystore::ID => match services.keystore.begin(
+                frame,
+                &mut payload,
+                entropy,
+                &mut services.credentials,
+            ) {
                 Ok(Some(reply)) => Ok(reply),
                 Ok(None) => return Ok(()),
                 Err(refusal) => Err(refusal),
             },
-            credentials::ID => credentials::request(frame, &mut payload),
+            credentials::ID => {
+                credentials::request(frame, &mut payload, &mut services.credentials, entropy)
+            }
             boot_policy::ID => services
                 .xart
                 .policy_store_mut()
@@ -348,8 +361,12 @@ impl SepOs {
             } else {
                 // An `sks` frame names its request's length: bytes past it
                 // are an earlier request's, which may have held a passcode.
+                // An `scrd` command's input may hold a passphrase: only its
+                // payload and command head are recorded.
                 let request = if frame.service == keystore::ID {
                     u64::from(frame.data >> 16)
+                } else if frame.service == credentials::ID {
+                    credentials::OBSERVABLE_BYTES as u64
                 } else {
                     available
                 };

@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:12:46 +0000
+Subject: [PATCH] fix(nouveau): give GSP-RM the MNOC and kernel log regions
+ only on GB20x, where every family with a WPR OS carveout, Turing to Ada on
+ 570.144 included, got them
+
+---
+ drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index d2b72b6e4fd643b2fa817c9b8c9e08f8450abf87..09f8bbd63afd9fbcbae2cc68569029a5a20e155d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -1663,7 +1663,11 @@ r535_gsp_libos_init(struct nvkm_gsp *gsp)
+ 	create_pte_array(gsp->logrm.data + sizeof(u64), gsp->logrm.addr, gsp->logrm.size);
+ 	idx++;
+ 
+-	if (gsp->rm->wpr->os_carveout_size) {
++	/*
++	 * Only GB20x's GSP-RM 570.211.01 takes the MNOC and kernel log
++	 * regions; every other family's RM keeps the four regions it boots on.
++	 */
++	if (gsp->subdev.device->card_type >= GB20x) {
+ 		ret = nvkm_gsp_mem_ctor(gsp, 0x10000, &gsp->logmnoc);
+ 		if (ret)
+ 			return ret;

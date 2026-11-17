@@ -3,11 +3,17 @@
 
 use super::*;
 
-/// Native runs between two promotion steps, and the stamped cells each
-/// looks at: every stamped cell once in 256 steps, a lock and 256 loads
-/// in 1024 runs.
+/// Native runs between two promotion steps, each of which reads the cells
+/// the runs' cell probes named, at most one a run: a lock and a few
+/// lookups in 1024 runs.
 const PROMOTION_RUNS: u32 = 1024;
-const PROMOTION_CELLS: u32 = 256;
+/// Times promotion steps read an exit's cell before the exit is hot: with
+/// one transfer in [`chain::CELL_SAMPLE`] of its PE's named, about 512 of
+/// its transfers, while a rare one is seldom named twice.
+pub(super) const HOT_SAMPLES: u8 = 2;
+/// Exits whose cells promotion steps read once that the PE keeps before
+/// it starts over, so a count stays recent.
+const SAMPLED_EXITS: usize = 4096;
 
 impl<H: Host, D: Devices> Machine<H, D> {
     /// Run until a stop. `budget` limits executed blocks (0 = unlimited).
@@ -299,6 +305,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Whether a transition may continue in this run, logged where
         // counters tell the levels apart (`transitions`).
         self.mirrors.transitions.chain = self.transition_chain();
+        self.chain
+            .set_frames(self.frame_bound, self.code.blocks.epoch_address());
         self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
@@ -340,6 +348,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if transitioned {
             self.adopt_native_state();
         }
+        // An exception return native code made ends the interrupt handler
+        // the engine saw taken, as one the engine handles does.
+        if transitions[transition::EXCEPTION_RETURN] != 0
+            && let Some(timing) = &mut self.step_timing
+        {
+            timing.levels.exception_returned();
+        }
         let returned = self.timing_charge(step_timing::Phase::Native, entered);
         self.leave_amx_cell();
         self.cpu.pstate.daif = self.cpu.state.daif as u8;
@@ -351,6 +366,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let remaining = self.chain.budget().load(Ordering::Relaxed);
         let (block, retired, hits, _) = self.chain.completed();
+        let (cell_probes, sampled_cell) = self.chain.cell_probes();
+        self.statistics.cell_probes += cell_probes;
+        if sampled_cell != 0 && self.cell_samples.len() < PROMOTION_RUNS as usize {
+            self.cell_samples.push(sampled_cell);
+        }
         self.promotion_runs = self.promotion_runs.wrapping_add(1);
         if self.promotion_runs.is_multiple_of(PROMOTION_RUNS) {
             self.promote_hot_exits();
@@ -388,7 +408,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 };
                 block.pc.wrapping_sub(self.cpu.read(vbar) & !0x7ff)
             };
-            self.hot_samples.push((pc, level));
+            // The address space it ran in: its process, or the kernel's.
+            let asid = self.current_space_asid();
+            self.hot_samples.push((pc, level, asid));
             // Its RET, BLR or BR form's transfer, at most as many as the
             // hot samples a take would keep.
             if let NativeExit::Exit { next_pc, kind } = exit
@@ -682,8 +704,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
         if (next_pc ^ block.pc) & !(FETCH_PAGE - 1) != 0 {
+            // A cell needs the entry this PE's translation of the target
+            // names: without one it would hold none, and every transfer
+            // through it would go on to the table probe until the table
+            // took an entry of its PC, which a block another context
+            // compiled never takes again. The fetch of the target that
+            // follows translates its page and links the exit
+            // ([`Self::link_direct_exit`]).
+            if self.translated_entry(&cache, next_pc).is_none() {
+                self.direct_exit = Some((index, record.incarnation(), next_pc, word));
+                return false;
+            }
             let point = chain::direct_patch(block.successors[position].site);
-            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0) {
+            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, false) {
                 record.settle(position);
                 return true;
             }
@@ -746,6 +779,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         };
         self.patch_native(thunk, &bytes);
+        self.profile_code(thunk, bytes.len(), step_timing::CodeRegion::Link);
         self.patch_point(NativeCode(point as usize), jump);
         record.set_linked(position, true, false);
         self.statistics.links += 1;
@@ -831,6 +865,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return;
         }
         let word = kind.into();
+        // The predicted target's cell needs the entry this PE's translation
+        // names, as a direct exit's does ([`Self::link`]): the exit stays
+        // open for its next transfer, after the fetch of the target.
+        if predicted && self.translated_entry(&cache, target).is_none() {
+            return;
+        }
         if (predicted
             && self.redirect_through_prediction(&mut cache, point, retired, word, btype, target))
             || self.redirect_through_lookup(&mut cache, point, retired, word, btype)
@@ -879,8 +919,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Nothing reaches the tail before the point's jump: its direct exit
         // is linked first, so no predicted transfer returns to the engine.
         self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
-        if !self.link_through_cell(cache, exit, target, retired, word, btype) {
+        if !self.link_through_cell(cache, exit, target, retired, word, btype, false) {
             return false;
         }
         self.patch_point(NativeCode(site as usize), jump);
@@ -911,18 +952,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !chain::patchable(site) {
             return false;
         }
-        let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, chain::LOOKUP_TAIL_BYTES)
-        else {
+        // A return's tail first takes its call's paired frame.
+        let returning = word.kind == ExitKind::Return && btype == 0;
+        let bytes = match returning {
+            true => chain::PAIRED_TAIL_BYTES,
+            false => chain::LOOKUP_TAIL_BYTES,
+        };
+        let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, bytes) else {
             return false;
         };
         let at = tail.0 as u64;
-        let (Some(code), Some(jump)) = (
-            chain::lookup_tail(at, word, retired, probe + chain::PROBE_ENTRY as u64, btype),
-            chain::jump(site, at),
-        ) else {
+        let probe = probe + chain::PROBE_ENTRY as u64;
+        let code = match returning {
+            true => chain::paired_tail(at, word, retired, probe).map(|code| code.to_vec()),
+            false => chain::lookup_tail(at, word, retired, probe, btype).map(|code| code.to_vec()),
+        };
+        let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
             return false;
         };
         self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.lookups += 1;
         true
@@ -945,6 +994,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// a nonzero `btype` uses the probes of `btype`, whose cell probes take
     /// only entries that accept it, and gets a stamped tail only for a block
     /// that accepts it.
+    ///
+    /// A `hot` exit, whose cell probe transfers promotion found many
+    /// ([`Self::promote_hot_exits`]), takes a stamped cell and a stamped
+    /// tail ([`chain::stamped_tail`]) while one is free; every other a cell
+    /// past them and a cell tail.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn link_through_cell(
         &mut self,
         cache: &mut board::Cache,
@@ -953,16 +1008,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         retired: u32,
         word: ExitWord,
         btype: u8,
+        hot: bool,
     ) -> bool {
         if !chain::patchable(site) {
             return false;
         }
-        // An exit whose cell probe transfers made it hot gets a stamped
-        // tail ([`chain::stamped_tail`]); every other a cell tail.
-        let hot = cache
-            .targets
-            .site_cell_number(site)
-            .is_some_and(|cell| cache.targets.cell_heat(cell) >= chain::HOT_CELL);
         let bytes = if hot {
             chain::STAMPED_TAIL_BYTES
         } else {
@@ -971,13 +1021,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, bytes) else {
             return false;
         };
-        let current = self.current_key(next_pc).and_then(|key| {
-            let held = cache
-                .targets
-                .find(cache.targets.slot(next_pc, key), next_pc, key);
-            (held.pc == next_pc && held.key == key).then_some(held)
-        });
-        let cell = cache.targets.link_cell(site, next_pc, current);
+        // A relinked exit keeps what its cell holds, which its transfers
+        // entered: a promotion runs on any PE, whose own context may not
+        // translate the target at all. Else the entry this PE's
+        // translation of the target names now.
+        let current = cache
+            .targets
+            .site_cell(site)
+            .filter(|held| held.pc == next_pc && held.key != 0)
+            .or_else(|| self.translated_entry(cache, next_pc));
+        let cell = hot
+            .then(|| cache.targets.link_hot_cell(site, next_pc, current))
+            .flatten()
+            .unwrap_or_else(|| cache.targets.link_cell(site, next_pc, current));
         let number = cache.targets.site_cell_number(site);
         if let Some(number) = number {
             let link = chain::CellLink {
@@ -1026,29 +1082,69 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.statistics.stamped_tails += 1;
         }
         self.patch_native(tail, &code);
+        let region = match stamped_cell {
+            Some(_) => step_timing::CodeRegion::Stamped,
+            None => step_timing::CodeRegion::Lookup,
+        };
+        self.profile_code(tail, code.len(), region);
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.links += 1;
         true
     }
 
-    /// Give the exits of the next [`PROMOTION_CELLS`] stamped cells whose
-    /// cell probe transfers made them hot a stamped tail
+    /// The block table's entry of `pc` for the key this PE's translation
+    /// of its page names now ([`Self::current_key`]), if both are there:
+    /// what a cell of an exit to `pc` starts with.
+    fn translated_entry(&self, cache: &board::Cache, pc: u64) -> Option<chain::LookupEntry> {
+        let key = self.current_key(pc)?;
+        let held = cache.targets.find(cache.targets.slot(pc, key), pc, key);
+        (held.pc == pc && held.key == key).then_some(held)
+    }
+
+    /// Give the exits whose cells this PE's cell probes named
+    /// [`HOT_SAMPLES`] times a stamped cell and a stamped tail
     /// ([`chain::stamped_tail`]): a bounded step every [`PROMOTION_RUNS`]
-    /// native runs, sweeping every stamped cell in turn.
+    /// native runs, over the cells those runs named.
+    ///
+    /// The stamped tail enters the block the cell holds, which every
+    /// transfer that made the exit hot entered, whatever this PE's own
+    /// context translates now: each PE's stamp still requires its own
+    /// translation of the target to name the cell's key. A cell that holds
+    /// no entry yet waits for later samples; an exit whose block takes no
+    /// transfer of its BTYPE keeps its cell tail, as does every hot exit
+    /// while every stamped cell is held.
     pub(super) fn promote_hot_exits(&mut self) {
-        let from = self.promotion_cursor;
-        let to = from + PROMOTION_CELLS;
-        self.promotion_cursor = if to as usize >= chain::STAMPED_CELLS {
-            0
-        } else {
-            to
-        };
         let code = Arc::clone(&self.code);
         let mut cache = code.cache_at(board::LockSite::Link);
-        for link in cache.targets.hot_links(from..to) {
-            if let Some(cell) = cache.targets.site_cell_number(link.site) {
-                // Hot once: tried now whatever the link finds.
-                cache.targets.settle_heat(cell);
+        let mut samples = core::mem::take(&mut self.cell_samples);
+        self.statistics.cell_samples += samples.len() as u64;
+        for &address in &samples {
+            let Some((cell, link)) = cache.targets.sampled_link(address) else {
+                continue;
+            };
+            if (cell as usize) < chain::STAMPED_CELLS {
+                continue;
+            }
+            let count = self.sampled_exits.entry(link.site).or_insert(0);
+            *count += 1;
+            if *count < HOT_SAMPLES {
+                continue;
+            }
+            self.sampled_exits.remove(&link.site);
+            let Some(held) = cache
+                .targets
+                .site_cell(link.site)
+                .filter(|held| held.pc == link.pc && held.key != 0)
+            else {
+                self.statistics.promotions_waiting += 1;
+                continue;
+            };
+            if link.btype != 0 && held.targets & 1 << link.btype == 0 {
+                continue;
+            }
+            if !cache.targets.has_free_stamped() {
+                self.statistics.promotions_full += 1;
+                continue;
             }
             self.link_through_cell(
                 &mut cache,
@@ -1057,9 +1153,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 link.retired,
                 link.word,
                 link.btype,
+                true,
             );
         }
+        if self.sampled_exits.len() > SAMPLED_EXITS {
+            self.sampled_exits.clear();
+        }
+        samples.clear();
+        self.cell_samples = samples;
         self.statistics.stamped_in_use = cache.targets.stamped_tails() as u64;
+        self.statistics.cells_live = cache.targets.cells() as u64;
+        self.statistics.cells_past = cache.targets.cells_past_stamped() as u64;
+        self.statistics.cells_empty = cache.targets.cells_empty() as u64;
     }
 
     /// The probes of `btype` and room for a tail of `bytes` that calls
@@ -1077,10 +1182,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let Some(arena) = &code.arena else {
             let probe = self.lookup_dispatcher(btype)?;
-            let tail = self
-                .host
-                .install(&[0; chain::STAMPED_TAIL_BYTES][..bytes])
-                .ok()?;
+            let tail = self.host.install(&[0; chain::TAIL_ROOM][..bytes]).ok()?;
             return Some((probe, tail));
         };
         // In the generation of the exit's block, which the tail outlives
@@ -1088,7 +1190,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let stream = self.stream_at(site);
         self.install_stream = stream;
         let tail = self
-            .install_native(&[0; chain::STAMPED_TAIL_BYTES][..bytes], false)
+            .install_native(&[0; chain::TAIL_ROOM][..bytes], false)
             .ok()?;
         // The tail's part was chosen meanwhile: the exit stays as it is.
         if !self.note_reference(site, tail.0 as u64) {
@@ -1107,9 +1209,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Some((probe, tail));
         }
         self.install_stream = stream;
-        let probe = self
-            .install_native(&chain::lookup_dispatcher(btype)?, false)
-            .ok()?;
+        let dispatcher = chain::lookup_dispatcher(btype)?;
+        let probe = self.install_native(&dispatcher, false).ok()?;
+        self.profile_code(probe, dispatcher.len(), step_timing::CodeRegion::Probe);
         // The part filled between the two: the tail waits for the next.
         if part_of(probe.0) != part {
             return None;
@@ -1129,6 +1231,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let code = chain::lookup_dispatcher(btype)?;
         let installed = self.host.install(&code).ok()?;
+        self.profile_code(installed, code.len(), step_timing::CodeRegion::Probe);
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);
         Some(installed.0 as u64)
     }

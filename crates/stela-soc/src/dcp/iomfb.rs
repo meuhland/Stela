@@ -66,7 +66,29 @@
 //! kept submitting behind a fenced frame, 19 deep at most, until it
 //! cleared. The vsync callback
 //! `D588` carries the vblank's own counter value, not the time the model
-//! looked.
+//! looked, as its first value and as its timestamp, the second. The AP's
+//! library turns that timestamp from the coprocessor's clock, continuous
+//! time (the counter), into absolute time for its clients
+//! (libIOMobileFramebuffer's vsync handler converts it through fb+0xe70,
+//! `t - mach_continuous_time() + mach_absolute_time()`, and the swap
+//! record's times go the other way through fb+0xe68), and Core Animation's
+//! vsync callback takes it as the vblank's time. Sent as zero, the kernel
+//! puts a value of its own there (`swap_notify_dispatch_gated`, from a
+//! virtual method; inference: its clock at the dispatch), which the library
+//! then shifts as if it were the coprocessor's: Core Animation's display
+//! timeline sat 5.2 ms after the model's vblanks in the run measured.
+//! Its third value is the refresh period in counter ticks: sent as zero,
+//! the kernel's dispatch asks a method of its own for one, a 60 Hz period
+//! whatever the scanout runs.
+//!
+//! Frame info: `A033` counts the AP's clients per frame-info key. While any
+//! client asks, each displayed swap sends `D589 swap_info_notify_dispatch`
+//! just before its completion, with its presentation (that vblank's counter
+//! value) and its requested time; the keys the model does not fill are 0
+//! and reported once each when first asked for. `D590
+//! relbufinfo_notify_dispatch` is not sent: the AP passes its words to its
+//! relbuf clients without reading them, and no framework of the guest
+//! registers one.
 //!
 //! Composition (Inferred: the coprocessor's compositor is undocumented):
 //! layers 0..3 stack bottom to top over opaque black, each a source
@@ -141,9 +163,77 @@ const FENCE_TIMEOUT: u64 = 2 * COUNTER_HZ;
 /// +0x72d..+0x72f is padding in the complete 0x730-byte record.
 const SWAP_COMPLETE: [u8; 4] = *b"D594";
 /// `swap_notify_gated(u64, u64, u64)`: the refresh tick the AP forwards to every
-/// registered client, with no reply. It fills in the other two values itself
-/// when they are zero, and Core Animation stops presenting without it.
+/// registered client, with no reply: the vblank's counter value, its
+/// timestamp in the coprocessor's clock and a third value. The AP fills in the
+/// second and third itself when they are zero, and Core Animation stops
+/// presenting without the tick.
 const SWAP_NOTIFY: [u8; 4] = *b"D588";
+/// `swap_info_notify_dispatch(SwapInfoBlob)`: one presented swap's frame
+/// info for the clients that asked for it (`A033`). The AP's
+/// `UPPipeAP_H13P::do_swap_info_notify` (0xfffffe0009a531e0) sends each
+/// client its mask, the swap ID and the values of its keys, read from the
+/// blob at [`FRAME_INFO_FIELDS`]; it computes `Presentation_delta` itself.
+const SWAP_INFO: [u8; 4] = *b"D589";
+/// The frame-info keys, in the AP's order (`UPPipeAP_H13P::
+/// supported_frame_info` 0xfffffe0009a52fc8, table 0xfffffe000cb590e8):
+/// `A033` counts clients per key in this order.
+const FRAME_INFO_KEYS: [&str; 27] = [
+    "Layer_0_CRC",
+    "Layer_1_CRC",
+    "Layer_2_CRC",
+    "Blend_CRC",
+    "ColorManager_CRC",
+    "Dither_CRC",
+    "Presentation_time",
+    "Presentation_delta",
+    "Requested_presentation",
+    "Issued_time",
+    "Performance_headroom",
+    "Min_FrameTime",
+    "Max_FrameTime",
+    "Frame_APCE",
+    "Bright_ScalingFactor",
+    "BrightOut_NoScale",
+    "RTPLC_Bright_Capped",
+    "RTPLC_RT_Trig",
+    "RTPLC_Nits_Cap",
+    "GP0_Max_BW",
+    "GP1_Max_BW",
+    "GP2_Max_BW",
+    "GP0_Obs_BW",
+    "GP1_Obs_BW",
+    "GP2_Obs_BW",
+    "Vbl_FrameTime",
+    "Last_Fence_or_Event_Time",
+];
+/// Where `do_swap_info_notify` reads each key: the times are u64s at
+/// +0x00..+0x30, the other keys u32s at +0x54 + 4 * key, and
+/// `Presentation_delta` is `Presentation_time` less the client's last one.
+const FRAME_INFO_FIELDS: [usize; 27] = {
+    let mut fields = [0; 27];
+    let mut key = 0;
+    while key < 27 {
+        fields[key] = 0x54 + 4 * key;
+        key += 1;
+    }
+    fields[9] = 0x00;
+    fields[8] = 0x08;
+    fields[6] = 0x10;
+    fields[7] = 0x10;
+    fields[25] = 0x18;
+    fields[26] = 0x20;
+    fields[11] = 0x28;
+    fields[12] = 0x30;
+    fields
+};
+/// The keys the model fills: `Presentation_time` (and the delta the AP
+/// derives from it) and `Requested_presentation`. Every other key a client
+/// asks for is sent as 0 and reported once.
+const FRAME_INFO_FILLED: u32 = 1 << 6 | 1 << 7 | 1 << 8;
+/// The blob's swap ID (also `do_crc_notify`'s and the kdebug events'), and
+/// its length; its null flag follows it.
+const SWAP_INFO_ID: usize = 0x38;
+const SWAP_INFO_BLOB: usize = 0xe0;
 /// The ticks per second of the counter refreshes are timed by.
 const COUNTER_HZ: u64 = crate::counter::FREQUENCY_HZ;
 
@@ -215,7 +305,129 @@ pub struct Pacing {
     /// Vsyncs (`D588`) the notification clients answered, each from its
     /// vblank to the answer: the frame clock Core Animation paces by.
     pub vsync: Latency,
+    /// The gaps by whole refresh periods: 1, 2, 3, 4 to 7, and 8 or more.
+    /// An animation shows as short gaps between the long ones of a still
+    /// screen, which a window's average hides.
+    pub refreshes: [u32; 5],
+    /// The gaps of [`BURST_REFRESHES`] periods or fewer and their ticks:
+    /// the rate while frames keep coming, whatever the still time between.
+    pub burst_gaps: u32,
+    pub burst_ticks: u64,
+    /// Submits that followed a swap's completion answer, each from the
+    /// latest answer before it: how long the AP took to send its next frame
+    /// once it had a frame's surfaces back.
+    pub turnaround: Latency,
+    /// Each submit's vblank phase: from the last vblank to the submit.
+    pub after_vsync: Latency,
+    /// Submits made while an earlier swap's completion was not yet
+    /// answered, and the most swaps unanswered at one submit: none at
+    /// every submit means the AP sends a frame only once the last one
+    /// completed.
+    pub overlapped: u32,
+    pub most_unanswered: usize,
+    /// The first [`SAMPLED_SWAPS`] swaps submitted in the window, each with
+    /// its own times: what decides when the AP starts its next frame, which
+    /// the window's averages cannot tell apart.
+    pub swaps: Vec<SwapTimes>,
+    /// The display's refresh period, in counter ticks, for the sample's
+    /// report.
+    pub refresh: u64,
 }
+
+/// How many swaps each pacing window samples ([`Pacing::swaps`]).
+pub const SAMPLED_SWAPS: usize = 24;
+
+/// One sampled swap ([`Pacing::swaps`]), in counter ticks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SwapTimes {
+    pub swap_id: u32,
+    /// The first layer's surface ID, 0 for none: how many framebuffers the
+    /// AP turns through.
+    pub surface: u32,
+    /// The last vblank before the submit, the answer to that vblank's vsync
+    /// if it came before the submit, and the submit.
+    pub vblank: u64,
+    pub tick: Option<u64>,
+    pub submitted: u64,
+    /// The swap record's seven leading 64-bit words, +0x00 to +0x30: the
+    /// timestamps of types 1 to 7 that `IOMobileFramebufferSwapSetTimestamps`
+    /// writes (libIOMobileFramebuffer stores type n at the pending record's
+    /// word n - 1), counter values whose meaning the sample is to show; and
+    /// the small words at +0x48 and +0x50.
+    pub times: [u64; 7],
+    pub words: [u64; 2],
+    /// Ready (fences done), the vblank that showed or merged it, its
+    /// completion's answer, and the answer to that vblank's vsync.
+    pub ready: Option<u64>,
+    pub latched: Option<u64>,
+    pub answered: Option<u64>,
+    pub vsync: Option<u64>,
+}
+
+impl SwapTimes {
+    /// The record's words [`Self::times`] are read from, and [`Self::words`].
+    const TIMES: [usize; 7] = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30];
+    const WORDS: [usize; 2] = [0x48, 0x50];
+
+    fn word(input: &[u8], offset: usize) -> u64 {
+        input.get(offset..offset + 8).map_or(0, |bytes| {
+            u64::from_le_bytes(bytes.try_into().expect("eight bytes"))
+        })
+    }
+
+    /// `swap:surface:n:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync`:
+    /// n the vblank before the submit in whole refreshes after the first
+    /// sampled swap's (`first`), which places consecutive swaps on one
+    /// timeline; then milliseconds after that vblank, the latch in whole
+    /// refreshes after it, completion and vsync answers in milliseconds after
+    /// the latch; `-` for a time not seen (a zero word, or an event after the
+    /// window closed), `far` for a word more than 100 s away.
+    fn write(
+        &self,
+        f: &mut core::fmt::Formatter<'_>,
+        refresh: u64,
+        first: u64,
+    ) -> core::fmt::Result {
+        let ms = |ticks: i128| ticks as f64 * 1000.0 / COUNTER_HZ as f64;
+        let since = |base: u64, at: Option<u64>| at.map(|at| i128::from(at) - i128::from(base));
+        let show = |f: &mut core::fmt::Formatter<'_>, ticks: Option<i128>| match ticks {
+            None => write!(f, "-"),
+            Some(ticks) if ticks.unsigned_abs() > 100 * u128::from(COUNTER_HZ) => write!(f, "far"),
+            Some(ticks) => write!(f, "{:.1}", ms(ticks)),
+        };
+        let refreshes = |ticks: u64| (ticks + refresh / 2) / refresh.max(1);
+        write!(
+            f,
+            " {}:{}:{}:",
+            self.swap_id,
+            self.surface,
+            refreshes(self.vblank.saturating_sub(first))
+        )?;
+        show(f, since(self.vblank, Some(self.submitted)))?;
+        f.write_str("/")?;
+        show(f, since(self.vblank, self.tick))?;
+        for time in self.times {
+            f.write_str("/")?;
+            show(f, since(self.vblank, (time != 0).then_some(time)))?;
+        }
+        f.write_str("/")?;
+        show(f, since(self.vblank, self.ready))?;
+        f.write_str("/")?;
+        match self.latched {
+            Some(latched) => write!(f, "{}", refreshes(latched.saturating_sub(self.vblank)))?,
+            None => f.write_str("-")?,
+        }
+        let latched = self.latched.unwrap_or(0);
+        f.write_str("/")?;
+        show(f, self.latched.and(since(latched, self.answered)))?;
+        f.write_str("/")?;
+        show(f, self.latched.and(since(latched, self.vsync)))
+    }
+}
+
+/// The longest gap, in refresh periods, still counted as part of a burst of
+/// frames ([`Pacing::burst_gaps`]): 7 periods, about 117 ms at 60 Hz.
+pub const BURST_REFRESHES: u64 = 7;
 
 /// A count of intervals, their total and the longest, in counter ticks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -283,6 +495,19 @@ impl Pacing {
         self.total_gap += gap;
         self.longest = self.longest.max(gap);
         self.stalls += u32::from(gap > 2 * refresh);
+        let periods = (gap + refresh / 2) / refresh.max(1);
+        let bucket = match periods {
+            0..=1 => 0,
+            2 => 1,
+            3 => 2,
+            4..=7 => 3,
+            _ => 4,
+        };
+        self.refreshes[bucket] += 1;
+        if periods <= BURST_REFRESHES {
+            self.burst_gaps += 1;
+            self.burst_ticks += gap;
+        }
     }
 }
 
@@ -322,7 +547,36 @@ impl core::fmt::Display for Pacing {
             self.complete,
             self.total,
             self.vsync,
-        )
+        )?;
+        let [one, two, three, few, many] = self.refreshes;
+        write!(
+            f,
+            " gaps=1:{one}/2:{two}/3:{three}/4-7:{few}/8+:{many} burst_fps={:.1} turnaround={} after_vsync={} overlapped={}/{}",
+            if self.burst_ticks == 0 {
+                0.0
+            } else {
+                f64::from(self.burst_gaps) * 1000.0 / ms(self.burst_ticks)
+            },
+            self.turnaround,
+            self.after_vsync,
+            self.overlapped,
+            self.most_unanswered,
+        )?;
+        let Some(first) = self.swaps.first() else {
+            return Ok(());
+        };
+        write!(
+            f,
+            "\nDCP SWAPS refresh_ms={:.2} words48_50={}/{} \
+             swap:surface:n:submit/tick/t1/t2/t3/t4/t5/t6/t7/ready/latch/complete/vsync",
+            ms(self.refresh),
+            first.words[0],
+            first.words[1],
+        )?;
+        for swap in &self.swaps {
+            swap.write(f, self.refresh, first.vblank)?;
+        }
+        Ok(())
     }
 }
 
@@ -338,6 +592,9 @@ pub enum Degraded {
     /// Success with the value ignored, because the AP's caller retries a
     /// failure forever; the text says what is shown instead.
     Ignored(&'static str),
+    /// A frame-info key a client asked for that the model does not fill:
+    /// each presented swap's notice carries 0 for it.
+    Unfilled,
 }
 
 impl core::fmt::Display for Degraded {
@@ -349,6 +606,7 @@ impl core::fmt::Display for Degraded {
             Degraded::Unsupported => {
                 write!(f, "answered kIOReturnUnsupported (link status 2)")
             }
+            Degraded::Unfilled => write!(f, "not modeled; sent as 0"),
             Degraded::Ignored(shown) => {
                 write!(
                     f,
@@ -364,6 +622,32 @@ fn refresh_ticks(refresh: u32) -> u64 {
     let refresh = u64::from(refresh.max(1));
     (COUNTER_HZ * 1000 + refresh / 2) / refresh
 }
+/// The vblank after the one at `due`, of a `period`: a period on, or,
+/// when the monitor's last vertical blank began `age_ns` before `now`, the
+/// first point after half a period past `due` of the monitor's grid moved
+/// on by half a period. Vblanks then follow the monitor's whatever the two
+/// clocks' drift, and the flip a present queues, which the next vblank's
+/// flush requests, is asked for mid-period, never racing the monitor's
+/// blank. A grid moved this way gives one vblank between half a period and
+/// a period and a half after the last.
+fn next_vblank(due: u64, now: u64, period: u64, age_ns: Option<u64>) -> u64 {
+    let Some(age_ns) = age_ns else {
+        return due + period;
+    };
+    let period = period.max(1);
+    let age = u64::try_from(u128::from(age_ns) * u128::from(COUNTER_HZ) / 1_000_000_000)
+        .unwrap_or(u64::MAX)
+        % period;
+    // A point of the moved grid, a period on so it cannot fall below zero.
+    let base = now + period - age + period / 2;
+    let earliest = due + period / 2;
+    if base > earliest {
+        base - (base - earliest - 1) / period * period
+    } else {
+        base + ((earliest - base) / period + 1) * period
+    }
+}
+
 /// Original T6000 `D594_callback__` (container file 0x3daec14) reads this
 /// flag at VA 0xfffffe000adb2cec and passes nullptr for bit0=1. The AP
 /// skips absent statistics at 0xfffffe000ad9cb68 and still completes the
@@ -381,6 +665,8 @@ const SWAP_COMPLETE_DISPLAYED: usize = 4;
 const PROP_START: [u8; 4] = *b"D126";
 const PROP_CHUNK: [u8; 4] = *b"D127";
 const PROP_END: [u8; 4] = *b"D128";
+/// The property `setDisplayRefreshProperties` publishes (the kernel's key).
+const DISPLAY_REFRESH: &str = "IOMFBDisplayRefresh";
 /// `D127`'s chunk: `data[0x1000]` then `u32 offset`, `u32 length`.
 const CHUNK_BYTES: usize = 0x1000;
 /// `D128`'s key: `char[0x40]`, NUL-terminated by the AP.
@@ -438,6 +724,8 @@ pub struct Frame {
     /// notice (or the fence timeout).
     pub submitted_at: u64,
     pub ready_at: Option<u64>,
+    /// When the client asked for it to be shown ([`swap::REQUESTED`]).
+    pub requested: u64,
     /// The layer slots after this swap: what each shows, if anything.
     pub planes: [Option<scanout::Layer>; swap::LAYERS],
     /// The slots this swap set, whether to a surface or to nothing.
@@ -501,6 +789,10 @@ pub struct Methods {
     /// Slots that swaps dropped without a present (an abort or a shutdown)
     /// had set: their surfaces may differ from what is on screen.
     unshown: u32,
+    /// A present of the frame on screen again, which the scanout asked for
+    /// ([`Scanout::wants_frame`]), failed: it is not tried again until a
+    /// swap is presented.
+    repaint_refused: bool,
     /// The one mode, or why the scanout's mode cannot be advertised.
     advertised: Result<Advertised>,
     /// Why the last call refused, with the tag and its interface row.
@@ -526,6 +818,14 @@ pub struct Methods {
     pending_call: Option<Log>,
     /// Whether the AP has any notification client (`A033`).
     notified: bool,
+    /// The clients asking for each frame-info key ([`FRAME_INFO_KEYS`]),
+    /// as `A033` last counted them.
+    frame_info: [u32; FRAME_INFO_KEYS.len()],
+    /// The frame info of presented swaps, each sent just before its
+    /// swap's completion: `(swap ID, D589 input)`.
+    swap_info: VecDeque<(u32, Vec<u8>)>,
+    /// Frame-info notices sent; the first one is logged.
+    swap_info_sent: u64,
     /// The counter value of the next vblank; 0 before the display's first
     /// look, which starts the grid.
     next_refresh: u64,
@@ -554,8 +854,22 @@ pub struct Methods {
     pacing: Pacing,
     window_start: Option<u64>,
     last_present: Option<(u64, u32)>,
+    /// The last vblank, the latest swap completion the AP answered since
+    /// the last submit, and whether a completion is out to the AP: what a
+    /// submit is timed against ([`Pacing::turnaround`]).
+    last_vblank: Option<u64>,
+    /// The last vsync the AP answered: its vblank and the answer.
+    vsync_answered: Option<(u64, u64)>,
+    completion_answered: Option<u64>,
+    completing: bool,
     /// The monitor's power and sleep state, shared with its IOAV controller.
     display: Rc<RefCell<DisplayState>>,
+    /// Whether the scanout's monitor is lit, as last set; it follows the
+    /// display's power and sleep state ([`Self::apply_power`]).
+    sink_powered: bool,
+    /// The scanout refused to turn its monitor off or on, which is
+    /// reported once.
+    sink_power_refused: bool,
     /// Open IOMFB clients (`first_client_open` minus `last_client_close`).
     clients: u32,
     /// The mode set by `set_digital_out_mode`, `(color, timing)`.
@@ -583,8 +897,14 @@ pub struct Methods {
     /// For each queued completion, in the same order: its swap and the
     /// counter when it was submitted and presented ([`Pacing::complete`]).
     completion_times: VecDeque<(u32, u64, u64)>,
-    /// A callback is out and not answered yet.
+    /// A swap, mode or hot-plug callback is out and not answered yet:
+    /// these leave one at a time, in order.
     in_flight: bool,
+    /// A vsync (`D588`) is out and not answered yet. Vsyncs go out on a
+    /// stream of their own beside the other callbacks, as the link gives
+    /// each coprocessor thread its own stream, so a vblank's tick never
+    /// waits for the AP to answer a swap's completion or frame info.
+    vsync_out: bool,
     /// The AP shut the link down (`link_shutdown_signal`).
     shut_down: bool,
     /// The newest counter value the model was given: a call, notice or
@@ -599,6 +919,7 @@ impl Methods {
             || !self.outgoing.is_empty()
             || !self.completed.is_empty()
             || self.in_flight
+            || self.vsync_out
             || self.display.borrow().hotplug_pending()
         {
             return Err(refuse!(
@@ -647,13 +968,16 @@ impl Methods {
         // display, and it stops a minute later: the size is published at
         // the usual rate instead, at which macOS then draws.
         let mut reported = Vec::new();
-        let advertised = Advertised::sized(scanout.mode(), refresh, scanout.physical_size_mm())
+        let size_mm = scanout.physical_size_mm();
+        let monitor = scanout.monitor();
+        let advertised = Advertised::of_monitor(scanout.mode(), refresh, size_mm, monitor)
+            .map(|advertised| advertised.with_rates(&scanout.refresh_rates(), size_mm))
             .or_else(|refusal| {
                 let usual = super::super::scanout::DEFAULT_REFRESH_MILLIHERTZ;
                 reported.push(format!(
                     "IOMFB a {refresh} mHz display is advertised at {usual} mHz: {refusal}"
                 ));
-                Advertised::sized(scanout.mode(), usual, scanout.physical_size_mm())
+                Advertised::of_monitor(scanout.mode(), usual, size_mm, monitor)
             });
         Self {
             interface,
@@ -665,6 +989,7 @@ impl Methods {
             compose_stall_reported: false,
             shown: None,
             unshown: 0,
+            repaint_refused: false,
             advertised,
             last_refusal: None,
             unmodeled: BTreeSet::new(),
@@ -676,6 +1001,9 @@ impl Methods {
             called: BTreeSet::new(),
             pending_call: None,
             notified: false,
+            frame_info: [0; FRAME_INFO_KEYS.len()],
+            swap_info: VecDeque::new(),
+            swap_info_sent: 0,
             next_refresh: 0,
             refresh_ticks: refresh_ticks(refresh),
             latched: None,
@@ -689,7 +1017,13 @@ impl Methods {
             pacing: Pacing::default(),
             window_start: None,
             last_present: None,
+            last_vblank: None,
+            vsync_answered: None,
+            completion_answered: None,
+            completing: false,
             display,
+            sink_powered: true,
+            sink_power_refused: false,
             clients: 0,
             digital_out: None,
             config_frame: (0, 0),
@@ -703,6 +1037,7 @@ impl Methods {
             completed: VecDeque::new(),
             completion_times: VecDeque::new(),
             in_flight: false,
+            vsync_out: false,
             shut_down: false,
             now: 0,
         }
@@ -809,7 +1144,33 @@ impl Methods {
     /// open. A vblank that finds none ready closes its latch: the monitor
     /// repeats its frame, and a swap that becomes ready later waits for the
     /// next vblank.
+    /// Also true when the scanout shows nothing of the frame on screen, as
+    /// a display it took after that frame was presented: the frame is then
+    /// presented again, whole ([`Self::repaint_wanted`]).
     pub fn frame_ready(&mut self, now: u64) -> bool {
+        self.swap_ready(now) || self.repaint_wanted()
+    }
+
+    /// Whether the scanout wants the frame on screen presented again, whole,
+    /// with no swap: it took a display after that frame was presented, so
+    /// the display shows nothing of it. macOS draws nothing new on a still
+    /// screen until input, so waiting for the next swap would leave the
+    /// display dark until then.
+    fn repaint_wanted(&self) -> bool {
+        self.shown.is_some()
+            && !self.repaint_refused
+            && self.composing.is_none()
+            && !self.shut_down
+            && self.display.borrow().active()
+            && self
+                .scanout
+                .as_ref()
+                .is_some_and(|scanout| scanout.wants_frame())
+    }
+
+    /// Whether the last vblank latches a swap at counter `now`
+    /// ([`Self::frame_ready`]).
+    fn swap_ready(&mut self, now: u64) -> bool {
         if self.latched.is_none() {
             return false;
         }
@@ -839,6 +1200,10 @@ impl Methods {
                 self.pacing
                     .fence
                     .add(self.now.saturating_sub(frame.submitted_at));
+                let now = self.now;
+                if let Some(sample) = self.sampled(swap_id) {
+                    sample.ready = Some(now);
+                }
             }
         } else if self.started.iter().any(|&(id, _)| id == swap_id) {
             if self.early_fences.len() == STARTED_SWAPS {
@@ -849,11 +1214,14 @@ impl Methods {
     }
 
     /// The counter at which the display next needs a look: its next
-    /// vblank, while the AP's notification clients listen for it, a swap
-    /// waits for one or the scanout holds work for a later flush.
+    /// vblank, while the AP's notification clients listen for it on a lit
+    /// display ([`Self::vsyncs`]), a swap waits for one or the scanout
+    /// holds work for a later flush.
     pub fn refresh_deadline(&self) -> Option<u64> {
-        let wanted = self.notified
+        let wanted = self.vsyncs()
             || (!self.frames.is_empty() && self.display.borrow().active())
+            || self.display.borrow().active() != self.sink_powered
+            || self.repaint_wanted()
             || self
                 .scanout
                 .as_ref()
@@ -873,6 +1241,7 @@ impl Methods {
         if self.shut_down {
             return;
         }
+        self.apply_power();
         if let Some(scanout) = self.scanout.as_mut()
             && scanout.queued()
             && let Err(reason) = scanout.flush()
@@ -888,14 +1257,53 @@ impl Methods {
             let behind = (now - self.next_refresh) / self.refresh_ticks;
             self.next_refresh + behind * self.refresh_ticks
         };
-        self.next_refresh = due + self.refresh_ticks;
+        let age = self
+            .scanout
+            .as_ref()
+            .and_then(|scanout| scanout.vblank_age_ns());
+        self.next_refresh = next_vblank(due, now, self.refresh_ticks, age);
+        self.last_vblank = Some(due);
         // The latch takes only what is ready at its vblank.
         self.latched = Some(due);
-        self.frame_ready(now);
-        if self.notified {
+        self.swap_ready(now);
+        if self.vsyncs() {
             self.refresh = Some(due);
         }
         self.close_window(due);
+    }
+
+    /// Whether a vblank sends its vsync (`D588`): while the AP has a
+    /// notification client and the display is lit. A display powered off or
+    /// asleep runs no timing, so it passes no vblank, as Linux turns a
+    /// disabled CRTC's vblank off (`drm_crtc_vblank_off`); its first vblank
+    /// after the wake or power-on sends one again, on the same grid.
+    fn vsyncs(&self) -> bool {
+        self.notified && self.display.borrow().active()
+    }
+
+    /// Turn the scanout's monitor off or on as the display's power and sleep
+    /// state now ask, from `setPowerState`, DCPAVIPC's `SetPower` or its
+    /// display sleep: macOS's display sleep then darkens the monitor, and a
+    /// wake shows the last frame again before the next swap. While a compose
+    /// has the scanout this waits for the next look. A sink that refuses is
+    /// reported once, and its monitor keeps the last frame lit.
+    fn apply_power(&mut self) {
+        let active = self.display.borrow().active();
+        if active == self.sink_powered {
+            return;
+        }
+        let Some(scanout) = self.scanout.as_mut() else {
+            return;
+        };
+        self.sink_powered = active;
+        if let Err(reason) = scanout.set_power(active)
+            && !core::mem::replace(&mut self.sink_power_refused, true)
+        {
+            self.reported.push(format!(
+                "IOMFB display {}: {reason}; the monitor stays as it was",
+                if active { "wake" } else { "sleep" }
+            ));
+        }
     }
 
     /// The counter reads `now`: what the calls, notices and answers the link
@@ -917,7 +1325,11 @@ impl Methods {
         }
         let pacing = core::mem::take(&mut self.pacing);
         if pacing.presented != 0 || pacing.submitted != 0 {
-            self.record_log(Log::Pacing(Pacing { ticks, ..pacing }));
+            self.record_log(Log::Pacing(Box::new(Pacing {
+                ticks,
+                refresh: self.refresh_ticks,
+                ..pacing
+            })));
         }
         self.window_start = Some(due);
     }
@@ -953,13 +1365,17 @@ impl Methods {
             .scanout
             .as_mut()
             .expect("no batch while a compose has the scanout");
-        scanout::present(
+        let presented = scanout::present(
             scanout.as_mut(),
             &batch.layers,
             batch.damage.clone(),
             read,
             &mut self.frame,
-        )?;
+        );
+        if batch.count == 0 {
+            return self.repainted(presented);
+        }
+        presented?;
         // Both the surface DMA and host sink can refuse. The submitted swaps
         // own their surfaces until presentation succeeds, or the AP explicitly
         // aborts/shuts down; neither failure consumes them or queues D594.
@@ -975,8 +1391,17 @@ impl Methods {
             return None;
         }
         self.refresh(now);
-        if !self.frame_ready(now) {
-            return None;
+        if !self.swap_ready(now) {
+            // The frame on screen again, whole, completing no swap.
+            let planes = self.shown.filter(|_| self.repaint_wanted())?;
+            return Some(Batch {
+                now,
+                due: now,
+                count: 0,
+                planes,
+                layers: planes.iter().flatten().copied().collect(),
+                damage: None,
+            });
         }
         let due = self.latched.expect("a ready frame has an open latch");
         let count = self.ready_swaps(now);
@@ -1090,9 +1515,30 @@ impl Methods {
             self.in_place = true;
             return Ok(false);
         }
+        if batch.count == 0 {
+            return self.repainted(result).map(|()| false);
+        }
         result?;
         self.presented(batch);
         Ok(true)
+    }
+
+    /// Finish a present of the frame on screen again: it completes no swap.
+    /// A failure is reported once and not tried again until a swap is
+    /// presented; the display shows that swap whole, as a display that holds
+    /// none of the frame on screen asks every row.
+    fn repainted(&mut self, presented: Result<()>) -> Result<()> {
+        match presented {
+            Ok(()) => self.unshown = 0,
+            Err(reason) => {
+                self.repaint_refused = true;
+                self.refusal(format!(
+                    "DCP could not show the frame on screen again on a display taken after it: \
+                     {reason}; the display shows the next swap"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Finish the present of `batch`, whose rows the scanout now holds:
@@ -1120,12 +1566,16 @@ impl Methods {
         }
         self.shown = Some(planes);
         self.unshown = 0;
+        self.repaint_refused = false;
         let waiting = self.frames.len();
         let batch: Vec<Frame> = self.frames.drain(..count).collect();
         let (shown, merged) = batch.split_last().expect("a latched batch is not empty");
         for frame in &batch {
             let ready = frame.ready_at.unwrap_or(now);
             self.pacing.latch.add(now.saturating_sub(ready));
+            if let Some(sample) = self.sampled(frame.swap_id) {
+                sample.latched = Some(due);
+            }
         }
         for (index, frame) in merged.iter().enumerate() {
             let later = batch[index + 1..]
@@ -1141,6 +1591,9 @@ impl Methods {
             // Replaced in every slot it set, with none of its surfaces on
             // screen: the AP may take its surfaces back at once.
             let displayed = frame.updated & !later != 0 || on_screen;
+            if displayed {
+                self.queue_swap_info(frame.swap_id, frame.requested, due);
+            }
             self.completed.push_back((frame.swap_id, displayed));
             self.completion_times
                 .push_back((frame.swap_id, frame.submitted_at, now));
@@ -1168,9 +1621,36 @@ impl Methods {
                 last_swap: shown.swap_id,
             });
         }
+        self.queue_swap_info(shown.swap_id, shown.requested, due);
         self.completed.push_back((shown.swap_id, true));
         self.completion_times
             .push_back((shown.swap_id, shown.submitted_at, now));
+    }
+
+    /// Hold the frame info of swap `swap_id`, shown at the vblank whose
+    /// counter value is `presented` after its client asked for `requested`,
+    /// to send before its completion, when any client asked for frame info.
+    /// Core Animation's handler (QuartzCore 0x18e05848c) finds its record
+    /// of the swap by ID and drops a notice whose record is gone, so the
+    /// notice goes first (inferred order: the firmware is not available).
+    /// `Presentation_time` is the vblank's counter value, the time and clock
+    /// of that vblank's vsync (`D588`); Core Animation takes it as the
+    /// presented time when `Vbl_FrameTime` is 0, as here. A key without a
+    /// field here is 0 and was reported when asked for.
+    fn queue_swap_info(&mut self, swap_id: u32, requested: u64, presented: u64) {
+        if self.frame_info.iter().all(|&clients| clients == 0) {
+            return;
+        }
+        let mut input = alloc::vec![0u8; SWAP_INFO_BLOB + 4];
+        let mut put = |key: usize, value: u64| {
+            let at = FRAME_INFO_FIELDS[key];
+            input[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        put(6, presented);
+        put(8, requested);
+        input[SWAP_INFO_ID..SWAP_INFO_ID + 4].copy_from_slice(&swap_id.to_le_bytes());
+        // The null flag at SWAP_INFO_BLOB stays clear: the blob is present.
+        self.swap_info.push_back((swap_id, input));
     }
 
     fn refusal(&mut self, text: String) {
@@ -1212,6 +1692,27 @@ impl Methods {
     /// `detail` (a parameter the method names, where one tells requests
     /// apart), in the display log and as an `UNMODELED` line.
     fn report_unmodeled(&mut self, tag: [u8; 4], answer: Degraded, detail: Option<u32>) {
+        let name = self.name(&tag);
+        self.report_degraded(tag, name, answer, detail);
+    }
+
+    /// Report once that frame-info `key` is asked for and sent as 0.
+    fn report_unfilled(&mut self, key: usize) {
+        self.report_degraded(
+            SWAP_INFO,
+            FRAME_INFO_KEYS[key],
+            Degraded::Unfilled,
+            Some(key as u32),
+        );
+    }
+
+    fn report_degraded(
+        &mut self,
+        tag: [u8; 4],
+        name: &'static str,
+        answer: Degraded,
+        detail: Option<u32>,
+    ) {
         if self.unmodeled.len() >= UNMODELED_REPORTS && !self.unmodeled.contains(&(tag, detail)) {
             if !self.unlisted_unmodeled {
                 self.unlisted_unmodeled = true;
@@ -1222,7 +1723,6 @@ impl Methods {
             return;
         }
         if self.unmodeled.insert((tag, detail)) {
-            let name = self.name(&tag);
             let entry = Log::Unmodeled {
                 tag,
                 name,
@@ -1323,35 +1823,69 @@ impl Methods {
             ("ColorElements", advertised.color_elements()),
             ("DisplayAttributes", advertised.display_attributes()),
             ("Transport", Advertised::transport()),
-            ("IOMFBUUID", Advertised::uuid()),
+            ("IOMFBUUID", advertised.uuid()),
         ];
+        let (width, height) = advertised.native();
+        let published = Log::Published {
+            width,
+            height,
+            image_cm: (advertised.edid[21], advertised.edid[22]),
+            uuid: advertised.display_uuid(),
+            from_monitor: advertised.from_monitor(),
+        };
         for (key, xml) in properties {
-            // setDCPAVPropEnd NUL-terminates the buffer's last byte and
-            // hands the whole buffer to OSUnserializeXML.
-            let mut bytes = xml.into_bytes();
-            bytes.push(0);
-            let length =
-                u32::try_from(bytes.len()).map_err(|_| refuse!("DCP property is too long"))?;
-            self.queue(PROP_START, Packed::new().u32(length))?;
-            for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
-                let mut data = [0u8; CHUNK_BYTES];
-                data[..chunk.len()].copy_from_slice(chunk);
-                self.queue(
-                    PROP_CHUNK,
-                    Packed::new()
-                        .bytes(&data)
-                        .u32((index * CHUNK_BYTES) as u32)
-                        .u32(chunk.len() as u32),
-                )?;
-            }
-            let mut name = [0u8; KEY_BYTES];
-            name[..key.len()].copy_from_slice(key.as_bytes());
-            self.queue(PROP_END, Packed::new().bytes(&name))?;
+            self.publish_property(key, xml)?;
         }
+        self.record_log(published);
         // A single, untiled display: a zero IOMFB_TiledDisplayInfo, present
         // (its null flag clear); the trailing bool is not read by
         // IOMobileFramebufferShim::hotPlug_notify_gated.
         self.queue_hotplug()
+    }
+
+    /// Queue the publication of property `key` on the IOMFB service:
+    /// `D126` with the document's length, its `D127` chunks, then `D128`
+    /// with the key.
+    fn publish_property(&mut self, key: &str, xml: String) -> Result<()> {
+        // setDCPAVPropEnd NUL-terminates the buffer's last byte and
+        // hands the whole buffer to OSUnserializeXML.
+        let mut bytes = xml.into_bytes();
+        bytes.push(0);
+        let length = u32::try_from(bytes.len()).map_err(|_| refuse!("DCP property is too long"))?;
+        self.queue(PROP_START, Packed::new().u32(length))?;
+        for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+            let mut data = [0u8; CHUNK_BYTES];
+            data[..chunk.len()].copy_from_slice(chunk);
+            self.queue(
+                PROP_CHUNK,
+                Packed::new()
+                    .bytes(&data)
+                    .u32((index * CHUNK_BYTES) as u32)
+                    .u32(chunk.len() as u32),
+            )?;
+        }
+        let mut name = [0u8; KEY_BYTES];
+        name[..key.len()].copy_from_slice(key.as_bytes());
+        self.queue(PROP_END, Packed::new().bytes(&name))
+    }
+
+    /// Run the monitor at `refresh` millihertz: the scanout switches, the
+    /// vblanks take its period from the next one on, and the refresh
+    /// dictionary is published again for it.
+    fn retime(&mut self, refresh: u32) -> Result<()> {
+        let ticks = refresh_ticks(refresh);
+        if ticks == self.refresh_ticks {
+            return Ok(());
+        }
+        self.scanout
+            .as_mut()
+            .ok_or_else(|| refuse!("the DCP has no scanout to set the refresh of"))?
+            .set_refresh(refresh)?;
+        self.refresh_ticks = ticks;
+        self.publish_property(
+            DISPLAY_REFRESH,
+            modes::display_refresh(self.refresh_ticks, COUNTER_HZ),
+        )
     }
 
     fn queue_hotplug(&mut self) -> Result<()> {
@@ -1437,10 +1971,35 @@ impl Service for Methods {
                 self.reply(tag, packed)
             }
             // update_notify_clients_dcp(u32 clients[27]): a count of clients
-            // for each notification. Every one is told of the refresh.
+            // for each frame-info key (`set_notify_tag_mask` type 3 through
+            // `update_notify_clients`). Every one is told of the refresh;
+            // presented swaps send the keys asked for ([`SWAP_INFO`]), and a
+            // key the model does not fill is reported once.
             (H13P, "update_notify_clients_dcp") => {
                 self.notified = input.iter().any(|&byte| byte != 0);
+                for key in 0..FRAME_INFO_KEYS.len() {
+                    self.frame_info[key] = fields.u32()?;
+                    if self.frame_info[key] != 0 && FRAME_INFO_FILLED & 1 << key == 0 {
+                        self.report_unfilled(key);
+                    }
+                }
                 Ok(Step::Return(Vec::new()))
+            }
+            // setDisplayRefreshProperties() -> bool: the AP's method
+            // (IOMobileFramebufferAP 0xfffffe000ad7e48c) only makes the call
+            // and returns its bool; nothing on the AP builds the dictionary,
+            // so the coprocessor publishes IOMFBDisplayRefresh itself, and
+            // D126..D128 is its one way to publish a dictionary (inferred:
+            // the firmware is not available). The keys, order and units are
+            // the kernel's own builder's ([`modes::display_refresh`]), for
+            // the refresh the vblank grid runs at.
+            (AP, "setDisplayRefreshProperties") => {
+                let xml = modes::display_refresh(self.refresh_ticks, COUNTER_HZ);
+                if let Err(reason) = self.publish_property(DISPLAY_REFRESH, xml) {
+                    return self.refuse(tag, reason);
+                }
+                let packed = Packed::new().bool(true).finish(output);
+                self.reply(tag, packed)
             }
             // setup_video_limits(): the fixed mode has no limits to set up.
             (H13P, "setup_video_limits") => Ok(Step::Return(Vec::new())),
@@ -1584,6 +2143,7 @@ impl Service for Methods {
                         );
                     }
                 });
+                self.apply_power();
                 let packed = Packed::new().u32(0).u32(IO_RETURN_SUCCESS).finish(output);
                 self.reply(tag, packed)
             }
@@ -1633,11 +2193,25 @@ impl Service for Methods {
             (AP, "set_digital_out_mode") => {
                 let color = fields.u32()?;
                 let timing = fields.u32()?;
-                if (color, timing) != (modes::COLOR_ID, modes::TIMING_ID) {
+                let rate = self
+                    .advertised
+                    .as_ref()
+                    .ok()
+                    .filter(|_| color == modes::COLOR_ID)
+                    .and_then(|advertised| advertised.refresh_of(timing));
+                let Some(rate) = rate else {
                     return self.refuse(
                         tag,
                         refuse!("set_digital_out_mode names a mode the DCP never advertised"),
                     );
+                };
+                // Another rate of the size, or the preferred one again
+                // after another: the monitor runs it and the vblanks follow.
+                let other = |timing| timing != modes::TIMING_ID;
+                if (other(timing) || self.digital_out.is_some_and(|(_, set)| other(set)))
+                    && let Err(reason) = self.retime(rate)
+                {
+                    return self.refuse(tag, reason);
                 }
                 self.digital_out = Some((color, timing));
                 let packed = Packed::new().u32(IO_RETURN_SUCCESS).finish(output);
@@ -1796,6 +2370,7 @@ impl Service for Methods {
                 self.outgoing.clear();
                 self.completed.clear();
                 self.completion_times.clear();
+                self.swap_info.clear();
                 Ok(Step::Return(Vec::new()))
             }
             _ => match answer(row, input, output, self.mode()) {
@@ -1818,35 +2393,48 @@ impl Service for Methods {
     }
 
     fn callback_pending(&self) -> bool {
-        !self.in_flight
-            && (!(self.outgoing.is_empty() && self.completed.is_empty())
-                || self.refresh.is_some()
-                || (!self.shut_down && self.display.borrow().hotplug_pending()))
+        let vsync = !self.vsync_out && self.refresh.is_some() && self.outgoing.is_empty();
+        vsync
+            || !self.in_flight
+                && (!(self.outgoing.is_empty() && self.completed.is_empty())
+                    || (!self.shut_down && self.display.borrow().hotplug_pending()))
     }
 
     fn take_callback(&mut self) -> Option<Callback<Self>> {
-        if self.in_flight {
-            return None;
-        }
-        if !self.shut_down && self.display.borrow_mut().take_hotplug_request() {
+        if !self.in_flight && !self.shut_down && self.display.borrow_mut().take_hotplug_request() {
             self.queue_hotplug()
                 .expect("the recorded fixed-monitor HPD callback has a valid size");
         }
-        if let Some(counter) = self.refresh.take_if(|_| self.outgoing.is_empty()) {
-            self.in_flight = true;
+        // A mode the AP has not been told of yet goes before the vblanks.
+        if !self.vsync_out
+            && let Some(counter) = self.refresh.take_if(|_| self.outgoing.is_empty())
+        {
+            self.vsync_out = true;
             let mut input = alloc::vec![0u8; size_of::<[u64; 3]>()];
             input[..8].copy_from_slice(&counter.to_le_bytes());
+            input[8..16].copy_from_slice(&counter.to_le_bytes());
+            input[16..24].copy_from_slice(&self.refresh_ticks.to_le_bytes());
             return Some(Callback {
                 tag: SWAP_NOTIFY,
                 input,
                 output: 0,
                 then: Box::new(move |methods, _| {
-                    methods.in_flight = false;
+                    methods.vsync_out = false;
                     let waited = methods.now.saturating_sub(counter);
                     methods.pacing.vsync.add(waited);
+                    let now = methods.now;
+                    methods.vsync_answered = Some((counter, now));
+                    for sample in &mut methods.pacing.swaps {
+                        if sample.latched == Some(counter) {
+                            sample.vsync = Some(now);
+                        }
+                    }
                     Ok(())
                 }),
             });
+        }
+        if self.in_flight {
+            return None;
         }
         if let Some(Outgoing { tag, input, output }) = self.outgoing.pop_front() {
             self.in_flight = true;
@@ -1874,6 +2462,35 @@ impl Service for Methods {
                 }),
             });
         }
+        let &(next, _) = self.completed.front()?;
+        // The frame info of a swap whose completion is gone is dropped.
+        while self.swap_info.front().is_some_and(|&(swap, _)| {
+            swap != next && !self.completed.iter().any(|&(id, _)| id == swap)
+        }) {
+            self.swap_info.pop_front();
+        }
+        if self
+            .swap_info
+            .front()
+            .is_some_and(|&(swap, _)| swap == next)
+        {
+            let (_, input) = self.swap_info.pop_front().expect("front checked");
+            self.in_flight = true;
+            self.swap_info_sent += 1;
+            if self.swap_info_sent == 1 || self.trace_swap(next) {
+                self.callback_log(SWAP_INFO, input.len(), SWAP_INFO_BLOB as u32);
+            }
+            return Some(Callback {
+                tag: SWAP_INFO,
+                input,
+                output: SWAP_INFO_BLOB as u32,
+                // The AP copies the blob back; nothing reads it.
+                then: Box::new(|methods, _| {
+                    methods.in_flight = false;
+                    Ok(())
+                }),
+            });
+        }
         let (swap_id, displayed) = self.completed.pop_front()?;
         let times = self
             .completion_times
@@ -1890,6 +2507,7 @@ impl Service for Methods {
         input[SWAP_COMPLETE_DISPLAYED] = u8::from(displayed);
         input[SWAP_COMPLETE_DATA_NULL] = 1;
         self.in_flight = true;
+        self.completing = true;
         if self.trace_swap(swap_id) {
             self.callback_log(SWAP_COMPLETE, length, 0);
         }
@@ -1899,6 +2517,12 @@ impl Service for Methods {
             output: 0,
             then: Box::new(move |methods, _| {
                 methods.in_flight = false;
+                methods.completing = false;
+                methods.completion_answered = Some(methods.now);
+                let now = methods.now;
+                if let Some(sample) = methods.sampled(swap_id) {
+                    sample.answered = Some(now);
+                }
                 if let Some((_, submitted, presented)) = times {
                     let now = methods.now;
                     methods.pacing.complete.add(now.saturating_sub(presented));
@@ -2002,6 +2626,24 @@ impl Methods {
             false
         });
         self.pacing.fence_waits += u32::from(fenced != 0);
+        self.pace_submit();
+        if self.pacing.swaps.len() < SAMPLED_SWAPS {
+            let now = self.now;
+            self.pacing.swaps.push(SwapTimes {
+                swap_id,
+                surface: submission.surface_ids[0],
+                vblank: self.last_vblank.unwrap_or(now),
+                tick: self
+                    .vsync_answered
+                    .filter(|&(vblank, _)| Some(vblank) == self.last_vblank)
+                    .map(|(_, answered)| answered),
+                submitted: now,
+                times: SwapTimes::TIMES.map(|offset| SwapTimes::word(input, offset)),
+                words: SwapTimes::WORDS.map(|offset| SwapTimes::word(input, offset)),
+                ready: (fenced == 0).then_some(now),
+                ..SwapTimes::default()
+            });
+        }
         self.frames.push_back(Frame {
             swap_id,
             client,
@@ -2011,6 +2653,7 @@ impl Methods {
             waiting_since: None,
             submitted_at: self.now,
             ready_at: (fenced == 0).then_some(self.now),
+            requested: submission.requested,
             planes: shown,
             updated: if submission.enabled & swap::REMOVE_LAYERS != 0 {
                 (1 << swap::LAYERS) - 1
@@ -2024,6 +2667,31 @@ impl Methods {
 }
 
 impl Methods {
+    /// Time a submit at the counter's last reading against the last vblank
+    /// and the latest completion answered, and count the swaps still
+    /// waiting for their completion's answer: queued, presented and not
+    /// yet sent, or out to the AP.
+    fn pace_submit(&mut self) {
+        let now = self.now;
+        if let Some(vblank) = self.last_vblank {
+            self.pacing.after_vsync.add(now.saturating_sub(vblank));
+        }
+        if let Some(answered) = self.completion_answered.take() {
+            self.pacing.turnaround.add(now.saturating_sub(answered));
+        }
+        let unanswered = self.frames.len() + self.completed.len() + usize::from(self.completing);
+        self.pacing.overlapped += u32::from(unanswered != 0);
+        self.pacing.most_unanswered = self.pacing.most_unanswered.max(unanswered);
+    }
+
+    /// This window's sample of `swap_id`, if it is one ([`Pacing::swaps`]).
+    fn sampled(&mut self, swap_id: u32) -> Option<&mut SwapTimes> {
+        self.pacing
+            .swaps
+            .iter_mut()
+            .find(|sample| sample.swap_id == swap_id)
+    }
+
     /// Log each slot whose surface size, source rectangle or destination
     /// size `planes` changes, the first [`PLACEMENTS`] times: what the guest
     /// asks the scaler for. A destination that only moves (the cursor) is
@@ -2157,8 +2825,6 @@ pub fn answer(row: &Method, input: &[u8], output: u32, mode: Mode) -> Result<Opt
         (UP, "set_create_DFB") | (AP, "stop_signal") | (AP, "free_signal") => sized(Vec::new()),
         // flush_supportsPower(bool): no output.
         (AP, "flush_supportsPower") => sized(Vec::new()),
-        // setDisplayRefreshProperties: success (out=4).
-        (AP, "setDisplayRefreshProperties") => sized(bool_reply(true)),
         // apt_supported (UPPipeAP_H13P::late_init 0x2a4e98c): false. The
         // firmware answers pipe word +0x42c == 1 (restore 0x2bcad0, normal
         // 0x2bf884), which its init sets only to 3 or 0 (0x2c84b0, 0x2c8724).

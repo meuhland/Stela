@@ -194,12 +194,13 @@ fn shape_rules_follow_metal() {
     let mut shared = descriptor(TextureType::D2, PixelFormat::Rgba8Unorm);
     shared.options.storage_mode = StorageMode::Shared;
     assert!(texture(&capabilities, &shared).is_ok());
+    // Multisample too, with no CPU copies (Metal copies no samples).
     shared.texture_type = TextureType::D2Multisample;
     shared.sample_count = 4;
-    assert!(matches!(
-        texture(&capabilities, &shared),
-        Err(Error::Unsupported(_))
-    ));
+    assert_eq!(
+        texture(&capabilities, &shared).unwrap().cpu_access,
+        CpuAccess::None
+    );
 
     let mut huge = descriptor(TextureType::D2, PixelFormat::Rgba8Unorm);
     huge.width = 65536;
@@ -247,6 +248,42 @@ fn unsupported_formats_and_uses_are_refused_by_capability() {
         texture(&capabilities, &float_atomic),
         Err(Error::Unsupported("texture atomics on this pixel format"))
     );
+}
+
+/// Metal gives depth and stencil formats no shader writes, and Apple's
+/// drivers make a depth texture whose descriptor asks for them, as Setup
+/// Assistant's Depth32Float texture does: the bit is dropped, its other uses
+/// kept.
+#[test]
+fn shader_writes_asked_of_a_depth_or_stencil_texture_are_dropped() {
+    let capabilities = capabilities();
+    for format in [
+        PixelFormat::Depth32Float,
+        PixelFormat::Depth16Unorm,
+        PixelFormat::Depth32FloatStencil8,
+        PixelFormat::Stencil8,
+    ] {
+        let mut depth = descriptor(TextureType::D2, format);
+        depth.usage =
+            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET;
+        let plan = texture(&capabilities, &depth).unwrap();
+        assert!(
+            !plan.image.usage.contains(ImageUsage::STORAGE),
+            "{format:?}"
+        );
+        assert!(
+            plan.image
+                .usage
+                .contains(ImageUsage::SAMPLED | ImageUsage::DEPTH_STENCIL_ATTACHMENT),
+            "{format:?}"
+        );
+        depth.usage = TextureUsage::SHADER_WRITE;
+        let plan = texture(&capabilities, &depth).unwrap();
+        assert!(
+            !plan.image.usage.contains(ImageUsage::STORAGE),
+            "{format:?}"
+        );
+    }
 }
 
 #[test]
@@ -340,6 +377,50 @@ fn shared_textures_use_host_image_copies() {
     let plan = texture(&capabilities(), &shared).unwrap();
     assert_eq!(plan.cpu_access, CpuAccess::HostImageCopy);
     assert!(plan.image.usage.contains(ImageUsage::HOST_TRANSFER));
+}
+
+/// On Apple GPUs every storage mode is unified memory: shared textures of
+/// formats without host image copy are made, as NVK's depth and stencil
+/// formats are, and each keeps the CPU access Metal gives it.
+#[test]
+fn shared_textures_without_host_image_copy_are_made() {
+    let capabilities = capabilities();
+    let plan = |format, samples: u64| {
+        let mut shared = descriptor(TextureType::D2, format);
+        if samples > 1 {
+            shared.texture_type = TextureType::D2Multisample;
+        }
+        shared.sample_count = samples;
+        shared.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
+        shared.options = options(StorageMode::Shared);
+        texture(&capabilities, &shared)
+    };
+    for format in [
+        PixelFormat::Depth16Unorm,
+        PixelFormat::Depth32Float,
+        PixelFormat::Stencil8,
+    ] {
+        let made = plan(format, 1).unwrap();
+        assert_eq!(made.cpu_access, CpuAccess::Staged, "{format:?}");
+        assert!(!made.image.usage.contains(ImageUsage::HOST_TRANSFER));
+        assert_eq!(made.memory.required, M::DEVICE_LOCAL);
+    }
+    // No CPU call reaches a combined format's texels: blits copy each
+    // aspect.
+    assert_eq!(
+        plan(PixelFormat::Depth32FloatStencil8, 1)
+            .unwrap()
+            .cpu_access,
+        CpuAccess::None
+    );
+    // Nor does any CPU call reach a multisample texture's, as Chess's
+    // shared 4x Depth32Float attachment and a shared multisample color
+    // target are made.
+    for format in [PixelFormat::Depth32Float, PixelFormat::Rgba8Unorm] {
+        let made = plan(format, 4).unwrap();
+        assert_eq!(made.cpu_access, CpuAccess::None, "{format:?}");
+        assert!(!made.image.usage.contains(ImageUsage::HOST_TRANSFER));
+    }
 }
 
 #[test]
@@ -519,7 +600,7 @@ fn stencil_views_read_the_stencil_aspect() {
 }
 
 #[test]
-fn linear_textures_alias_buffer_rows_with_nvk_alignment() {
+fn linear_textures_alias_buffer_rows_of_whole_pixels() {
     let capabilities = capabilities();
     let mut linear = descriptor(TextureType::D2, PixelFormat::Bgra8Unorm);
     linear.width = 100;
@@ -529,13 +610,26 @@ fn linear_textures_alias_buffer_rows_with_nvk_alignment() {
     assert_eq!(plan.image.tiling, ImageTiling::DrmFormatModifier);
     assert_eq!(plan.image.linear, Some(LinearLayout { row_pitch: 416 }));
     assert_eq!(plan.cpu_access, CpuAccess::Linear);
+    let copy = aligned_copy(&plan.image);
+    assert_eq!((copy.tiling, copy.linear), (ImageTiling::Optimal, None));
+    assert!(
+        copy.usage
+            .contains(ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST)
+    );
 
     let refused = |offset, bytes_per_row, length| {
         linear_texture(&capabilities, &linear, length, offset, bytes_per_row).is_err()
     };
-    assert!(refused(8192, 400, 1 << 20), "rows need 32-byte alignment");
+    // Rows and offsets of whole pixels are taken; those the GPU cannot
+    // address in place become an aligned copy.
+    assert!(!refused(8192, 400, 1 << 20));
+    assert!(!refused(4100, 416, 1 << 20));
+    assert!(linear_layout_fits(&capabilities, 8192, 416));
+    assert!(!linear_layout_fits(&capabilities, 8192, 400));
+    assert!(!linear_layout_fits(&capabilities, 4100, 416));
+    assert!(refused(8192, 402, 1 << 20), "rows are whole pixels");
+    assert!(refused(4098, 416, 1 << 20), "offsets are whole pixels");
     assert!(refused(8192, 384, 1 << 20), "a row is 400 bytes");
-    assert!(refused(4100, 416, 1 << 20), "offsets need page alignment");
     assert!(refused(0, 416, 9 * 416 + 399), "the last row must fit");
     assert!(!refused(0, 416, 9 * 416 + 400));
     let mut d1 = linear;

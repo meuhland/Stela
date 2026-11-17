@@ -738,3 +738,107 @@ fn a_set_pac_bit_63_does_not_move_the_field_to_the_upper_range() -> Result<()> {
     assert!(upper > 0 && lower > 0, "both PAC bit-63 values occur");
     Ok(())
 }
+
+/// A context with its regime's layouts worked out ahead signs,
+/// authenticates and strips exactly as one that works each layout out.
+#[test]
+fn layouts_worked_out_ahead_match_the_regime() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let tbis = [
+        0,
+        1 << 37,
+        1 << 38,
+        1 << 37 | 1 << 38 | 1 << 51,
+        1 << 38 | 1 << 52,
+    ];
+    for tcr in tbis.into_iter().flat_map(|tbi| {
+        [17 | 17 << 16, 25 | 25 << 16, 16 | 39 << 16, 48 | 1 << 16].map(|sizes| tbi | sizes)
+    }) {
+        let layouts = Layouts::new(tcr);
+        assert_eq!(layouts.tcr(), tcr);
+        for version in [
+            Version::Classic,
+            Version::Enhanced,
+            Version::FaultingCombined,
+        ] {
+            let worked = Context::new_with_version(1, all_keys(), version)
+                .with_translation_regime(tcr)
+                .with_implementation_defined_cipher();
+            let ahead = Context::new_with_version(1, all_keys(), version)
+                .with_layouts(layouts)
+                .with_implementation_defined_cipher();
+            for _ in 0..64 {
+                let pointer = next();
+                let pointer = match pointer & 3 {
+                    0 => pointer & 0x0000_ffff_ffff_fff0,
+                    1 => pointer | 0xffff_0000_0000_0000,
+                    _ => pointer,
+                };
+                let modifier = next();
+                for key in [Key::Ia, Key::Ib, Key::Da, Key::Db] {
+                    let signed = worked.sign(key, pointer, modifier);
+                    assert_eq!(signed, ahead.sign(key, pointer, modifier));
+                    assert_eq!(worked.strip(key, pointer), ahead.strip(key, pointer));
+                    for candidate in [pointer, signed.unwrap()] {
+                        for combined in [false, true] {
+                            assert_eq!(
+                                worked.authenticate_operation(key, candidate, modifier, combined),
+                                ahead.authenticate_operation(key, candidate, modifier, combined)
+                            );
+                        }
+                    }
+                }
+            }
+            for data in [false, true] {
+                assert_eq!(worked.stripping_masks(data), ahead.stripping_masks(data));
+            }
+        }
+    }
+}
+
+/// A regime's layout of a signing or an authentication depends on one
+/// pointer bit, the one `Layouts::native` names, under every combination
+/// of TBI0, TBI1, TBID0 and TBID1 and for both domains, with the ranges'
+/// TnSZ equal or not.
+#[test]
+fn layouts_depend_on_the_one_bit_native_code_selects_by() {
+    for controls in 0..16u64 {
+        let bits = (controls & 1) << 37
+            | (controls >> 1 & 1) << 38
+            | (controls >> 2 & 1) << 51
+            | (controls >> 3 & 1) << 52;
+        for (t0sz, t1sz) in [(25, 25), (17, 25), (16, 39), (39, 16)] {
+            let layouts = Layouts::new(t0sz | t1sz << 16 | bits);
+            for data in [false, true] {
+                let domain = if data {
+                    policy::Domain::Data
+                } else {
+                    policy::Domain::Instruction
+                };
+                for signing in [false, true] {
+                    let (select, extension) = layouts.native(data, signing);
+                    assert!(select == 55 || select == 63);
+                    // Authentications always select by bit 55.
+                    assert!(signing || select == 55);
+                    for pointer in [0, 1 << 55, 1 << 63, 1 << 55 | 1 << 63] {
+                        let selected = usize::from(pointer & 1 << select != 0);
+                        assert_eq!(
+                            layouts.get(domain, pointer, signing).extension_mask(),
+                            extension[selected],
+                            "controls={controls:#x} t0sz={t0sz} t1sz={t1sz} data={data} signing={signing} pointer={pointer:#x}"
+                        );
+                        // The select bit is in the extension it selects.
+                        assert_ne!(extension[selected] & 1 << select, 0);
+                        assert_ne!(extension[selected] & 1 << 55, 0);
+                    }
+                }
+            }
+        }
+    }
+}

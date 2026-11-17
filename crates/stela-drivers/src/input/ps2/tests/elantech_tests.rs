@@ -390,7 +390,7 @@ fn real_v1_parity_rocker_and_startup_quirk_reports_keep_suppressed_packets() {
             polled
                 .inputs
                 .iter()
-                .filter(|e| **e == Input::Buttons(1))
+                .filter(|e| **e == Input::MouseButtons(1))
                 .count(),
             1
         );
@@ -917,10 +917,9 @@ fn bad_packet_and_idle_prefix_keep_fault_bytes_even_after_explicit_input_release
         };
         raw[0] ^= if firmware == 0x010000 { 0x10 } else { 4 };
         emit(&h, Port::Mouse, &raw);
-        assert_eq!(
-            c.poll().unwrap_err().kind,
-            ErrorKind::Elantech(elantech::Error::Packet)
-        );
+        // Dropped, and the pad reads on, as psmouse resynchronizes.
+        assert!(c.poll().unwrap().is_empty());
+        assert!(c.framing_errors() != 0);
         assert_eq!(c.elantech_fragment().unwrap(), raw);
         c.release_inputs();
         assert_eq!(c.elantech_fragment().unwrap(), raw);
@@ -934,10 +933,9 @@ fn bad_packet_and_idle_prefix_keep_fault_bytes_even_after_explicit_input_release
         emit(&h, Port::Mouse, &raw[..2]);
         c.poll().unwrap();
         h.borrow().time.set(h.borrow().time.get() + 501);
-        assert_eq!(
-            c.poll().unwrap_err().kind,
-            ErrorKind::PacketTimeout(Port::Mouse)
-        );
+        // Dropped, and the pad reads on, as psmouse resynchronizes.
+        assert!(c.poll().unwrap().is_empty());
+        assert!(c.framing_errors() != 0);
         c.release_inputs();
         assert_eq!(c.elantech_fragment().unwrap(), &raw[..2]);
     }

@@ -6,16 +6,19 @@
 pub mod cyapa;
 mod device;
 pub mod elan;
+mod held;
 pub mod hid_i2c;
 pub mod ish;
 pub mod observation;
 pub mod ps2;
+pub mod ptp;
 pub mod rmi;
 pub mod sfh;
 pub mod touchpad;
 pub mod virtio;
 
 pub use device::{InputDevice, InputError};
+pub use held::HeldInputs;
 
 /// What masking an I2C touchpad's interrupt after a failed operation
 /// achieved, as Cypress and Elan drivers report with their errors.

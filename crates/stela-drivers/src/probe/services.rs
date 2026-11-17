@@ -247,6 +247,23 @@ pub unsafe trait NativeServices {
         physical: u64,
         bytes: usize,
     ) -> Result<core::ptr::NonNull<u8>, ServiceError>;
+
+    /// Copies firmware memory at `physical` that is no device's BAR, such as
+    /// a table in ACPI NVS a device's configuration points at (an Intel
+    /// GPU's OpRegion). It is read through the same owner and under the same
+    /// refusals as [`Self::firmware_memory`]; no pointer leaves the owner, so
+    /// nothing is written through this service.
+    #[cfg(feature = "native-acpi")]
+    fn read_firmware_memory(&self, physical: u64, into: &mut [u8]) -> Result<(), ServiceError> {
+        let base = self.firmware_memory(physical, into.len())?;
+        for (offset, byte) in into.iter_mut().enumerate() {
+            // SAFETY: `firmware_memory` mapped `into.len()` bytes at `base`
+            // for the program; firmware may change them, so each is read
+            // volatile and none is borrowed.
+            *byte = unsafe { base.as_ptr().add(offset).read_volatile() };
+        }
+        Ok(())
+    }
 }
 
 /// ACPI hardware IDs of the classes attached through [`NativeServices`].
@@ -288,6 +305,9 @@ pub(crate) mod tests {
     pub(crate) struct Refusing {
         pub(crate) requests: RefCell<Vec<Address>>,
         pub(crate) preparations: RefCell<Vec<Address>>,
+        /// Firmware memory the mount would lend: its base and bytes.
+        #[cfg(feature = "native-acpi")]
+        firmware: RefCell<Option<(u64, Vec<u8>)>>,
         model_minimum: bool,
     }
     impl Refusing {
@@ -369,11 +389,39 @@ pub(crate) mod tests {
         #[cfg(feature = "native-acpi")]
         fn firmware_memory(
             &self,
-            _: u64,
-            _: usize,
+            physical: u64,
+            bytes: usize,
         ) -> Result<core::ptr::NonNull<u8>, ServiceError> {
-            Err(ServiceError::Unavailable)
+            let mut firmware = self.firmware.borrow_mut();
+            let (base, memory) = firmware.as_mut().ok_or(ServiceError::Unavailable)?;
+            physical
+                .checked_sub(*base)
+                .and_then(|start| memory.get_mut(start as usize..)?.get_mut(..bytes))
+                .and_then(|range| core::ptr::NonNull::new(range.as_mut_ptr()))
+                .ok_or(ServiceError::Refused("outside the firmware's memory"))
         }
+    }
+
+    #[cfg(feature = "native-acpi")]
+    #[test]
+    fn firmware_memory_is_copied_within_its_owners_range_only() {
+        let services = Refusing::default();
+        let mut bytes = [0xff; 4];
+        assert_eq!(
+            services.read_firmware_memory(0x7a00_0000, &mut bytes),
+            Err(ServiceError::Unavailable)
+        );
+        *services.firmware.borrow_mut() = Some((0x7a00_0000, (0..16).collect()));
+        services
+            .read_firmware_memory(0x7a00_0004, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [4, 5, 6, 7]);
+        // A range the owner refuses copies nothing.
+        assert!(matches!(
+            services.read_firmware_memory(0x7a00_000e, &mut bytes),
+            Err(ServiceError::Refused(_))
+        ));
+        assert_eq!(bytes, [4, 5, 6, 7]);
     }
 
     #[test]

@@ -69,6 +69,13 @@ pub trait Kick: Send + Sync {
     fn ticks(&self) -> u64 {
         0
     }
+    /// The host's counter as [`super::Host::counter`] reads it, from any
+    /// core: what a wake for a PE that serves the host marks in the shared
+    /// count ([`Hub::wake`]). `None` from a host that keeps no such count,
+    /// whose wakes then mark nothing.
+    fn count(&self) -> Option<u64> {
+        None
+    }
     /// Runs on the processor that just released the devices' lock, outside
     /// it: host work its device call left for that processor to do. Whether
     /// that work completed something the devices should look at now.
@@ -125,6 +132,111 @@ pub(super) fn idle_poll_after(poll: u64, blocked: u64, most: u64, doorbell: bool
 
 /// A PE that may use any context's translations ([`Inbox::translating`]).
 const ANY_CONTEXT: u32 = u32::MAX;
+
+/// [`Inbox::serving`] of a PE that does not serve the host.
+const NOT_SERVING: u64 = u64::MAX;
+
+/// [`Inbox::serving_accepts`] of a PE that takes both lines.
+const ACCEPTS_ALL: u8 = 3;
+
+/// IRQ and FIQ as [`Inbox::serving_accepts`] holds them.
+fn pack_accepts(lines: Lines) -> u8 {
+    u8::from(lines.irq) | u8::from(lines.fiq) << 1
+}
+
+/// Guest work that waits for a PE while its machine serves the host
+/// ([`GuestWatch::pending`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// Its device lines changed: an interrupt, a fast IPI among them.
+    Lines,
+    /// The host called for its core ([`Hub::call_host`]).
+    HostCall,
+    /// Another PE's device access waits for the home machine.
+    Forward,
+    /// The PEs are stopped or the run ends: it is to park.
+    Stop,
+    /// Its own timer, PMI or wait timeout is due.
+    Timer,
+}
+
+impl Pending {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lines => "lines",
+            Self::HostCall => "call",
+            Self::Forward => "forward",
+            Self::Stop => "stop",
+            Self::Timer => "timer",
+        }
+    }
+}
+
+/// What ends the host's work on one PE's core early ([`Machine::serve_host`]):
+/// guest work for that PE. A PE out of its run loop answers no interrupt
+/// and runs no timer of its own, so the host's work runs in short parts and
+/// looks between them ([`Self::pending`]). A wake with guest work for it
+/// also kicks its core, which ends a host wait for an interrupt, and holds
+/// the shared count a stall limit past the wake should the PE stay out
+/// (`clock`), as its own due timer does: no other PE then sees it answer
+/// nothing for longer than XNU's cross-core timeouts allow.
+#[derive(Clone)]
+pub struct GuestWatch {
+    hub: Option<Arc<Hub>>,
+    pe: usize,
+    /// The device line epoch its machine last read.
+    epoch: u64,
+    /// The host count at which its own timers next want it, not before it
+    /// began to serve ([`Machine::serving_mark`]).
+    wake_at: Option<u64>,
+}
+
+impl GuestWatch {
+    /// A watch of PE `pe` on `hub` from line epoch `epoch`, whose own
+    /// timers want it at host count `wake_at`.
+    pub fn new(hub: Option<Arc<Hub>>, pe: usize, epoch: u64, wake_at: Option<u64>) -> Self {
+        Self {
+            hub,
+            pe,
+            epoch,
+            wake_at,
+        }
+    }
+
+    pub fn pe(&self) -> usize {
+        self.pe
+    }
+
+    /// The guest work waiting for the PE at host count `host`, if any: a
+    /// few loads, for a look between two parts of the host's work.
+    pub fn pending(&self, host: u64) -> Option<Pending> {
+        if let Some(pending) = self
+            .hub
+            .as_ref()
+            .and_then(|hub| hub.guest_pending(self.pe, self.epoch))
+        {
+            return Some(pending);
+        }
+        self.wake_at
+            .filter(|&at| host >= at)
+            .map(|_| Pending::Timer)
+    }
+
+    /// [`Self::pending`], with the host counts it has waited at `host`
+    /// when known: since its timer's deadline, or since the first wake that
+    /// brought it.
+    pub fn waited(&self, host: u64) -> Option<(Pending, Option<u64>)> {
+        let pending = self.pending(host)?;
+        let since = match pending {
+            Pending::Timer => self.wake_at,
+            _ => self.hub.as_ref().and_then(|hub| {
+                let woken = hub.inboxes[self.pe].serving_woken.load(Ordering::Relaxed);
+                (woken != 0).then_some(woken)
+            }),
+        };
+        Some((pending, since.map(|since| host.saturating_sub(since))))
+    }
+}
 
 /// The maintenance a PE keeps for the others ([`Machine::post`]) before it
 /// sends it, DSB or not.
@@ -312,6 +424,10 @@ struct Inbox {
     /// A running core reads its mail at its next return to the engine,
     /// which [`Hub::interrupt`] brings forward to its next chained transfer.
     sleeping: AtomicBool,
+    /// The host tick of the first [`Hub::wake`] that kicked it in this
+    /// sleep, 0 for none: how long its core takes to come back
+    /// ([`Hub::take_wake_latency`]).
+    kicked_at: AtomicU64,
     /// While it sleeps, it waits for an interrupt (or is powered down), so a
     /// wake for the host's service is one it takes ([`Hub::request_service`]):
     /// one waiting in WFE may hold a ticket another PE hands it, and leaves
@@ -323,6 +439,19 @@ struct Inbox {
     /// compiles: it runs no guest code until it reads its mail again, so a
     /// broadcast need not wait for it, as for one that sleeps.
     outside: AtomicBool,
+    /// While its machine does the host's work outside its run loop
+    /// ([`Machine::serve_host`]): the device line epoch it last read, else
+    /// [`NOT_SERVING`]. A wake that brings it guest work then kicks it and
+    /// marks the shared count ([`Hub::wake`]), and the work ends at its next
+    /// part ([`GuestWatch`]).
+    serving: AtomicU64,
+    /// The host count of the first wake with guest work since it began
+    /// serving, 0 for none: how long that work has waited.
+    serving_woken: AtomicU64,
+    /// The device lines that bring it back to guest work while it serves
+    /// ([`Machine::accepted_lines`], [`pack_accepts`]): a line change is
+    /// guest work for it only while it accepts some line.
+    serving_accepts: AtomicU8,
     /// Odd while its machine acts on a fetched block: runs it natively
     /// (with the translations its host and chained blocks keep) and
     /// completes its exit, or takes the fetch's exception or checked
@@ -467,10 +596,18 @@ pub struct Counts {
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail and its probe
-    /// transfers ([`super::Statistics::lookup_hits`]).
-    pub stamped: [u64; chain::STAMP_COUNTS + 4],
+    /// transfers ([`super::Statistics::lookup_hits`]), its cell probe
+    /// transfers, and the cells held, those past the stamped ones and those
+    /// holding no entry when it last looked, then the hot exits promotion
+    /// left waiting, the cell samples it read and the hot exits it found
+    /// no free stamped cell for ([`super::Statistics::cell_probes`] on).
+    pub stamped: [u64; chain::STAMP_COUNTS + 11],
+    /// What its paired frames did since boot ([`chain::PairCount`]'s order).
+    pub pairs: [u64; chain::PAIR_COUNTS],
     /// PAC results its service computed since boot, each a memo miss.
     pub pac_fills: u64,
+    /// Its PAC census under step timing ([`step_timing::PAC_CENSUS_WORDS`]).
+    pub pac_census: [u64; step_timing::PAC_CENSUS_WORDS],
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
     /// step timing is enabled.
     pub phases: [u64; step_timing::Phase::COUNT],
@@ -496,6 +633,10 @@ pub(super) struct Cluster {
 pub struct Hub {
     inboxes: Box<[Inbox]>,
     kick: Box<dyn Kick>,
+    /// Sleeping PEs a [`Hub::wake`] kicked, and the host ticks from that
+    /// kick to their sleep's end, summed and the longest
+    /// ([`Hub::take_wake_latency`]).
+    wake_latency: [AtomicU64; 3],
     /// Cluster state by physical cluster (MPIDR_EL1 Aff1).
     clusters: Mutex<BTreeMap<u64, Cluster>>,
     /// The count every PE reads, from the home machine's as the board went
@@ -591,11 +732,15 @@ impl Hub {
                     pending: AtomicBool::new(false),
                     live: AtomicBool::new(false),
                     sleeping: AtomicBool::new(false),
+                    kicked_at: AtomicU64::new(0),
                     serves: AtomicBool::new(false),
                     host_call: AtomicBool::new(false),
                     translating: AtomicU32::new(ANY_CONTEXT),
                     lower_globals: Arc::new(GlobalSpan::new()),
                     outside: AtomicBool::new(false),
+                    serving: AtomicU64::new(NOT_SERVING),
+                    serving_woken: AtomicU64::new(0),
+                    serving_accepts: AtomicU8::new(ACCEPTS_ALL),
                     active: AtomicU64::new(0),
                     doing: AtomicU64::new(0),
                     chain: chain_control::Storage::new(),
@@ -614,6 +759,7 @@ impl Hub {
                 })
                 .collect(),
             kick: Box::new(kick),
+            wake_latency: Default::default(),
             clusters: Mutex::new(BTreeMap::new()),
             clock: Arc::new(SharedClock::new(pes)),
             home: Padded(AtomicUsize::new(0)),
@@ -637,6 +783,19 @@ impl Hub {
     /// The host's count for timing lock waits ([`Kick::ticks`]).
     pub(super) fn ticks(&self) -> u64 {
         self.kick.ticks()
+    }
+
+    /// Since the last call: the sleeping PEs a wake kicked, and the host
+    /// ticks ([`Kick::ticks`]) from the kick to the end of their sleep,
+    /// summed and the longest. What a device interrupt or an IPI for an
+    /// idle PE pays before its engine runs again.
+    pub fn take_wake_latency(&self) -> (u64, u64, u64) {
+        let [count, ticks, longest] = &self.wake_latency;
+        (
+            count.swap(0, Ordering::Relaxed),
+            ticks.swap(0, Ordering::Relaxed),
+            longest.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// What the code the board's PEs share came to: `None` while each
@@ -663,6 +822,12 @@ impl Hub {
     /// last call ([`SharedClock::take_stalled`]).
     pub fn clock_stalled(&self) -> u64 {
         self.clock.take_stalled()
+    }
+
+    /// Host counts of those a lease held while a kernel spin was old,
+    /// since the last call ([`SharedClock::take_leased`]).
+    pub fn clock_leased(&self) -> u64 {
+        self.clock.take_leased()
     }
 
     /// Host counts the count now lags the host's by, and the counts the
@@ -746,12 +911,113 @@ impl Hub {
         self.inboxes[pe].chain.notify();
     }
 
-    /// Kick PE `pe`'s core if it halts. Ordered after the store that tells
-    /// it why, against its own store of `sleeping` before it looks
-    /// ([`Self::sleep`]): one of them sees the other's.
+    /// Kick PE `pe`'s core if it halts, or if it serves the host and this
+    /// wake brings it guest work ([`Self::wake_serving`]). Ordered after the
+    /// store that tells it why, against its own store of `sleeping` before
+    /// it looks ([`Self::sleep`]), or of `serving` ([`Self::set_serving`]):
+    /// one of them sees the other's. A PE in its run loop costs one more
+    /// load.
     fn wake(&self, pe: usize) {
-        if self.inboxes[pe].sleeping.load(Ordering::SeqCst) {
+        let inbox = &self.inboxes[pe];
+        if inbox.sleeping.load(Ordering::SeqCst) {
+            let ticks = self.kick.ticks();
+            if ticks != 0 {
+                let _ = inbox.kicked_at.compare_exchange(
+                    0,
+                    ticks,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
             self.kick.kick(pe);
+            return;
+        }
+        let epoch = inbox.serving.load(Ordering::SeqCst);
+        if epoch != NOT_SERVING {
+            self.wake_serving(pe, epoch, true);
+        }
+    }
+
+    /// PE `pe` serves the host from line epoch `epoch`: with guest work for
+    /// it, its first such wake kicks its core (`kick`), whose host waits for
+    /// an interrupt then end. Its work looks for the guest's at its next
+    /// part ([`GuestWatch`]). A line it accepts also marks its slot of the
+    /// shared count with the count now, so that the count waits for it a
+    /// stall limit later (`clock`): only an interrupt it would take, or that
+    /// ends its wait, is guest work another core's XNU can time. A host
+    /// call is not, and a forwarded access or a stop waits on PEs whose own
+    /// slots hold the count while they wait in their exits.
+    #[cold]
+    fn wake_serving(&self, pe: usize, epoch: u64, kick: bool) {
+        let Some(pending) = self.guest_pending(pe, epoch) else {
+            return;
+        };
+        let host = self.kick.count();
+        let first = self.inboxes[pe]
+            .serving_woken
+            .compare_exchange(
+                0,
+                host.unwrap_or(0).max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        if first && kick {
+            self.kick.kick(pe);
+        }
+        // Lowers the slot to the first such wake's count; a later one, or
+        // one after a host call's, leaves it or lowers it once.
+        if pending == Pending::Lines
+            && let Some(host) = host
+        {
+            let count = self.clock.count(|| host);
+            self.clock.pending(pe, count);
+        }
+    }
+
+    /// The device lines that bring PE `pe` back to guest work while its
+    /// machine serves the host ([`Machine::accepted_lines`]), set before
+    /// [`Self::set_serving`].
+    pub(super) fn set_accepts(&self, pe: usize, lines: Lines) {
+        self.inboxes[pe]
+            .serving_accepts
+            .store(pack_accepts(lines), Ordering::Relaxed);
+    }
+
+    /// PE `pe`'s machine serves the host from line epoch `epoch`, or no
+    /// longer (`None`); the state before. Guest work already there when it
+    /// begins marks the count as a wake would, without a kick.
+    pub(super) fn set_serving(&self, pe: usize, epoch: Option<u64>) -> Option<u64> {
+        let inbox = &self.inboxes[pe];
+        let word = epoch.unwrap_or(NOT_SERVING);
+        if epoch.is_some() {
+            inbox.serving_woken.store(0, Ordering::Relaxed);
+        }
+        let was = inbox.serving.swap(word, Ordering::SeqCst);
+        if let Some(epoch) = epoch {
+            self.wake_serving(pe, epoch, false);
+        }
+        (was != NOT_SERVING).then_some(was)
+    }
+
+    /// The guest work waiting for PE `pe`, whose machine last read line
+    /// epoch `epoch`, other than its own timers: a line change while it
+    /// accepts a line ([`Self::set_accepts`]), a host call, a forwarded
+    /// access for the home machine, or a stop.
+    pub(super) fn guest_pending(&self, pe: usize, epoch: u64) -> Option<Pending> {
+        let inbox = &self.inboxes[pe];
+        if inbox.lines.load(Ordering::SeqCst) != epoch
+            && inbox.serving_accepts.load(Ordering::Relaxed) != 0
+        {
+            Some(Pending::Lines)
+        } else if inbox.host_call.load(Ordering::SeqCst) {
+            Some(Pending::HostCall)
+        } else if self.home.load(Ordering::Relaxed) == pe && self.requested.load(Ordering::SeqCst) {
+            Some(Pending::Forward)
+        } else if self.home.load(Ordering::Relaxed) != pe && self.stopped.load(Ordering::SeqCst) {
+            Some(Pending::Stop)
+        } else {
+            None
         }
     }
 
@@ -770,10 +1036,18 @@ impl Hub {
     /// interrupt, so takes the host's service a wake brings ([`Inbox::serves`]).
     fn sleep(&self, pe: usize, epoch: u64, serves: bool, halt: impl FnOnce()) {
         let inbox = &self.inboxes[pe];
+        inbox.kicked_at.store(0, Ordering::Relaxed);
         inbox.serves.store(serves, Ordering::SeqCst);
         inbox.sleeping.store(true, Ordering::SeqCst);
         if !self.woken(pe, epoch) {
             halt();
+        }
+        let kicked = inbox.kicked_at.swap(0, Ordering::Relaxed);
+        if kicked != 0 {
+            let took = self.kick.ticks().saturating_sub(kicked);
+            self.wake_latency[0].fetch_add(1, Ordering::Relaxed);
+            self.wake_latency[1].fetch_add(took, Ordering::Relaxed);
+            self.wake_latency[2].fetch_max(took, Ordering::Relaxed);
         }
         // Ordered before its look at its mail, against a broadcast's look
         // at `sleeping` ([`Self::applied`]).
@@ -834,6 +1108,20 @@ impl Hub {
         self.inboxes[pe].host_call.store(true, Ordering::SeqCst);
         self.interrupt(pe);
         self.wake(pe);
+    }
+
+    /// The host has work for an idle core, such as a job a guest call waits
+    /// for: a PE other than `skip` that sleeps waiting for an interrupt is
+    /// called ([`Self::call_host`]), so its wait ends and it serves the host
+    /// at once. A sleeping PE wakes only for its guest or the host's
+    /// service, so without this the work waits for the next PE that stops
+    /// to wait. Whether one was called; with none asleep, the work waits.
+    pub fn call_sleeping_server(&self, skip: usize) -> bool {
+        let Some(pe) = self.sleeping_server(skip) else {
+            return false;
+        };
+        self.call_host(pe);
+        true
     }
 
     /// Whether the host needs PE `pe`'s core; once for each call.
@@ -1280,6 +1568,16 @@ impl Hub {
         self.inboxes
             .get(home)
             .is_some_and(|inbox| inbox.outside.load(Ordering::Acquire))
+    }
+
+    /// Whether the home machine is outside its run loop at work of its own
+    /// (serving the host, compiling, a report), not asleep: a wake would
+    /// not reach it until that work ends.
+    pub(super) fn home_busy_outside(&self) -> bool {
+        let home = self.home.load(Ordering::Acquire);
+        self.inboxes.get(home).is_some_and(|inbox| {
+            inbox.outside.load(Ordering::Acquire) && !inbox.sleeping.load(Ordering::SeqCst)
+        })
     }
 
     /// The counts in a millisecond of the count every PE reads.
@@ -1834,6 +2132,116 @@ impl<H: Host, D: Devices> Machine<H, D> {
         result
     }
 
+    /// Run the host's `work` on this PE's core outside its run loop, as
+    /// [`Self::outside_run`], while staying reachable for guest work: a wake
+    /// that brings this PE an interrupt kicks its core and marks the shared
+    /// count, as its own timer's deadline does, so the count holds a stall
+    /// limit past either if the PE stays out (`clock`). `work` looks for
+    /// that guest work between its parts ([`Self::guest_watch`]). Costs the
+    /// service path a clock read, two stores and a few loads; nothing on
+    /// the guest's.
+    pub fn serve_host<R>(&mut self, work: impl FnOnce(&mut Self) -> R) -> R {
+        // A nested service keeps the outer one's start.
+        let outer = self.serving_since;
+        self.serving_since = Some(outer.unwrap_or_else(|| self.host.counter()));
+        let result = match self.parallel.clone() {
+            None => work(self),
+            Some(hub) => {
+                let now = self.now();
+                let mark = self.serving_mark(now);
+                self.clock.serving(mark);
+                hub.set_accepts(self.current, self.accepted_lines());
+                let was = hub.set_serving(self.current, Some(self.lines_epoch));
+                let result = self.outside_run(work);
+                hub.set_serving(self.current, was);
+                result
+            }
+        };
+        self.serving_since = outer;
+        result
+    }
+
+    /// The count from which the running PE, leaving its run loop at count
+    /// `now` to serve the host, has guest work of its own waiting: its own
+    /// next wake ([`Self::own_deadline`]), but not before `now`. Until it
+    /// left it ran guest code, so a wake already past then waited for it no
+    /// longer than the service has.
+    pub(super) fn serving_mark(&mut self, now: u64) -> Option<u64> {
+        self.own_deadline(now).map(|deadline| deadline.max(now))
+    }
+
+    /// What ends the host's work on this PE's core early: the guest work
+    /// [`GuestWatch::pending`] finds for it, from the device lines it last
+    /// read and its own timers' next deadline, in host counts, not before
+    /// it began to serve ([`Self::serving_mark`]).
+    pub fn guest_watch(&mut self) -> GuestWatch {
+        let host = self.host.counter();
+        let since = self.serving_since.unwrap_or(host);
+        let now = self.now();
+        let wake_at = self
+            .own_deadline(now)
+            .map(|deadline| self.clock.host_deadline(deadline).max(since));
+        GuestWatch::new(
+            self.parallel.clone(),
+            self.current,
+            self.lines_epoch,
+            wake_at,
+        )
+    }
+
+    /// The earliest count at which the running PE's own wake would bring it
+    /// back to guest code, none while it is paused or powered down: its WFET
+    /// or WFIT timeout, which ends its wait whatever its masks, and its
+    /// timers and PMI, which Apple cores signal as FIQ, while it accepts the
+    /// FIQ ([`Self::accepted_lines`]). A timer that is disabled or masked by
+    /// its IMASK has no deadline (`timer::Channel::deadline`).
+    pub(super) fn own_deadline(&mut self, now: u64) -> Option<u64> {
+        if self.processor_paused(self.current) || self.waiting.is_some_and(|wait| wait.down) {
+            return None;
+        }
+        let timeout = self.waiting.and_then(|wait| wait.timeout).map(|timeout| {
+            if timeout.expired(now) {
+                now
+            } else {
+                timeout.deadline(now)
+            }
+        });
+        let fiq = if self.accepted_lines().fiq {
+            [
+                self.timer_deadline(),
+                self.cpu.pmu.as_ref().and_then(|monitor| monitor.deadline()),
+                self.devices.own_deadline(self.current),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        } else {
+            None
+        };
+        fiq.into_iter().chain(timeout).min()
+    }
+
+    /// The device lines that bring the running PE back to guest work now:
+    /// those its core's CYC_OVRD does not disable and that end its WFI or
+    /// WFE, masked or not, while it waits ([`Self::ready`]), or that it
+    /// takes at its PSTATE and routing while it runs ([`Self::taken`]). A PE
+    /// that runs with an interrupt masked leaves it pending until its own
+    /// code unmasks it, and no other core waits on that sooner.
+    pub(super) fn accepted_lines(&self) -> Lines {
+        use crate::machine::exception::{DAIF_F, DAIF_I, Vector};
+        if self.processor_paused(self.current) {
+            return Lines::default();
+        }
+        let enabled = |irq: bool| self.cpu.wakes_for(Lines { irq, fiq: !irq });
+        let takes = |vector: Vector, mask: u8| {
+            self.waiting.is_some() || self.taken(self.cpu.interrupt_target(vector), mask)
+        };
+        Lines {
+            irq: enabled(true) && takes(Vector::Irq, DAIF_I),
+            fiq: enabled(false) && takes(Vector::Fiq, DAIF_F),
+        }
+    }
+
     /// Halt the host core until an interrupt, or, in parallel, also until
     /// mail or a device line change reaches this PE.
     pub(super) fn sleep(&mut self) {
@@ -1988,6 +2396,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             super::timer::next_event(&self.cpu, now),
             self.timer_deadline(),
             self.cpu.pmu.as_ref().and_then(|monitor| monitor.deadline()),
+            self.devices.own_deadline(self.current),
             wait.timeout.map(|timeout| timeout.deadline(now)),
             lines,
         ]
@@ -2280,15 +2689,28 @@ impl<H: Host, D: Devices> Machine<H, D> {
             transition_misses: statistics.transition_misses,
             branch_misses: statistics.branch_misses,
             stamped: {
-                let mut stamped = [0; chain::STAMP_COUNTS + 4];
+                let mut stamped = [0; chain::STAMP_COUNTS + 11];
                 stamped[..chain::STAMP_COUNTS].copy_from_slice(&self.chain.stamp_counts());
                 stamped[chain::STAMP_COUNTS] = statistics.stamped_tails;
                 stamped[chain::STAMP_COUNTS + 1] = statistics.stamped_in_use;
                 stamped[chain::STAMP_COUNTS + 2] = statistics.predicted_tails;
                 stamped[chain::STAMP_COUNTS + 3] = statistics.lookup_hits;
+                stamped[chain::STAMP_COUNTS + 4] = statistics.cell_probes;
+                stamped[chain::STAMP_COUNTS + 5] = statistics.cells_live;
+                stamped[chain::STAMP_COUNTS + 6] = statistics.cells_past;
+                stamped[chain::STAMP_COUNTS + 7] = statistics.cells_empty;
+                stamped[chain::STAMP_COUNTS + 8] = statistics.promotions_waiting;
+                stamped[chain::STAMP_COUNTS + 9] = statistics.cell_samples;
+                stamped[chain::STAMP_COUNTS + 10] = statistics.promotions_full;
                 stamped
             },
+            pairs: self.chain.pairs(),
             pac_fills: self.pointer.fills,
+            pac_census: self
+                .pointer
+                .census
+                .as_ref()
+                .map_or([0; step_timing::PAC_CENSUS_WORDS], |census| census.words()),
             phases: self
                 .step_timing
                 .as_ref()

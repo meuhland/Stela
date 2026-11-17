@@ -183,7 +183,7 @@ fn measure_against_timers() -> Option<(Calibrated, TscSource)> {
     let rsdp = crate::storage::rsdp()?;
     let timers = Timers {
         // SAFETY: the UEFI configuration table's ACPI root, before EBS;
-        // `find` checks every table's checksum.
+        // `find` checks each table's length.
         pm: unsafe { acpi::find(rsdp, b"FACP") }
             .ok()
             .and_then(|table| pm_timer::Prepared::from_fadt(table).ok())
@@ -336,7 +336,7 @@ impl Timer for Hpet {
 
 /// Whether the firmware's current page tables map `address` (UEFI maps
 /// what it maps one to one). Reads its tables through that identity map.
-fn identity_mapped(address: u64) -> bool {
+pub(crate) fn identity_mapped(address: u64) -> bool {
     let (cr3, cr4): (u64, u64);
     // SAFETY: reads control registers only.
     unsafe {

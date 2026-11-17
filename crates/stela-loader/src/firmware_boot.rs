@@ -94,6 +94,15 @@ impl LoadOption {
             (None, _) => own.starts_with(&self.device_path),
         }
     }
+
+    /// Whether it starts a system installed on a disk: its path names a
+    /// partition (a hard drive node), as the entries a system's installer
+    /// adds do, such as Windows Boot Manager's or a Linux loader's. A
+    /// network boot, a firmware application or a whole removable device is
+    /// not a system on this PC's disks.
+    pub fn on_disk(&self) -> bool {
+        hard_drive_node(&self.device_path).is_some()
+    }
 }
 
 /// `BootOrder`: the entries' numbers, first boot first.
@@ -128,18 +137,24 @@ fn first_instance(path: &[u8]) -> Result<&[u8]> {
     Err(refuse!("a boot entry's device path has no end node").into())
 }
 
-/// The GPT partition GUID a path's hard drive node names.
-fn partition(path: &[u8]) -> Option<[u8; 16]> {
+/// A path's first hard drive node, of any partition table.
+fn hard_drive_node(path: &[u8]) -> Option<&[u8]> {
     let mut at = 0;
     while let Some(header) = path.get(at..at + 4) {
         let length = u16::from_le_bytes([header[2], header[3]]) as usize;
         let node = path.get(at..at + length.max(4))?;
         if header[0] == MEDIA && header[1] == HARD_DRIVE && length == HARD_DRIVE_BYTES {
-            return (node[41] == GUID_SIGNATURE).then(|| node[24..40].try_into().unwrap());
+            return Some(node);
         }
         at += length.max(4);
     }
     None
+}
+
+/// The GPT partition GUID a path's hard drive node names.
+fn partition(path: &[u8]) -> Option<[u8; 16]> {
+    let node = hard_drive_node(path)?;
+    (node[41] == GUID_SIGNATURE).then(|| node[24..40].try_into().unwrap())
 }
 
 #[cfg(test)]
@@ -247,6 +262,32 @@ mod tests {
         assert!(!parse([hard_drive(2), file("\\x.efi"), end()].concat()).starts_from(&own));
         let other = [node(2, 1, &[0; 8]), node(1, 1, &[0, 0x1d]), end()].concat();
         assert!(!parse(other).starts_from(&own));
+    }
+
+    #[test]
+    fn only_entries_on_a_partition_start_a_system_on_disk() {
+        let parse = |path: Vec<u8>| LoadOption::parse(&entry(ACTIVE, "x", &path)).unwrap();
+        // Windows Boot Manager or a Linux loader, short form or full.
+        assert!(
+            parse([hard_drive(7), file("\\EFI\\ubuntu\\shimx64.efi"), end()].concat()).on_disk()
+        );
+        assert!(parse([usb(), hard_drive(3), file("\\x.efi"), end()].concat()).on_disk());
+        // A partition of an MBR disk.
+        let mut mbr = hard_drive(4);
+        mbr[41] = 1;
+        assert!(parse([mbr, end()].concat()).on_disk());
+        // A whole removable device, a firmware application and a network
+        // boot (`MAC()/IPv4()`).
+        assert!(!parse([usb(), end()].concat()).on_disk());
+        assert!(!parse([file("\\shell.efi"), end()].concat()).on_disk());
+        let network = [
+            node(2, 1, &[0; 8]),
+            node(3, 11, &[0; 33]),
+            node(3, 12, &[0; 23]),
+            end(),
+        ]
+        .concat();
+        assert!(!parse(network).on_disk());
     }
 
     #[test]

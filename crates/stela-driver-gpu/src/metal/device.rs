@@ -49,6 +49,7 @@ pub mod pins;
 pub mod pipelines;
 pub mod queue;
 pub mod resources;
+pub use resources::SurfaceNote;
 
 /// A slab of objects addressed by index; freed slots are reused.
 #[derive(Debug)]
@@ -434,6 +435,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         self.completion.take()
     }
 
+    /// Exports the queue's timeline again for [`Self::take_completion`],
+    /// as the platform's waiter that took it left: whether one is offered.
+    /// None once lost.
+    pub fn rearm_completion(&mut self) -> bool {
+        if self.lost {
+            return false;
+        }
+        if self.completion.is_none() {
+            self.completion = self.backend.export_semaphore(self.timeline);
+        }
+        self.completion.is_some()
+    }
+
     /// `currentAllocatedSize`, including allocations pending GPU completion.
     pub fn current_allocated_size(&self) -> u64 {
         self.allocated
@@ -476,6 +490,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         !self.queue.reads(release)
     }
 
+    /// Whether `object`, which `release` released, may be destroyed now:
+    /// whole memory once no command buffer in flight may reach it
+    /// ([`queue::Queue::reaches_memory`]), anything else once none may read
+    /// it.
+    fn frees_object(&self, release: &pins::Release, object: Object) -> bool {
+        match object {
+            Object::Memory(_) => !self.queue.reaches_memory(release),
+            _ => self.frees(release),
+        }
+    }
+
     /// The deferred objects and bytes that only held work keeps.
     fn pinned(&self) -> (usize, u64) {
         self.deferred
@@ -497,7 +522,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             self.book.release(memory, self.submitted);
         }
         let release = self.release_now();
-        if !self.lost && self.frees(&release) {
+        if !self.lost && self.frees_object(&release, object) {
             self.destroy_now(object);
             self.allocated -= allocated;
         } else {
@@ -533,10 +558,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// Destroys `object` now that no submitted work uses it; freed memory
     /// leaves the book as of the completed serial.
     fn destroy_now(&mut self, object: Object) {
-        if let Object::Memory(memory) = object {
-            self.book.free(memory, self.completed);
+        let Object::Memory(memory) = object else {
+            self.backend.destroy(object);
+            return;
+        };
+        // Its address, while it has one, for a fault in it later.
+        if self.book.lacks_address(memory)
+            && let Some(va) = self.backend.memory_address(memory)
+        {
+            self.book.learn_address(memory, va);
         }
+        let kept = self.backend.kept_bound(memory);
+        self.book.free(memory, self.completed, kept);
         self.backend.destroy(object);
+        let unbound = self.backend.take_unbound();
+        self.book.unbound(&unbound, self.completed);
     }
 
     /// Notes `memory`, a whole allocation of `bytes` that `what` owns, in
@@ -555,7 +591,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     /// The newest frees of whole allocations and the live ranges either
     /// side, which name what the address of a GPU MMU fault held.
-    pub fn memory_book_report(&self) -> Vec<alloc::string::String> {
+    pub fn memory_book_report(&mut self) -> Vec<alloc::string::String> {
+        for memory in self.book.addressless() {
+            if let Some(va) = self.backend.memory_address(memory) {
+                self.book.learn_address(memory, va);
+            }
+        }
         self.book.report(self.submitted)
     }
 }

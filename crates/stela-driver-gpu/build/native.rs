@@ -4,7 +4,7 @@ use std::path::Path;
 use std::{env, path::PathBuf};
 #[cfg(feature = "linux-kernel")]
 use stela_c_build::linux_build::{archive, linux_archive, out_dir, sources};
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 use stela_c_build::{
     linux_build::{upstream_build, upstream_warnings},
     linux_capture::{self, COMMON, Captured, Import, Projection, Unit, UnitSpec},
@@ -30,18 +30,18 @@ const COMPAT: &str = "../stela-linux/src/compat";
 #[cfg(feature = "linux-kernel")]
 pub struct Linux {
     pub environment: stela_c_build::linux::Environment,
-    #[cfg(feature = "nouveau-port")]
+    #[cfg(feature = "linux-drm")]
     pub archive: PathBuf,
-    #[cfg(feature = "nouveau-port")]
+    #[cfg(feature = "linux-drm")]
     pub common_archive: PathBuf,
-    #[cfg(feature = "nouveau-port")]
+    #[cfg(feature = "linux-drm")]
     pub captured: Vec<Captured>,
     pub hosted: Vec<PathBuf>,
 }
-/// DRM's core and the helpers nouveau selects, as Linux's `drm-y`,
+/// DRM's core and the helpers every driver port selects, as Linux's `drm-y`,
 /// `drm_kms_helper-y`, `ttm-y`, `gpu-sched-y` and `drm_display_helper-y`
 /// compose them under Stela's Kconfig.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 const DRM_SOURCES: &[&str] = &[
     "drm_atomic",
     "drm_atomic_uapi",
@@ -83,6 +83,13 @@ const DRM_SOURCES: &[&str] = &[
     "drm_writeback",
     "drm_exec",
     "drm_gpuvm",
+    "drm_buddy",
+    "drm_client",
+    "drm_client_event",
+    "drm_client_modeset",
+    "drm_client_sysrq",
+    "drm_panel_backlight_quirks",
+    "drm_suballoc",
     "drm_gem_ttm_helper",
     "drm_atomic_helper",
     "drm_atomic_state_helper",
@@ -120,12 +127,25 @@ const DRM_SOURCES: &[&str] = &[
     "display/drm_dp_dual_mode_helper",
     "display/drm_dp_helper",
     "display/drm_dp_mst_topology",
+    "display/drm_dsc_helper",
+    "display/drm_hdcp_helper",
     "display/drm_hdmi_helper",
     "display/drm_scdc_helper",
 ];
 
+/// What the profile selects besides, for a driver's Kconfig entry: GPU SVM,
+/// panels, the MIPI DSI bus and the driver core's auxiliary bus. Paths are
+/// below Linux's tree.
+#[cfg(feature = "linux-drm")]
+const SELECTED_SOURCES: &[&str] = &[
+    "drivers/gpu/drm/drm_gpusvm",
+    "drivers/gpu/drm/drm_panel",
+    "drivers/gpu/drm/drm_mipi_dsi",
+    "drivers/base/auxiliary",
+];
+
 /// Class-owned registration prefix after the shared common cohort.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 const DRM_UNITS: &[UnitSpec] = &[
     UnitSpec {
         scope: stela_c_build::linux_capture::Scope {
@@ -163,10 +183,67 @@ const DRM_UNITS: &[UnitSpec] = &[
         module: "drm_display_helper",
         file: "drivers/gpu/drm/display/drm_display_helper",
     },
+    // The buddy allocator under drm_buddy, whose initcall makes its block
+    // cache: a unit of DRM's level, before any driver's.
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "gpubuddy",
+            group_ordinal: 8,
+            unit_ordinal: 1,
+            global_ordinal: 8,
+        },
+        source: "drivers/gpu/buddy",
+        module: "buddy",
+        file: "drivers/gpu/buddy",
+    },
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "drmmipidsi",
+            group_ordinal: 9,
+            unit_ordinal: 1,
+            global_ordinal: 9,
+        },
+        source: "drivers/gpu/drm/drm_mipi_dsi",
+        module: "drm_mipi_dsi",
+        file: "drivers/gpu/drm/drm_mipi_dsi",
+    },
+    // The hwmon and backlight classes, which a driver's sensors and panel
+    // brightness register devices of: each unit's initcall registers its
+    // class. Ordinal 9 is the MIPI DSI bus's.
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "hwmon",
+            group_ordinal: 10,
+            unit_ordinal: 1,
+            global_ordinal: 10,
+        },
+        source: "drivers/hwmon/hwmon",
+        module: "hwmon",
+        file: "drivers/hwmon/hwmon",
+    },
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "backlight",
+            group_ordinal: 11,
+            unit_ordinal: 1,
+            global_ordinal: 11,
+        },
+        source: "drivers/video/backlight/backlight",
+        module: "backlight",
+        file: "drivers/video/backlight/backlight",
+    },
 ];
 
+/// The captured units that define `pr_fmt` themselves.
+#[cfg(feature = "linux-drm")]
+const PREFIXED: [&str; 2] = ["drivers/hwmon/hwmon", "drivers/video/backlight/backlight"];
+
 /// Reviewed common-first/DRM-next prefix, used again by the final class image.
-#[cfg(feature = "nouveau-port")]
+#[cfg(feature = "linux-drm")]
 pub fn environment_units() -> Vec<UnitSpec> {
     COMMON.iter().chain(DRM_UNITS).copied().collect()
 }
@@ -193,18 +270,24 @@ impl Linux {
         .into_iter()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "linux-drm")]
         let mut upstream = upstream;
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "linux-drm")]
         upstream.extend(
             DRM_SOURCES
                 .iter()
                 .map(|source| PathBuf::from(format!("{DRM}/{source}.c"))),
         );
+        #[cfg(feature = "linux-drm")]
+        upstream.extend(
+            SELECTED_SOURCES
+                .iter()
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
+        );
         let hosted_upstream = upstream[..4].to_vec();
         let mut build = stela_c_build::native::configure();
         environment.apply(&mut build, None, &[], None);
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "linux-drm")]
         let (captured, shared_count) = {
             let mut captured_build = upstream_build(&build, Path::new(COMPAT));
             upstream_warnings(&mut captured_build);
@@ -270,6 +353,13 @@ impl Linux {
                     ],
                 )
                 .expect("DRM source placement");
+                // A unit that names its messages (`pr_fmt`) does so before
+                // its first include; the registration header comes before
+                // that here and has printk.h's default defined already.
+                let mut captured_build = captured_build.clone();
+                if PREFIXED.contains(&spec.source) {
+                    captured_build.flag("-Wno-macro-redefined");
+                }
                 captured.push(linux_capture::compile(
                     &captured_build,
                     &Path::new(COMPAT).join("stela/registration.h"),
@@ -279,7 +369,7 @@ impl Linux {
             }
             (captured, shared_count)
         };
-        #[cfg(feature = "nouveau-port")]
+        #[cfg(feature = "linux-drm")]
         {
             let source = linux_capture::source(
                 &captured,
@@ -303,11 +393,11 @@ impl Linux {
         );
         let mut linux = Self {
             environment,
-            #[cfg(feature = "nouveau-port")]
+            #[cfg(feature = "linux-drm")]
             archive: _class_archive,
-            #[cfg(feature = "nouveau-port")]
+            #[cfg(feature = "linux-drm")]
             common_archive: shared.join("libstela-linux.a"),
-            #[cfg(feature = "nouveau-port")]
+            #[cfg(feature = "linux-drm")]
             captured,
             hosted: Vec::new(),
         };
@@ -333,11 +423,6 @@ impl Linux {
             ];
         }
         linux
-    }
-
-    #[cfg(feature = "nouveau-port")]
-    pub fn take_captured(&mut self) -> Vec<Captured> {
-        std::mem::take(&mut self.captured)
     }
 
     pub fn tests(&self, tests: &mut stela_c_build::linux_build::Tests) {

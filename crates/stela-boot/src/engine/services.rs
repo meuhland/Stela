@@ -187,6 +187,13 @@ unsafe impl NativeServices for Services<'_> {
         use stela_drivers::bus::pci::requester::preparation::PreparingRequester;
         let role = self.remappers.function_role(address);
         if role != FunctionRole::Physical {
+            // The defect, on this function or on one whose VF it could be.
+            if let Some(issue) = self.remappers.role_refusal(address) {
+                output::arguments(format_args!(
+                    "UNSUPPORTED Stela PCI function {address}: its role is unverified, as the \
+                     PCI census found {issue:?}\n"
+                ));
+            }
             return Err(ServiceError::Claim(ClaimError::UnsupportedRole(role)));
         }
         let prepared = match self.remappers.unremapped_preparation(self.mmio, address) {
@@ -408,8 +415,8 @@ unsafe impl NativeServices for Services<'_> {
             Some(at) => at,
             None => {
                 // SAFETY: probe owns the device whose `_CRS` names the span.
-                let root =
-                    unsafe { self.mmio.claim_platform(pages) }.map_err(ServiceError::Mapping)?;
+                let root = unsafe { self.mmio.claim_platform_broker(pages) }
+                    .map_err(ServiceError::Mapping)?;
                 // SAFETY: the broker is the only suballocator of the window,
                 // which the aperture reserved outside RAM after EBS.
                 let broker =

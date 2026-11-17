@@ -19,9 +19,12 @@ native-acpi = ["stela-driver-base/native-acpi", "stela-driver-net/native-acpi"]
 ram-disk = ["stela-driver-base/ram-disk"]
 irq-diagnostics = ["stela-driver-base/irq-diagnostics"]
 nouveau-port = ["stela-driver-gpu/nouveau-port"]
+amdgpu-port = ["stela-driver-gpu/amdgpu-port"]
+xe-port = ["stela-driver-gpu/xe-port"]
 metal = ["stela-driver-gpu/metal"]
 metal-vulkan = ["stela-driver-gpu/metal-vulkan"]
 metal-linked = ["stela-driver-gpu/metal-linked"]
+radv = ["amdgpu-port", "metal-linked", "stela-driver-gpu/radv"]
 
 [dependencies]
 stela-driver-audio = { path = "../stela-driver-audio" }

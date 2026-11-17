@@ -30,6 +30,10 @@
 //! RCX, RDX, R8, R9 and flags; a service call every register the SysV ABI
 //! lets a call clobber, which no block keeps live across its exit. The call
 //! aligns the stack to 16 bytes itself.
+//!
+//! Where the host has AES-NI, thunks and blocks given a [`cipher::Cipher`]
+//! compute signings, successful authentications and PACGA in native code
+//! instead of looking them up; the rest still goes to the service.
 use crate::x86_64::asm::{Alu, Asm, Code, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size, resolve};
 use crate::{
     Anchor, GuestAddress, Place,
@@ -41,11 +45,14 @@ use crate::{
 };
 use alloc::vec::Vec;
 
+pub mod cipher;
 pub mod inline;
 pub mod strip;
 
-/// Entries in the memo.
-pub const MEMO_ENTRIES: usize = 1 << 14;
+/// Entries in the memo: [`MEMO_WAYS`] to a set, each set one 64-byte line.
+pub const MEMO_ENTRIES: usize = 1 << 16;
+/// Entries a set holds, the most recently filled first.
+pub const MEMO_WAYS: usize = 2;
 /// The tag word of the generic key, after those of [`key_index`].
 pub const GENERIC_KEY: u8 = 4;
 /// The tag words, one for each key.
@@ -120,16 +127,43 @@ const _: () = assert!(core::mem::size_of::<MemoEntry>() == 32);
 const MODIFIER: i32 = core::mem::offset_of!(MemoEntry, modifier) as i32;
 const TAG: i32 = core::mem::offset_of!(MemoEntry, tag) as i32;
 const VALUE: i32 = core::mem::offset_of!(MemoEntry, value) as i32;
-/// The multiplier and shift of [`slot`]: the top 14 bits index the memo.
+/// The multiplier and shift of [`slot`]: the top 15 bits index the sets.
 const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
-const SLOT_SHIFT: u8 = 50;
-const _: () = assert!(1 << (64 - SLOT_SHIFT) == MEMO_ENTRIES);
+const SLOT_SHIFT: u8 = 49;
+const _: () = assert!((1 << (64 - SLOT_SHIFT)) * MEMO_WAYS == MEMO_ENTRIES);
+/// Bytes of a set: log2 for the native index.
+const SET_BITS: u8 = 6;
+const _: () = assert!(MEMO_WAYS * core::mem::size_of::<MemoEntry>() == 1 << SET_BITS);
 
 /// The memo slot of a PAC operation's operands, which never depends on a
-/// key: their sum's multiplicative hash, one LEA of both registers before
-/// the multiply.
+/// key: the multiplicative hash of the pointer XOR the modifier with its
+/// halves swapped. A sum would put return addresses a few instructions
+/// apart, signed with stack pointers a few frames apart, in one slot
+/// (LR + SP equal), which a call tree does all the time; the swap pairs
+/// the pointer's varying low bits with the modifier's steady high bits.
+/// Returns the set's first entry.
 pub fn slot(pointer: u64, modifier: u64) -> usize {
-    (pointer.wrapping_add(modifier).wrapping_mul(MIX) >> SLOT_SHIFT) as usize
+    ((pointer ^ modifier.rotate_left(32)).wrapping_mul(MIX) >> SLOT_SHIFT) as usize * MEMO_WAYS
+}
+
+/// Remember `entry` in its set: in place of an entry for the same operands
+/// under the same tag (whatever its kind), else first, the set's first
+/// entry moving to its second.
+pub fn insert(memo: &mut [MemoEntry], entry: MemoEntry) {
+    let first = slot(entry.pointer, entry.modifier);
+    let same = |held: &MemoEntry| {
+        held.pointer == entry.pointer
+            && held.modifier == entry.modifier
+            && held.tag & !0xf == entry.tag & !0xf
+    };
+    if same(&memo[first + 1]) && !same(&memo[first]) {
+        memo[first + 1] = entry;
+    } else {
+        if !same(&memo[first]) {
+            memo[first + 1] = memo[first];
+        }
+        memo[first] = entry;
+    }
 }
 
 /// The index of `key`'s word in the engine's tags.
@@ -286,13 +320,9 @@ struct Lookup {
     modifier: Gpr,
 }
 
-/// The memo lookup of `form`'s operands, the pointer in RAX and the modifier
-/// in its host register if it has one (SP in pinned code), else in RDX,
-/// under the tag words at `tags`; a hit leaves the result in RAX. A key that
-/// is not open misses (no entry's tag is a bare kind), and so does a
-/// disabled key's first use of each operand pair. Clobbers RCX, RDX, R8, R9
-/// and flags.
-fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
+/// `form`'s pointer into RAX, and the register holding its modifier: its
+/// host register if it has one (SP in pinned code), else RDX.
+fn operands(asm: &mut Asm, form: Form) -> Gpr {
     use Gpr::{R8, R9, Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
     let pointer = asm.guest(Register::X(form.pointer)).expect("X0..X30");
@@ -317,29 +347,58 @@ fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
     };
     debug_assert!(!matches!(
         modifier,
-        Gpr::Rsp | Gpr::R11 | Rax | Rcx | R8 | R9
+        Gpr::Rsp | Gpr::R10 | Gpr::R11 | Rax | Rcx | R8 | R9
     ));
+    modifier
+}
+
+/// The memo lookup of `form`'s operands, the pointer in RAX and the modifier
+/// in its host register if it has one (SP in pinned code), else in RDX,
+/// under the tag words at `tags`; a hit leaves the result in RAX. A key that
+/// is not open misses (no entry's tag is a bare kind), and so does a
+/// disabled key's first use of each operand pair. Clobbers RCX, RDX, R8, R9
+/// and flags.
+fn lookup(asm: &mut Asm, form: Form, tags: Place) -> Lookup {
+    use Gpr::{R8, R9, Rax, Rcx};
+    use Size::Qword;
+    let modifier = operands(asm, form);
     // The anchor, then the key's tag word through it: one load, no LEA.
     asm.place(R8, Place::new(tags.anchor, 0));
     let word = i32::try_from(tags.offset + usize::from(form.key) * 8).expect("a tag word offset");
     asm.mov_load(Qword, R8, Mem::base(R8, word));
-    asm.lea(Qword, Rcx, Mem::indexed(Rax, modifier, 1, 0));
+    asm.mov(Qword, Rcx, modifier);
+    asm.shift_imm(ShiftOp::Rol, Qword, Rcx, 32);
+    asm.alu(Alu::Xor, Qword, Rcx, Rax);
     asm.mov_imm64(R9, MIX);
     asm.imul(Qword, Rcx, R9);
     asm.shift_imm(ShiftOp::Shr, Qword, Rcx, SLOT_SHIFT);
-    // 32-byte entries.
-    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, 5);
+    // 64-byte sets of two 32-byte entries.
+    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, SET_BITS);
     // The memo's anchor added from the frame.
     let memo = core::mem::offset_of!(crate::GuestState, anchors) + Anchor::Memo as usize * 8;
     asm.alu_load(Alu::Add, Qword, Rcx, Mem::base(Gpr::Rdi, memo as i32));
-    let mut misses = Vec::new();
-    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rcx, 0));
-    misses.push(asm.jcc(Cond::Ne));
-    asm.alu_load(Alu::Cmp, Qword, modifier, Mem::base(Rcx, MODIFIER));
-    misses.push(asm.jcc(Cond::Ne));
+    // The set's first entry, then its second.
     asm.alu_imm8(Alu::Or, Qword, R8, form.kind as i8);
+    let mut second = Vec::new();
+    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rcx, 0));
+    second.push(asm.jcc(Cond::Ne));
+    asm.alu_load(Alu::Cmp, Qword, modifier, Mem::base(Rcx, MODIFIER));
+    second.push(asm.jcc(Cond::Ne));
     asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(Rcx, TAG));
+    let first_hit = asm.jcc(Cond::E);
+    for patch in second {
+        asm.bind(patch);
+    }
+    let entry = core::mem::size_of::<MemoEntry>() as i32;
+    let mut misses = Vec::new();
+    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rcx, entry));
     misses.push(asm.jcc(Cond::Ne));
+    asm.alu_load(Alu::Cmp, Qword, modifier, Mem::base(Rcx, entry + MODIFIER));
+    misses.push(asm.jcc(Cond::Ne));
+    asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(Rcx, entry + TAG));
+    misses.push(asm.jcc(Cond::Ne));
+    asm.alu_imm8(Alu::Add, Qword, Rcx, entry as i8);
+    asm.bind(first_hit);
     asm.mov_load(Qword, Rax, Mem::base(Rcx, VALUE));
     Lookup { misses, modifier }
 }
@@ -392,15 +451,43 @@ fn call_service(asm: &mut Asm, form: Form, routine: Routine, modifier: Gpr) -> P
     failed
 }
 
-/// The thunk completing the PAC instruction of `form` at `pc` from the memo
-/// ([`Anchor::Memo`]) under the tag words at `tags`, or through `service`, a
-/// [`ServiceRoutine`], else exiting at `pc` for the engine.
-pub fn thunk(form: Form, pc: GuestAddress, tags: Place, service: u64) -> Thunk {
+/// The bytes a service call ends with, up to its return address: through
+/// the service's cell `routine` in a block ([`inline::Cells`]), and through
+/// the address `service` in a [`thunk`]. `--profile`'s host samples look for
+/// them before a return address into native code, to tell a sample taken
+/// in the service from one in another routine native code calls.
+pub fn service_call_ends(routine: u32, service: u64) -> [Vec<u8>; 2] {
+    let mut cell = Code::pinned();
+    let mut asm = cell.asm();
+    asm.place(Gpr::Rdi, Place::new(Anchor::Pointer, 0));
+    let routine = i32::try_from(routine).expect("a field of the service");
+    asm.call_rm(Mem::base(Gpr::Rdi, routine));
+    let mut address = Code::pinned();
+    let mut asm = address.asm();
+    asm.mov_imm64(Gpr::Rax, service);
+    asm.call_rm(Gpr::Rax);
+    [cell.into_bytes(), address.into_bytes()]
+}
+
+/// The thunk completing the PAC instruction of `form` at `pc` under the tag
+/// words at `tags`, from the [`cipher::Cipher`] at `cipher` when there is
+/// one and from the memo ([`Anchor::Memo`]) otherwise, or through `service`,
+/// a [`ServiceRoutine`], else exiting at `pc` for the engine.
+pub fn thunk(
+    form: Form,
+    pc: GuestAddress,
+    tags: Place,
+    service: u64,
+    cipher: Option<Place>,
+) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::Qword;
     let mut code = Code::pinned();
     let mut asm = code.asm();
-    let Lookup { misses, modifier } = lookup(&mut asm, form, tags);
+    let Lookup { misses, modifier } = match cipher {
+        Some(cipher) => cipher::compute(&mut asm, form, tags, cipher),
+        None => lookup(&mut asm, form, tags),
+    };
     let complete = asm.len();
     let next_pc = GuestAddress(pc.0.wrapping_add(4));
     let mut next = None;

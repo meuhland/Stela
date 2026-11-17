@@ -149,3 +149,69 @@ fn unstable_resource_or_mode_lists_stop_without_modesetting() {
         assert!(card.set.is_none());
     }
 }
+
+#[test]
+fn the_last_vblank_is_the_first_outputs_on_linuxs_clock() {
+    let mut card = Card::new(vec![mode(2, 2, PREFERRED)]);
+    card.vblank = Some((1, 5_000_000_123));
+    let mut display = Display::take(&mut card, (2, 2)).unwrap();
+    assert_eq!(display.last_vblank_ns(), Some(5_000_000_123));
+    assert_eq!(display.drm.sequences, [41]);
+    // A controller that is off, a refusal, or no time: none.
+    display.drm.vblank = Some((0, 5_000_000_123));
+    assert_eq!(display.last_vblank_ns(), None);
+    display.drm.vblank = Some((1, 0));
+    assert_eq!(display.last_vblank_ns(), None);
+    display.drm.vblank = None;
+    assert_eq!(display.last_vblank_ns(), None);
+    // Not asked where a request must wait, nor while the outputs are dark.
+    display.drm.vblank = Some((1, 9));
+    display.drm.immediate = false;
+    assert_eq!(display.last_vblank_ns(), None);
+    display.drm.immediate = true;
+    display.dark = true;
+    assert_eq!(display.last_vblank_ns(), None);
+    assert_eq!(display.drm.sequences.len(), 4);
+}
+
+#[test]
+fn the_display_switches_between_the_rates_of_its_size_the_guest_can_be_told_of() {
+    use super::outputs::at;
+    let interlaced = ModeInfo {
+        flags: INTERLACED,
+        ..at(2, 2, 0, 240)
+    };
+    let mut card = Card::new(vec![
+        at(2, 2, PREFERRED, 60),
+        at(2, 2, 0, 144),
+        at(2, 2, 0, 120),
+        interlaced,
+        at(2, 2, 0, 60),
+        at(4, 2, 0, 75),
+    ]);
+    let no_200: Fits<'_> = &|_, _, refresh| refresh != 200_000;
+    let mut display = Display::take_fitting(&mut card, Wanted::Size((2, 2)), no_200).unwrap();
+    assert_eq!(display.refresh_millihertz(), 144_000);
+    assert_eq!(display.refresh_rates(), [144_000, 120_000, 60_000]);
+    let sets = display.drm.mode_sets;
+    display.set_refresh(60_000).unwrap();
+    assert_eq!(display.refresh_millihertz(), 60_000);
+    assert_eq!(display.drm.mode_sets, sets + 1);
+    assert_eq!(display.drm.set.map(|(mode, _)| mode.vrefresh), Some(60));
+    assert_eq!(display.set_refresh(75_000), Err(Error::NoRate));
+    // Where a request must wait, the next flush that may sets it.
+    display.drm.immediate = false;
+    display.set_refresh(120_000).unwrap();
+    assert_eq!(display.refresh_millihertz(), 60_000);
+    assert!(display.queued());
+    display.drm.immediate = true;
+    display.flush().unwrap();
+    assert!(!display.queued());
+    assert_eq!(display.refresh_millihertz(), 120_000);
+    assert_eq!(display.drm.set.map(|(mode, _)| mode.vrefresh), Some(120));
+    // A refused set keeps the mode that ran.
+    display.drm.set_error = Some(-22);
+    assert_eq!(display.set_refresh(144_000), Err(Error::Request(-22)));
+    assert_eq!(display.refresh_millihertz(), 120_000);
+    assert_eq!(display.heads[0].mode.vrefresh, 120);
+}

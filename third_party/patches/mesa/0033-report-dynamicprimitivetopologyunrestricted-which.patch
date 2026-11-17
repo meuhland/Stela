@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sat, 14 Nov 2026 16:34:47 +0000
+Subject: [PATCH] radv: report dynamicPrimitiveTopologyUnrestricted, which its
+ draws already honour
+
+Each draw computes the primitive it outputs from the dynamic topology
+(radv_get_vgt_outprim_type), and NGG shaders take the vertices of a
+primitive from user SGPRs, so one pipeline draws every topology class.
+Stela's Metal device creates a pipeline of no stated class with a
+triangle topology and draws points and lines with it.
+---
+ src/amd/vulkan/radv_physical_device.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 9331137c1bbeda7fa7a39d6b0da568e8efa63aeb..f623cb04397dd740b37fee57d33439483718ab48 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2270,7 +2270,12 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
+       .prefersCompactPrimitiveOutput = false,
+ 
+       /* VK_EXT_extended_dynamic_state3 */
+-      .dynamicPrimitiveTopologyUnrestricted = false,
++      /* Every draw derives its output primitive from the dynamic topology
++       * (radv_get_vgt_outprim_type), and NGG reads the vertices per
++       * primitive from user SGPRs, so a pipeline draws any topology class.
++       * Stela's Metal device draws points and lines with a pipeline whose
++       * class Metal left unspecified. */
++      .dynamicPrimitiveTopologyUnrestricted = true,
+ 
+       /* VK_EXT_descriptor_buffer */
+       .combinedImageSamplerDescriptorSingleArray = true,

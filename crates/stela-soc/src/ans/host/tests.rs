@@ -352,3 +352,143 @@ fn abandoned_discards_never_reach_the_disk() {
     assert_eq!(log.started().len(), 1);
     assert_eq!(disk.abandon_discards(), 0);
 }
+
+fn discard_tags(log: &Log) -> Vec<u32> {
+    log.started()
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| matches!(command, Command::Discard { .. }))
+        .map(|(tag, _)| tag as u32)
+        .collect()
+}
+
+/// A waiting flush keeps [`DISCARD_COMMANDS`] on the disk: each one that
+/// completes makes room for the next at once, whatever the others do, and
+/// the flush goes only once none remains.
+#[test]
+fn a_waiting_flush_refills_each_discard_slot_as_it_completes() {
+    let (mut disk, log) = queued(1, true);
+    let runs = DISCARD_COMMANDS + 4;
+    for run in 0..runs as u64 {
+        disk.discard(run * 2, 1);
+    }
+    assert!(disk.submit(1, Request::Flush, 0).is_none());
+    assert!(disk.poll(0).is_empty());
+    assert_eq!(discard_tags(&log).len(), DISCARD_COMMANDS);
+    // The last started completes first; the first stays on the disk.
+    release(&log, DISCARD_COMMANDS as u32 - 1);
+    assert!(disk.poll(1).is_empty());
+    assert_eq!(discard_tags(&log).len(), DISCARD_COMMANDS + 1);
+    assert!(!log.started().contains(&Command::Flush));
+    for tag in discard_tags(&log) {
+        release(&log, tag);
+    }
+    assert!(disk.poll(2).is_empty());
+    for tag in discard_tags(&log) {
+        release(&log, tag);
+    }
+    assert!(disk.poll(3).is_empty());
+    assert_eq!(discard_tags(&log).len(), runs);
+    assert_eq!(log.started().last(), Some(&Command::Flush));
+    assert!(!disk.discarding());
+}
+
+/// A disk that runs each command where it is asked: the discard commands
+/// it ran.
+struct Inline {
+    disk: RamDisk,
+    discards: Rc<RefCell<usize>>,
+}
+
+impl BlockDevice for Inline {
+    fn identity(&self) -> &Identity {
+        self.disk.identity()
+    }
+
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.disk.read(lba, buffer)
+    }
+
+    fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        self.disk.write(lba, data)
+    }
+
+    fn flush_cache(&mut self) -> Result<(), BlockError> {
+        self.disk.flush_cache()
+    }
+
+    fn execute(&mut self, command: Command) -> Finished {
+        if matches!(command, Command::Discard { .. }) {
+            *self.discards.borrow_mut() += 1;
+            return Ok(None);
+        }
+        self.disk.execute(command)
+    }
+}
+
+/// On a disk that runs each command on the calling PE, under the devices'
+/// lock, one poll of a waiting flush runs at most [`DISCARD_COMMANDS`]
+/// discards; the rest go at the next polls, and the flush after them.
+#[test]
+fn a_disk_that_runs_commands_where_asked_takes_a_bounded_number_of_discards_a_poll() {
+    let mut ram = RamDisk::new("", 256, 4096);
+    ram.identity.features.discard = Some(DiscardLimits {
+        blocks: 0,
+        ranges: 1,
+    });
+    ram.identity.features.write_zeroes = Some(WriteZeroes {
+        blocks: 64,
+        unmap: true,
+    });
+    ram.identity.features.write_cache = true;
+    let discards = Rc::new(RefCell::new(0));
+    let mut disk = HostDisk::new(Box::new(Inline {
+        disk: ram,
+        discards: discards.clone(),
+    }));
+    let runs = DISCARD_COMMANDS * 3 - 2;
+    for run in 0..runs as u64 {
+        disk.discard(run * 2, 1);
+    }
+    assert!(disk.submit(1, Request::Flush, 0).is_none());
+    assert!(disk.poll(0).is_empty());
+    assert_eq!(*discards.borrow(), DISCARD_COMMANDS);
+    assert!(disk.poll(1).is_empty());
+    assert_eq!(*discards.borrow(), DISCARD_COMMANDS * 2);
+    let done = disk.poll(2);
+    assert_eq!(*discards.borrow(), runs);
+    assert_eq!(done.len(), 1, "the flush goes once every discard ran");
+    assert!(!disk.discarding());
+}
+
+/// Urgent batches go beside guest transfers, and a write waits out
+/// whichever running batch it overlaps, not the others.
+#[test]
+fn a_write_waits_only_for_the_urgent_batch_it_overlaps() {
+    let (mut disk, log) = queued(1, true);
+    assert!(disk.submit(1, write(40), 0).is_none());
+    for start in [0, 4, 8] {
+        disk.discard(start, 2);
+    }
+    assert!(disk.submit(2, Request::Flush, 0).is_none());
+    assert!(disk.poll(0).is_empty());
+    assert_eq!(discard_tags(&log), [1, 2, 3], "beside the running write");
+    // A write into the batch at 4 waits; one beside every batch goes.
+    assert!(disk.submit(3, write(5), 1).is_none());
+    assert!(disk.submit(4, write(20), 1).is_none());
+    assert_eq!(disk.discards.held.len(), 2, "the flush and the write at 5");
+    assert_eq!(log.started().len(), 5);
+    release(&log, 1);
+    release(&log, 3);
+    assert!(disk.poll(2).is_empty());
+    assert_eq!(log.started().len(), 5, "the batch at 4 still runs");
+    release(&log, 2);
+    disk.poll(3);
+    // Both held transfers go once the last batch completed, in the order
+    // they came: the flush, then the write.
+    let after: Vec<Command> = log.started()[5..].to_vec();
+    assert!(matches!(
+        after.as_slice(),
+        [Command::Flush, Command::Write { lba: 5, .. }]
+    ));
+}

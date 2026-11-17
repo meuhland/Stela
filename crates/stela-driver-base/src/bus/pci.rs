@@ -101,9 +101,31 @@ const FLR_READY_POLL_US: u64 = 1_000;
 const FLR_READY_US: u64 = 60_000_000;
 /// The ARI extended capability's ID.
 const EXTENDED_ARI: u16 = 0x0e;
+/// The Resizable BAR extended capability's ID, and in each of its control
+/// registers (one per resizable BAR, eight bytes apart from offset 8) the
+/// number of resizable BARs (first register only) and the BAR Size field
+/// (Linux `PCI_REBAR_CTRL`, `PCI_REBAR_CTRL_NBAR_MASK`,
+/// `PCI_REBAR_CTRL_BAR_SIZE`).
+const EXTENDED_REBAR: u16 = 0x15;
+const REBAR_CONTROL: u16 = 8;
+const REBAR_BARS_SHIFT: u32 = 5;
+const REBAR_BARS: u32 = 7;
+const REBAR_SIZE: u32 = 0x3f << 8;
+/// A control register's BAR Index field (Linux `PCI_REBAR_CTRL_BAR_IDX`).
+const REBAR_INDEX: u32 = 7;
+/// The smallest BAR size a BAR Size field encodes, 1 MiB at value 0.
+const REBAR_SIZE_UNIT: u64 = 1 << 20;
 /// The Vendor ID a function still initializing answers with Configuration
 /// RRS Software Visibility on.
 const VENDOR_NOT_READY: u16 = 0x0001;
+
+/// A Resizable BAR ([`Function::resizable_bars`]): its BAR index and the
+/// size its control register selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResizableBar {
+    pub bar: u8,
+    pub bytes: u64,
+}
 
 /// A function-local reset [`Function::reset`] performs, in Linux
 /// `pci_reset_function`'s order.
@@ -131,12 +153,16 @@ impl Method {
 
 /// What Linux's `pci_dev_save_and_disable` keeps of a function before a
 /// reset and `pci_dev_restore` writes back after it: the header after its
-/// command register, the command register, and the PCI Express device and
-/// link controls.
+/// command register, the command register, the PCI Express device and link
+/// controls, and each Resizable BAR control.
 struct Saved {
     header: [u32; HEADER_REST_WORDS],
     command: u16,
     controls: Option<[(u16, u16); 4]>,
+    /// Each Resizable BAR control register and what it held. A reset puts
+    /// every BAR back at its default size, where firmware may have set
+    /// another, and the BAR registers alone do not carry the size.
+    rebar: Vec<(u16, u32)>,
 }
 impl Saved {
     /// Save the function's state, then leave only INTx disabled in its
@@ -144,8 +170,9 @@ impl Saved {
     fn save_and_disable<C: ConfigSpace>(
         config: &mut C,
         express: Option<u16>,
+        rebar: Option<u16>,
     ) -> Result<Self, ConfigError> {
-        let saved = Self::save(config, express)?;
+        let saved = Self::save(config, express, rebar)?;
         saved.disable(config)?;
         Ok(saved)
     }
@@ -154,7 +181,11 @@ impl Saved {
         config.write16(regs::COMMAND, regs::COMMAND_INTX_DISABLE)
     }
     /// Save the function's state.
-    fn save<C: ConfigSpace>(config: &C, express: Option<u16>) -> Result<Self, ConfigError> {
+    fn save<C: ConfigSpace>(
+        config: &C,
+        express: Option<u16>,
+        rebar: Option<u16>,
+    ) -> Result<Self, ConfigError> {
         let mut header = [0; HEADER_REST_WORDS];
         for (word, value) in header.iter_mut().enumerate() {
             *value = config.read32(HEADER_REST + word as u16 * 4)?;
@@ -178,10 +209,20 @@ impl Saved {
             }
             None => None,
         };
+        let mut resizable = Vec::new();
+        if let Some(rebar) = rebar {
+            let first = config.read32(rebar + REBAR_CONTROL)?;
+            let bars = (first >> REBAR_BARS_SHIFT) & REBAR_BARS;
+            for bar in 0..bars as u16 {
+                let control = rebar + REBAR_CONTROL + bar * 8;
+                resizable.push((control, config.read32(control)?));
+            }
+        }
         Ok(Self {
             header,
             command,
             controls,
+            rebar: resizable,
         })
     }
     /// The writes [`Self::restore`] makes, in order, each an offset, a width
@@ -202,8 +243,16 @@ impl Saved {
             .chain([(regs::COMMAND, 2, u32::from(self.command))])
             .collect()
     }
-    /// Write the saved state back.
+    /// Write the saved state back: each Resizable BAR's size first, as
+    /// Linux `pci_restore_rebar_state` does before the BARs, and like it
+    /// without checking that the size took. A BAR that kept another size
+    /// decodes that one: its owner reads it back ([`Function::resizable_bars`])
+    /// and goes on with it, as the reset itself succeeded.
     fn restore<C: ConfigSpace>(&self, config: &mut C) -> Result<(), ConfigError> {
+        for &(control, saved) in &self.rebar {
+            let current = config.read32(control)?;
+            config.write32(control, current & !REBAR_SIZE | saved & REBAR_SIZE)?;
+        }
         for (offset, width, value) in self.writes() {
             match width {
                 4 => config.write32(offset, value)?,
@@ -812,8 +861,9 @@ impl<C: ConfigSpace> Function<C> {
     }
     /// The function-local reset Linux `pci_reset_function` would pick, from
     /// the ones offered here: FLR, then a D3hot to D0 power management reset
-    /// when the function is in D0 and No_Soft_Reset is clear. None when it
-    /// has neither. Reads only.
+    /// when the function is in D0, No_Soft_Reset is clear and that
+    /// transition resets the function ([`Self::power_reset_resets`]). None
+    /// when it has neither. Reads only.
     pub fn reset_method(&self) -> Result<Option<ResetMethod>, BlockError> {
         Ok(self.method()?.map(Method::public))
     }
@@ -861,11 +911,30 @@ impl<C: ConfigSpace> Function<C> {
             }
             // `pci_pm_reset` refuses a function outside D0 or one whose
             // D3hot exit keeps its state.
-            if control & (PM_STATE | PM_NO_SOFT_RESET) == 0 {
+            if control & (PM_STATE | PM_NO_SOFT_RESET) == 0 && self.power_reset_resets() {
                 return Ok(Some(Method::PowerManagement { power }));
             }
         }
         Ok(None)
+    }
+    /// Whether a D3hot to D0 transition resets the function when it
+    /// advertises that it does (No_Soft_Reset clear). Linux's
+    /// `quirk_no_pm_reset` names the functions where it does not: every
+    /// AMD/ATI VGA function, which keeps its framebuffer contents and
+    /// monitor sync through it, and four Mellanox switch functions, which
+    /// stay operational. Linux still takes that transition on a root bus, as
+    /// better than nothing; here a reset that resets nothing is no reset, on
+    /// any bus, so a caller that needs one learns that it has none.
+    pub fn power_reset_resets(&self) -> bool {
+        const ATI: u16 = 0x1002;
+        const MELLANOX: u16 = 0x15b3;
+        const VGA: [u8; 2] = [3, 0];
+        let ineffective = match self.vendor {
+            ATI => self.class[..2] == VGA,
+            MELLANOX => [0xcb84, 0xcf6c, 0xcf70, 0xcf80].contains(&self.device),
+            _ => false,
+        };
+        !ineffective
     }
     /// `pci_dev_save_and_disable`, the reset, `pci_dev_wait` and
     /// `pci_dev_restore`, for either method.
@@ -875,8 +944,12 @@ impl<C: ConfigSpace> Function<C> {
         mut delay: impl FnMut(u64) -> Result<(), BlockError>,
     ) -> Result<(), BlockError> {
         let express = self.express_offset()?;
+        let rebar = match express {
+            Some(_) => self.extended_capability(EXTENDED_REBAR)?,
+            None => None,
+        };
         let mut config = transaction::Transaction::new(&mut self.config);
-        let saved = Saved::save_and_disable(&mut config, express)?;
+        let saved = Saved::save_and_disable(&mut config, express, rebar)?;
         match method {
             Method::FunctionLevel { express } => {
                 for attempt in 0..3 {
@@ -918,6 +991,35 @@ impl<C: ConfigSpace> Function<C> {
     /// The PCI Express capability's offset, from the complete checked list.
     fn express_offset(&self) -> Result<Option<u16>, CapabilityError> {
         express_offset(&self.config)
+    }
+    /// Each Resizable BAR and the size its control register selects now: a
+    /// reset restores the sizes before it without checking them, as Linux
+    /// does, so an owner that keeps BAR sizes compares them with these
+    /// afterwards. Empty for a function without the capability. Reads only.
+    pub fn resizable_bars(&self) -> Result<Vec<ResizableBar>, BlockError> {
+        let Some(rebar) = (match self.express_offset()? {
+            Some(_) => self.extended_capability(EXTENDED_REBAR)?,
+            None => None,
+        }) else {
+            return Ok(Vec::new());
+        };
+        let first = self.config.read32(rebar + REBAR_CONTROL)?;
+        let mut bars = Vec::new();
+        for index in 0..((first >> REBAR_BARS_SHIFT) & REBAR_BARS) as u16 {
+            let control = self.config.read32(rebar + REBAR_CONTROL + index * 8)?;
+            if control == u32::MAX {
+                return Err(BlockError::Unsupported("PCI function does not answer"));
+            }
+            let shift = REBAR_SIZE_UNIT.trailing_zeros() + ((control & REBAR_SIZE) >> 8);
+            let Some(bytes) = 1u64.checked_shl(shift) else {
+                continue;
+            };
+            bars.push(ResizableBar {
+                bar: (control & REBAR_INDEX) as u8,
+                bytes,
+            });
+        }
+        Ok(bars)
     }
     /// Complete checked conventional capability inventory; malformed/access
     /// failures are distinct from an absent capability.
@@ -1011,6 +1113,21 @@ impl<C: ConfigSpace> Function<C> {
     /// Enable a polling driver. A failed prefix stays contained with its owner;
     /// no later MSI/MSI-X/command write is issued after the first access denial.
     pub fn enable_polled(&mut self) -> Result<(), BlockError> {
+        self.enable_polled_with(regs::COMMAND_MASTER)
+    }
+    /// [`Self::enable_polled`] with bus mastering left as it is, off after
+    /// the device start: for a driver that first stops an engine the
+    /// firmware left running, then calls [`Self::enable_bus_master`].
+    pub fn enable_polled_decode(&mut self) -> Result<(), BlockError> {
+        self.enable_polled_with(0)
+    }
+    pub fn enable_bus_master(&mut self) -> Result<(), BlockError> {
+        let mut config = transaction::Transaction::new(&mut self.config);
+        let command = config.read16(regs::COMMAND)?;
+        config.write16(regs::COMMAND, command | regs::COMMAND_MASTER)?;
+        Ok(())
+    }
+    fn enable_polled_with(&mut self, master: u16) -> Result<(), BlockError> {
         let interrupts = self.interrupts()?;
         let mut config = transaction::Transaction::new(&mut self.config);
         if let Some(msi) = interrupts.msi {
@@ -1026,7 +1143,7 @@ impl<C: ConfigSpace> Function<C> {
         let command = config.read16(regs::COMMAND)?;
         config.write16(
             regs::COMMAND,
-            command | regs::COMMAND_MEMORY | regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
+            command | regs::COMMAND_MEMORY | master | regs::COMMAND_INTX_DISABLE,
         )?;
         Ok(())
     }

@@ -372,6 +372,33 @@ fn schedule1(code: &mut Code, operand: &Operand, target: TargetCpu, result: u8) 
     }
 }
 
+/// How an instruction or a [`HashGroup`] reaches the block's vector cache.
+/// The schedule updates and, with Intel SHA, the hash rounds read V only
+/// through [`read_vector`] and write it only through [`commit`], with
+/// scratch in XMM0 to XMM4: the homes stay. The scalar rounds without
+/// Intel SHA borrow general registers and XMM4 to XMM7 and settle.
+pub(in crate::x86_64) fn vector_use(
+    operand: &Operand,
+    target: TargetCpu,
+) -> crate::x86_64::block::VectorUse {
+    use crate::x86_64::block::VectorUse::{Keep, Settle};
+    match operand.kind {
+        Kind::Schedule0 | Kind::Schedule1 => Keep,
+        Kind::Hash | Kind::Hash2 if target.supports(TargetCpu::Sha) => Keep,
+        Kind::Hash | Kind::Hash2 => Settle,
+    }
+}
+
+/// [`vector_use`] for a group: its hash rounds decide.
+pub(in crate::x86_64) fn group_vector_use(target: TargetCpu) -> crate::x86_64::block::VectorUse {
+    use crate::x86_64::block::VectorUse::{Keep, Settle};
+    if target.supports(TargetCpu::Sha) {
+        Keep
+    } else {
+        Settle
+    }
+}
+
 pub(super) fn emit(code: &mut Code, operand: &Operand, target: TargetCpu) {
     match operand.kind {
         Kind::Hash | Kind::Hash2 => {

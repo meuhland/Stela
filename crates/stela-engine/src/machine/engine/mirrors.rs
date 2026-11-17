@@ -91,6 +91,11 @@ pub(super) struct Mirrors {
     /// `value` the interrupt epoch they reflect
     /// ([`Machine::refresh_interrupt_status`]).
     pub(super) interrupt_status: register_read::Cell,
+    /// What a native timer write that lowers the EL2 virtual timer's output
+    /// leaves waiting (`x86_64::register_read::TimerPlaces::quiet`): open
+    /// with [`GuestState::pending`] as the step set it but for a FIQ that
+    /// channel alone raised ([`Machine::refresh_timer_quiet`]).
+    pub(super) timer_quiet: register_read::Cell,
     /// What a native DSB checks (`x86_64::register_read::barrier_thunk`):
     /// open while this PE has no maintenance outstanding, whatever its
     /// state or derived state ([`Machine::open_barrier`]).
@@ -223,6 +228,7 @@ pub(super) const TIMER: register_read::TimerPlaces = register_read::TimerPlaces 
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     interrupt_status: INTERRUPT_STATUS,
     count: Place::new(Anchor::Count, 0),
+    quiet: Place::new(Anchor::Mirrors, offset_of!(Mirrors, timer_quiet)),
 };
 
 /// MSR CNTV_TVAL_EL0, CNTV_CTL_EL0 and CNTV_CVAL_EL0, and MRS
@@ -449,6 +455,7 @@ impl Default for Mirrors {
             selected: 0,
             fields: [0; 3],
             interrupt_status: register_read::Cell::default(),
+            timer_quiet: register_read::Cell::default(),
             barrier: register_read::Cell::default(),
             events: register_read::Cell::default(),
             exclusive: register_read::Cell::default(),

@@ -606,7 +606,7 @@ static nir_def *
 sampler_lod_bound(const struct call *call, const struct tex *t, float scale)
 {
    nir_builder *b = call->b;
-   nir_def *pixel = nir_trim_vector(b, nir_load_frag_coord(b), 2);
+   nir_def *pixel = nir_trim_vector(b, nir_build_frag_coord(b, 4), 2);
    struct tex query = {.op = nir_texop_lod, .texture = t->texture, .sampler = t->sampler,
                        .coord = nir_fmul_imm(b, pixel, scale)};
    return nir_channel(b, emit(call, &query), 0);

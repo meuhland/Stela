@@ -3,14 +3,16 @@
 //! mode (Intel SDM Vol. 3A chapter 11; AMD APM Vol. 2 chapter 16). Its timer
 //! is measured against the TSC.
 //!
-//! Two tiers, chosen once per processor at bring-up ([`prefer_x2apic`]):
-//! x2APIC whenever CPUID offers it, else the xAPIC page. In x2APIC mode
+//! Two tiers, chosen once per processor at bring-up ([`choose_mode`]):
+//! x2APIC whenever CPUID offers it and the firmware does not opt out
+//! ([`honours_x2apic_opt_out`]), else the xAPIC page. In x2APIC mode
 //! every access is one RDMSR/WRMSR (no uncached load or store, no
 //! instruction a hypervisor must decode), the ICR is one 64-bit write with
 //! a 32-bit destination, and it has no delivery status to wait for.
 use crate::msr;
 use core::arch::asm;
 
+pub mod stale;
 pub mod startup;
 
 /// IA32_APIC_BASE: x2APIC mode enabled.
@@ -22,7 +24,13 @@ const CPUID_X2APIC: u32 = 1 << 21;
 /// IA32_APIC_BASE: the register page's physical address.
 pub const BASE_ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
+/// Task priority.
+pub const TPR: u32 = 0x80;
 pub const EOI: u32 = 0xb0;
+/// The first of the eight in-service (`ISR`) and interrupt request (`IRR`)
+/// registers, 10h apart, vector 0 in bit 0 of the first.
+pub const ISR: u32 = 0x100;
+pub const IRR: u32 = 0x200;
 pub const SPURIOUS: u32 = 0xf0;
 pub const LVT_TIMER: u32 = 0x320;
 pub const LVT_LINT0: u32 = 0x350;
@@ -34,6 +42,7 @@ const ICR_LOW: u32 = 0x300;
 const ICR_HIGH: u32 = 0x310;
 const ICR_PENDING: u32 = 1 << 12;
 const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+const ICR_NMI: u32 = 4 << 8;
 const ICR_INIT: u32 = 5 << 8;
 const ICR_STARTUP: u32 = 6 << 8;
 /// The INIT settling and STARTUP acceptance delays of the MP specification,
@@ -127,6 +136,33 @@ pub fn base_msr() -> u64 {
 /// keeps the APIC's state.
 pub fn x2apic_base(base: u64, offers: bool) -> Option<u64> {
     (offers && base & APIC_ENABLED != 0 && base & X2APIC_MODE == 0).then_some(base | X2APIC_MODE)
+}
+
+/// DMAR flags bit 1, X2APIC_OPT_OUT (Intel VT-d specification 8.1).
+const DMAR_X2APIC_OPT_OUT: u8 = 1 << 1;
+
+/// Whether the boot keeps the xAPIC mode the firmware left although CPUID
+/// offers x2APIC: the firmware's DMAR sets X2APIC_OPT_OUT (`dmar_flags`),
+/// which firmware does when its SMM code reaches the APIC through the xAPIC
+/// page, and every enabled processor's APIC ID (`apic_ids`) fits xAPIC's
+/// eight bits below the broadcast ID. Linux honours the flag the same way
+/// (`intel_prepare_irq_remapping`). An APIC ID of 255 or more needs x2APIC
+/// whatever the firmware asks.
+pub fn honours_x2apic_opt_out(dmar_flags: u8, mut apic_ids: impl Iterator<Item = u64>) -> bool {
+    dmar_flags & DMAR_X2APIC_OPT_OUT != 0 && apic_ids.all(|id| id < 0xff)
+}
+
+/// [`prefer_x2apic`], or with `keep_xapic` ([`honours_x2apic_opt_out`])
+/// IA32_APIC_BASE as the firmware left it.
+///
+/// # Safety
+/// As [`prefer_x2apic`].
+pub unsafe fn choose_mode(keep_xapic: bool) -> u64 {
+    match keep_xapic {
+        true => base_msr(),
+        // SAFETY: the caller's contract.
+        false => unsafe { prefer_x2apic() },
+    }
 }
 
 /// Put this processor's APIC in x2APIC mode when CPUID offers it, and
@@ -357,6 +393,17 @@ impl Apic {
         self.command(destination, u32::from(vector))
     }
 
+    /// Send one physical NMI, without waiting to see it delivered, as
+    /// [`Self::notify`] sends a doorbell.
+    ///
+    /// # Safety
+    /// The destination's NMI gate is live and stops or handles it. The
+    /// caller exclusively owns the local ICR with interrupts disabled.
+    pub unsafe fn notify_nmi(&self, destination: u32, tsc_hz: u64) -> Result<(), StartupError> {
+        self.wait_delivery(tsc_hz)?;
+        self.command(destination, ICR_NMI)
+    }
+
     /// Mask the legacy PICs, enable the APIC with `spurious` as its
     /// spurious vector and LINT0 masked, and measure its timer against the
     /// TSC running at `tsc_hz`, with `timer` masked. Returns the timer's
@@ -402,6 +449,28 @@ mod tests {
         assert!(x2.is_x2apic() && !x.is_x2apic());
     }
 
+    /// The DMAR opt-out keeps xAPIC only while every APIC ID fits it, and
+    /// no other DMAR flag does.
+    #[test]
+    fn dmar_x2apic_opt_out_keeps_xapic_while_every_id_fits() {
+        let ids = [0u64, 2, 0x10, 0xfe];
+        assert!(honours_x2apic_opt_out(0b010, ids.into_iter()));
+        assert!(honours_x2apic_opt_out(0b111, ids.into_iter()));
+        assert!(
+            !honours_x2apic_opt_out(0b101, ids.into_iter()),
+            "no opt-out"
+        );
+        assert!(!honours_x2apic_opt_out(0, ids.into_iter()));
+        assert!(
+            !honours_x2apic_opt_out(0b010, [0u64, 0xff].into_iter()),
+            "the broadcast ID"
+        );
+        assert!(
+            !honours_x2apic_opt_out(0b010, [0u64, 0x100].into_iter()),
+            "an ID only x2APIC reaches"
+        );
+    }
+
     /// The same ICR command in both tiers: x2APIC one write with a 32-bit
     /// destination, xAPIC the destination in ICR_HIGH[31:24] and no wider.
     #[test]
@@ -425,6 +494,14 @@ mod tests {
         assert_eq!(
             icr_write(true, 0x23, command),
             Ok(IcrWrite::X2(0x23 << 32 | u64::from(command)))
+        );
+        // An NMI: delivery mode 100b, fixed physical destination, no vector.
+        assert_eq!(
+            icr_write(false, 0x02, ICR_NMI),
+            Ok(IcrWrite::X {
+                high: 0x02 << 24,
+                low: 0x400
+            })
         );
     }
 

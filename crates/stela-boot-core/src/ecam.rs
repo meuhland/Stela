@@ -1,6 +1,7 @@
 //! Pure geometry for original captured ECAM/RootBridge descriptions.
 //! This module creates no Resource, mapping, device exclusion or root permission.
 pub mod census;
+pub mod memory;
 pub mod topology;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
@@ -88,6 +89,100 @@ fn physical(window: EcamWindow, bits: u8) -> Result<PhysicalSpan, Error> {
         return Err(Error::InvalidRange);
     }
     PhysicalSpan::new(start, end - start)
+}
+
+/// Whether a root bridge forwards configuration requests for `bus` of
+/// `segment`. A request for any other bus of an MCFG window ends at the
+/// root complex, which completes it with all ones.
+pub fn root_decodes(roots: &[RootWindow], segment: u16, bus: u8) -> bool {
+    roots.iter().any(|root| {
+        root.segment == u32::from(segment) && root.buses().is_some_and(|buses| buses.contains(&bus))
+    })
+}
+
+/// Whether the Type 1 bridge at `address`, whose bus dword reads `buses`,
+/// forwards a bus that a root bridge of its segment grants. An unconfigured
+/// bridge forwards none, and neither does one whose secondary..subordinate
+/// range lies wholly outside the grants: the firmware enumerates only
+/// granted buses, so no function behind such a bridge was ever enabled.
+/// Stale numbers (`census::Route::Invalid`) may name buses in use, so they
+/// count as forwarding.
+pub fn forwards_granted_bus(roots: &[RootWindow], address: Address, buses: u32) -> bool {
+    match census::route(address.bus, buses) {
+        census::Route::Unconfigured => false,
+        census::Route::Invalid => true,
+        census::Route::Forwards { buses, .. } => buses
+            .into_iter()
+            .any(|bus| root_decodes(roots, address.segment, bus)),
+    }
+}
+
+/// Whether a configuration read of `offset` at `address` ends at the root
+/// complex, which completes it with all ones: no root bridge forwards the
+/// bus, and the request still leaves the processor. That is the case for a
+/// bus of an MCFG window, and, on segment 0 below register 0x100, for any
+/// bus, which the type 1 mechanism reaches without ECAM. Linux reads such a
+/// register through `raw_pci_read` that way. A segment no root bridge
+/// describes says nothing about the decode, so outside the MCFG windows its
+/// reads are not answered.
+pub fn ends_at_root_complex(
+    windows: &[EcamWindow],
+    roots: &[RootWindow],
+    address: Address,
+    offset: u16,
+) -> bool {
+    if root_decodes(roots, address.segment, address.bus) {
+        return false;
+    }
+    let windowed = windows.iter().any(|window| {
+        window.segment == address.segment
+            && (window.start_bus..=window.end_bus).contains(&address.bus)
+    });
+    let type1 = address.segment == 0
+        && offset < 0x100
+        && roots
+            .iter()
+            .any(|root| root.segment == 0 && root.buses().is_some());
+    windowed || type1
+}
+
+/// A bus of an ECAM window whose configuration space a memory map entry
+/// that is not left to devices overlaps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryConflict {
+    pub bus: u8,
+    /// The bus's configuration space.
+    pub span: PhysicalSpan,
+    /// The entry, as (start, end, kind).
+    pub entry: (u64, u64, u32),
+}
+
+/// The first bus of `window` whose configuration space overlaps a memory
+/// map entry (start, end, kind) that is not reserved or MMIO
+/// (`firmware_map::leaves_to_devices`). Only the window's own buses count,
+/// as Linux sizes an MCFG window from its bus range; a range no entry
+/// covers is no conflict.
+pub fn memory_conflict(
+    window: EcamWindow,
+    bits: u8,
+    entries: impl IntoIterator<Item = (u64, u64, u32)> + Clone,
+) -> Result<Option<MemoryConflict>, Error> {
+    for bus in window.start_bus..=window.end_bus {
+        let span = physical(
+            EcamWindow {
+                start_bus: bus,
+                end_bus: bus,
+                ..window
+            },
+            bits,
+        )?;
+        if let Some(entry) =
+            crate::firmware_map::first_conflict(entries.clone(), span.start(), span.end())
+        {
+            return Ok(Some(MemoryConflict { bus, span, entry }));
+        }
+    }
+    Ok(None)
 }
 
 /// Borrowed immutable descriptions whose COMPLETE original MCFG windows were
@@ -297,6 +392,129 @@ mod tests {
         };
         assert_eq!(bus.normalize(), Reading::Derived);
         assert_eq!(bus.buses(), Some(0x10..=0x1f));
+    }
+
+    #[test]
+    fn only_root_bridge_buses_are_decoded() {
+        let root = |segment: u32, first: u64, last: u64| RootWindow {
+            segment,
+            bridge: 1,
+            space: 2,
+            minimum: first,
+            maximum: last,
+            length: last - first + 1,
+            ..RootWindow::default()
+        };
+        let roots = [root(0, 0, 0x3f), root(1, 0x10, 0x10)];
+        assert!(root_decodes(&roots, 0, 0));
+        assert!(root_decodes(&roots, 0, 0x3f));
+        assert!(!root_decodes(&roots, 0, 0x40));
+        assert!(root_decodes(&roots, 1, 0x10));
+        assert!(!root_decodes(&roots, 1, 0x11));
+        assert!(!root_decodes(&roots, 2, 0));
+        // A memory window is no bus grant.
+        let memory = RootWindow {
+            space: 0,
+            ..root(0, 0x40, 0x7f)
+        };
+        assert!(!root_decodes(&[memory], 0, 0x40));
+    }
+
+    #[test]
+    fn a_bridge_forwards_a_granted_bus_only_when_one_of_its_buses_is_granted() {
+        let at = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let roots = [parent(0, 0xfe)];
+        let dword = |primary: u8, secondary: u8, subordinate: u8| {
+            u32::from_le_bytes([primary, secondary, subordinate, 0])
+        };
+        // A wrong primary and buses 0xff..0xff, past a 0x00-0xfe grant.
+        assert!(!forwards_granted_bus(&roots, at, dword(0xff, 0xff, 0xff)));
+        assert!(!forwards_granted_bus(&roots, at, 0xffff_ffff));
+        assert!(!forwards_granted_bus(&roots, at, 0));
+        assert!(forwards_granted_bus(&roots, at, dword(0, 1, 1)));
+        // Partly granted counts as forwarding.
+        assert!(forwards_granted_bus(&roots, at, dword(0, 0xfe, 0xff)));
+        // Stale numbers may name buses in use.
+        assert!(forwards_granted_bus(&roots, at, dword(0, 0, 5)));
+        // Another segment's grant does not count.
+        let other = Address { segment: 1, ..at };
+        assert!(!forwards_granted_bus(&roots, other, dword(0, 1, 1)));
+    }
+
+    #[test]
+    fn a_bus_no_root_bridge_forwards_reads_all_ones_where_the_request_leaves_the_processor() {
+        let at = |segment, bus| Address {
+            segment,
+            bus,
+            device: 0,
+            function: 0,
+        };
+        // MCFG names buses 0-0x7f; the root bridge forwards 0-0x7e.
+        let windows = [window(0xe000_0000, 0, 0, 0x7f)];
+        let roots = [parent(0, 0x7e)];
+        assert!(!ends_at_root_complex(&windows, &roots, at(0, 0), 0x19));
+        assert!(ends_at_root_complex(&windows, &roots, at(0, 0x7f), 0x100));
+        // Bus 0xff is in no window: the type 1 mechanism reaches its
+        // header, extended registers need ECAM.
+        assert!(ends_at_root_complex(&windows, &roots, at(0, 0xff), 0x19));
+        assert!(ends_at_root_complex(&windows, &roots, at(0, 0xff), 0xff));
+        assert!(!ends_at_root_complex(&windows, &roots, at(0, 0xff), 0x100));
+        // No type 1 mechanism beyond segment 0, and no answer without a
+        // root bridge on the segment.
+        assert!(!ends_at_root_complex(&windows, &roots, at(1, 0xff), 0x19));
+        assert!(!ends_at_root_complex(&windows, &[], at(0, 0xff), 0x19));
+    }
+
+    #[test]
+    fn an_ecam_window_needs_reserved_mmio_or_unlisted_memory_under_each_bus() {
+        use crate::firmware_map::{MMIO, RESERVED};
+        const RAM: u32 = 7;
+        let full = window(0xe000_0000, 0, 0, 0xff);
+        let end = 0xf000_0000;
+        // The firmware's map leaves the window out: a hole.
+        let hole = [(0, 0x8000_0000, RAM), (0x1_0000_0000, 0x2_0000_0000, RAM)];
+        assert_eq!(memory_conflict(full, 48, hole), Ok(None));
+        // An MMIO or a reserved entry over the window.
+        for kind in [MMIO, RESERVED] {
+            assert_eq!(
+                memory_conflict(full, 48, [(0xe000_0000, end, kind)]),
+                Ok(None)
+            );
+        }
+        // RAM over bus 0x80 refuses at that bus.
+        let ram = [(0xe000_0000, 0xe800_0000, MMIO), (0xe800_0000, end, RAM)];
+        assert_eq!(
+            memory_conflict(full, 48, ram),
+            Ok(Some(MemoryConflict {
+                bus: 0x80,
+                span: PhysicalSpan::new(0xe800_0000, 1 << 20).unwrap(),
+                entry: (0xe800_0000, end, RAM),
+            }))
+        );
+        // A window of 64 buses ends at 0xe400_0000: RAM right after it is
+        // no conflict, RAM in its last bus is.
+        let short = window(0xe000_0000, 0, 0, 0x3f);
+        assert_eq!(
+            memory_conflict(short, 48, [(0xe400_0000, end, RAM)]),
+            Ok(None)
+        );
+        assert_eq!(
+            memory_conflict(short, 48, [(0xe3ff_f000, end, RAM)])
+                .unwrap()
+                .map(|conflict| conflict.bus),
+            Some(0x3f)
+        );
+        // A window that starts at bus 0x10 begins 16 MiB above its base.
+        let late = window(0xe000_0000, 0, 0x10, 0x1f);
+        assert_eq!(
+            memory_conflict(late, 48, [(0xe000_0000, 0xe100_0000, RAM)]),
+            Ok(None)
+        );
     }
 
     #[test]

@@ -6,9 +6,12 @@
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -171,3 +174,47 @@ size_t strftime(char *buffer, size_t size, const char *format, const struct tm *
 	(void)time;
 	return 0;
 }
+
+int inotify_init1(int flags)
+{
+	(void)flags;
+	return refused();
+}
+
+int inotify_add_watch(int fd, const char *path, uint32_t mask)
+{
+	(void)fd;
+	(void)path;
+	(void)mask;
+	return refused();
+}
+
+int inotify_rm_watch(int fd, int watch)
+{
+	(void)fd;
+	(void)watch;
+	return refused();
+}
+
+int system(const char *command)
+{
+	return command ? refused() : 0;
+}
+
+int uname(struct utsname *name)
+{
+	(void)name;
+	return refused();
+}
+
+/* The processor model __builtin_cpu_supports reads, compiler-rt's layout.
+ * Every feature reads as absent, so code that checks one takes its generic
+ * path (addrlib's swizzled copies take their scalar loop): the image's C
+ * target is built for SSE, and nothing proves wider vector state survives
+ * where that code runs. */
+struct __processor_model {
+	unsigned int __cpu_vendor;
+	unsigned int __cpu_type;
+	unsigned int __cpu_subtype;
+	unsigned int __cpu_features[1];
+} __cpu_model;

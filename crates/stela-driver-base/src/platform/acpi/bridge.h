@@ -32,6 +32,7 @@ struct stela_acpi_services {
     void (*stall)(void *, u32);
     acpi_status (*read_port)(void *, u64, u32 *, u32);
     acpi_status (*write_port)(void *, u64, u32, u32);
+    /* Hardware registers and every AML SystemMemory field access. */
     acpi_status (*read_memory)(void *, u64, u64 *, u32);
     acpi_status (*write_memory)(void *, u64, u64, u32);
     acpi_status (*read_pci)(void *, struct acpi_pci_id *, u32, u64 *, u32);
@@ -65,4 +66,19 @@ acpi_status stela_acpi_bind_node(acpi_handle, u64);
  * the original OSL provider is still alive. Failed shutdown retains the list. */
 acpi_status stela_acpi_retain_context(acpi_status (*)(void *), acpi_status (*)(void *), acpi_status (*)(void *), void *);
 u8 stela_acpi_arbitration_ready(void);
+/* Where AML runs: the running method's path ("\\" for a table's
+ * module-level code), the opcode it executes, its offset in the method's
+ * AML, and whether a While loop holds it; found is 0 outside AML. */
+struct stela_acpi_location {
+    char path[128];
+    u32 offset;
+    u16 opcode;
+    u8 in_loop;
+    u8 found;
+};
+void stela_acpi_locate(struct stela_acpi_location *);
+/* Bound the interpreter's time in the native call that follows to `ticks`
+ * 100 ns units; end returns 1, and where AML was, when it ran out. */
+void stela_acpi_bound_begin(u64 ticks);
+u8 stela_acpi_bound_end(struct stela_acpi_location *);
 #endif

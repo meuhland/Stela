@@ -196,6 +196,32 @@ vertex Full vert_full(uint v [[vertex_id]], constant float &depth [[buffer(2)]])
     return {float4(p * 2.0f - 1.0f, depth, 1.0f)};
 }
 
+// A path coverage pass in shape: varyings without perspective, and an
+// output to color attachment 1 alone, with early fragment tests.
+struct Distance {
+    float4 position [[position]];
+    float2 p [[center_no_perspective]];
+    float2 p1p2 [[center_no_perspective]];
+    float denom [[center_no_perspective]];
+};
+
+vertex Distance vert_distance(uint v [[vertex_id]], constant float4 *c [[buffer(0)]])
+{
+    float2 p = float2((v << 1) & 2, v & 2);
+    return {float4(p * 2.0f - 1.0f, 0.5f, 1.0f), c[0].xy, c[0].zw, c[1].x};
+}
+
+struct Coverage {
+    float2 coverage [[color(1)]];
+};
+
+[[early_fragment_tests]] fragment Coverage frag_distance(Distance in [[stage_in]])
+{
+    float t = saturate(dot(in.p, in.p1p2) * in.denom);
+    float2 q = fma(in.p1p2, float2(-t), in.p);
+    return {float2(0.0f, 0.5f - 0.5f * saturate(length(q)))};
+}
+
 static uint pixel(float4 position, uint width)
 {
     return uint(position.y) * width + uint(position.x);

@@ -195,6 +195,60 @@ pub struct ExtendedPlanes {
     /// image's dirty tiles ([`PassDirty`](crate::metal::binding::PassDirty)),
     /// which its encode then converts alone.
     pub stamp: u32,
+    /// The copies that refresh an IOSurface plane's aligned copy from its
+    /// rows once the encode wrote them, the first plane's and the
+    /// second's ([`RowCopy`](super::device::resources::RowCopy)).
+    pub refreshes: [Option<super::device::resources::RowCopy>; 2],
+    /// Where an encode of [`PlaneStaging::MIN_TEXELS`] or more writes an
+    /// IOSurface's planes first, for the copy engine to copy into them;
+    /// `None` to write them in place.
+    pub staging: Option<PlaneStaging>,
+}
+
+/// Device memory laid out as an IOSurface's two planes, which a large
+/// encode writes, before copies move what it wrote into the planes in
+/// guest RAM.
+///
+/// The texel kernels write guest RAM a texel at a time, partial lines the
+/// bus and the host's memory take one by one; the copy engine moves whole
+/// rows. The planes still hold what Metal's IOSurface texture holds once
+/// the command buffer completes, for the CPU and the display that read
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneStaging {
+    pub buffer: super::vulkan::object::Buffer,
+    /// The buffer's address: the codes words, `color_bytes_per_row` a
+    /// row, then from `alpha_offset` the alpha bytes, `alpha_bytes_per_row`
+    /// a row.
+    pub address: u64,
+    pub color_bytes_per_row: u32,
+    pub alpha_offset: u64,
+    pub alpha_bytes_per_row: u32,
+    /// The planes' linear images, the codes' and alpha's, which the copies
+    /// write.
+    pub planes: [Image; 2],
+}
+
+impl PlaneStaging {
+    /// The least texels an encode copies through the staging memory: below
+    /// it, the kernel's writes of the texels that changed in place cost
+    /// less than the copies' fixed cost.
+    pub const MIN_TEXELS: u32 = 1 << 16;
+
+    /// The layout of a surface of `extent`: codes words, then alpha bytes,
+    /// each with rows of the width, the alpha's starting at the next 256
+    /// bytes. Answers the rows' bytes and the alpha's offset and size.
+    pub fn layout(extent: [u32; 2]) -> (u32, u64, u32, u64) {
+        let [width, height] = extent.map(u64::from);
+        let color_row = width * 4;
+        let alpha_offset = (color_row * height).next_multiple_of(256);
+        (
+            color_row as u32,
+            alpha_offset,
+            width as u32,
+            alpha_offset + width * height,
+        )
+    }
 }
 
 /// Storage copies of a pass's depth and stencil samples and of its stencil
@@ -243,6 +297,10 @@ pub struct RenderPassPlan<T> {
     /// Custom sample positions in Vulkan's [0, 1) pixel space.
     pub sample_locations: Vec<[f32; 2]>,
     pub inputs: AttachmentInputs,
+    /// The profile's note of the pass
+    /// ([`Rendering::note`](crate::metal::vulkan::command::Rendering::note)),
+    /// zero for none.
+    pub note: u32,
 }
 
 /// `tileWidth`, `tileHeight`, `threadgroupMemoryLength` and
@@ -650,6 +708,7 @@ pub fn render_pass<T: Copy + Eq>(
         visibility_results: descriptor.visibility_results,
         sample_locations,
         inputs: AttachmentInputs::default(),
+        note: 0,
     })
 }
 

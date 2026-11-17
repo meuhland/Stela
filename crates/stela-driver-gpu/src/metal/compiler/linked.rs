@@ -98,8 +98,9 @@ impl Service {
             && core::ptr::fn_addr_eq(self.compile, linked.compile)
     }
 
-    /// The linked service, compiling with the driver's `nir_options`.
-    pub fn linked(nir_options: NonNull<c_void>) -> Self {
+    /// The linked service, compiling with the driver's `nir_options` for
+    /// each stage.
+    pub fn linked(nir_options: [NonNull<c_void>; super::NIR_STAGES]) -> Self {
         Self {
             reflect: stela_metal_reflect,
             reflect_bindings: stela_metal_reflect_bindings,

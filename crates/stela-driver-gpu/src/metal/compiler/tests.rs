@@ -227,7 +227,7 @@ unsafe extern "C" fn compile(
     // SAFETY: the compiler passes its target and specialization, whose
     // arrays and identifiers it keeps alive for the call.
     let (target, specialization) = unsafe { (&*target, &*specialization) };
-    assert!(!target.nir.is_null());
+    assert!(target.nir.iter().all(|options| !options.is_null()));
     // SAFETY: as above.
     let (lengths, varyings, constants) = unsafe {
         (
@@ -505,7 +505,7 @@ fn service() -> Service {
         decode_astc_kernel: kernel::<10>,
         release,
         buffer_reads,
-        nir_options: NonNull::dangling(),
+        nir_options: [NonNull::dangling(); super::NIR_STAGES],
     }
 }
 
@@ -1697,4 +1697,30 @@ fn function_constant_types_follow_their_spelling() {
             Err(Error::Unsupported("function constant type"))
         );
     }
+}
+
+#[test]
+fn every_target_limit_keys_the_nir_a_compilation_stores() {
+    let base = ffi::Target {
+        nir: [ptr::null(); NIR_STAGES],
+        max_instructions: 1,
+        max_threadgroup_bytes: 2,
+        max_private_bytes: 3,
+        max_constant_bytes: 4,
+        max_varying_slots: 5,
+        max_payload_bytes: 6,
+        max_mesh_vertices: 7,
+        max_mesh_primitives: 8,
+        stencil_export: 9,
+        raster_order_groups: 10,
+        fragment_tests: 11,
+    };
+    let limits = target_limits(&base);
+    assert_eq!(limits, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    // Where the driver's NIR options live is no limit: it differs by boot.
+    let moved = ffi::Target {
+        nir: [ptr::dangling(); NIR_STAGES],
+        ..base
+    };
+    assert_eq!(target_limits(&moved), limits);
 }

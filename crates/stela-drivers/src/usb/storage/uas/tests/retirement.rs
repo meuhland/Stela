@@ -24,9 +24,9 @@ fn lost_endpoint_readiness_fences_every_published_lun_before_dma_mutation() {
             let owner = owner.borrow();
             let engine = &owner.transport.engine;
             (
-                engine.command.bytes().to_vec(),
-                engine.status.bytes().to_vec(),
-                engine.data.bytes().to_vec(),
+                engine.lanes[0].command.bytes().to_vec(),
+                engine.lanes[0].status.bytes().to_vec(),
+                engine.lanes[0].data.bytes().to_vec(),
             )
         };
         state.borrow_mut().fault = Fault::EndpointUnavailable;
@@ -42,9 +42,9 @@ fn lost_endpoint_readiness_fences_every_published_lun_before_dma_mutation() {
         let owner = owner.borrow();
         let engine = &owner.transport.engine;
         assert!(engine.poisoned);
-        assert_eq!(engine.command.bytes(), before.0);
-        assert_eq!(engine.status.bytes(), before.1);
-        assert_eq!(engine.data.bytes(), before.2);
+        assert_eq!(engine.lanes[0].command.bytes(), before.0);
+        assert_eq!(engine.lanes[0].status.bytes(), before.1);
+        assert_eq!(engine.lanes[0].data.bytes(), before.2);
     }
 }
 

@@ -280,14 +280,13 @@ fn v4_late_mode_effect_backpressure_bad_signature_and_stop_are_kept() {
     assert_eq!(c.poll_elantech().unwrap().frames.len(), 8);
     let released = c.stop().unwrap();
     assert_eq!(c.elantech_multitouch().unwrap().fingers, 0);
-    assert!(released.contains(&Input::Buttons(0)));
+    assert!(released.contains(&Input::MouseButtons(0)));
     c.initialize().unwrap();
     head[0] |= 8;
     emit(&h, Port::Mouse, &head);
-    assert_eq!(
-        c.poll().unwrap_err().kind,
-        ErrorKind::Elantech(elantech::Error::Packet)
-    );
+    // Dropped, and the pad reads on, as psmouse resynchronizes.
+    assert!(c.poll().unwrap().is_empty());
+    assert!(c.framing_errors() != 0);
     c.release_inputs();
     assert_eq!(c.elantech_fragment(), Some(head.as_slice()));
 }
@@ -328,10 +327,9 @@ fn v4_geometry_and_signature_refusals_precede_mode_or_preserve_exact_bad_packet(
                 raw[3] ^= if crc { 8 } else { 4 };
             }
             emit(&h, Port::Mouse, &raw);
-            assert_eq!(
-                c.poll().unwrap_err().kind,
-                ErrorKind::Elantech(elantech::Error::Packet)
-            );
+            // Dropped, and the pad reads on, as psmouse resynchronizes.
+            assert!(c.poll().unwrap().is_empty());
+            assert!(c.framing_errors() != 0);
             assert_eq!(c.elantech_fragment(), Some(raw.as_slice()));
             assert_eq!(c.elantech_multitouch().unwrap().fingers, 0);
         }

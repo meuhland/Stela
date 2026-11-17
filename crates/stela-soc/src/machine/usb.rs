@@ -163,7 +163,9 @@ impl AppleDevices {
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
-        let network = network.map(Ecm::new).transpose()?;
+        let network = network
+            .map(|mac| Ecm::with_model(mac, crate::usb::ecm::Model::Ncm))
+            .transpose()?;
         let disks = disks
             .into_iter()
             .map(MassStorage::of)
@@ -273,6 +275,14 @@ impl AppleDevices {
     pub fn network_status(&mut self) -> Option<(bool, UsbNetworkCounters)> {
         let network = self.usb_network().ok()?;
         Some((network.up(), network.counters()))
+    }
+
+    /// The carrier of the host link the guest's USB Ethernet adapter is
+    /// bridged to, which the guest sees as its cable (`Ecm::set_carrier`).
+    pub fn network_carrier(&mut self, carrier: bool) {
+        if let Ok(network) = self.usb_network() {
+            network.set_carrier(carrier);
+        }
     }
 
     /// Whether the guest's USB Ethernet adapter has room for a frame from
@@ -385,8 +395,15 @@ impl AppleDevices {
                     .map_or_else(String::new, |ecm| {
                         let c = ecm.counters();
                         format!(
-                            " net=[to_guest={} to_host={} filtered={} overflowed={} oversized={}]",
-                            c.to_guest, c.to_host, c.filtered, c.overflowed, c.oversized
+                            " net=[model={:?} to_guest={} to_host={} filtered={} overflowed={} \
+                             oversized={} malformed={}]",
+                            ecm.model(),
+                            c.to_guest,
+                            c.to_host,
+                            c.filtered,
+                            c.overflowed,
+                            c.oversized,
+                            c.malformed
                         )
                     });
                 format!(

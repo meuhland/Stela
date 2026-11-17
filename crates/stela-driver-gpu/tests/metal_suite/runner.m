@@ -5458,6 +5458,67 @@ static void host_two_plane(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
 	CFRelease(s);
 }
 
+/* Writes a 16-bit word plane of `comps` components a pixel with a ramp
+ * that `variant` shifts, under a write lock, which changes the seed. */
+static void frames_plane(IOSurfaceRef s, size_t plane, size_t comps, uint32_t variant)
+{
+	IOSurfaceLock(s, 0, NULL);
+	uint8_t *base = IOSurfaceGetBaseAddressOfPlane(s, plane);
+	size_t stride = IOSurfaceGetBytesPerRowOfPlane(s, plane);
+	size_t w = IOSurfaceGetWidthOfPlane(s, plane) * comps, height = IOSurfaceGetHeightOfPlane(s, plane);
+	for (size_t y = 0; y < height; y++) {
+		uint16_t *row = (uint16_t *)(base + y * stride);
+		for (size_t x = 0; x < w; x++)
+			row[x] = (uint16_t)(((x * 7u + y * 13u + variant * 389u) % 1024u) << 6);
+	}
+	IOSurfaceUnlock(s, 0, NULL);
+}
+
+/* A compositor's frames over a large 10-bit 4:2:0 video surface, as
+ * Mission Control draws a video wallpaper: each frame samples the whole
+ * surface into a private target and reads 16 probes of it, and the CPU
+ * rewrites the luma before frame `change`. The case's gpu_ms is the frames'
+ * GPU time; the probes show each frame saw the surface's current rows. */
+static void host_two_plane_frames(Case *c, id<MTLCommandQueue> queue, NSDictionary *h)
+{
+	size_t w = number(h, @"width", 1), height = number(h, @"height", 1);
+	uint32_t frames = (uint32_t)number(h, @"frames", 1), change = (uint32_t)number(h, @"change", 0);
+	IOSurfaceRef s = two_plane_surface(w, height, w / 2, height / 2, 2, 'x420');
+	frames_plane(s, 0, 1, 0);
+	frames_plane(s, 1, 2, 0);
+	id<MTLTexture> t = surface_texture(c, s, 0, (MTLPixelFormat)number(h, @"format", 0), MTLTextureUsageShaderRead);
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+										     width:w
+										    height:height
+										 mipmapped:NO];
+	d.usage = MTLTextureUsageShaderWrite;
+	d.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> target = [c.device newTextureWithDescriptor:d];
+	if (!target)
+		@throw failure(@"no frame target");
+	id<MTLComputePipelineState> frame = host_pipeline(c, @"surface_frame");
+	id<MTLComputePipelineState> probe = host_pipeline(c, @"surface_probe");
+	for (uint32_t f = 0; f < frames; f++) {
+		if (f == change)
+			frames_plane(s, 0, 1, 1);
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e setComputePipelineState:frame];
+		[e setTexture:t atIndex:0];
+		[e setTexture:target atIndex:1];
+		[e dispatchThreads:MTLSizeMake(w, height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+		uint32_t first = f * 16;
+		[e setComputePipelineState:probe];
+		[e setTexture:t atIndex:0];
+		[e setBuffer:c.buffers[@"probes"] offset:0 atIndex:0];
+		[e setBytes:&first length:sizeof first atIndex:1];
+		[e dispatchThreads:MTLSizeMake(16, 1, 1) threadsPerThreadgroup:MTLSizeMake(16, 1, 1)];
+		[e endEncoding];
+		wait_for(cb, c.spec);
+	}
+	CFRelease(s);
+}
+
 /* Copies both planes of a 4:4:4 two-plane surface into `out`: the first
  * plane's bytes, then the second's pairs, tight. */
 static void two_plane_out(IOSurfaceRef s, id<MTLBuffer> out, size_t w, size_t height)
@@ -8084,6 +8145,7 @@ static void run_host(Case *c, id<MTLCommandQueue> queue, NSDictionary *spec)
 		@"iosurface_buffer" : [NSValue valueWithPointer:host_iosurface_buffer],
 		@"two_plane" : [NSValue valueWithPointer:host_two_plane],
 		@"two_plane_render" : [NSValue valueWithPointer:host_two_plane_render],
+		@"two_plane_frames" : [NSValue valueWithPointer:host_two_plane_frames],
 		@"share" : [NSValue valueWithPointer:host_share],
 		@"archive" : [NSValue valueWithPointer:host_archive],
 		@"errors" : [NSValue valueWithPointer:host_errors],

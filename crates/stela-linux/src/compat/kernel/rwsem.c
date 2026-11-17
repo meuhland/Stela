@@ -49,6 +49,11 @@ int down_read_killable(struct rw_semaphore *sem)
 	return wait_var_event_killable(&sem->count, down_read_trylock(sem)) ? -EINTR : 0;
 }
 
+int down_read_interruptible(struct rw_semaphore *sem)
+{
+	return wait_var_event_interruptible(&sem->count, down_read_trylock(sem)) ? -EINTR : 0;
+}
+
 void down_write(struct rw_semaphore *sem)
 {
 	wait_var_event(&sem->count, down_write_trylock(sem));

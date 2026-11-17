@@ -16,11 +16,12 @@ pub(crate) unsafe fn attach(
     domain: Arc<dyn DmaDomain>,
     clock: Clock,
     location: String,
+    quirks: Quirks,
 ) -> Result<Attached, BlockError> {
     // SAFETY: forwarded unchanged kept-owner attachment contract.
     unsafe {
         super::super::attach_with_timeout(
-            registers, lifecycle, source, domain, clock, location, 1_000,
+            registers, lifecycle, source, domain, clock, location, 1_000, quirks,
         )
     }
 }
@@ -104,6 +105,13 @@ impl Protocol {
         model.fail_unmap = matches!(fault, Fault::Unmap);
         model.fail_retire = matches!(fault, Fault::RegistersRetire);
     }
+    /// Give the namespace this EUI-64 and write `bytes` to its medium at
+    /// byte `offset`, as a disk's own contents before the boot.
+    pub(crate) fn medium(&self, eui64: [u8; 8], offset: usize, bytes: &[u8]) {
+        let mut model = self.model.lock().unwrap();
+        model.eui64 = eui64;
+        model.disk[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
     pub(crate) fn sibling(namespace: &Namespace) -> Namespace {
         Namespace {
             controller: namespace.controller.clone(),
@@ -112,6 +120,7 @@ impl Protocol {
             ids: namespace.ids.clone(),
             scanned: namespace.scanned,
             removed: namespace.removed.clone(),
+            rescanning: None,
         }
     }
     pub(crate) fn snapshot(&self) -> Snapshot {

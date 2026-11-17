@@ -17,7 +17,7 @@ use crate::{
         pci::power::Interval,
     },
 };
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use core::{
     cell::Cell,
     ops::{Deref, DerefMut},
@@ -41,7 +41,8 @@ const RESET_RECOVERY_US: u64 = 6_000_000;
 const MAX_LUN: u8 = 15;
 /// xHCI completion code 22: the slot must be retired, not cancelled.
 const INCOMPATIBLE_DEVICE: u32 = 22;
-const PROTOCOL_ERROR: BlockError = BlockError::Protocol("malformed Bulk-Only wrapper or transfer");
+pub(super) const PROTOCOL_ERROR: BlockError =
+    BlockError::Protocol("malformed Bulk-Only wrapper or transfer");
 const SHORT_WRITE: BlockError = BlockError::Protocol("short Bulk-Only write");
 
 pub(super) fn supported(device: &Device) -> Result<(), &'static str> {
@@ -110,6 +111,11 @@ pub(super) trait Io {
     fn signals(&self) -> bool {
         false
     }
+    /// Whether a device that leaves the bus and comes back is started
+    /// again for this transport's disks ([`super::resume`]).
+    fn resumable(&self) -> bool {
+        false
+    }
     /// Whether a submitted transfer may have completed, for [`Self::reap`];
     /// a look at memory alone.
     fn posted(&self) -> bool {
@@ -169,6 +175,16 @@ pub(super) trait Io {
         Self: Sized,
     {
         None
+    }
+    /// The device's port status for a log line, where the host reads one.
+    fn port_status(&mut self) -> Option<String> {
+        None
+    }
+    /// Whether a timed-out command is recovered by the owner's port reset
+    /// ([`Self::reset_device`]) rather than a class reset first: where that
+    /// reset runs at once, without fresh allocation.
+    fn port_reset_first(&self) -> bool {
+        false
     }
 }
 
@@ -231,10 +247,27 @@ impl Io for Native {
         Some(bot.reset_and_rebind(dma))
     }
 
+    fn port_status(&mut self) -> Option<String> {
+        self.controller.try_borrow_mut().ok()?.port_status(self.id)
+    }
+
+    /// A device's reset runs at once from its owner, on a root port or
+    /// behind hubs, reusing its own storage; during the first scan too.
+    fn port_reset_first(&self) -> bool {
+        self.command_us.get() == SCAN_COMMAND_US
+            || self
+                .controller
+                .try_borrow()
+                .is_ok_and(|controller| controller.reset_reuses_storage(self.id))
+    }
+
     fn signals(&self) -> bool {
         self.controller
             .try_borrow()
             .is_ok_and(|controller| controller.signals())
+    }
+    fn resumable(&self) -> bool {
+        true
     }
     fn posted(&self) -> bool {
         self.controller
@@ -394,6 +427,44 @@ impl Io for Native {
     }
 }
 
+/// GET_MAX_LUN for `interface`.
+pub(super) fn max_lun_request(interface: u8) -> [u8; 8] {
+    setup(
+        DEVICE_TO_HOST | TYPE_CLASS | RECIPIENT_INTERFACE,
+        GET_MAX_LUN,
+        0,
+        u16::from(interface),
+        1,
+    )
+}
+
+/// The max LUN a GET_MAX_LUN answer gives, or `None` where it means one
+/// LUN: Linux `usb_stor_Bulk_max_lun` takes a stall, no data, a timeout or
+/// nonsense for one, and EP0 must still be usable afterwards.
+pub(super) fn max_lun_answer(answer: Result<Vec<u8>, BlockError>) -> Option<u8> {
+    match answer {
+        Ok(bytes) if bytes.len() == 1 && bytes[0] <= MAX_LUN => Some(bytes[0]),
+        _ => None,
+    }
+}
+
+/// The two buffers of a transport for a device that came back after boot,
+/// taken in the step that has the allocator ([`Bot::resumed`]).
+pub(in crate::usb) struct ResumeBuffers {
+    data: DmaBuffer,
+    wrapper: DmaBuffer,
+}
+
+/// Take a resumed transport's buffers, as [`Bot::native`] takes its own.
+pub(in crate::usb) fn resume_buffers(
+    dma: &mut dyn DmaAllocator,
+) -> Result<ResumeBuffers, BlockError> {
+    Ok(ResumeBuffers {
+        data: dma.allocate(MAX_TD, MAX_TD)?,
+        wrapper: dma.allocate(64, 64)?,
+    })
+}
+
 /// The unique owner can move to a fresh transport only after whole-device
 /// retirement and successful native reconstruction. Old media aliases
 /// keep their poisoned Bot, whose buffer slots are then permanently empty.
@@ -443,6 +514,8 @@ pub(super) struct Bot<I: Io> {
     /// The data a failed command's data phase moved in, until the next
     /// command: sd keeps it when the sense is RECOVERED ERROR.
     failed_data: Option<Vec<u8>>,
+    /// The port's status when a command first failed, for its log line.
+    failure_status: Option<String>,
 }
 
 /// A command between its wrapper and its status, one transfer at a time,
@@ -542,22 +615,12 @@ impl<I: Io> Bot<I> {
     /// Perform transport admission before committing any moved buffers.
     fn startup(io: &mut I, interface: u8, flags: quirks::Flags) -> Result<u8, BlockError> {
         io.ready()?;
-        let request = setup(
-            DEVICE_TO_HOST | TYPE_CLASS | RECIPIENT_INTERFACE,
-            GET_MAX_LUN,
-            0,
-            u16::from(interface),
-            1,
-        );
         Ok(if flags.single_lun() {
             0
         } else {
-            match io.control(request) {
-                Ok(bytes) if bytes.len() == 1 && bytes[0] <= MAX_LUN => bytes[0],
-                // Linux `usb_stor_Bulk_max_lun`: devices stall this request, send
-                // nothing, time out or answer nonsense; all mean one LUN. EP0
-                // must still be usable afterwards.
-                _ => {
+            match max_lun_answer(io.control(max_lun_request(interface))) {
+                Some(max_lun) => max_lun,
+                None => {
                     io.ready()?;
                     0
                 }
@@ -590,6 +653,7 @@ impl<I: Io> Bot<I> {
             recovery: None,
             begun: None,
             failed_data: None,
+            failure_status: None,
         }
     }
     /// A transport over `io` that takes this one's buffers, cleared, once a
@@ -642,6 +706,10 @@ impl<I: Io> Bot<I> {
     pub fn take_failed_data(&mut self) -> Option<Vec<u8>> {
         self.failed_data.take()
     }
+    /// The port's status when a command last failed in its transport.
+    pub fn take_failure_status(&mut self) -> Option<String> {
+        self.failure_status.take()
+    }
 
     pub fn generation(&self) -> u64 {
         self.reset_generation
@@ -662,27 +730,18 @@ impl<I: Io> Bot<I> {
         self.flags.max_transfer_bytes()
     }
     pub fn read_before_mode_sense(&mut self, lun: u8, block_size: usize) -> Result<(), BlockError> {
-        let mut cdb = [0; 10];
-        cdb[0] = scsi::READ_10;
-        cdb[8] = 1;
-        if self.initial_read {
-            // Linux INITIAL_READ10 discards the first result. This workaround
-            // runs only while probing metadata before publication, never on a
-            // caller's data command or after an observed media change.
-            self.initial_read = false;
-            match self.command(lun, &cdb, Data::In(block_size)) {
-                Err(BlockError::Sense(sense)) if super::media::changed(&sense, true) => {
-                    return Err(BlockError::Sense(sense));
-                }
-                Err(error) if self.poisoned => return Err(error),
-                _ => {}
-            }
-        }
-        let bytes = self.command(lun, &cdb, Data::In(block_size))?;
-        if bytes.len() != block_size {
-            return Err(BlockError::Protocol("short USB block-zero read"));
-        }
-        Ok(())
+        let initial_read = self.take_initial_read();
+        stela_driver_base::stepped::block_on(super::read_block_zero(
+            &mut super::Now(self),
+            lun,
+            block_size,
+            initial_read,
+        ))
+    }
+    /// Whether the next block-zero read is the `INITIAL_READ10` one whose
+    /// result is discarded; asked once.
+    pub(super) fn take_initial_read(&mut self) -> bool {
+        core::mem::take(&mut self.initial_read)
     }
 
     fn ready(&mut self) -> Result<(), BlockError> {
@@ -827,6 +886,21 @@ impl<I: Io> Bot<I> {
         }
     }
     fn failed<T>(&mut self, error: BlockError) -> Result<T, BlockError> {
+        // Read as the transfer failed, before its recovery changes it.
+        if self.failure_status.is_none() {
+            self.failure_status = self.io.port_status();
+        }
+        // Linux `usb_stor_invoke_transport`: a command that timed out is
+        // recovered by a port reset first, and the class reset only follows
+        // a failed one. A device hung that way rarely answers its class
+        // reset, which then costs its own timeout and settle before the port
+        // reset runs anyway. The cancelled transfer left the endpoints idle;
+        // the owner resets the port of a poisoned transport. Where the port
+        // reset cannot run at once, the class reset stays first.
+        if error == BlockError::Timeout && self.io.port_reset_first() {
+            self.poisoned = true;
+            return Err(error);
+        }
         self.recover();
         Err(self.minimum_error.clone().unwrap_or(error))
     }
@@ -881,6 +955,21 @@ impl<I: Io> Bot<I> {
             crate::waiting();
             core::hint::spin_loop();
         }
+    }
+
+    /// Whether a reset recovery is under way, moved on as far as it goes,
+    /// for a caller that runs commands in steps.
+    pub(super) fn settling(&mut self) -> bool {
+        self.recovering()
+    }
+    /// Whether a failed command's class reset is still unanswered, which a
+    /// caller waits for to see the generation it leaves.
+    pub(super) fn resetting(&mut self) -> bool {
+        matches!(self.recovery, Some(Recovery::Resetting(_))) && self.recovering()
+    }
+    /// The minimum timer's failure, which ends every later command.
+    pub(super) fn minimum_error(&self) -> Option<BlockError> {
+        self.minimum_error.clone()
     }
 
     /// Whether a begun command has not ended, or a reset recovery settles.
@@ -1237,6 +1326,42 @@ impl Bot<Native> {
         bot.attachment = Some((device.clone(), setting.clone()));
         Ok(bot)
     }
+    /// A transport for `device`, configured with `setting`, that came back
+    /// after boot as the device another transport had: the buffers
+    /// [`resume_buffers`] took, and the max LUN the device answered in
+    /// steps, so nothing here waits.
+    pub(super) fn resumed(
+        io: Native,
+        device: &Device,
+        setting: &Interface,
+        buffers: ResumeBuffers,
+        max_lun: u8,
+    ) -> Result<Self, BlockError> {
+        let flags = quirks::Flags::from_device(device).map_err(BlockError::Unsupported)?;
+        let endpoints = io.endpoints;
+        let mut bot = Self::with_buffers(
+            io,
+            setting.number,
+            endpoints,
+            TransportBuffer::new(buffers.data),
+            TransportBuffer::new(buffers.wrapper),
+            flags,
+            max_lun,
+        );
+        bot.attachment = Some((device.clone(), setting.clone()));
+        Ok(bot)
+    }
+    /// Whether the device answers more than one LUN: false where its quirks
+    /// say it has one and is not asked ([`Self::startup`]).
+    pub(super) fn asks_max_lun(device: &Device) -> Result<bool, BlockError> {
+        quirks::Flags::from_device(device)
+            .map(|flags| !flags.single_lun())
+            .map_err(BlockError::Unsupported)
+    }
+    /// The device and setting this transport was bound to.
+    pub(super) fn attached(&self) -> Option<&(Device, Interface)> {
+        self.attachment.as_ref()
+    }
     pub fn device(&self) -> &Device {
         &self.attachment.as_ref().expect("native BOT attachment").0
     }
@@ -1244,14 +1369,42 @@ impl Bot<Native> {
         self.interface
     }
     /// Reconstruct the attachment while keeping its two transport
-    /// allocations. Root-leaf reset also reuses the controller's retired
-    /// resources; downstream reset keeps the existing allocation behavior.
+    /// allocations. The reset also reuses the controller's retired
+    /// resources, on a root port or behind hubs.
     /// Every fallible reconstruction step precedes moving either buffer owner.
     #[expect(
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
     pub fn reset_and_rebind(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<Self, (alloc::string::String, BlockError)> {
+        // A device generation that is no longer live is refused before any
+        // register access, its port status included.
+        let port = {
+            let controller = self.io.controller.borrow();
+            controller
+                .reset_reuses_storage(self.io.id)
+                .then(|| controller.root_port_of(self.io.id))
+                .flatten()
+        };
+        self.reset_and_rebind_once(dma)
+            .map_err(|(operation, error)| {
+                // The port as the failed step left it.
+                let status =
+                    port.map(|port| self.io.controller.borrow_mut().root_port_status(port));
+                match status {
+                    Some(status) => (alloc::format!("{operation} ({status})"), error),
+                    None => (operation, error),
+                }
+            })
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    fn reset_and_rebind_once(
         &mut self,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Self, (alloc::string::String, BlockError)> {
@@ -1284,7 +1437,7 @@ impl Bot<Native> {
         let mut fresh = unsafe {
             controller
                 .borrow_mut()
-                .reset_and_reuse_root(old, &self.endpoints, dma)?
+                .reset_and_reuse(old, &self.endpoints, dma)?
         };
         let id = fresh.id;
         let result = (|| {

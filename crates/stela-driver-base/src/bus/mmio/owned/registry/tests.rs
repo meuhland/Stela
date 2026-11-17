@@ -8,6 +8,75 @@ use core::{cell::RefCell, ops::Deref};
 use std::sync::Mutex;
 
 const BASE: u64 = 0x1000_0000;
+
+#[cfg(feature = "native-acpi")]
+#[test]
+fn acpi_broker_child_maps_after_exclusive_parent_leaves_physical_lookup() {
+    use crate::platform::acpi::{
+        Mode, Session,
+        resources::{DeviceResources, MemoryBroker},
+        test_support::{TEST_SERIAL, reduced_hardware_fixture},
+    };
+    let _serial = TEST_SERIAL.lock().unwrap();
+    // SAFETY: the real ACPICA singleton is serialized; fixture owns its tables.
+    let session =
+        unsafe { Session::start(reduced_hardware_fixture(&[]), Mode::InterpreterOnly) }.unwrap();
+    let device = DeviceResources::inspect(session.handle("\\_SB.UCSI").unwrap()).unwrap();
+    let model = Model::fixture();
+    // SAFETY: isolated actual RAM mapper, no external root users.
+    let authority = unsafe { fixture(Arc::clone(&model), Vec::new()) };
+    let (root, dropped) = make_resource(
+        &model,
+        PhysicalSpan::new(0x9000, 4096).unwrap(),
+        ResourceKind::Registers,
+    );
+    let id = authority.register_resource(root.clone()).unwrap();
+    // SAFETY: this root is exclusively delegated; no user maps the root.
+    let broker = unsafe { MemoryBroker::new(vec![root]) }.unwrap();
+    let reservation = broker.reserve(&device, 0).unwrap();
+    assert!(matches!(
+        authority.map(
+            reservation.resource().clone(),
+            0,
+            0x100,
+            CacheAttribute::Uncached,
+            Protection::ReadWrite
+        ),
+        Err(Error::ResourceConflict)
+    ));
+    assert_eq!(model.live(), 0);
+    authority.unregister_resource(id).unwrap();
+    assert!(matches!(
+        authority.resolve_resource(PhysicalSpan::new(0x9000, 4096).unwrap()),
+        Err(Error::OutsideResource)
+    ));
+    let mut mapping = authority
+        .map(
+            reservation.resource().clone(),
+            0,
+            0x100,
+            CacheAttribute::Uncached,
+            Protection::ReadWrite,
+        )
+        .unwrap();
+    assert_eq!(model.live(), 1);
+    // Another independently claimed backing is still refused while mapped.
+    let (other, _) = make_resource(
+        &model,
+        PhysicalSpan::new(0x9000, 4096).unwrap(),
+        ResourceKind::Registers,
+    );
+    assert!(authority.register_resource(other).is_err());
+    drop(broker);
+    drop(reservation);
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    // SAFETY: this isolated mapping has no outstanding users.
+    unsafe { mapping.retire() }.unwrap();
+    drop(mapping);
+    assert_eq!(model.live(), 0);
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    session.shutdown().unwrap();
+}
 const SPACE: AddressSpace = AddressSpace {
     identity: 7,
     physical_bits: 48,
@@ -251,7 +320,18 @@ unsafe impl MappingPlatform for Model {
         resource: &Resource,
         request: MapRequest,
     ) -> Result<InstalledMapping, MapFailure> {
-        let backing = resource.backing().downcast_ref::<Backing>().unwrap();
+        #[cfg(feature = "native-acpi")]
+        let original = {
+            let mut original = resource;
+            while let Some(parent) = crate::platform::acpi::resources::reservation_parent(original)
+            {
+                original = parent;
+            }
+            original
+        };
+        #[cfg(not(feature = "native-acpi"))]
+        let original = resource;
+        let backing = original.backing().downcast_ref::<Backing>().unwrap();
         assert!(Arc::ptr_eq(&backing.pool, &self.pool));
         assert!(
             backing.mapping.uses() != 0,

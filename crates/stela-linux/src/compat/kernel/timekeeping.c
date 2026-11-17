@@ -17,6 +17,20 @@ ktime_t ktime_get(void)
 	return owner->services->now_ns(owner->context);
 }
 
+/* The owner's monotonic clock runs at the hardware's rate and nothing slews
+ * it, so the raw clock is the same one. */
+ktime_t ktime_get_raw(void)
+{
+	return ktime_get();
+}
+
+/* Linux's fast accessor is for contexts that may interrupt a clock update.
+ * The owner's clock read has no update to interrupt, so it is the same read. */
+u64 notrace ktime_get_mono_fast_ns(void)
+{
+	return (u64)ktime_get();
+}
+
 notrace u64 sched_clock(void)
 {
 	ktime_t now = ktime_get();
@@ -59,6 +73,14 @@ static void realtime(struct timespec64 *ts, u32 mode, u32 tick_ns)
 void ktime_get_real_ts64(struct timespec64 *ts)
 {
 	realtime(ts, 0, 0);
+}
+
+time64_t ktime_get_real_seconds(void)
+{
+	struct timespec64 now;
+
+	ktime_get_real_ts64(&now);
+	return now.tv_sec;
 }
 
 void ktime_get_coarse_real_ts64_mg(struct timespec64 *ts)

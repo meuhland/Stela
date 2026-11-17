@@ -24,6 +24,10 @@ impl Mouse {
     pub(super) fn partial(&self) -> bool {
         self.position != 0
     }
+    /// Drop the packet in progress, so the next byte starts a packet.
+    pub(super) fn resync(&mut self) {
+        self.position = 0;
+    }
     pub(super) fn expire(&mut self, now: u64, timeout: u64) -> Result<(), ErrorKind> {
         if self.partial() && now.wrapping_sub(self.start) >= timeout {
             self.position = 0;
@@ -48,9 +52,10 @@ impl Mouse {
         events: &mut Vec<Input>,
         mut horizontal: Option<&mut Vec<i8>>,
     ) -> Result<(), ErrorKind> {
+        // A packet that expired before this byte is dropped, and the byte
+        // may start the next one.
         if self.position != 0 && now.wrapping_sub(self.start) >= timeout {
             self.position = 0;
-            return Err(ErrorKind::PacketTimeout(Port::Mouse));
         }
         if self.position == 0 {
             if data & 8 == 0 {

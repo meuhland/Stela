@@ -268,6 +268,7 @@ impl Prefix {
             direct_exits: Vec::new(),
             fault_recovery: Vec::new(),
             self_loop: false,
+            cold: (0, 0),
         })
     }
 }

@@ -897,6 +897,67 @@ fn a_page_with_a_long_index_list_retires_in_steps_of_bounded_work() {
     }
 }
 
+/// While another PE waits for the code lock, a retirement step ends at its
+/// next bound of [`YIELD_VISITS`] units, not at the full step's: the same
+/// retirement in more, shorter holds, which retires the same blocks.
+#[test]
+fn a_retirement_step_lets_a_waiting_pe_in_early() {
+    const B4: u32 = 0x1400_0001; // b .+4
+    let retire = |waiting: u32| {
+        let words: Vec<u32> = [B4, RET]
+            .iter()
+            .copied()
+            .cycle()
+            .take(FETCH_PAGE as usize / 4)
+            .collect();
+        let mut memory = vec![0u8; 1 << 17];
+        let mut machine = windowed(&words, &mut memory);
+        let base = machine.cpu.pc;
+        for pc in (0..FETCH_PAGE / 4).map(|word| base + 4 * word) {
+            assert!(matches!(
+                machine.fetch_block(pc, false),
+                Ok(Fetched::Block(_))
+            ));
+        }
+        let slot = machine
+            .code
+            .find(
+                base,
+                machine.code.blocks[0].physical,
+                machine.code.blocks[0].variant,
+            )
+            .expect("indexed");
+        let range = part_of(&machine, slot);
+        let evicted = (0..machine.code.blocks.len())
+            .filter(|&slot| {
+                machine
+                    .code
+                    .blocks
+                    .installed(slot)
+                    .is_some_and(|block| range.contains(&block.code.0))
+            })
+            .count();
+        let listed = machine.code.cache().index.page(base).count() as u64;
+        machine.code.waiting.store(waiting, Ordering::Relaxed);
+        machine.evict_code(range);
+        machine.code.waiting.store(0, Ordering::Relaxed);
+        let events = &machine.code.events;
+        let step = events.retire_step_visits.load(Ordering::Relaxed);
+        let left = machine.code.cache().index.page(base).count() as u64;
+        (step, listed, listed - left, evicted as u64)
+    };
+    let (alone, listed, gone, evicted) = retire(0);
+    let (waited, _, gone_waited, _) = retire(1);
+    assert_eq!((gone, gone_waited), (evicted, evicted));
+    let yielded = super::super::code_cache::YIELD_VISITS;
+    // The page's index list share (a sixteenth) and a table set per block.
+    assert!(
+        waited <= yielded + listed / 16 + 8,
+        "{waited} visits in a step with a PE waiting, list of {listed}"
+    );
+    assert!(alone > waited, "{alone} visits alone, {waited} waited");
+}
+
 /// The code lock work an install takes: one hold, in which the fetch that
 /// compiled the block also puts in its block table entry. A fetch of a
 /// block another PE installed takes none.

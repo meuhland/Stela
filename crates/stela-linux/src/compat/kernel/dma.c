@@ -43,6 +43,20 @@ void dma_unmap_page_attrs(struct device *dev, dma_addr_t addr, size_t size,
 	dma_unmap_phys(dev, addr, size, dir, attrs);
 }
 
+/* Device memory, such as another device's BAR: the owner's mapping is told
+ * it is MMIO, as kernel/dma/mapping.c tells it. */
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys, size_t size,
+			    enum dma_data_direction dir, unsigned long attrs)
+{
+	return dma_map_phys(dev, phys, size, dir, attrs | DMA_ATTR_MMIO);
+}
+
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+			enum dma_data_direction dir, unsigned long attrs)
+{
+	dma_unmap_phys(dev, addr, size, dir, attrs | DMA_ATTR_MMIO);
+}
+
 static int map_sg(struct device *dev, struct scatterlist *sg, int nents,
 		  enum dma_data_direction dir, unsigned long attrs)
 {
@@ -146,6 +160,14 @@ int dma_set_coherent_mask(struct device *dev, u64 mask)
 		return -EIO;
 	dev->coherent_dma_mask = mask;
 	return 0;
+}
+
+/* kernel/dma/mapping.c: whether the device's mask keeps it below addresses
+ * its mappings may get. The owner hands out bus addresses up to its limit
+ * and says whether a mask reaches it. */
+bool dma_addressing_limited(struct device *dev)
+{
+	return !supported(dev, min_not_zero(dma_get_mask(dev), dev->bus_dma_limit));
 }
 
 #ifdef STELA_LINUX_DMA_TEST
@@ -254,6 +276,10 @@ int main(void)
 	assert(dma_set_mask(&dev, DMA_BIT_MASK(31)) == -EIO && !mask);
 	assert(!dma_set_mask_and_coherent(&dev, DMA_BIT_MASK(47)));
 	assert(mask == DMA_BIT_MASK(47) && dev.coherent_dma_mask == mask);
+	/* The mask reaches what the owner hands out; a bus limit below it does not. */
+	assert(!dma_addressing_limited(&dev));
+	dev.bus_dma_limit = DMA_BIT_MASK(31);
+	assert(dma_addressing_limited(&dev));
 	stela_linux_exit();
 	printf("Linux DMA mapping through the owner's dma_map_ops passed\n");
 	return 0;

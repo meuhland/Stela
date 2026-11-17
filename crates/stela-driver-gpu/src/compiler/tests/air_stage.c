@@ -622,13 +622,21 @@ aggregate_phi_semantics(void)
       "float -0.0,float poison,float 0.0,float 4.0");
    raw = bitcode(bad); free(bad); free(text);
    ralloc_free(translate(raw, "test_vertex", &o)); LLVMDisposeMemoryBuffer(raw);
-   const char *unsupported[] = {"<{double,<4 x float>}>", "<{<{float}>,<4 x float>}>"};
-   for (unsigned i = 0; i < ARRAY_SIZE(unsupported); i++) {
+   /* A nested aggregate joins leaf by leaf; a double leaf or a pointer
+    * leaf (whose proven resource the aggregate would hide) is refused. */
+   const char *phi_types[] = {"<{<{float}>,<4 x float>}>", "<{double,<4 x float>}>",
+                              "<{ptr addrspace(1),<4 x float>}>"};
+   for (unsigned i = 0; i < ARRAY_SIZE(phi_types); i++) {
       char body[1024];
       snprintf(body, sizeof(body), "{\nentry:\n %%take = icmp eq i32 %%id, 0\n br i1 %%take, label %%a, label %%b\n"
-         "a:\n br label %%join\nb:\n br label %%join\njoin:\n %%bad = phi %s [undef,%%a],[undef,%%b]\n ret " STAGE_PAIR " undef\n}", unsupported[i]);
+         "a:\n br label %%join\nb:\n br label %%join\njoin:\n %%bad = phi %s [undef,%%a],[undef,%%b]\n ret " STAGE_PAIR " undef\n}", phi_types[i]);
       text = vertex_body(body);
-      refusal(text, "test_vertex", STELA_AIR_VERTEX, &o, STELA_AIR_TYPE);
+      if (i == 0) {
+         raw = bitcode(text);
+         ralloc_free(translate(raw, "test_vertex", &o)); LLVMDisposeMemoryBuffer(raw);
+      } else {
+         refusal(text, "test_vertex", STELA_AIR_VERTEX, &o, STELA_AIR_TYPE);
+      }
       free(text);
    }
    const char *constant = "{\nentry:\n br label %join\njoin:\n %bad = phi " STAGE_PAIR " [zeroinitializer,%entry]\n ret " STAGE_PAIR " %bad\n}";

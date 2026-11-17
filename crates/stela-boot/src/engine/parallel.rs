@@ -71,6 +71,10 @@ impl Kick for Doorbells {
         host::fresh_counter()
     }
 
+    fn count(&self) -> Option<u64> {
+        Some(host::fresh_counter())
+    }
+
     fn released(&self) -> bool {
         super::storage::released()
     }
@@ -223,6 +227,9 @@ impl Pe {
         let mut screen = Share::new(super::display::BUSY_SHARE);
         loop {
             let limit = machine.statistics.blocks + SLICE;
+            if step_timing {
+                host::sampling::host_service();
+            }
             let stop = machine.run_with_budget(RunBudget {
                 blocks: limit,
                 host_ticks: Some(host::COUNTER_HZ / WAIT_POLLS_PER_SECOND),
@@ -233,7 +240,9 @@ impl Pe {
                 if stored_report.is_none_or(|before| {
                     counter.wrapping_sub(before) >= super::run::BEAT_SECONDS * host::COUNTER_HZ
                 }) {
-                    report_stored_pages(&machine, counter);
+                    super::run::host_part("stored pages", pe, || {
+                        report_stored_pages(&machine, counter)
+                    });
                     stored_report = Some(counter);
                 }
             }
@@ -245,7 +254,7 @@ impl Pe {
             // devices it reaches can take milliseconds (a VM's port I/O
             // waits on the hypervisor), which no other PE's maintenance
             // broadcast waits for. The PE reads its mail before it runs.
-            super::run::host_work(&mut machine, |machine| {
+            super::run::host_work(&mut machine, "reports", |machine| {
                 if observing {
                     report_diagnostics(machine);
                 }
@@ -258,8 +267,15 @@ impl Pe {
                 // gives the screen the frames the DCP model presented and a
                 // staged guest disk its host I/O.
                 stop if machine.yielded_for_interrupt(&stop) => {
-                    super::run::host_work(&mut machine, |machine| {
-                        super::service::serve(false, false);
+                    super::run::host_work(&mut machine, "idle service", |machine| {
+                        let watch = machine.guest_watch();
+                        // The GPUs' Linux work first, which a frame waits
+                        // on, in the boot CPU's place, until this PE's
+                        // guest has work.
+                        super::gpu::pump_waiting_pe(&|| {
+                            watch.pending(host::fresh_counter()).is_some()
+                        });
+                        super::service::serve(false, false, &watch);
                         super::display::flush(super::display::Turn::Idle);
                         if super::storage::serve_staged(true) {
                             machine.devices.call_home();
@@ -276,7 +292,7 @@ impl Pe {
                 Stop::Budget | Stop::Waiting => {
                     let now = host::rdtsc();
                     if screen.allows(now) {
-                        let spent = super::run::host_work(&mut machine, |_| {
+                        let spent = super::run::host_work(&mut machine, "display", |_| {
                             super::display::flush(super::display::Turn::Busy)
                         });
                         screen.spent(spent, now.wrapping_add(spent));
@@ -288,21 +304,30 @@ impl Pe {
                     // waits for it.
                     #[cfg(feature = "nvk")]
                     if machine.cpu.pstate.el == 0 && super::gpu::gate::busy_job_due() {
-                        super::run::host_work(&mut machine, |_| {
+                        super::run::host_work(&mut machine, "gpu job", |_| {
                             super::gpu::gate::run_job(super::gpu::gate::Taker::Busy)
                         });
                     }
                 }
                 stop => stopped(pe, stop),
             }
-            hub.publish(pe, machine.counts());
+            super::run::host_part("publish", pe, || hub.publish(pe, machine.counts()));
+            // Whether the boot processor's Linux step returns.
+            super::run::host_part("watchdog", pe, super::step_watchdog::look);
             if machine.step_timing().is_some() {
-                hub.add_system_exits(pe, &machine.take_system_exits());
-                if machine.has_hot_samples() {
-                    hub.add_hot_samples(|hot| machine.take_hot_samples(hot));
-                }
+                super::run::host_part("profile", pe, || {
+                    hub.add_system_exits(pe, &machine.take_system_exits());
+                    if machine.has_hot_samples() {
+                        hub.add_hot_samples(|hot| machine.take_hot_samples(hot));
+                    }
+                });
             }
-            super::run::host_work(&mut machine, |_| output::drain_some());
+            // A PE whose guest waits sends the serial queue in its wait; one
+            // whose guest runs only once none did for a while: each burst is
+            // a port access, which a hypervisor can hold for milliseconds.
+            if output::drain_due() {
+                super::run::host_work(&mut machine, "drain", |_| output::drain_some());
+            }
         }
     }
 }
@@ -431,8 +456,9 @@ pub(super) fn report_source_observations<H: Host>(home: &Machine<H, Board>) {
 
 /// A PE's machine stopped, which only the home machine may: the board stops.
 fn stopped(pe: usize, stop: Stop) -> ! {
-    output::arguments(format_args!("PARALLEL PE {pe} stopped: {stop:?}\n"));
-    output::fatal("a PE on its own host core stopped")
+    output::fatal(format_args!(
+        "PE {pe} on its own host core stopped: {stop:?}"
+    ))
 }
 
 /// Each PE's counts: the home machine's own, and those every other PE's

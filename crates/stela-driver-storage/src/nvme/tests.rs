@@ -65,7 +65,9 @@ impl Fixture {
             host_memory_enabled: false,
             events: Events::default(),
             aborts: Vec::new(),
+            errand: None,
             limits: Limits::default(),
+            quirks: Quirks::NONE,
         };
         Self {
             _registers: registers,
@@ -76,6 +78,7 @@ impl Fixture {
                 ids: Ids::default(),
                 scanned: 0,
                 removed: None,
+                rescanning: None,
                 identity: Identity {
                     transport: Transport::Nvme,
                     location: "fixture".into(),
@@ -116,6 +119,7 @@ fn a_timeout_aborts_then_a_controller_that_stays_down_poisons_its_siblings() {
         ids: Ids::default(),
         scanned: 0,
         removed: None,
+        rescanning: None,
     };
     {
         let c = fixture.disk.controller.borrow();
@@ -141,35 +145,61 @@ fn a_timeout_aborts_then_a_controller_that_stays_down_poisons_its_siblings() {
     assert_eq!(fixture.disk.controller.borrow().command_id, 2);
 }
 
+/// A completion is taken by its command identifier alone, as Linux's
+/// `nvme_handle_cqe` takes it: the submission queue identifier and head it
+/// reports are not read, so a stale, early or foreign head does not fail the
+/// controller.
 #[test]
-fn unrelated_or_malformed_completions_do_not_retire_our_command() {
-    for (cid, sqid, head) in [
-        (2u32, 1u32, 1u32),
-        (1, 2, 1),
-        (1, 1, 16),
-        (1, 1, 0),
-        (1, 1, 2),
-    ] {
+fn completions_are_taken_whatever_submission_queue_and_head_they_report() {
+    for (sqid, head) in [(2u32, 1u32), (1, 16), (1, 0), (1, 2), (1, 63)] {
         let mut fixture = Fixture::new();
         {
             let mut c = fixture.disk.controller.borrow_mut();
             c.io.completions.write(8, sqid << 16 | head);
-            c.io.completions.write(12, 1u32 << 16 | cid);
+            c.io.completions.write(12, 1u32 << 16 | 1);
         }
-        let error = BlockError::Device { status: 0xffff };
-        assert_eq!(fixture.disk.flush(), Err(error.clone()));
-        assert_eq!(fixture.disk.write(0, &[0x71; 512]), Err(error));
+        assert_eq!(fixture.disk.flush(), Ok(()));
         let c = fixture.disk.controller.borrow();
-        assert_eq!(c.io.head, 0);
-        assert_eq!(c.registers.read32(DOORBELLS + 12).unwrap(), 0);
-        assert!(pool_untouched(&c));
+        assert_eq!(c.io.head, 1);
+        assert_eq!(c.registers.read32(DOORBELLS + 12).unwrap(), 1);
+        assert!(c.fault.is_none());
     }
 }
 
+/// A completion naming no outstanding command is passed over, as Linux
+/// reports an invalid ID and goes on: the entry is retired and counted as a
+/// status read, the controller keeps working and the running command takes
+/// its own completion when it comes.
 #[test]
-fn sq_head_validation_preserves_wrap_and_rejects_stale_or_ahead_heads() {
+fn a_completion_naming_no_command_is_passed_over() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        let id = running_id(&controller, read);
+        post(&mut controller, id.wrapping_add(7), 0);
+    }
+    assert_eq!(disk.finish(read), None);
+    {
+        let mut controller = disk.controller.borrow_mut();
+        assert!(controller.fault.is_none());
+        assert_eq!(controller.io.head, 1);
+        assert_eq!(controller.registers.read32(DOORBELLS + 12).unwrap(), 1);
+        controller.tag_page(read as usize, 0).bytes_mut()[..512].fill(0x5a);
+        let id = running_id(&controller, read);
+        post(&mut controller, id, 0);
+    }
+    assert_eq!(disk.finish(read), Some(Ok(Some(vec![0x5a; 512]))));
+    assert!(disk.controller.borrow().fault.is_none());
+}
+
+/// The completion queue wraps with its phase whatever submission head the
+/// last entry before the wrap reports: a stale or early head is not read.
+#[test]
+fn the_completion_queue_wraps_whatever_head_its_entries_report() {
     let stale = u32::from(IO_ENTRIES - 1);
-    for invalid_head in [None, Some(stale), Some(1)] {
+    for reported in [0, stale, 1] {
         let mut fixture = Fixture::new();
         for next in 1..IO_ENTRIES {
             {
@@ -185,30 +215,19 @@ fn sq_head_validation_preserves_wrap_and_rejects_stale_or_ahead_heads() {
         {
             let mut c = fixture.disk.controller.borrow_mut();
             let last = usize::from(IO_ENTRIES - 1) * 16;
-            c.io.completions
-                .write(last + 8, 1u32 << 16 | invalid_head.unwrap_or(0));
+            c.io.completions.write(last + 8, 1u32 << 16 | reported);
             c.io.completions
                 .write(last + 12, 1u32 << 16 | u32::from(IO_ENTRIES));
         }
-        let result = fixture.disk.flush();
+        assert_eq!(fixture.disk.flush(), Ok(()));
         let mut c = fixture.disk.controller.borrow_mut();
         assert_eq!(c.io.tail, 0);
-        match invalid_head {
-            Some(_) => {
-                assert_eq!(result, Err(BlockError::Device { status: 0xffff }));
-                assert_eq!(c.io.head, IO_ENTRIES - 1);
-                assert!(c.io.phase);
-            }
-            None => {
-                assert_eq!(result, Ok(()));
-                assert_eq!(c.io.head, 0);
-                assert!(!c.io.phase);
-                c.io.completions.write(8, 1u32 << 16 | 1);
-                c.io.completions.write(12, u32::from(IO_ENTRIES) + 1); // New phase is zero.
-                drop(c);
-                fixture.disk.flush().unwrap();
-            }
-        }
+        assert_eq!(c.io.head, 0);
+        assert!(!c.io.phase);
+        c.io.completions.write(8, 1u32 << 16 | 1);
+        c.io.completions.write(12, u32::from(IO_ENTRIES) + 1); // New phase is zero.
+        drop(c);
+        fixture.disk.flush().unwrap();
     }
 }
 
@@ -410,6 +429,42 @@ fn answer_next_admin(controller: &mut Controller) {
         .write(entry + 12, phase | u32::from(id));
 }
 
+/// An admin completion naming no outstanding command is passed over while
+/// the controller's status is good, and the command waited for takes the
+/// completion after it; with a fatal status the stray one is the
+/// controller's failure.
+#[test]
+fn an_admin_completion_naming_no_command_is_passed_over() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    let stray = |c: &mut Controller| {
+        let id = c.command_id.wrapping_add(9);
+        let entry = usize::from(c.admin.head) * 16;
+        let phase = u32::from(c.admin.phase) << 16;
+        c.admin.completions.write(entry + 12, phase | u32::from(id));
+        c.admin.head = c.admin.next(c.admin.head);
+    };
+    let head = c.admin.head;
+    stray(&mut c);
+    answer_next_admin(&mut c);
+    c.admin.head = head;
+    let identify = c.identify_command(IDENTIFY_CONTROLLER, 0).unwrap();
+    assert_eq!(c.admin(identify), Ok(0));
+    assert_eq!(c.fault, None);
+    assert_eq!(c.admin.head, c.admin.next(c.admin.next(head)));
+
+    c.registers.write32(STATUS, READY | FATAL).unwrap();
+    stray(&mut c);
+    c.admin.head = c.admin.next(c.admin.next(head));
+    assert_eq!(
+        c.admin_completion(None),
+        Err(BlockError::Device {
+            status: READY | FATAL
+        })
+    );
+}
+
 /// Linux `nvme_wait_ready` ends at CSTS.RDY and reads no more of CSTS
 /// before its first command, whose completion it takes: a CSTS.CFS still
 /// set once the controller is ready stands, at attach and after a reset,
@@ -482,6 +537,146 @@ fn a_short_mqes_shortens_the_io_queue_and_only_one_entry_is_refused() {
     assert!(matches!(c.initialize(), Err(BlockError::Unsupported(_))));
 }
 
+/// `NVME_QUIRK_QDEPTH_ONE` runs one command on a two-entry queue whatever
+/// CAP.MQES says, and the PM1725 rule reads its MQES 0 as 64 entries
+/// instead of refusing it.
+#[test]
+fn queue_depth_quirks_set_the_io_queue_whatever_mqes_says() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    c.quirks = Quirks::QUEUE_DEPTH_ONE;
+    c.registers
+        .write64(CAPABILITIES, 63 | 1 << 24 | 1 << 37)
+        .unwrap();
+    assert_eq!(c.initialize(), Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!((c.io.entries, c.tags.len()), (2, 1));
+    assert_eq!(c.create_queue(true).unwrap()[10] >> 16, 1);
+
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    assert!(Quirks::for_device(0x144d, 0xa821).contains(Quirks::QUEUE_DEPTH_64));
+    c.quirks = Quirks::QUEUE_DEPTH_64;
+    c.registers
+        .write64(CAPABILITIES, 1 << 24 | 1 << 37)
+        .unwrap();
+    assert_eq!(c.initialize(), Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!((c.io.entries, c.tags.len()), (64, DEPTH));
+}
+
+/// A reset of a controller with `NVME_QUIRK_DELAY_BEFORE_CHK_RDY` reads
+/// CSTS only 2.3 s after clearing CC.EN, and each look meanwhile returns
+/// at once: CSTS reading all ones in that time is not a removal.
+#[test]
+fn a_reset_reads_csts_only_after_the_ready_delay_under_its_quirk() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.quirks = Quirks::READY_DELAY;
+    c.disable().unwrap();
+    assert_eq!(c.registers.read32(CONFIGURATION).unwrap(), 0);
+    c.registers.write32(STATUS, REMOVED).unwrap();
+    for _ in 0..3 {
+        let started = Clock::ticks();
+        assert_eq!(c.recover(), Ok(()));
+        assert!(Clock::ticks() - started < 1000 * 1000, "a step took 1 ms");
+        assert!(matches!(c.recovery, Some(Recovery::Disabling(_, Some(_)))));
+    }
+    crate::test_clock::advance(c.clock, quirks::READY_CHECK_DELAY_US);
+    c.registers.write32(STATUS, 0).unwrap();
+    assert_eq!(c.recover(), Ok(()));
+    assert!(matches!(c.recovery, Some(Recovery::Enabling(_))));
+
+    // Without it, the same CSTS is a removal at the first look.
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.disable().unwrap();
+    assert!(matches!(c.recovery, Some(Recovery::Disabling(_, None))));
+    c.registers.write32(STATUS, REMOVED).unwrap();
+    assert_eq!(c.recover(), Err(removed()));
+}
+
+/// `NVME_QUIRK_NO_FUA` and `NVME_QUIRK_DISABLE_WRITE_ZEROES` leave FUA and
+/// Write Zeroes out of a namespace's features; other quirks change neither.
+#[test]
+fn feature_quirks_leave_fua_and_write_zeroes_out() {
+    let format = Format {
+        blocks: 1024,
+        block_size: 512,
+        read_only: false,
+        deallocate: 0,
+    };
+    let transfer = TransferLimits {
+        data: BOUNCE_BYTES,
+        command: MAX_COMMAND_BYTES,
+    };
+    let commands = COMMANDS_DATASET_MANAGEMENT | COMMANDS_WRITE_ZEROES;
+    let of = |quirks| features(true, commands, Limits::default(), &format, transfer, quirks);
+    let plain = of(Quirks::NONE);
+    assert!(plain.fua && plain.write_zeroes.is_some());
+    assert_eq!(
+        of(Quirks::NO_DEEPEST_POWER_STATE | Quirks::BOGUS_IDS),
+        plain
+    );
+    let no_fua = of(Quirks::NO_FUA);
+    assert!(no_fua.write_cache && !no_fua.fua);
+    assert_eq!(no_fua.write_zeroes, plain.write_zeroes);
+    let no_zeroes = of(Quirks::NO_WRITE_ZEROES);
+    assert_eq!(no_zeroes.write_zeroes, None);
+    assert!(no_zeroes.fua && no_zeroes.discard.is_some());
+}
+
+/// Bus mastering comes between the stop and the start: CC is cleared and
+/// CSTS.RDY seen clear first, CC.EN set only after; a controller that never
+/// stops is never given it.
+#[test]
+fn bus_mastering_is_enabled_only_once_the_controller_stopped() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    c.registers
+        .write64(CAPABILITIES, 15 | 1 << 24 | 1 << 37)
+        .unwrap();
+    // As the firmware left it: enabled and ready.
+    c.registers
+        .write32(CONFIGURATION, CONFIGURATION_VALUE)
+        .unwrap();
+    c.registers.write32(STATUS, READY).unwrap();
+    let mut seen = None;
+    let observe = |c: &Controller| {
+        (
+            c.registers.read32(CONFIGURATION).unwrap(),
+            c.registers.read32(STATUS).unwrap(),
+        )
+    };
+    let started = start_after_stop(&mut c, |c| {
+        seen = Some(observe(c));
+        Ok(false)
+    });
+    assert_eq!(seen, None, "a controller that never stopped got DMA");
+    assert_eq!(started, Err(BlockError::Timeout.at(DISABLE_WAIT)));
+
+    c.registers.write32(STATUS, 0).unwrap();
+    let started = start_after_stop(&mut c, |c| {
+        seen = Some(observe(c));
+        Ok(true)
+    });
+    assert_eq!(seen, Some((0, 0)));
+    // The fixture never sets CSTS.RDY again.
+    assert_eq!(started, Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!(c.registers.read32(CONFIGURATION).unwrap() & ENABLE, ENABLE);
+    assert!(c.signalled);
+}
+
 #[test]
 fn submission_publication_keeps_the_whole_wire_entry_and_rings_its_queue() {
     let fixture = Fixture::new();
@@ -519,12 +714,23 @@ fn pool_untouched(controller: &Controller) -> bool {
         .all(|page| page.bytes().iter().all(|byte| *byte == 0))
 }
 
+/// The submission entry of tag `tag`'s running command, found by its
+/// identifier.
+fn submission(controller: &Controller, tag: u32) -> &[u8] {
+    let id = running_id(controller, tag);
+    controller
+        .io
+        .submissions
+        .bytes()
+        .chunks(64)
+        .take(usize::from(IO_ENTRIES))
+        .find(|entry| u16::from_le_bytes([entry[2], entry[3]]) == id)
+        .expect("the command's submission entry")
+}
+
 /// The submission entry of tag `tag`'s command: its PRP1 and PRP2.
 fn prps(controller: &Controller, tag: u32) -> (u64, u64) {
-    let Tag::Running { slot, .. } = controller.tags[tag as usize] else {
-        panic!("tag {tag} runs nothing");
-    };
-    let entry = &controller.io.submissions.bytes()[usize::from(slot) * 64..][..64];
+    let entry = submission(controller, tag);
     let word = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
     (word(24), word(32))
 }
@@ -623,10 +829,7 @@ fn a_write_across_pages_copies_each_page_and_keeps_force_unit_access() {
             .extend_from_slice(&controller.tag_page(write as usize, index).bytes()[..part.len()]);
     }
     assert_eq!(written, data);
-    let Tag::Running { slot, .. } = controller.tags[write as usize] else {
-        panic!("the write runs");
-    };
-    let entry = &controller.io.submissions.bytes()[usize::from(slot) * 64..][..64];
+    let entry = submission(&controller, write);
     let cdw12 = u32::from_le_bytes(entry[48..52].try_into().unwrap());
     assert_eq!(cdw12, FORCE_UNIT_ACCESS | (data.len() / 512 - 1) as u32);
 }
@@ -812,12 +1015,14 @@ fn a_completed_borrowed_read_survives_a_later_cq_fault() {
     let id = running_id(&controller, read);
     controller.tag_page(read as usize, 0).bytes_mut()[..512].fill(0x5a);
     post(&mut controller, id, 0);
+    // A stray completion from a controller that is gone.
     let other_id = running_id(&controller, other);
-    controller.io.completions.write(16 + 8, 2u32 << 16 | 2);
+    controller.io.completions.write(16 + 8, 1u32 << 16 | 2);
     controller
         .io
         .completions
-        .write(16 + 12, 1u32 << 16 | u32::from(other_id));
+        .write(16 + 12, 1u32 << 16 | u32::from(other_id.wrapping_add(5)));
+    controller.registers.write32(STATUS, REMOVED).unwrap();
     let mut data = [0x11; 512];
     assert_eq!(
         controller.finish_into(read as usize, Some(&mut data)),
@@ -825,10 +1030,7 @@ fn a_completed_borrowed_read_survives_a_later_cq_fault() {
     );
     assert_eq!(data, [0x5a; 512]);
     assert_eq!(controller.io.head, 1);
-    assert_eq!(
-        controller.finish(other as usize),
-        Some(Err(BlockError::Device { status: 0xffff }))
-    );
+    assert_eq!(controller.finish(other as usize), Some(Err(removed())));
 }
 
 #[test]
@@ -875,7 +1077,6 @@ fn delayed_read_completes_after_submission_ring_wraps() {
         {
             let mut controller = disk.controller.borrow_mut();
             assert_eq!(controller.io.tail, 0);
-            assert_eq!(controller.io.consumed, 0);
             controller.tag_page(delayed as usize, 0).bytes_mut()[..512].fill(0x42);
             post(&mut controller, delayed_id, 0);
         }
@@ -884,8 +1085,10 @@ fn delayed_read_completes_after_submission_ring_wraps() {
     }
 }
 
+/// A reused tag's new command completes by its identifier, whatever
+/// submission head its completion reports.
 #[test]
-fn reused_tag_requires_its_new_submission_to_be_fetched() {
+fn a_reused_tag_completes_by_its_new_identifier() {
     let _clock = crate::test_clock::virtualize();
     let mut fixture = Fixture::new();
     let disk = &mut fixture.disk;
@@ -901,23 +1104,18 @@ fn reused_tag_requires_its_new_submission_to_be_fetched() {
     {
         let mut controller = disk.controller.borrow_mut();
         let id = running_id(&controller, second);
+        controller.tag_page(second as usize, 0).bytes_mut()[..512].fill(0x33);
         let entry = usize::from(controller.io.head) * 16;
-        let consumed = u32::from(controller.io.consumed);
         let phase = u32::from(controller.io.phase) << 16;
-        controller
-            .io
-            .completions
-            .write(entry + 8, 1u32 << 16 | consumed);
+        // The first command's head, which the second has not passed.
+        controller.io.completions.write(entry + 8, 1u32 << 16 | 1);
         controller
             .io
             .completions
             .write(entry + 12, phase | u32::from(id));
     }
-    assert_eq!(
-        disk.finish(second),
-        Some(Err(BlockError::Device { status: 0xffff }))
-    );
-    assert_eq!(disk.controller.borrow().io.head, 1);
+    assert_eq!(disk.finish(second), Some(Ok(Some(vec![0x33; 512]))));
+    assert_eq!(disk.controller.borrow().io.head, 2);
 }
 
 #[test]
@@ -994,10 +1192,11 @@ fn a_command_past_its_deadline_is_aborted_then_resets_the_controller_and_runs_ag
     assert_eq!(disk.finish(read), None);
     {
         let controller = disk.controller.borrow();
-        assert!(matches!(controller.recovery, Some(Recovery::Disabling(_))));
+        assert!(matches!(controller.recovery, Some(Recovery::Disabling(..))));
         assert_eq!(controller.registers.read32(CONFIGURATION).unwrap(), 0);
-        assert!(!disk.room());
     }
+    // A start meanwhile waits for the reset's end under its tag.
+    assert!(disk.room());
     // CSTS.RDY is clear: it is enabled again.
     assert_eq!(disk.finish(read), None);
     {
@@ -1121,31 +1320,93 @@ fn due_retries_publish_before_expired_commands_abort_in_tag_order() {
     ));
 }
 
-/// Each state idles into the deepest usable non-operational state below
-/// it, one per latency tolerance, as Linux `nvme_configure_apst`.
-#[test]
-fn apst_follows_linux_tolerances_from_the_deepest_state_up() {
+/// An Identify Controller page with APSTA and NPSS 5, whose (state, entry
+/// us, exit us) non-operational states are `states`.
+fn apst_identify(states: &[(usize, u32, u32)]) -> Vec<u8> {
     let mut identify = vec![0u8; PAGE];
-    assert_eq!(apst_table(&identify), None, "no APST support");
     identify[CONTROLLER_APST] = 1;
     identify[CONTROLLER_POWER_STATES] = 5;
-    // (state, entry us, exit us): PS5's exit is past the latency limit.
-    for (state, entry, exit) in [
-        (2, 500, 500),
-        (3, 2_000, 2_000),
-        (4, 4_000, 30_000),
-        (5, 0, 200_000),
-    ] {
+    for &(state, entry, exit) in states {
         let descriptor = &mut identify[CONTROLLER_POWER_DESCRIPTORS + 32 * state..][..32];
         descriptor[3] = POWER_NON_OPERATIONAL;
         descriptor[4..8].copy_from_slice(&u32::to_le_bytes(entry));
         descriptor[8..12].copy_from_slice(&u32::to_le_bytes(exit));
     }
-    let table = apst_table(&identify).unwrap();
+    identify
+}
+
+/// Each state idles into the deepest usable non-operational state below
+/// it, one per latency tolerance, as Linux `nvme_configure_apst`; a state
+/// whose exit latency is past `default_ps_max_latency_us` is never a target.
+#[test]
+fn apst_follows_linux_tolerances_from_the_deepest_state_up() {
+    let mut identify = vec![0u8; PAGE];
+    assert_eq!(apst_table(&identify, Quirks::NONE), None, "no APST support");
+    identify[CONTROLLER_POWER_STATES] = 5;
+    assert_eq!(apst_table(&identify, Quirks::NO_APST), None);
+    // PS5's exit is past the latency limit.
+    let identify = apst_identify(&[
+        (2, 500, 500),
+        (3, 2_000, 2_000),
+        (4, 4_000, 30_000),
+        (5, 0, 200_000),
+    ]);
+    let (table, enable) = apst_table(&identify, Quirks::NONE).unwrap();
+    assert!(enable);
     let primary = 3 << 3 | APST_PRIMARY_TIMEOUT_MS << 8;
     let secondary = 4 << 3 | APST_SECONDARY_TIMEOUT_MS << 8;
     assert_eq!(table[..6], [primary, primary, primary, secondary, 0, 0]);
     assert!(table[6..].iter().all(|&entry| entry == 0));
+}
+
+/// `NVME_QUIRK_NO_DEEPEST_PS`: no entry targets NPSS; quirks of other
+/// paths leave the table as it was.
+#[test]
+fn apst_never_targets_the_deepest_state_under_its_quirk() {
+    // Non-operational PS3 to PS5, exit latencies 2, 10 and 22 ms.
+    let identify = apst_identify(&[(3, 0, 2_000), (4, 0, 10_000), (5, 0, 22_000)]);
+    let primary = |state: u64| state << 3 | APST_PRIMARY_TIMEOUT_MS << 8;
+    let secondary = |state: u64| state << 3 | APST_SECONDARY_TIMEOUT_MS << 8;
+    // PS4 is the primary target; NPSS the secondary one, from PS4 alone.
+    let (plain, _) = apst_table(&identify, Quirks::NONE).unwrap();
+    assert_eq!(
+        plain[..6],
+        [
+            primary(4),
+            primary(4),
+            primary(4),
+            primary(4),
+            secondary(5),
+            0
+        ]
+    );
+    assert_eq!(
+        apst_table(&identify, Quirks::NO_WRITE_ZEROES | Quirks::BOGUS_IDS),
+        Some((plain, true))
+    );
+    let (table, enable) = apst_table(&identify, Quirks::NO_DEEPEST_POWER_STATE).unwrap();
+    assert!(enable);
+    assert!(table.iter().all(|entry| entry >> 3 & 0x1f != 5));
+    assert_eq!(
+        table[..6],
+        [primary(4), primary(4), primary(4), primary(4), 0, 0]
+    );
+}
+
+/// `NVME_QUIRK_NO_APST` sends an empty table with APSTE clear, so APST the
+/// firmware or the drive left on is turned off.
+#[test]
+fn apst_is_turned_off_under_its_quirk() {
+    let identify = apst_identify(&[(3, 0, 2_000), (4, 0, 10_000)]);
+    assert_eq!(
+        apst_table(&identify, Quirks::NO_APST | Quirks::NO_DEEPEST_POWER_STATE),
+        Some(([0; 32], false))
+    );
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    let command = c.apst_command(&[0; 32], false).unwrap();
+    assert_eq!((command[10], command[11]), (FEATURE_APST, 0));
+    assert!(c.admin_data.bytes()[..256].iter().all(|byte| *byte == 0));
 }
 
 /// A signalled controller's I/O completion queue raises vector 0, and
@@ -1242,6 +1503,30 @@ fn identification_descriptors_parse_like_nvme_identify_ns_descs() {
     assert_eq!((ids.eui64, ids.nguid), ([5; 8], [0; 16]));
     ids.fill(VERSION_1_2, &data);
     assert_eq!(ids.nguid, [6; 16]);
+}
+
+/// An active namespace list is increasing and within NN; `NVME_QUIRK_BOGUS_NID`
+/// keeps only the descriptors' command set.
+#[test]
+fn active_lists_must_increase_within_nn_and_bogus_ids_keep_the_command_set() {
+    assert!(active_list_valid(&[], 0));
+    assert!(active_list_valid(&[1, 2, 7], 7));
+    assert!(!active_list_valid(&[1, 1], 7));
+    assert!(!active_list_valid(&[3, 2], 7));
+    assert!(!active_list_valid(&[1, 8], 7));
+    let ids = Ids {
+        eui64: [1; 8],
+        nguid: [2; 16],
+        uuid: [3; 16],
+        csi: CSI_ZONED,
+    };
+    assert_eq!(
+        ids.without_identifiers(),
+        Ids {
+            csi: CSI_ZONED,
+            ..Ids::default()
+        }
+    );
 }
 
 #[test]
@@ -1347,26 +1632,6 @@ fn completions_are_trusted_without_a_status_read_unless_they_look_invalid() {
     assert_eq!(disk.controller.borrow().fault, Some(error));
 }
 
-/// An invalid completion from a controller whose status is good poisons it
-/// as a corrupt queue.
-#[test]
-fn an_invalid_completion_from_a_healthy_controller_is_a_corrupt_queue() {
-    let mut fixture = Fixture::new();
-    let disk = &mut fixture.disk;
-    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
-    {
-        let mut controller = disk.controller.borrow_mut();
-        controller.registers.write32(STATUS, READY).unwrap();
-        let id = running_id(&controller, read);
-        post(&mut controller, id.wrapping_add(7), 0);
-    }
-    let corrupt = BlockError::Device { status: 0xffff };
-    assert_eq!(disk.finish(read), Some(Err(corrupt)));
-}
-
-/// A dead controller posts nothing: its commands' timeout reads its status,
-/// within the command deadline, and resets one that failed fatally and
-/// fails the commands of one that reads all ones.
 #[test]
 fn a_dead_controller_is_found_at_the_command_timeout() {
     let _clock = crate::test_clock::virtualize();
@@ -1451,4 +1716,185 @@ fn a_batch_of_starts_rings_the_submission_doorbell_once() {
     let fourth = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
     assert_eq!(doorbell(disk), 4);
     let _ = fourth;
+}
+
+/// The Identify Namespace page of a 512-byte format of `blocks` blocks,
+/// all allocated.
+fn allocated(blocks: u64) -> Vec<u8> {
+    let mut page = namespace(blocks, 0, &[(0, 9 << 16)], 0);
+    page[NAMESPACE_CAPACITY].copy_from_slice(&blocks.to_le_bytes());
+    page
+}
+
+/// Answer the errand that is out with `status`, `page` in the admin page.
+fn answer_errand(controller: &mut Controller, page: &[u8], status: u32) -> Purpose {
+    let errand = controller.errand.as_ref().expect("an errand is out");
+    let (id, purpose) = (errand.id, errand.purpose);
+    controller.admin_data.bytes_mut()[..page.len()].copy_from_slice(page);
+    post_admin(controller, id, status);
+    purpose
+}
+
+/// A rescan's Identify goes out with a start, which runs its own command
+/// at once, and a later start takes its answer: no start waits for an
+/// admin command, where one waited up to the admin timeout (60 s) and a
+/// controller that never answered held its processor that long.
+#[test]
+fn a_rescan_sends_its_identify_without_waiting_and_a_later_start_takes_it() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    disk.controller.borrow_mut().scans = 1;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut c = disk.controller.borrow_mut();
+        running_id(&c, read);
+        let offset = usize::from(c.admin.tail - 1) * 64;
+        assert_eq!(c.admin.submissions.bytes()[offset], ADMIN_IDENTIFY);
+        let purpose = answer_errand(&mut c, &allocated(2048), 0);
+        assert_eq!(
+            purpose,
+            Purpose::Identify {
+                namespace: 1,
+                cns: IDENTIFY_NAMESPACE,
+                scans: 1
+            }
+        );
+        // The errand's answer is taken while the read runs.
+        let id = running_id(&c, read);
+        post(&mut c, id, 0);
+    }
+    assert_eq!(disk.finish(read), Some(Ok(Some(vec![0; 512]))));
+    assert_eq!(disk.scanned, 0);
+    let write = disk.start(write_command(0)).unwrap();
+    assert_eq!(disk.scanned, 1);
+    assert_eq!(disk.identity.blocks, 2048);
+    let c = disk.controller.borrow();
+    assert!(c.errand.is_none());
+    running_id(&c, write);
+}
+
+fn write_command(lba: u64) -> Command {
+    Command::Write {
+        lba,
+        data: vec![0x31; 512],
+        fua: false,
+    }
+}
+
+/// An errand past its deadline fails the start that finds it and resets
+/// the controller, as a lost admin command does; with no command running,
+/// the next start waits for the reset under its tag and its looks move
+/// the reset on, after which it runs. Before, the reset was waited out in
+/// the start, and a start during a reset found no room.
+#[test]
+fn a_lost_errand_resets_the_controller_and_the_next_start_moves_the_reset_on() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let clock = {
+        let mut c = disk.controller.borrow_mut();
+        c.scans = 1;
+        c.errand(
+            Purpose::Identify {
+                namespace: 1,
+                cns: IDENTIFY_NAMESPACE,
+                scans: 1,
+            },
+            true,
+            |c| c.identify_command(IDENTIFY_NAMESPACE, 1),
+        )
+        .unwrap();
+        assert!(c.errand.is_some());
+        c.clock
+    };
+    let started = clock.try_start().unwrap();
+    while clock.try_elapsed_us(started).unwrap() < 1000 {
+        core::hint::spin_loop();
+    }
+    let lost = disk.start(write_command(0)).unwrap_err();
+    assert_eq!(
+        lost,
+        within(identify_name(IDENTIFY_NAMESPACE), BlockError::Timeout)
+    );
+    assert!(disk.room());
+    let write = disk.start(write_command(1)).unwrap();
+    assert!(matches!(
+        disk.controller.borrow().tags[write as usize],
+        Tag::Waiting { .. }
+    ));
+    // CSTS.RDY is clear: the controller is enabled again, then ready.
+    assert_eq!(disk.finish(write), None);
+    {
+        let c = disk.controller.borrow();
+        assert!(matches!(c.recovery, Some(Recovery::Enabling(_))));
+        c.registers.write32(STATUS, READY).unwrap();
+    }
+    for _ in 0..4 {
+        assert_eq!(disk.finish(write), None);
+        let mut c = disk.controller.borrow_mut();
+        let Some(Recovery::Admin { id, .. }) = c.recovery else {
+            panic!("no bring-up command");
+        };
+        post_admin(&mut c, id, 0);
+    }
+    assert_eq!(disk.finish(write), None);
+    let mut c = disk.controller.borrow_mut();
+    assert!(c.recovery.is_none());
+    let id = running_id(&c, write);
+    post(&mut c, id, 0);
+    drop(c);
+    assert_eq!(disk.finish(write), Some(Ok(None)));
+}
+
+/// A namespace-change notice's Get Log Page is an errand too: the start
+/// that took the notice runs its command, and a later one ends the log,
+/// queues a scan and requests the next event. Before, the start waited
+/// for the log.
+#[test]
+fn a_namespace_notice_reads_its_log_without_waiting() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    {
+        let mut c = disk.controller.borrow_mut();
+        c.events.supported = 1 << 8;
+        c.request_event().unwrap();
+        let request = c.events.request.unwrap();
+        let entry = usize::from(c.admin.head) * 16;
+        let phase = u32::from(c.admin.phase) << 16;
+        c.admin
+            .completions
+            .write(entry, EVENT_NOTICE | NOTICE_NAMESPACES_CHANGED << 8);
+        let tail = u32::from(c.admin.tail);
+        c.admin.completions.write(entry + 8, tail);
+        c.admin
+            .completions
+            .write(entry + 12, phase | u32::from(request));
+    }
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut c = disk.controller.borrow_mut();
+        running_id(&c, read);
+        assert_eq!(c.scans, 0);
+        let offset = usize::from(c.admin.tail - 1) * 64;
+        assert_eq!(c.admin.submissions.bytes()[offset], ADMIN_GET_LOG_PAGE);
+        assert_eq!(
+            answer_errand(&mut c, &[0; 16], 0),
+            Purpose::Log(LOG_CHANGED_NAMESPACES)
+        );
+        let id = running_id(&c, read);
+        post(&mut c, id, 0);
+    }
+    assert_eq!(disk.finish(read), Some(Ok(Some(vec![0; 512]))));
+    let write = disk.start(write_command(0)).unwrap();
+    let c = disk.controller.borrow();
+    assert_eq!(c.scans, 1);
+    assert!(c.events.request.is_some() && c.events.completed.is_none());
+    // The scan the notice queued has sent its Identify.
+    assert!(matches!(
+        c.errand.as_ref().map(|errand| errand.purpose),
+        Some(Purpose::Identify { scans: 1, .. })
+    ));
+    running_id(&c, write);
 }

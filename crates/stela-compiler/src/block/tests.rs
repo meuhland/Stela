@@ -602,11 +602,12 @@ fn system_mode_blocks_report_their_direct_successor_exits() {
             0x3700_0040,
             vec![fallthrough, (BASE + 12, ExitKind::Direct)],
         ), // tbnz w0, #0, +8
-        (0x9400_0002, vec![(BASE + 12, ExitKind::Call)]),       // bl +8
+        // A call's continuation exit follows its own (`paired_exit`).
+        (0x9400_0002, vec![(BASE + 12, ExitKind::Call), fallthrough]), // bl +8
         (ADD, vec![fallthrough]),
-        (0xd65f_03c0, vec![]), // ret
-        (0xd63f_0000, vec![]), // blr x0
-        (0xd518_1000, vec![]), // msr sctlr_el1, x0
+        (0xd65f_03c0, vec![]),            // ret
+        (0xd63f_0000, vec![fallthrough]), // blr x0
+        (0xd518_1000, vec![]),            // msr sctlr_el1, x0
     ] {
         let source: Vec<u8> = [ADD, word].into_iter().flat_map(u32::to_le_bytes).collect();
         let compiled = crate::testing::block_for(
@@ -624,8 +625,12 @@ fn system_mode_blocks_report_their_direct_successor_exits() {
                 // Padded for its offset: patchable where it lies.
                 assert_eq!(
                     code[exit.offset..exit.offset + DIRECT_EXIT_BYTES],
-                    direct_exit_at(exit.offset as u64, exit.target, exit.kind)
+                    direct_exit_at(exit.offset as u64, exit.target, exit.word())
                 );
+                // A continuation leaves every instruction of the block unrun.
+                let continuation =
+                    exit.kind == ExitKind::Fallthrough && matches!(word, 0x9400_0002 | 0xd63f_0000);
+                assert_eq!(exit.skipped, if continuation { 2 } else { 0 });
                 (exit.target.0, exit.kind)
             })
             .collect();
@@ -1071,7 +1076,6 @@ fn system_profile_has_one_source_bound_exit_and_rejects_memory_prefixes() {
     const UDF: u32 = 0x0000_0042;
     const IRG: u32 = 0x9ac0_1000;
     const LDG: u32 = 0xd960_0000;
-    const RETURN: u8 = 0xc3;
     const MOV_RAX_IMMEDIATE: [u8; 2] = [0x48, 0xb8];
     const MOV_EDX_IMMEDIATE: u8 = 0xba;
     for word in [SVC, UDF, IRG, LDG] {
@@ -1099,9 +1103,10 @@ fn system_profile_has_one_source_bound_exit_and_rejects_memory_prefixes() {
         expected.extend(instruction.instruction_pc.0.to_le_bytes());
         expected.push(MOV_EDX_IMMEDIATE);
         expected.extend((ExitKind::System as u32).to_le_bytes());
-        expected.push(RETURN);
-        // The room a jump at the RET and its pad take.
-        expected.extend([0xcc; 8]);
+        // The patch point's jump to the return after it, the return, the pad.
+        expected.extend(crate::x86_64::chain::RET_ROOM);
+        expected.extend(crate::x86_64::chain::EXIT_RETURN);
+        expected.extend([0xcc; 4]);
         assert_eq!(&compiled.native.x86_64_code[at..], expected);
     }
     // Ordinary RAM, exclusives and legacy FP/SIMD cannot bypass shared owners.
@@ -1147,9 +1152,7 @@ fn half_division_continues_its_block_on_every_target() {
     let exit = |pc: GuestAddress, kind: ExitKind| {
         let mut exit = vec![0x48, 0xb8]; // MOVABS RAX,PC
         exit.extend(pc.0.to_le_bytes());
-        exit.push(0xba); // MOV EDX,kind; RET
-        exit.extend((kind as u32).to_le_bytes());
-        exit.extend([0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
+        exit.extend(crate::x86_64::chain::exit_word(kind as u32));
         exit
     };
     // VDIVPH XMM0,XMM0,XMM1 with EVEX.

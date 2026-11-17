@@ -1496,7 +1496,7 @@ fn same_controller_root_reuse_preserves_stale_forwarding_cache_and_current_compl
                 let mut fresh = unsafe {
                     shared
                         .borrow_mut()
-                        .reset_and_reuse_root(&original, &endpoints, &mut dma)
+                        .reset_and_reuse(&original, &endpoints, &mut dma)
                 }
                 .unwrap();
                 fresh.configuration = fresh.configurations[0].clone();

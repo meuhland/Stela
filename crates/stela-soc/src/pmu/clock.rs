@@ -10,6 +10,12 @@ use stela_soc_data::pmu::WallClock;
 /// The upcount's qualified range: 2^32 seconds at 32768 Hz.
 pub const LIMIT: u64 = 1 << 47;
 
+/// The most ticks a read runs ahead of the published upcount
+/// ([`RtcClock::read_ticks`]): about 2 ms, far more than the reads of one
+/// held count seen (#121: six), and little enough that the guest's view of
+/// the RTC against its timebase stays within it.
+pub const READ_LEAD: u64 = 64;
+
 /// Declared emulated resource origin, not an observed Apple reset value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcEpoch {
@@ -101,6 +107,8 @@ struct Sample {
 struct Clock {
     epoch: RtcEpoch,
     sample: Cell<Option<Sample>>,
+    /// The last upcount a reader was given ([`RtcClock::read_ticks`]).
+    read: Cell<Option<u64>>,
     /// The last counter refused for preceding the publication, with it.
     regression: Cell<Option<(u64, u64)>>,
 }
@@ -125,6 +133,7 @@ impl RtcClock {
         Ok(Self(Rc::new(Clock {
             epoch,
             sample: Cell::new(None),
+            read: Cell::new(None),
             regression: Cell::new(None),
         })))
     }
@@ -143,8 +152,12 @@ impl RtcClock {
         let elapsed = u128::from(elapsed) * u128::from(RTC_HZ) / u128::from(FREQUENCY_HZ);
         let ticks = u128::from(self.0.epoch.ticks) + elapsed;
         if ticks >= u128::from(LIMIT) {
+            // 2^32 seconds of upcount: a count this far past the epoch is
+            // one no boot reaches, so the board's time itself is wrong.
+            let epoch = self.0.epoch.counter;
             return Err(refuse!(
-                "PMU RTC upcount/alarm wrap behavior is unqualified"
+                "PMU RTC upcount past its 47-bit range: the count is over 136 years after the epoch at {epoch:#x}; upcount/alarm wrap behavior is unqualified",
+                epoch
             ));
         }
         Ok(ticks as u64)
@@ -185,6 +198,49 @@ impl RtcClock {
             .get()
             .map(|sample| sample.ticks)
             .ok_or(refuse!("PMU RTC has no actual counter publication"))
+    }
+
+    /// The upcount a guest read of the PMIC or the SMC returns: the
+    /// published count, or one tick past the last count a read returned
+    /// when the publication has not passed it. The guest's system counter
+    /// holds while a PE with guest work is kept from running (the engine's
+    /// clock), and the count follows it, but a Mac's PMIC oscillator keeps
+    /// counting meanwhile: XNU's `AppleDialogSPMIPMURTC` takes an upcount
+    /// no higher than the last it read as the RTC running backwards ("RTC
+    /// count backward detected"). A tick is 30.5 us; the publication passes
+    /// the reads again within as many ticks once the counter moves.
+    ///
+    /// The lead stays within [`READ_LEAD`] ticks of the publication. A read
+    /// past that returns the cap again: XNU then logs its line, and its
+    /// check (KC file offset 0x2ddb14c, in the KC of the PMU module's
+    /// offsets: `cmp` of the count, `ccmp` of its microseconds, both
+    /// strictly greater) changes nothing else, as it keeps the count as the
+    /// last either way. The alarm compares against
+    /// what reads returned ([`Self::shown_ticks`]).
+    pub fn read_ticks(&self) -> Result<u64> {
+        let published = self.published_ticks()?;
+        let ticks = match self.0.read.get() {
+            Some(last) if published <= last => (last + 1)
+                .min(published + READ_LEAD)
+                .min(LIMIT - 1)
+                .max(last),
+            _ => published,
+        };
+        self.0.read.set(Some(ticks));
+        Ok(ticks)
+    }
+
+    /// The upcount the guest has seen: the published count, or the last a
+    /// read returned when that ran ahead of it. The alarm's comparator
+    /// takes it, so an alarm programmed from a read that ran ahead fires
+    /// when the guest's reads say its time came, not ticks later.
+    pub fn shown_ticks(&self) -> Result<u64> {
+        let published = self.published_ticks()?;
+        Ok(self
+            .0
+            .read
+            .get()
+            .map_or(published, |read| read.max(published)))
     }
 
     /// First counter at which the oscillator reaches a tick in this epoch.
@@ -343,6 +399,77 @@ mod tests {
         let clock = RtcClock::new(last).unwrap();
         assert_eq!(clock.ticks_at(5 + FREQUENCY_HZ), None);
     }
+    #[test]
+    fn reads_while_the_counter_holds_still_count_up() {
+        // #121: six reads of one held count all returned 0x89287fe2.
+        let clock = RtcClock::new(RtcEpoch {
+            counter: 0,
+            ticks: 0x8928_7fe2,
+        })
+        .unwrap();
+        let smc = clock.clone();
+        assert!(clock.read_ticks().is_err());
+        clock.publish(0).unwrap();
+        let reads: Vec<_> = (0..6).map(|_| clock.read_ticks().unwrap()).collect();
+        assert_eq!(reads, (0x8928_7fe2..0x8928_7fe8).collect::<Vec<_>>());
+        // The SMC's key reads the same upcount, after the PMIC's.
+        assert_eq!(smc.read_ticks(), Ok(0x8928_7fe8));
+        // The counter moves on: the publication counts again once past the
+        // reads, and the published count itself is never changed.
+        clock.publish(counter_ticks(3)).unwrap();
+        assert_eq!(clock.published_ticks(), Ok(0x8928_7fe5));
+        assert_eq!(clock.read_ticks(), Ok(0x8928_7fe9));
+        clock.publish(FREQUENCY_HZ).unwrap();
+        assert_eq!(clock.read_ticks(), Ok(0x8928_7fe2 + RTC_HZ));
+        assert_eq!(clock.read_ticks(), Ok(0x8928_7fe3 + RTC_HZ));
+    }
+
+    #[test]
+    fn reads_of_a_held_count_lead_it_by_a_bounded_number_of_ticks() {
+        let base = 0x1000;
+        let clock = RtcClock::new(RtcEpoch {
+            counter: 0,
+            ticks: base,
+        })
+        .unwrap();
+        clock.publish(0).unwrap();
+        assert_eq!(clock.shown_ticks(), Ok(base));
+        // A long hold: reads count up to the cap, then return it again.
+        let reads: Vec<_> = (0..READ_LEAD + 3)
+            .map(|_| clock.read_ticks().unwrap())
+            .collect();
+        assert_eq!(
+            reads[..=READ_LEAD as usize],
+            (base..=base + READ_LEAD).collect::<Vec<_>>()
+        );
+        assert!(
+            reads[READ_LEAD as usize..]
+                .iter()
+                .all(|&read| read == base + READ_LEAD)
+        );
+        assert!(reads.windows(2).all(|pair| pair[0] <= pair[1]));
+        // The published count is unchanged; what the guest saw is the cap.
+        assert_eq!(clock.published_ticks(), Ok(base));
+        assert_eq!(clock.shown_ticks(), Ok(base + READ_LEAD));
+        // The counter moves 10 ticks: the cap moves with it, and reads count
+        // up again from where they were.
+        clock.publish(counter_ticks(10)).unwrap();
+        assert_eq!(clock.read_ticks(), Ok(base + READ_LEAD + 1));
+        // Once the publication passes the reads it is what they return.
+        clock.publish(counter_ticks(READ_LEAD + 20)).unwrap();
+        assert_eq!(clock.read_ticks(), Ok(base + READ_LEAD + 20));
+        assert_eq!(clock.shown_ticks(), Ok(base + READ_LEAD + 20));
+        // At the end of the range the cap is the last tick.
+        let last = RtcClock::new(RtcEpoch {
+            counter: 0,
+            ticks: LIMIT - 2,
+        })
+        .unwrap();
+        last.publish(0).unwrap();
+        let reads: Vec<_> = (0..4).map(|_| last.read_ticks().unwrap()).collect();
+        assert_eq!(reads, [LIMIT - 2, LIMIT - 1, LIMIT - 1, LIMIT - 1]);
+    }
+
     #[test]
     fn explicit_epoch_is_shared_and_has_no_implicit_sample() {
         let clock = RtcClock::new(RtcEpoch {

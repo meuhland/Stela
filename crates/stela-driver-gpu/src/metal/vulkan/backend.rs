@@ -165,6 +165,17 @@ pub enum Object {
     ExecutionSet(ExecutionSet),
 }
 
+/// What one [`Backend::idle_step`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleStep {
+    /// Nothing queued can reach the backend's resources.
+    Idle,
+    /// Work may still run; step again later.
+    Waiting,
+    /// The bound passed or the driver failed: nothing is proven stopped.
+    Unproven,
+}
+
 pub trait Backend {
     fn physical_device(&self) -> &PhysicalDevice;
 
@@ -177,6 +188,18 @@ pub trait Backend {
         Err(crate::metal::error::Error::Unsupported(
             "GPU idle acknowledgement",
         ))
+    }
+
+    /// One step of proving that no queued GPU operation can still access a
+    /// backend that is about to be dropped, for a caller whose processor
+    /// takes no guest interrupt meanwhile: each step waits at most once and
+    /// briefly, and the steps together wait no longer than the backend's own
+    /// idle bound. Once a step answers [`IdleStep::Idle`] or
+    /// [`IdleStep::Unproven`], dropping the backend waits for nothing: an
+    /// unproven backend keeps what work may still use. A backend that tracks
+    /// no work is idle.
+    fn idle_step(&mut self) -> IdleStep {
+        IdleStep::Idle
     }
 
     /// Memory of its own, zeroed before the host or the GPU reaches it.
@@ -270,7 +293,7 @@ pub trait Backend {
     fn deferred(&self) -> bool {
         false
     }
-    /// The pipeline creation the call deferred.
+    /// The next of the jobs the call left, oldest first.
     fn take_job(&mut self) -> Option<crate::metal::deferred::Job> {
         None
     }
@@ -331,6 +354,19 @@ pub trait Backend {
         _memory: Memory,
         _offset: u64,
     ) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
+        None
+    }
+    /// The host's view of `length` bytes at `offset` of mapped,
+    /// host-coherent `memory`, valid until the memory is freed and readable
+    /// from any processor once the GPU's writes to it completed: where the
+    /// CPU reads what a GPU copy wrote, outside the device's lock. `None`
+    /// when the memory is not mapped coherently there.
+    fn host_bytes(
+        &mut self,
+        _memory: Memory,
+        _offset: u64,
+        _length: u64,
+    ) -> Option<core::ptr::NonNull<u8>> {
         None
     }
     /// Copies into mapped memory and flushes it.
@@ -420,6 +456,26 @@ pub trait Backend {
     fn whole_memory(&self, _memory: Memory) -> bool {
         true
     }
+
+    /// The GPU address of whole allocation `memory`'s first byte, for
+    /// naming what a GPU fault address held; `None` when the backend
+    /// cannot tell.
+    fn memory_address(&mut self, _memory: Memory) -> Option<u64> {
+        None
+    }
+
+    /// The allocation behind whole `memory`, as [`Self::take_unbound`]
+    /// names it, when freeing it may keep it bound (a freed import kept for
+    /// reuse): it is unbound only once that names it.
+    fn kept_bound(&self, _memory: Memory) -> Option<u64> {
+        None
+    }
+
+    /// The allocations [`Self::kept_bound`] named that were unbound since
+    /// the last call.
+    fn take_unbound(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// A Vulkan feature or extension the Metal layer needs from every device.
@@ -431,7 +487,15 @@ pub struct Requirement {
 
 /// The features the binding ABI, dynamic state model and synchronization
 /// rely on; a device missing any is refused rather than half-supported.
-pub fn requirements(features: &Features) -> [Requirement; 20] {
+///
+/// `unifiedImageLayouts` is not among them: every image stays in
+/// `VK_IMAGE_LAYOUT_GENERAL`, which core Vulkan allows for each access the
+/// layer makes (transfers, sampling, storage, attachments, and input
+/// attachments read with `dynamicRenderingLocalRead`). The feature only
+/// promises that `GENERAL` costs nothing beside the optimal layouts, and
+/// lets `GENERAL` stand for the attachment feedback loop and video layouts,
+/// which the layer never uses. The device enables it when offered.
+pub fn requirements(features: &Features) -> [Requirement; 19] {
     let requirement = |name, present| Requirement { name, present };
     [
         requirement("bufferDeviceAddress", features.buffer_device_address),
@@ -464,7 +528,6 @@ pub fn requirements(features: &Features) -> [Requirement; 20] {
             "extendedDynamicState",
             features.extended_dynamic_state && features.extended_dynamic_state2,
         ),
-        requirement("unifiedImageLayouts", features.unified_image_layouts),
         requirement(
             "maintenance5",
             features.maintenance4 && features.maintenance5,

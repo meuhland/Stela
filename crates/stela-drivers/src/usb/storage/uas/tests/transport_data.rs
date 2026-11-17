@@ -57,17 +57,17 @@ fn begun_commands_end_at_later_polls_without_waiting() {
     let mut engine = Engine::new(io, &mut dma).unwrap();
     let (lun, cdb) = ([0; 8], rw(true, length));
     engine.begin(lun, &cdb, Data::In(length)).unwrap();
-    assert!(engine.active.is_some());
+    assert!(engine.lanes[0].active.is_some());
     assert_eq!(
         engine.begin(lun, &cdb, Data::In(length)),
-        Err(BlockError::Protocol("a UAS command is already running"))
+        Err(BlockError::Protocol("every UAS command tag is in use"))
     );
     let started = clock.get();
     let mut polls = 0;
     let result = loop {
         polls += 1;
         assert!(polls < 100);
-        if let Some(result) = engine.poll(None, &mut None) {
+        if let Some(result) = engine.poll(0, None, &mut None) {
             break result;
         }
     };
@@ -76,7 +76,7 @@ fn begun_commands_end_at_later_polls_without_waiting() {
     // none of them waited.
     assert!(polls > 1);
     assert_eq!(clock.get(), started);
-    assert!(engine.active.is_none() && !engine.poisoned);
+    assert!(engine.lanes[0].active.is_none() && !engine.poisoned);
 }
 
 #[test]

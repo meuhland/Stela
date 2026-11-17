@@ -3,16 +3,15 @@
 //!
 //! Hardware access, firmware, memory management, command submission and
 //! shader code generation stay with nouveau, NVK and NAK; this module only
-//! admits a device and supplies the facts Vulkan does not report, and
-//! [`open`] serves it.
+//! admits a device and supplies the facts Vulkan does not report, as the
+//! NVIDIA stack's part of [`open`](super::open).
 use super::{
     abi::DeviceLocation,
     capabilities::Platform,
+    open::{self, Admission, Attachment},
     vulkan::{DriverId, PhysicalDeviceType, physical::Identity},
 };
 use alloc::string::String;
-
-pub mod open;
 
 pub const VENDOR_ID: u32 = 0x10de;
 
@@ -63,51 +62,6 @@ impl Chip {
     }
 }
 
-/// The negotiated PCI Express link, from the Link Status register
-/// (`PCI_EXP_LNKSTA`) of the GPU's PCIe capability.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PcieLink {
-    /// Current Link Speed: 1 for 2.5 GT/s through 6 for 64 GT/s.
-    pub speed: u8,
-    /// Negotiated Link Width in lanes.
-    pub width: u8,
-}
-
-impl PcieLink {
-    pub const fn from_link_status(status: u16) -> Self {
-        Self {
-            speed: (status & 0xf) as u8,
-            width: ((status >> 4) & 0x3f) as u8,
-        }
-    }
-
-    /// Data bandwidth in bytes per second after line encoding, as Linux's
-    /// `PCIE_SPEED2MBS_ENC`: 8b/10b through 5 GT/s, 128b/130b from 8 GT/s,
-    /// and FLIT mode at 64 GT/s. Unknown speeds report zero.
-    pub const fn bytes_per_second(self) -> u64 {
-        let megabits_per_lane: u64 = match self.speed {
-            1 => 2500 * 8 / 10,
-            2 => 5000 * 8 / 10,
-            3 => 8000 * 128 / 130,
-            4 => 16000 * 128 / 130,
-            5 => 32000 * 128 / 130,
-            6 => 64000,
-            _ => 0,
-        };
-        megabits_per_lane * self.width as u64 * 1_000_000 / 8
-    }
-}
-
-/// Where the GPU is attached, as the platform's PCI and ACPI owners report it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Attachment {
-    pub link: PcieLink,
-    /// Behind a hot-pluggable Thunderbolt or USB4 tunnel.
-    pub external: bool,
-    /// The slot or enclosure index Metal reports as `locationNumber`.
-    pub location_number: u64,
-}
-
 /// NVK's explicit linear layouts need 32-byte row pitches on Maxwell B and
 /// later (NIL `Image::new_linear`).
 const LINEAR_ROW_ALIGNMENT: u64 = 32;
@@ -139,6 +93,59 @@ impl Chip {
         }
     }
 }
+
+/// The NVIDIA stack's admission: nouveau's chipset must be one of [`CHIPS`]
+/// and the Vulkan device NVK's.
+pub const ADMISSION: Admission = Admission { admit };
+
+fn admit(
+    identity: &Identity,
+    chip: u32,
+    attachment: Attachment,
+) -> Result<Platform, open::Refusal> {
+    let chipset = u16::try_from(chip).unwrap_or(u16::MAX);
+    Chip::admit(identity, chipset)
+        .map(|chip| chip.platform(attachment))
+        .map_err(open::Refusal::Nvidia)
+}
+
+/// NVK as linked into the image, with its driver-internal calls
+/// (`compat/mesa/nir_options.c`, `compat/mesa/submit_thread.c`).
+#[cfg(all(feature = "metal-linked", not(test)))]
+pub const DRIVER: super::native::Driver = {
+    use super::native::{Driver, Refusals, vk};
+    use core::ffi::{c_char, c_void};
+    unsafe extern "system" {
+        fn vk_icdGetInstanceProcAddr(
+            instance: vk::Instance,
+            name: *const c_char,
+        ) -> vk::PFN_vkVoidFunction;
+    }
+    unsafe extern "C" {
+        fn stela_nvk_nir_options(physical: vk::PhysicalDevice, stage: u32) -> *const c_void;
+        fn stela_nvk_submit_thread(queue: vk::Queue) -> vk::Result;
+        fn stela_nvk_submit_failure(
+            queue: vk::Queue,
+            semaphore: vk::Semaphore,
+            value: u64,
+        ) -> vk::Result;
+        fn stela_nvk_forget_failures(queue: vk::Queue) -> u32;
+        fn stela_nvk_count_failures(queue: vk::Queue, outstanding: *mut u32);
+    }
+    Driver {
+        get_instance_proc_addr: vk_icdGetInstanceProcAddr,
+        nir_options: stela_nvk_nir_options,
+        // A commit's submission runs where Linux does, not on its PE.
+        submit_thread: Some(stela_nvk_submit_thread),
+        // A refused submission fails its command buffer, not the device.
+        refusals: Some(Refusals {
+            take: stela_nvk_submit_failure,
+            forget: stela_nvk_forget_failures,
+            count: stela_nvk_count_failures,
+        }),
+        keep_lost: false,
+    }
+};
 
 #[cfg(test)]
 pub(crate) mod fixture;

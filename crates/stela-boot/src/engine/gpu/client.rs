@@ -6,6 +6,13 @@
 //! round trip, not a core. Each call runs on one of a few standing Linux
 //! tasks, since an ioctl may sleep on the GPU. On the boot CPU itself there is
 //! no one to wait for, so the caller runs the environment until its call is done.
+//! Each wait is bounded ([`posted_call`]): a call no task took in time is
+//! withdrawn and answered `ETIMEDOUT`, and one a task performs too long stops
+//! the boot, naming it, as a processor held out of its guest for long makes
+//! XNU panic. A fence wait runs at most [`posted_call::HELD_WAIT_MS`] where
+//! its processor waits for it, or [`posted_call::WAIT_MS`] in a deferred
+//! job's slice, and answers `ETIME` past that, so a wait on a channel that
+//! hangs ends before the stop and within XNU's bound.
 //!
 //! A thread Mesa starts is a Linux task too, as Linux's own kthreads are, so it
 //! makes its calls in place and sleeps in Linux. It runs Mesa on a stack of its
@@ -14,7 +21,7 @@
 //! shootdowns and spins, the boot CPU also runs the environment, and a task
 //! thread sleeps.
 use super::{
-    BOOT_CPU, Installed, PAGE, installed,
+    BOOT_CPU, Installed, PAGE, installed, refused,
     stack::{self, Stack},
 };
 use crate::{engine::host, output};
@@ -36,7 +43,10 @@ use core::{
         AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
     },
 };
+use stela_boot_core::gpu_requests::{HostCall, Request as Code};
 use stela_boot_core::page_window::Cache;
+use stela_boot_core::posted_call::{self, Claim};
+use stela_drivers::gpu::stack::{GpuStack, Reset, ResetState};
 use stela_drivers::platform::work::{WorkError, service::Idle};
 use stela_linux::{
     client,
@@ -78,10 +88,13 @@ impl LibcClock {
     }
 }
 
+const EINVAL: i64 = -22;
 const ENODEV: i64 = -19;
 const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
 const EAGAIN: i64 = -11;
+const ETIMEDOUT: i64 = -110;
+const ETIME: i64 = -62;
 
 /// `struct stela_libc_drm_device`.
 #[repr(C)]
@@ -96,20 +109,144 @@ pub(super) struct DrmDevice {
     pub slot: u8,
     pub function: u8,
     pub revision: u8,
+    /// Its DRM minor ([`minor`]), filled as Mesa asks.
+    pub minor: u32,
 }
 
-/// `struct drm_nouveau_getparam`.
-#[repr(C)]
-struct GetParam {
-    parameter: u64,
-    value: u64,
-}
-
-/// `DRM_IOCTL_NOUVEAU_GETPARAM`.
-const GET_PARAM: u32 = 0xc010_6440;
-const CHIPSET_ID: u64 = 11;
 /// The first render node's minor.
 pub(super) const RENDER_MINOR: u32 = 128;
+/// How many primary minors DRM gives out before [`RENDER_MINOR`].
+const PRIMARY_MINORS: u32 = 64;
+/// `DRM_IOCTL_GET_UNIQUE`: `DRM_IOWR(0x01, struct drm_unique)`.
+const GET_UNIQUE: u32 = 0xc010_6401;
+/// `DRM_IOCTL_SET_VERSION`: `DRM_IOWR(0x07, struct drm_set_version)`.
+const SET_VERSION: u32 = 0xc010_6407;
+
+/// `struct drm_set_version`: interface 1.4, which names a master's bus,
+/// and no driver version.
+#[repr(C)]
+struct SetVersion {
+    interface_major: i32,
+    interface_minor: i32,
+    driver_major: i32,
+    driver_minor: i32,
+}
+
+/// `struct drm_unique`.
+#[repr(C)]
+struct Unique {
+    length: usize,
+    name: *mut u8,
+}
+
+/// The primary minor of each bound GPU, by its index, once found.
+static MINORS: AtomicPtr<Vec<Option<u32>>> = AtomicPtr::new(ptr::null_mut());
+
+/// The DRM minor of the bound GPU at `index`: its primary node's, and its
+/// render node's past [`RENDER_MINOR`]. DRM gives a device both when it is
+/// made, each the lowest free in its range, and every GPU driver here makes
+/// both, so they move in step. They follow the order the drivers made their
+/// devices in, which is not the bound GPUs' order when a probe that made one
+/// failed or hung while others went on, so each GPU's is found once by the
+/// name DRM gives its device: its PCI function's (`drm_dev_init`). A GPU
+/// whose node is not found is said once and has none. The first call opens
+/// each primary node as its master, as libdrm's `drmGetBusid` does, so it
+/// comes before anything holds one ([`super::display::take`]).
+pub(super) fn minor(index: usize) -> Option<u32> {
+    // SAFETY: published once below and leaked.
+    let minors = match unsafe { MINORS.load(Ordering::Acquire).as_ref() } {
+        Some(minors) => minors,
+        None => {
+            let found = Box::into_raw(Box::new(find_minors()?));
+            match MINORS.compare_exchange(
+                ptr::null_mut(),
+                found,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // SAFETY: just published, never freed.
+                Ok(_) => unsafe { &*found },
+                Err(first) => {
+                    // SAFETY: never published; the first finder's stays.
+                    drop(unsafe { Box::from_raw(found) });
+                    // SAFETY: published and leaked.
+                    unsafe { &*first }
+                }
+            }
+        }
+    };
+    minors.get(index).copied().flatten()
+}
+
+/// Each bound GPU's primary minor, by the PCI function its master names.
+fn find_minors() -> Option<Vec<Option<u32>>> {
+    let bound = &installed()?.start.bound;
+    // A function by its bus, slot and function; DRM puts its domain first.
+    let functions: Vec<_> = bound
+        .iter()
+        .map(|gpu| {
+            alloc::format!(
+                "{:02x}:{:02x}.{}",
+                gpu.drm.bus,
+                gpu.drm.slot,
+                gpu.drm.function
+            )
+        })
+        .collect();
+    let mut minors = alloc::vec![None; bound.len()];
+    for minor in 0..PRIMARY_MINORS {
+        let Some(fd) = open_node(minor) else {
+            continue;
+        };
+        let mut name = [0u8; 32];
+        let named = bus_name(fd, &mut name);
+        close_descriptor(fd);
+        // "pci:DDDD:BB:SS.F" from a PCI device's master, else the device's
+        // own name, "DDDD:BB:SS.F".
+        let Some((_, function)) = named
+            .map(|name| name.trim_start_matches("pci:"))
+            .and_then(|name| name.split_once(':'))
+        else {
+            continue;
+        };
+        if let Some(index) = functions.iter().position(|name| name == function)
+            && minors[index].is_none()
+        {
+            minors[index] = Some(minor);
+        }
+    }
+    for (gpu, minor) in bound.iter().zip(&minors) {
+        if minor.is_none() {
+            output::arguments(format_args!(
+                "GPU {}: its driver bound it, but no DRM node of it was found\n",
+                gpu.name
+            ));
+        }
+    }
+    Some(minors)
+}
+
+/// The bus name the master of the primary node `fd` gives its device, read
+/// into `name`.
+fn bus_name(fd: c_int, name: &mut [u8]) -> Option<&str> {
+    let mut version = SetVersion {
+        interface_major: 1,
+        interface_minor: 4,
+        driver_major: -1,
+        driver_minor: -1,
+    };
+    if control(fd, SET_VERSION, ptr::addr_of_mut!(version).cast()) != 0 {
+        return None;
+    }
+    let mut unique = Unique {
+        length: name.len(),
+        name: name.as_mut_ptr(),
+    };
+    if control(fd, GET_UNIQUE, ptr::addr_of_mut!(unique).cast()) != 0 {
+        return None;
+    }
+    str::from_utf8(name.get(..unique.length)?).ok()
+}
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -117,6 +254,7 @@ enum Operation {
     Close(c_int),
     Duplicate(c_int),
     Device(c_int),
+    Seek(c_int, i64, c_int),
     Control {
         fd: c_int,
         request: u32,
@@ -185,9 +323,12 @@ fn run_thread(gpu: &Installed, thread: &Thread, stack: &Stack) {
     gpu.mesa_threads.borrow_mut().remove(&stack.bottom());
 }
 
-/// The Mesa thread running here, by its stack.
+/// The Mesa thread running here, by its stack. Mesa's threads are Linux
+/// tasks, which run only under the host drivers' lock, on the boot CPU or a
+/// processor in its place, so a processor without it runs none and must not
+/// read the threads Linux changes.
 fn current_thread(gpu: &Installed) -> Option<Running> {
-    if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
+    if !crate::engine::storage::holds_host_drivers() {
         return None;
     }
     let pointer = stack::pointer();
@@ -196,7 +337,9 @@ fn current_thread(gpu: &Installed) -> Option<Running> {
     (pointer < thread.top).then_some(*thread)
 }
 
-/// A posted call, which its caller keeps until `done`.
+/// A posted call, which its caller keeps until `done`, unless it withdrew
+/// it ([`Claim`]): a withdrawn call is boxed, and the task that meets it
+/// frees it ([`release_withdrawn`]).
 struct Request {
     operation: Operation,
     next: Cell<*const Request>,
@@ -205,6 +348,8 @@ struct Request {
     wake_task: bool,
     /// The TSC at posting, for the report of calls that wait.
     posted: u64,
+    /// Whether a task took it, or its poster withdrew it.
+    claim: Claim,
 }
 
 impl Request {
@@ -216,7 +361,18 @@ impl Request {
             done: AtomicU32::new(0),
             wake_task: false,
             posted: host::rdtsc(),
+            claim: Claim::new(),
         }
+    }
+
+    /// Whether its poster may withdraw it once its wait passes
+    /// [`posted_call::WITHDRAW_MS`]: a call whose absence its caller answers
+    /// as a failure. A thread, a wake and the stop are waited for.
+    fn withdrawable(&self) -> bool {
+        !matches!(
+            self.operation,
+            Operation::Thread(_) | Operation::Wake | Operation::Shutdown
+        )
     }
 
     fn complete(&self, result: i64) -> bool {
@@ -276,6 +432,13 @@ fn unload(request: &Request, seconds: u64) -> bool {
     let Some(gpu) = installed() else {
         return true;
     };
+    // The unload frees interrupt routes the boot CPU owns: it runs there.
+    super::close_moves();
+    // The GPUs unload one after another, each bounded by nouveau in time:
+    // each has its own `seconds`, so one that does not answer leaves the
+    // next its whole share.
+    let gpus = gpu.start._attached.len().max(1) as u64;
+    let seconds = seconds.saturating_mul(gpus);
     let deadline = host::rdtsc().saturating_add(seconds.saturating_mul(gpu.tsc_hz));
     wait(gpu, request, deadline);
     request.done.load(Ordering::Acquire) != 0
@@ -351,27 +514,21 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
             Operation::Close(fd) => client::close(fd).into(),
             Operation::Duplicate(fd) => client::duplicate(fd).into(),
             Operation::Device(fd) => client::device(fd),
+            Operation::Seek(fd, offset, whence) => client::seek(fd, offset, whence),
             Operation::Control {
                 fd,
                 request,
                 argument,
-            } => client::control(fd, request, argument),
+            } => {
+                let input = refused::before(request, argument);
+                let result = client::control(fd, request, argument);
+                refused::control(fd, request, input.as_ref(), result);
+                result
+            }
             Operation::Map { fd, offset, size } => {
-                let pages = size / PAGE as usize;
-                let Some(address) = gpu.window.reserve(pages) else {
-                    return ENOMEM;
-                };
-                match client::map(fd, address, size, offset) {
-                    Ok(mapping) => {
-                        gpu.mappings.borrow_mut().insert(address, (mapping, pages));
-                        MAPPINGS.fetch_add(1, Ordering::Relaxed);
-                        address as i64
-                    }
-                    Err(error) => {
-                        gpu.window.release(address, pages);
-                        error.into()
-                    }
-                }
+                let result = map_pages(gpu, fd, offset, size);
+                refused::map(fd, offset, size, result);
+                result
             }
             Operation::Unmap(address) => {
                 let Some((mapping, pages)) = gpu.mappings.borrow_mut().remove(&address) else {
@@ -391,7 +548,8 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 let Some((&start, &(mapping, pages))) = found else {
                     return EFAULT;
                 };
-                if address >= start + pages as u64 * PAGE || !client::fault(mapping, address, write)
+                if address >= start + pages as u64 * PAGE
+                    || !client::fill_around(mapping, address, write)
                 {
                     return EFAULT;
                 }
@@ -420,6 +578,39 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     .for_each(|attached| attached.shutdown());
                 0
             }
+        }
+    }
+}
+
+/// Maps `size` bytes of `fd` at `offset` in the window, for the address or a
+/// negative errno. As Linux's `mmap`, the length need not be whole pages: the
+/// mapping covers the pages it reaches. libdrm maps a buffer object by the
+/// size it was asked for, which for RADV's events, queries and descriptor
+/// pools is a few bytes.
+///
+/// # Safety
+/// As [`perform`].
+unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64 {
+    let Some(size) = size
+        .checked_next_multiple_of(PAGE as usize)
+        .filter(|size| *size != 0)
+    else {
+        return EINVAL;
+    };
+    let pages = size / PAGE as usize;
+    let Some(address) = gpu.window.reserve(pages) else {
+        return ENOMEM;
+    };
+    // SAFETY: as the function's; the window reserved `address` for it.
+    match unsafe { client::map(fd, address, size, offset) } {
+        Ok(mapping) => {
+            gpu.mappings.borrow_mut().insert(address, (mapping, pages));
+            MAPPINGS.fetch_add(1, Ordering::Relaxed);
+            address as i64
+        }
+        Err(error) => {
+            gpu.window.release(address, pages);
+            error.into()
         }
     }
 }
@@ -460,7 +651,12 @@ impl Service {
     fn refuse_queued(&self, result: i64) {
         let queued = core::mem::take(&mut *self.queue.borrow_mut());
         for request in queued {
-            // SAFETY: a queued call's poster keeps it until it is done.
+            // SAFETY: a queued call's poster keeps it until it is done or
+            // withdrawn, and then the call is this task's to free.
+            if unsafe { release_withdrawn(request) } {
+                continue;
+            }
+            // SAFETY: as above; taken, so its poster waits for it.
             self.wake(unsafe { request.as_ref() }.refuse(result));
         }
     }
@@ -494,8 +690,9 @@ unsafe impl ManagedJob for Worker {
             let next = service.queue.borrow_mut().pop_front();
             if let Some(request) = next {
                 idle_since = None;
-                // SAFETY: a queued call's poster keeps it until it is done.
-                serve(gpu, unsafe { request.as_ref() });
+                // SAFETY: a queued call's poster keeps it until it is done
+                // or withdrawn, and then the call is this worker's to free.
+                unsafe { serve(gpu, request) };
                 continue;
             }
             let now = host::rdtsc();
@@ -517,8 +714,34 @@ unsafe impl ManagedJob for Worker {
 static SERVING: [(AtomicU32, AtomicU64); 32] =
     [const { (AtomicU32::new(0), AtomicU64::new(0)) }; 32];
 
-/// Performs `request` on this task and answers its poster.
-fn serve(gpu: &Installed, request: &Request) {
+/// Frees `request` when its poster withdrew it, which no task then performs;
+/// else takes it to perform. Whether it was freed.
+///
+/// # Safety
+/// `request` is a live posted call this task met; a withdrawn one is boxed
+/// and no one else frees it.
+unsafe fn release_withdrawn(request: NonNull<Request>) -> bool {
+    // SAFETY: the caller's.
+    if unsafe { request.as_ref() }.claim.take() {
+        return false;
+    }
+    // SAFETY: withdrawn calls are boxed by `submit`, and the poster left it.
+    drop(unsafe { Box::from_raw(request.as_ptr()) });
+    true
+}
+
+/// Performs `request` on this task and answers its poster, unless its poster
+/// withdrew it.
+///
+/// # Safety
+/// `request` is a queued call this worker took off the queue.
+unsafe fn serve(gpu: &Installed, request: NonNull<Request>) {
+    // SAFETY: the caller's.
+    if unsafe { release_withdrawn(request) } {
+        return;
+    }
+    // SAFETY: taken, so its poster keeps it until it is done.
+    let request = unsafe { request.as_ref() };
     let code = request_code(&request.operation);
     let started = host::rdtsc();
     let slot = SERVING.iter().find(|slot| {
@@ -701,12 +924,25 @@ unsafe extern "C" fn wake_waiters(_: *mut c_void) {
     unsafe { client::wake() };
 }
 
-/// An ioctl by its request code; every other request as zero.
+/// An ioctl by its request code; every other host call by a small code of
+/// its own ([`HostCall`]), which the reports name.
 fn request_code(operation: &Operation) -> u32 {
-    match *operation {
-        Operation::Control { request, .. } => request,
-        _ => 0,
-    }
+    let call = match *operation {
+        Operation::Control { request, .. } => return request,
+        Operation::Open(_) => HostCall::Open,
+        Operation::Close(_) => HostCall::Close,
+        Operation::Duplicate(_) => HostCall::Duplicate,
+        Operation::Device(_) => HostCall::Device,
+        Operation::Map { .. } => HostCall::Map,
+        Operation::Unmap(_) => HostCall::Unmap,
+        Operation::Fault { .. } => HostCall::Fault,
+        Operation::Thread(_) => HostCall::Thread,
+        Operation::Wake => HostCall::Wake,
+        Operation::Export(..) => HostCall::Export,
+        Operation::Shutdown => HostCall::Shutdown,
+        Operation::Seek(..) => HostCall::Seek,
+    };
+    call.code()
 }
 
 /// Request counts and ticks by request code plus one, in slots that fill in
@@ -795,6 +1031,10 @@ pub(super) fn start(gpu: &Installed) -> Result<(), WorkError> {
                 }
             }
             Operation::Thread(_) => start_thread(gpu, current)?,
+            // SAFETY: the posted call met here, which nothing queued yet;
+            // `request` is its non-null pointer.
+            _ if current.claim.withdrawn()
+                && unsafe { release_withdrawn(NonNull::new_unchecked(request.cast_mut())) } => {}
             _ => {
                 count(
                     &TAKEN,
@@ -869,16 +1109,216 @@ fn submit(operation: Operation) -> i64 {
         return result;
     }
     let code = request_code(&operation);
-    let request = Request::new(operation);
-    let posted = host::rdtsc();
-    wait(gpu, &request, u64::MAX);
+    // A job's slice gives its processor back while a call waits.
+    let bound_ms = if super::slice::can_end() {
+        posted_call::WAIT_MS
+    } else {
+        posted_call::HELD_WAIT_MS
+    };
+    let bounded = match operation {
+        Operation::Control {
+            request, argument, ..
+        } => {
+            // SAFETY: the caller's argument of its request.
+            unsafe { bound_wait(request, argument, bound_ms) }
+        }
+        _ => None,
+    };
+    let fence = posted_call::wait_timeout_offset(code).is_some();
+    let mut result = perform_posted(gpu, operation, code);
+    // A fence wait withdrawn at its bound timed out, as Linux answers one.
+    if fence && result == ETIMEDOUT {
+        result = ETIME;
+    }
+    if let Some((field, asked)) = bounded {
+        // SAFETY: as in `bound_wait`; Linux's wait does not write it.
+        unsafe { field.write_unaligned(asked) };
+        if result == ETIME {
+            let count = BOUNDED.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                output::arguments(format_args!(
+                    "GPU fence wait {code:#x} on PE {} asked for more than {bound_ms} ms and \
+                     ended at that bound with ETIME ({count} bounded)\n",
+                    host::processor(),
+                ));
+            }
+        }
+    }
+    result
+}
+
+/// Fence waits [`bound_wait`] bounded that ended at the bound, for the
+/// report of the first and of each power of two after it.
+static BOUNDED: AtomicU64 = AtomicU64::new(0);
+
+/// Bounds a posted fence wait that asks for longer than `bound_ms` to that,
+/// as its poster spins until it ends: its timeout field and the timeout it
+/// asked for, which the caller's argument gets back after the call. None
+/// for any other call.
+///
+/// # Safety
+/// `argument` is the caller's argument of `request`, valid for its size.
+unsafe fn bound_wait(
+    request: u32,
+    argument: *mut c_void,
+    bound_ms: u64,
+) -> Option<(*mut i64, i64)> {
+    let offset = posted_call::wait_timeout_offset(request)?;
+    if argument.is_null() {
+        return None;
+    }
+    let field = argument.cast::<u8>().wrapping_add(offset).cast::<i64>();
+    // SAFETY: the request's argument holds its timeout at `offset`.
+    let asked = unsafe { field.read_unaligned() };
+    let deadline = posted_call::bounded_wait_deadline(asked, now_ns(), bound_ms)?;
+    // SAFETY: as above.
+    unsafe { field.write_unaligned(deadline) };
+    Some((field, asked))
+}
+
+/// [`submit`]'s posted call: `operation` for a Linux task, waited for.
+fn perform_posted(gpu: &Installed, operation: Operation, code: u32) -> i64 {
+    // Boxed, so that a withdrawn call outlives this frame with the task
+    // that meets it.
+    let request = NonNull::from(Box::leak(Box::new(Request::new(operation))));
+    // SAFETY: this frame owns the box until it frees it or withdraws the call.
+    let posted = unsafe { request.as_ref() }.posted;
+    // SAFETY: as above.
+    let Some(result) = posted_wait(gpu, unsafe { request.as_ref() }, code) else {
+        return ETIMEDOUT;
+    };
+    // SAFETY: done, so no task touches it again; this frame's box.
+    drop(unsafe { Box::from_raw(request.as_ptr()) });
     let waited = host::rdtsc().wrapping_sub(posted);
     if let Some(mine) = MINE.get(host::processor() as usize) {
         mine.0.fetch_add(1, Ordering::Relaxed);
         mine.1.fetch_add(waited, Ordering::Relaxed);
     }
     count(&POSTED, code, waited);
-    request.result.load(Ordering::Acquire)
+    result
+}
+
+/// Calls withdrawn so far, for the report of the first and of each power of
+/// two after it.
+static WITHDRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// Posts `request` and waits for its result, within the bounds of
+/// [`posted_call`]: None when it was withdrawn, no task having taken it by
+/// [`posted_call::withdraw_ms`]; it then stays with the task that meets it,
+/// which never performs it, and the guest call it was made for is made
+/// again if it fails and may be ([`super::gate::defer_for_wait`]).
+/// A call a task performs past that is reported and waited for, and one
+/// still running at [`posted_call::STOP_MS`] stops the boot, naming it.
+fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
+    if super::slice::can_end() {
+        return job_wait(gpu, request, code);
+    }
+    let millis = (gpu.tsc_hz / 1000).max(1);
+    let posted = request.posted;
+    let ms = || host::rdtsc().wrapping_sub(posted) / millis;
+    let done = || request.done.load(Ordering::Acquire) != 0;
+    let withdraw_at = posted.saturating_add(posted_call::withdraw_ms(code) * millis);
+    wait(gpu, request, withdraw_at);
+    if !done() {
+        if request.withdrawable() && request.claim.withdraw() {
+            // The call never ran: a guest call that can be made again is,
+            // rather than failing for a wait.
+            let again = super::gate::defer_for_wait();
+            let count = WITHDRAWN.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                output::arguments(format_args!(
+                    "GPU call {code:#x} withdrawn after {} ms on PE {}: no task took it; \
+                     answered {}, {} ({count} withdrawn)\n",
+                    ms(),
+                    host::processor(),
+                    if posted_call::wait_timeout_offset(code).is_some() {
+                        "ETIME"
+                    } else {
+                        "ETIMEDOUT"
+                    },
+                    if again {
+                        "and the guest call runs again if it fails"
+                    } else {
+                        "which fails the guest call"
+                    }
+                ));
+                // One processor's report: the boot CPU's.
+                if host::processor() == BOOT_CPU.load(Ordering::Relaxed)
+                    && let Some(line) = pool_report(gpu.tsc_hz)
+                {
+                    output::arguments(format_args!("{line}\n"));
+                }
+            }
+            return None;
+        }
+        output::arguments(format_args!(
+            "GPU call {code:#x} still running after {} ms on PE {}, which waits for it\n",
+            ms(),
+            host::processor()
+        ));
+        spin(
+            gpu,
+            request,
+            posted.saturating_add(posted_call::STOP_MS * millis),
+        );
+        if !done() {
+            output::fatal(format_args!(
+                "a GPU call ({code:#x}) still ran after {} ms",
+                posted_call::STOP_MS
+            ));
+        }
+    }
+    Some(request.result.load(Ordering::Acquire))
+}
+
+/// [`posted_wait`] in a deferred job's slice, which no guest waits on: the
+/// slice gives its processor back while the call waits, and the call is not
+/// withdrawn for a wait a task would end, as a Linux process blocks in its
+/// ioctl. Only a call no task took by [`posted_call::STOP_MS`] is withdrawn,
+/// failing with ETIMEDOUT, and one a task still performs then stops the
+/// boot, naming it, as for a guest's call.
+fn job_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
+    let millis = (gpu.tsc_hz / 1000).max(1);
+    let posted = request.posted;
+    let stop_at = posted.saturating_add(posted_call::STOP_MS * millis);
+    let done = || request.done.load(Ordering::Acquire) != 0;
+    post(request);
+    if let Err(error) = gpu.events.notify() {
+        output::fatal(format_args!(
+            "the host's Linux environment failed: {error:?}"
+        ));
+    }
+    while !done() {
+        if host::rdtsc() >= stop_at {
+            if request.withdrawable() && request.claim.withdraw() {
+                output::arguments(format_args!(
+                    "GPU call {code:#x} withdrawn after {} ms in a deferred job on PE {}: \
+                     no task took it; answered ETIMEDOUT\n",
+                    host::rdtsc().wrapping_sub(posted) / millis,
+                    host::processor()
+                ));
+                return None;
+            }
+            spin(gpu, request, stop_at.saturating_add(millis));
+            if !done() {
+                output::fatal(format_args!(
+                    "a GPU call ({code:#x}) of a deferred job still ran after {} ms",
+                    posted_call::STOP_MS
+                ));
+            }
+            break;
+        }
+        // The boot processor serves the call only from its run loop, so a
+        // slice there gives it back at once; one that cannot runs Linux.
+        if host::processor() == BOOT_CPU.load(Ordering::Relaxed) && !super::slice::can_end() {
+            spin(gpu, request, stop_at);
+            continue;
+        }
+        super::slice::wait_point();
+        crate::native_mmio::shootdown::service();
+        hint::spin_loop();
+    }
+    Some(request.result.load(Ordering::Acquire))
 }
 
 /// Requests posted to the service task since [`take_posted`] by request
@@ -938,7 +1378,7 @@ fn slowest_line(tsc_hz: u64) -> Option<alloc::string::String> {
     let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
     let mut line = alloc::string::String::from("GPU SERVED LONGEST request:longest_us/shootdowns");
     for &(request, longest, shootdowns) in rows.iter().take(SHOWN) {
-        let _ = write!(line, " {request:#x}:{}/{shootdowns}", micros(longest));
+        let _ = write!(line, " {}:{}/{shootdowns}", Code(request), micros(longest));
     }
     Some(line)
 }
@@ -1052,6 +1492,11 @@ pub(super) fn posted_waiting() -> bool {
 /// entry other than the pump's ([`wait`], startup) leaves them unlooked.
 static CHILDREN_STALE: AtomicBool = AtomicBool::new(true);
 
+/// Linux ran steps outside a pump, which may have ended a child.
+pub(super) fn children_stale() {
+    CHILDREN_STALE.store(true, Ordering::Relaxed);
+}
+
 /// Whether a pump's first pass retires tasks and runs [`start`]: a call is
 /// posted, a PE asked for a wake, a task waits for a wake, calls wait for workers, or steps ran
 /// since the last look, which may have ended a child. Without any, both
@@ -1094,8 +1539,15 @@ pub(super) fn pool_report(tsc_hz: u64) -> Option<alloc::string::String> {
 /// idle and starting ones, queued calls with the oldest one's wait, and each
 /// call still running with how long it has.
 fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
-    use core::fmt::Write;
     let gpu = installed()?;
+    // Only Linux entries change the pool, on any processor; a report while
+    // one runs is left out.
+    crate::engine::storage::with_drivers_held(|| workers_held(gpu, tsc_hz))?
+}
+
+/// [`workers_line`] with no Linux entry running.
+fn workers_held(gpu: &Installed, tsc_hz: u64) -> Option<alloc::string::String> {
+    use core::fmt::Write;
     let service = &gpu.service;
     let now = host::rdtsc();
     let ms = |since: u64| now.wrapping_sub(since) / (tsc_hz / 1000).max(1);
@@ -1109,7 +1561,7 @@ fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
         let code = slot.0.load(Ordering::Relaxed);
         let took = ms(slot.1.load(Ordering::Relaxed));
         if code != 0 && took >= 1000 {
-            let _ = write!(serving, " {:#x}:{took}ms", code.wrapping_sub(1));
+            let _ = write!(serving, " {}:{took}ms", Code(code.wrapping_sub(1)));
         }
     }
     if queue.is_empty() && serving.is_empty() {
@@ -1133,15 +1585,40 @@ fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
 /// Posts `request` to the service and waits for it, until the host counter
 /// reaches `deadline`.
 fn wait(gpu: &Installed, request: &Request, deadline: u64) {
-    let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
     post(request);
-    if let Err(error) = gpu.events.notify() {
+    // A poster that runs Linux for its call itself wakes nobody: a
+    // processor holding the host drivers' lock meanwhile takes the call at
+    // its next pass, and the poster when it lets go.
+    if !super::serves_own_posts()
+        && let Err(error) = gpu.events.notify()
+    {
         output::fatal(format_args!(
             "the host's Linux environment failed: {error:?}"
         ));
     }
+    spin(gpu, request, deadline);
+}
+
+/// Waits for the posted `request`, until the host counter reaches
+/// `deadline`: the boot CPU runs the environment; another processor runs it
+/// in the boot CPU's place whenever no other processor does, and spins
+/// meanwhile (`super::serve_posted`).
+fn spin(gpu: &Installed, request: &Request, deadline: u64) {
+    let waiting = || request.done.load(Ordering::Acquire) == 0 && host::rdtsc() < deadline;
     if host::processor() != BOOT_CPU.load(Ordering::Relaxed) {
+        // When it last ran Linux and found nothing to run.
+        let mut idle_since = None;
         while waiting() {
+            if idle_since.is_none_or(|since| super::posted_work_ready(gpu, since)) {
+                match super::serve_posted(gpu, &waiting) {
+                    Some(true) => {
+                        idle_since = None;
+                        continue;
+                    }
+                    Some(false) => idle_since = Some(host::rdtsc()),
+                    None => {}
+                }
+            }
             // The boot CPU's work may be retiring a mapping, which waits for this.
             crate::native_mmio::shootdown::service();
             hint::spin_loop();
@@ -1201,55 +1678,149 @@ pub(super) fn unmap(address: NonNull<u8>) {
     }
 }
 
-/// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
-pub(super) fn chipset(index: u32) -> Option<u16> {
-    let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
+/// What the kernel driver of the bound GPU at `index` answers `ask`, one of
+/// its stack's queries (`stela_drivers::gpu::stack::Kernel`), on a render
+/// node opened for it.
+pub(super) fn query<T>(
+    index: u32,
+    ask: fn(stela_drivers::gpu::stack::Control) -> Option<T>,
+) -> Option<T> {
+    let fd = submit(Operation::Open(RENDER_MINOR + minor(index as usize)?)) as c_int;
     if fd < 0 {
         return None;
     }
-    let mut parameter = GetParam {
-        parameter: CHIPSET_ID,
-        value: 0,
-    };
-    let result = submit(Operation::Control {
-        fd,
-        request: GET_PARAM,
-        argument: (&raw mut parameter).cast(),
-    });
+    let answer = ask(&mut device_control(fd));
     close_descriptor(fd);
-    (result == 0).then_some(parameter.value as u16)
+    answer
 }
 
-/// `NOUVEAU_GETPARAM_FB_SIZE`: the VRAM nouveau makes available.
-const FB_SIZE: u64 = 8;
+/// The device memory bytes [`remember_memory`] read of each bound GPU, by
+/// index; zero before it read them.
+static MEMORY_BYTES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
-/// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
-pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
-    let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
-    if fd < 0 {
-        return None;
+/// Asks the kernel driver of the bound GPU at `index` for its device memory
+/// once, before the GPU's first work, for [`vram_bytes`].
+pub(super) fn remember_memory(index: u32, stack: &GpuStack) {
+    if let Some(bytes) = query(index, stack.kernel.memory_bytes)
+        && let Some(kept) = MEMORY_BYTES.get(index as usize)
+    {
+        kept.store(bytes, Ordering::Relaxed);
     }
-    let mut parameter = GetParam {
-        parameter: FB_SIZE,
-        value: 0,
-    };
-    let result = submit(Operation::Control {
-        fd,
-        request: GET_PARAM,
-        argument: (&raw mut parameter).cast(),
-    });
-    close_descriptor(fd);
-    (result == 0 && parameter.value != 0).then_some(parameter.value)
 }
 
-/// Serve a fault on a mapping that moved, as Linux unmaps a buffer it evicts.
-/// False when `address` is not one a client mapped.
-pub(in crate::engine) fn serve_fault(address: u64, write: bool) -> bool {
-    installed().is_some_and(|gpu| {
-        gpu.window.contains(address)
-            && MAPPINGS.load(Ordering::Relaxed) != 0
-            && submit(Operation::Fault { address, write }) == 0
-    })
+/// The device memory bytes of the GPU of Metal service `service`, for the
+/// guest's `StelaHost` of that gate, as the service's open read them.
+/// Asking the driver again would open and close a file of the GPU, and
+/// amdgpu's close waits, unbounded, for its VM's page-table clear: on a GPU
+/// amdgpu is still resetting that never comes, and the boot stopped at
+/// "Setting up the Mac's hardware".
+pub(in crate::engine) fn vram_bytes(service: u32) -> Option<u64> {
+    let index = super::gate::served_gpu(service as usize)?;
+    MEMORY_BYTES
+        .get(index)
+        .map(|kept| kept.load(Ordering::Relaxed))
+        .filter(|&bytes| bytes != 0)
+}
+
+/// A kernel driver's watch for resets on a file of its own, made before a
+/// GPU's first work ([`stela_drivers::gpu::stack::Reset`]). Its file stays
+/// open for the boot: closing a file of a GPU in reset waits for the
+/// reset's end.
+pub(super) struct ResetWatch {
+    fd: c_int,
+    context: u32,
+    reset: &'static Reset,
+}
+
+impl ResetWatch {
+    /// A watch on the bound GPU at `index`; `None` when the driver gave no
+    /// file or context.
+    pub(super) fn new(index: u32, reset: &'static Reset) -> Option<Self> {
+        let fd = submit(Operation::Open(RENDER_MINOR + minor(index as usize)?)) as c_int;
+        if fd < 0 {
+            return None;
+        }
+        let Some(context) = (reset.watch)(&mut device_control(fd)) else {
+            // A file without a context watches nothing; it closes while the
+            // GPU has had no work.
+            close_descriptor(fd);
+            return None;
+        };
+        Some(Self { fd, context, reset })
+    }
+
+    /// Whether the driver reset the GPU since the watch was made, `None`
+    /// when it did not answer.
+    pub(super) fn state(&self) -> Option<ResetState> {
+        (self.reset.state)(&mut device_control(self.fd), self.context)
+    }
+}
+
+/// The device-control calls on `fd`, as a stack's queries make them.
+fn device_control(fd: c_int) -> impl FnMut(u32, *mut c_void) -> i32 {
+    move |request, argument| control(fd, request, argument) as i32
+}
+
+/// Whether a fault at `address` may be on a client's mapping: a page past
+/// the window a map or an earlier fault filled, or one Linux unmapped as it
+/// moved the buffer behind it. For the #PF handler, which leaves the fault,
+/// and the fill of the rest of its window, to the faulting context
+/// ([`serve_moved`]).
+pub(in crate::engine) fn client_fault(address: u64) -> bool {
+    installed()
+        .is_some_and(|gpu| gpu.window.contains(address) && MAPPINGS.load(Ordering::Relaxed) != 0)
+}
+
+/// Client faults served so far, for the report of the first and of each
+/// power of two after it.
+static CLIENT_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// `rip` as an offset in this image.
+fn image_offset(rip: u64) -> u64 {
+    unsafe extern "C" {
+        static __ImageBase: u8;
+    }
+    rip.wrapping_sub((&raw const __ImageBase).addr() as u64)
+}
+
+/// Serve the fault at `address` that the code at `rip` took, in that code's
+/// own context, as Linux's fault handler runs in the faulting task: a Mesa
+/// thread refaults on its task, which may sleep; other code posts the
+/// refault, and the boot CPU runs Linux for it, as at any posted call.
+pub(in crate::engine) fn serve_moved(address: u64, write: bool, rip: u64) {
+    let thread = installed().and_then(current_thread).is_some();
+    let count = CLIENT_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        output::arguments(format_args!(
+            "GPU CLIENT FAULT address={address:#x} write={write} rip=+{:#x} processor={} \
+             thread={} count={count}\n",
+            image_offset(rip),
+            host::processor(),
+            if thread { "mesa" } else { "host" },
+        ));
+    }
+    let result = submit(Operation::Fault { address, write });
+    if result != 0 {
+        output::fatal(format_args!(
+            "a GPU client fault at {address:#x} from +{:#x} on processor {} was not \
+             served: {result}",
+            image_offset(rip),
+            host::processor()
+        ));
+    }
+}
+
+/// Say why the fault at `address` from `rip` cannot reach its server, before
+/// the handler stops on it.
+pub(in crate::engine) fn note_unserved(
+    address: u64,
+    rip: u64,
+    refused: stela_boot_core::process_fault::Refused,
+) {
+    output::arguments(format_args!(
+        "GPU client fault at {address:#x} from +{:#x} not served: {refused:?}\n",
+        image_offset(rip)
+    ));
 }
 
 fn text(pointer: *const c_char) -> &'static str {
@@ -1288,7 +1859,7 @@ unsafe extern "C" fn stela_libc_log(pointer: *const u8, size: usize) {
     // SAFETY: the C library's live text.
     let bytes = unsafe { slice::from_raw_parts(pointer, size) };
     if let Ok(line) = str::from_utf8(bytes) {
-        output::arguments(format_args!("{line}"));
+        super::slice::without_yields(|| output::arguments(format_args!("{line}")));
     }
 }
 
@@ -1318,9 +1889,10 @@ extern "C" fn stela_libc_now_ns() -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_core() -> c_uint {
-    installed()
-        .and_then(current_thread)
-        .map_or_else(host::processor, |thread| thread.core)
+    match installed().and_then(current_thread) {
+        Some(thread) => thread.core,
+        None => super::slice::job_core().unwrap_or_else(host::processor),
+    }
 }
 
 /// The core a thread of the platform's own runs as: past the C library's
@@ -1360,6 +1932,8 @@ unsafe extern "C" fn stela_libc_wait(word: *const c_uint, value: c_uint, deadlin
         return hint::spin_loop();
     };
     let Some(thread) = current_thread(gpu) else {
+        // A job's slice past its time gives its processor back here.
+        super::slice::wait_point();
         return super::gate::relax();
     };
     let sleeping = &SLEEPING[thread.core as usize - PROCESSORS];
@@ -1390,6 +1964,7 @@ extern "C" fn stela_libc_wake(word: *const c_uint) {
     // slept yet finds its word changed and does not.
     if let Some(gpu) = installed()
         && host::processor() != BOOT_CPU.load(Ordering::Relaxed)
+        && !crate::engine::storage::holds_host_drivers()
     {
         WAKE_ASKED.store(true, Ordering::Release);
         if let Err(error) = gpu.events.notify() {
@@ -1427,6 +2002,11 @@ extern "C" fn stela_libc_drm_rdev(fd: c_int) -> c_long {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn stela_libc_drm_seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
+    submit(Operation::Seek(fd, offset, whence))
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn stela_libc_drm_ioctl(fd: c_int, request: c_ulong, argument: *mut c_void) -> c_int {
     submit(Operation::Control {
         fd,
@@ -1458,7 +2038,12 @@ extern "C" fn stela_libc_drm_devices() -> c_uint {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn stela_libc_drm_device(index: c_uint, device: *mut DrmDevice) {
     if let Some(found) = installed().and_then(|gpu| gpu.start.bound.get(index as usize)) {
+        let record = DrmDevice {
+            // A GPU without a node gets one past DRM's, which opens nothing.
+            minor: minor(index as usize).unwrap_or(PRIMARY_MINORS),
+            ..found.drm
+        };
         // SAFETY: the C library's record.
-        unsafe { device.write(found.drm) };
+        unsafe { device.write(record) };
     }
 }

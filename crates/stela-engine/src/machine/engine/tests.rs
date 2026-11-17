@@ -173,7 +173,12 @@ pub(super) struct FakeHost {
     /// The count at which a host interrupt brings host work
     /// ([`Host::host_work_due`]): it ends a wait it falls in.
     pub(super) host_work_at: Option<u64>,
+    /// The code installs described ([`Host::profile_code`]).
+    pub(super) described: Vec<Described>,
 }
+
+/// A described install: its code, length and regions.
+pub(super) type Described = (usize, usize, Vec<(u32, step_timing::CodeRegion)>);
 
 impl Host for FakeHost {
     fn memory_barrier(&mut self) {
@@ -370,6 +375,14 @@ impl Host for FakeHost {
     fn profile_ticks(&mut self) -> u64 {
         self.counter()
     }
+    fn profile_code(
+        &mut self,
+        code: NativeCode,
+        bytes: usize,
+        regions: &[(u32, step_timing::CodeRegion)],
+    ) {
+        self.described.push((code.0, bytes, regions.to_vec()));
+    }
     fn counter(&mut self) -> u64 {
         self.counter_reads += 1;
         let now = self.now;
@@ -506,7 +519,7 @@ pub(super) fn machine_on(
 /// both regimes (4 KiB granule, T0SZ 25, one 1 GiB block, EL0 access
 /// with `el0`, whose writable mapping EL1 cannot execute), for DC ZVA,
 /// which faults on the Device memory of a disabled stage 1.
-pub(super) fn normal_memory(machine: &mut Machine<FakeHost, NoDevices>, el0: bool) {
+pub(super) fn normal_memory<D: Devices>(machine: &mut Machine<FakeHost, D>, el0: bool) {
     const TABLE: usize = 0xf000;
     const TCR: u64 = 25 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 5 << 32;
     const SCTLR_M_C: u64 = 1 | 1 << 2;
@@ -595,6 +608,7 @@ pub(super) fn board_on<D: Devices>(
         code_partitions: None,
         parts: Vec::new(),
         host_work_at: None,
+        described: Vec::new(),
     };
     let profile = CpuProfile {
         name: "test",
@@ -811,6 +825,40 @@ fn a_lock_free_device_load_keeps_the_cached_lines() {
         machine.device_lines_of(pe, now);
         assert_eq!(machine.devices.queries, queries, "{address:#x}");
     }
+}
+
+/// A signal armed for the running PE that comes due by itself (an Apple
+/// deferred fast IPI, `Devices::own_deadline`) ends its wait: its next
+/// deadline, and its wake while it serves the host, are no later.
+#[test]
+fn a_pes_own_due_signal_ends_its_wait() {
+    #[derive(Default)]
+    struct Armed(Option<u64>);
+    impl Devices for Armed {
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Ok(0)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+        fn own_deadline(&mut self, _: usize) -> Option<u64> {
+            self.0
+        }
+    }
+    let mut machine = board(&[], Armed::default(), Vec::new());
+    assert_eq!(machine.next_deadline(10), None);
+    machine.devices.0 = Some(77);
+    assert_eq!(machine.next_deadline(10), Some(77));
+    // In WFI, which a FIQ ends whatever its mask.
+    machine.waiting = Some(Wait {
+        kind: WaitKind::Interrupt,
+        timeout: None,
+        down: false,
+    });
+    assert_eq!(machine.own_deadline(10), Some(77));
 }
 
 #[test]
@@ -2510,6 +2558,49 @@ fn a_fetch_that_reclaims_code_forgets_the_lookup_entries_of_its_blocks_alone() {
 /// The page of an evicted block keeps its other blocks, whose links into it
 /// are undone: their exits there return to the engine again.
 #[test]
+fn retirements_and_invalidations_fail_every_paired_frame() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![RET; 2 * FETCH_PAGE as usize / 4];
+    words[..5].copy_from_slice(&[ADD, 0x1400_0002, 0, ADD, 0x17ff_fffc]);
+    let mut machine = machine(&words);
+    machine.host.ring = Some(1);
+    let base = machine.cpu.pc;
+    let direct = |next_pc| NativeExit::Exit {
+        next_pc,
+        kind: ExitKind::Direct as u64,
+    };
+    // Each block of the page links into the other.
+    machine.host.exits = vec![direct(base + 12), direct(base), direct(base + 12)];
+    for _ in 0..3 {
+        machine.step().unwrap();
+    }
+    // Every native run may push frames, checked against the board's epoch.
+    let control = machine.chain.snapshot();
+    assert_eq!(
+        (control.frame_room as usize, control.retire_epoch),
+        (
+            chain::DEFAULT_FRAME_BOUND as usize * chain::FRAME_BYTES,
+            machine.code.blocks.epoch_address(),
+        )
+    );
+    // A retirement moves the epoch before its blocks retire.
+    let before = machine.code.blocks.epoch();
+    assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
+    assert_eq!(machine.statistics.code_evictions, 1);
+    let retired = machine.code.blocks.epoch();
+    assert!(retired > before);
+    // So does an IC IVAU of a page whose blocks a frame may name.
+    let index = machine.code.blocks.len() - 1;
+    let physical = machine.code.blocks[index].physical;
+    machine.invalidate_code_page(physical);
+    assert!(machine.code.blocks.epoch() > retired);
+    // Without a board epoch no frame is pushed.
+    machine.chain.set_frames(chain::DEFAULT_FRAME_BOUND, 0);
+    assert_eq!(machine.chain.snapshot().frame_room, 0);
+}
+
+#[test]
 fn eviction_undoes_the_links_into_evicted_blocks_and_keeps_their_pages() {
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
     const RET: u32 = 0xd65f_03c0;
@@ -3152,14 +3243,15 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
         kind: kind as u64,
     };
     machine.host.exits = vec![exit(far, ExitKind::Direct), exit(base, ExitKind::Return)];
-    // Other exits hold the first cells, so this exit's cell number takes a
+    // Other hot exits hold the first stamped cells, so this exit's takes a
     // 32-bit displacement in its stamp's address, as a booted guest's do.
     {
         let mut cache = machine.code.cache();
         for other in 0..300 {
             cache
                 .targets
-                .link_cell(0x7_0000 + 8 * other, 0x40_0000, None);
+                .link_hot_cell(0x7_0000 + 8 * other, 0x40_0000, None)
+                .unwrap();
         }
     }
     machine.step().unwrap();
@@ -3167,34 +3259,34 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
     let first = &machine.code.blocks[0];
     let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
     let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
-    let (number, cells) = {
-        let mut cache = machine.code.cache();
-        (
-            cache.targets.site_cell_number(site).expect("a cell"),
-            cache.targets.stamped_cells(),
-        )
+    let address = {
+        let cache = machine.code.cache();
+        let number = cache.targets.site_cell_number(site).expect("a cell");
+        assert!(number as usize >= chain::STAMPED_CELLS, "{number}");
+        cache.targets.cell_address(number)
     };
-    assert!(number > 256, "{number}");
-    // Cold: the sweep leaves it.
+    // Cold: a step without its samples, or with fewer than make it hot,
+    // leaves it.
     let patches = machine.host.patches.len();
-    for _ in 0..chain::STAMPED_CELLS / 256 {
-        machine.promote_hot_exits();
+    machine.promote_hot_exits();
+    for _ in 1..scheduler::HOT_SAMPLES {
+        machine.cell_samples.push(address);
     }
+    machine.promote_hot_exits();
     assert_eq!(machine.host.patches.len(), patches);
-    // Hot, as its cell probe would count: the sweep gives it a stamped tail
-    // jumping straight to the block of `far`, and the site's jump to it.
-    let heat = (cells as usize + chain::CELL_HEAT + 4 * number as usize)
-        as *const core::sync::atomic::AtomicU32;
-    // SAFETY: the board's stamped cells live while it does; the word is an atomic.
-    unsafe { &*heat }.store(chain::HOT_CELL, Ordering::Relaxed);
-    // One full sweep of the stamped cells, a bounded step at a time.
-    for _ in 0..chain::STAMPED_CELLS / 256 {
-        machine.promote_hot_exits();
-    }
+    // Hot, as its cell probe would name it: the step gives it a stamped
+    // cell and a stamped tail jumping straight to the block of `far`, and
+    // the site's jump to it.
+    machine.cell_samples.push(address);
+    machine.promote_hot_exits();
     assert_eq!(machine.host.patches.len(), patches + 2);
     let (tail, bytes) = machine.host.patches[patches].clone();
     let cache = machine.code.cache();
     let number = cache.targets.site_cell_number(site).expect("a cell");
+    assert!(
+        (257..chain::STAMPED_CELLS as u32).contains(&number),
+        "{number}"
+    );
     let held = cache.targets.site_cell(site).expect("a cell");
     assert_eq!(held.pc, far);
     assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
@@ -3213,14 +3305,178 @@ fn hot_exits_out_of_the_page_get_stamped_tails() {
         machine.host.patches[patches + 1],
         (site as usize, jump.to_vec())
     );
-    // Settled: hot no more.
+    // Its stamped cell's samples promote it no more.
+    let address = cache.targets.cell_address(number);
+    drop(cache);
+    for _ in 0..scheduler::HOT_SAMPLES {
+        machine.cell_samples.push(address);
+    }
+    machine.promote_hot_exits();
+    assert_eq!(machine.host.patches.len(), patches + 2);
+}
+
+/// An exit to a block another address space compiled, in a page this one
+/// does not translate yet, waits for the fetch of its target, which
+/// translates the page and finds the block's entry without adding one,
+/// and links through a cell holding that entry: a cell made at the exit
+/// would hold none, and send every transfer on to the table probe until
+/// the table took another entry of its PC.
+#[test]
+fn an_exit_to_an_untranslated_page_links_its_cell_at_the_fetch() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    const NG: u64 = 1 << 11;
+    let mut words = vec![0; 1026];
+    words[0] = 0x1400_0400; // b .+0x1000
+    words[1024] = ADD;
+    words[1025] = RET;
+    let private = |machine: &mut Machine<FakeHost, NoDevices>, space: usize| {
+        paged_space(machine, space, &[BASE, BASE + 0x1000]);
+        let [_, _, l3] = SPACES_TABLES[space];
+        for page in 0..2 {
+            let frame = BASE + 0x1000 * page;
+            write_entry(machine, l3 + 8 * page, page_descriptor(frame, false) | NG);
+        }
+    };
+    let mut machine = machine(&words);
+    let far = BASE + 0x1000;
+    private(&mut machine, 0);
+    let Ok(Fetched::Block(target)) = machine.fetch_block(far, false) else {
+        panic!("the target's block");
+    };
+    let key = target_key(&machine, far);
+    let entry = machine
+        .code
+        .table
+        .find(machine.code.table.slot(far, key), far, key);
+    assert_eq!((entry.pc, entry.block), (far, target as u32));
+    private(&mut machine, 1);
+    machine.cpu.pc = BASE;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: far,
+        kind: ExitKind::Direct as u64,
+    }];
+    machine.step().unwrap();
+    let (_, first) = machine
+        .code
+        .blocks
+        .iter()
+        .find(|(_, block)| block.pc == BASE)
+        .expect("the exit's block");
+    let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
+    let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
     assert!(
-        cache
-            .targets
-            .hot_links(0..chain::STAMPED_CELLS as u32)
-            .is_empty()
+        matches!(machine.fetch_block(far, false), Ok(Fetched::Block(index)) if index == target)
     );
-    let _ = number;
+    assert_eq!(machine.code.cache().targets.site_cell(site), Some(entry));
+}
+
+/// A promotion runs on whichever PE sweeps, often in another process or
+/// at another EL than the transfers that made the cell hot: its stamped
+/// tail enters the block the cell holds, and the cell keeps its entry. A
+/// cell holding nothing yet stays hot, and the sweep after its entry came
+/// stamps it.
+#[test]
+fn a_promotion_in_another_context_stamps_what_the_cell_holds() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0; 1026];
+    words[0] = 0x1400_0400; // b .+0x1000
+    words[1024] = ADD;
+    words[1025] = RET;
+    let mut machine = machine(&words);
+    let base = machine.cpu.pc;
+    let far = base + 0x1000;
+    let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
+        next_pc,
+        kind: kind as u64,
+    };
+    machine.host.exits = vec![exit(far, ExitKind::Direct), exit(base, ExitKind::Return)];
+    machine.step().unwrap();
+    machine.step().unwrap();
+    let first = &machine.code.blocks[0];
+    let code = &machine.host.installed[first.code.0 / NATIVE_CODE_STRIDE - 1];
+    let site = chain::direct_patch((first.code.0 + code.len() - chain::DIRECT_EXIT_BYTES) as u64);
+    let (address, held) = {
+        let cache = machine.code.cache();
+        let held = cache.targets.site_cell(site).expect("a cell");
+        let number = cache.targets.site_cell_number(site).expect("a cell");
+        (cache.targets.cell_address(number), held)
+    };
+    assert_eq!(held.pc, far);
+    assert_ne!(held.key, 0);
+    // A step after the samples that make the exit hot.
+    let sweep = |machine: &mut Machine<FakeHost, NoDevices>| {
+        for _ in 0..scheduler::HOT_SAMPLES {
+            machine.cell_samples.push(address);
+        }
+        machine.promote_hot_exits();
+    };
+    // The sweeping PE now runs in contexts no fetch translated a page in.
+    let contexts = machine.chain.contexts();
+    machine
+        .chain
+        .set_contexts([contexts[0] + 1000, contexts[1] + 1000]);
+    assert_eq!(machine.current_key(far), None);
+    // Its cell emptied, as a forget of its entry leaves it: a step finds it
+    // hot and patches nothing.
+    {
+        let mut cache = machine.code.cache();
+        let frame = chain::key_frame(held.key);
+        cache.targets.forget_frames(frame..=frame, |_| true);
+        assert_eq!(cache.targets.site_cell(site).map(|cell| cell.key), Some(0));
+    }
+    let patches = machine.host.patches.len();
+    sweep(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches);
+    assert_eq!(machine.statistics.promotions_waiting, 1);
+    // The table takes the entry again, and the cell with it.
+    {
+        let mut cache = machine.code.cache();
+        let slot = cache.targets.slot(far, held.key);
+        cache.targets.set(slot, held);
+        assert_eq!(cache.targets.site_cell(site), Some(held));
+    }
+    sweep(&mut machine);
+    assert_eq!(machine.host.patches.len(), patches + 2);
+    assert_eq!(machine.statistics.stamped_tails, 1);
+    let (tail, bytes) = machine.host.patches[patches].clone();
+    assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
+    let direct = (0..bytes.len() - 5).any(|at| {
+        bytes[at] == 0xe9 && {
+            let relative = i32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap());
+            (tail as u64 + at as u64 + 5).wrapping_add(relative as i64 as u64) == held.entry
+        }
+    });
+    assert!(direct, "no direct jump to the held block");
+    let cache = machine.code.cache();
+    assert_eq!(cache.targets.site_cell(site), Some(held));
+    assert_eq!(cache.targets.stamped_tails(), 1);
+}
+
+/// The cell probe counts its transfers in the low 32 bits of the
+/// control's `heat` and names a sampled one's cell in `sampled`: each
+/// native call starts both at 0 and the engine takes what they hold after.
+#[test]
+fn a_native_runs_cell_probe_transfers_and_sample_are_taken() {
+    const NOP: u32 = 0xd503_201f;
+    let mut machine = machine(&[NOP, NOP]);
+    let control = machine.chain.address() as *mut chain::ChainControl;
+    // SAFETY: the PE's control, which no native code runs with now.
+    unsafe {
+        core::ptr::addr_of_mut!((*control).heat).write(0xffff_ffff_0000_0007);
+        core::ptr::addr_of_mut!((*control).sampled).write(0x1234_5000);
+    }
+    assert_eq!(machine.chain.cell_probes(), (7, 0x1234_5000));
+    machine.chain.begin(0, 10);
+    assert_eq!(machine.chain.cell_probes(), (0, 0));
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: machine.cpu.pc + 4,
+        kind: ExitKind::Fallthrough as u64,
+    }];
+    machine.step().unwrap();
+    assert_eq!(machine.statistics.cell_probes, 0);
+    assert!(machine.cell_samples.is_empty());
 }
 
 #[test]
@@ -3305,7 +3561,8 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
                 .unwrap()
                 .to_vec()
         } else {
-            chain::lookup_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64, 0)
+            // A return's tail first takes its call's paired frame.
+            chain::paired_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64)
                 .unwrap()
                 .to_vec()
         };
@@ -3640,7 +3897,9 @@ fn block_entries_survive_a_tlbi_all() {
             _ => panic!("a block"),
         };
     let blocks = [BASE, BASE + 4, BASE + 8].map(|pc| fetch(&mut machine, pc));
-    let before = machine.chain.contexts()[chain::half(BASE)];
+    // The page's leaf is global: its entry is in the context every address
+    // space shares, the upper half's (`itlb_context`).
+    let before = machine.chain.contexts()[1];
     let key = target_key(&machine, BASE);
     machine.tlb_maintained(Reach::All, Everywhere::All, None);
     // Each page translates at its fetch, not ahead (`refill_pages`).
@@ -3648,7 +3907,7 @@ fn block_entries_survive_a_tlbi_all() {
     let [found, translated] = [machine.statistics.fetches[0], machine.statistics.fetches[1]];
     let (fills, entries) = (machine.statistics.itlb[0], table_entries(&machine));
     assert_eq!(fetch(&mut machine, BASE), blocks[0]);
-    let after = machine.chain.contexts()[chain::half(BASE)];
+    let after = machine.chain.contexts()[1];
     assert_ne!(after, before);
     assert_eq!(target_key(&machine, BASE), key);
     // One translation of the page, then each block from the table.
@@ -3745,7 +4004,9 @@ fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
     };
     let page = BASE & !(FETCH_PAGE - 1);
     fetch(&mut machine);
-    let context = machine.chain.contexts()[chain::half(BASE)];
+    // The page's leaf is global: its entry is in the context every address
+    // space shares, the upper half's (`itlb_context`).
+    let context = machine.chain.contexts()[1];
     let (expected, mut refills) = (misses(&machine), refilled(&machine));
     for epoch in [false, true] {
         machine.forget_lookups(Reach::Containing(BASE), None);
@@ -3757,7 +4018,7 @@ fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
             assert_ne!(machine.translation_generation, generation);
         }
         fetch(&mut machine);
-        assert_eq!(machine.chain.contexts()[chain::half(BASE)], context);
+        assert_eq!(machine.chain.contexts()[1], context);
         assert_eq!(misses(&machine), expected);
         refills += 1;
         assert_eq!(refilled(&machine), refills);
@@ -3769,7 +4030,7 @@ fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
     // The page translates at its fetch, not ahead (`refill_pages`).
     machine.pending_refills.clear();
     fetch(&mut machine);
-    assert_ne!(machine.chain.contexts()[chain::half(BASE)], context);
+    assert_ne!(machine.chain.contexts()[1], context);
     let mut expected = expected;
     expected[ItlbMiss::Context as usize] += 1;
     assert_eq!(misses(&machine), expected);
@@ -3796,14 +4057,18 @@ fn page_descriptor(frame: u64, pxn: bool) -> u64 {
 }
 
 /// Write `entry` at RAM offset `at`.
-fn write_entry(machine: &mut Machine<FakeHost, NoDevices>, at: u64, entry: u64) {
+pub(super) fn write_entry<D: Devices>(machine: &mut Machine<FakeHost, D>, at: u64, entry: u64) {
     let at = at as usize;
     machine.host.ram[at..at + 8].copy_from_slice(&entry.to_le_bytes());
 }
 
 /// Address space `space` maps BASE's GiB through 4 KiB pages: page `n` of
 /// BASE to `frames[n]`. TTBR0_EL1 then selects it, with the MMU on.
-fn paged_space(machine: &mut Machine<FakeHost, NoDevices>, space: usize, frames: &[u64]) {
+pub(super) fn paged_space<D: Devices>(
+    machine: &mut Machine<FakeHost, D>,
+    space: usize,
+    frames: &[u64],
+) {
     const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
     let [l1, l2, l3] = SPACES_TABLES[space];
     if machine.cpu.read(SystemRegister::SCTLR_EL1) & 1 == 0 {
@@ -3819,20 +4084,28 @@ fn paged_space(machine: &mut Machine<FakeHost, NoDevices>, space: usize, frames:
 }
 
 /// A TLBI by VA of the page at `va`, of every ASID.
-fn tlbi_page(machine: &mut Machine<FakeHost, NoDevices>, va: u64) {
+pub(super) fn tlbi_page<D: Devices>(machine: &mut Machine<FakeHost, D>, va: u64) {
     use mmu::tlbi::{Everywhere, Reach};
     let reach = Reach::Containing(va);
     machine.tlb_maintained(reach, Everywhere::Addresses(reach), None);
 }
 
-/// Two address spaces that map one frame at one PC share its block and
-/// its block table entry: the second translates the page once and finds
-/// the entry the first recorded, compiling nothing.
+/// Two address spaces that map one frame at one PC, each privately (nG),
+/// share its block and its block table entry: the second translates the
+/// page once and finds the entry the first recorded, compiling nothing.
+/// (A global page's one ITLB entry serves both:
+/// `address_spaces_share_their_global_pages_entries`.)
 #[test]
 fn two_address_spaces_mapping_one_frame_share_an_entry() {
     const RET: u32 = 0xd65f_03c0;
+    const NG: u64 = 1 << 11;
+    let private = |machine: &mut Machine<FakeHost, NoDevices>, space: usize| {
+        paged_space(machine, space, &[BASE]);
+        let [_, _, l3] = SPACES_TABLES[space];
+        write_entry(machine, l3, page_descriptor(BASE, false) | NG);
+    };
     let mut machine = machine(&[RET]);
-    paged_space(&mut machine, 0, &[BASE]);
+    private(&mut machine, 0);
     let Ok(Fetched::Block(block)) = machine.fetch_block(BASE, false) else {
         panic!("a block");
     };
@@ -3843,7 +4116,7 @@ fn two_address_spaces_mapping_one_frame_share_an_entry() {
         machine.block_key(BASE, machine.code.blocks[block].variant)
     );
     let (fetches, entries) = (machine.statistics.fetches, table_entries(&machine));
-    paged_space(&mut machine, 1, &[BASE]);
+    private(&mut machine, 1);
     assert!(
         matches!(machine.fetch_block(BASE, false), Ok(Fetched::Block(index)) if index == block)
     );
@@ -3852,17 +4125,16 @@ fn two_address_spaces_mapping_one_frame_share_an_entry() {
     assert_eq!(machine.statistics.fetches[1], fetches[1] + 1);
     assert_eq!(machine.statistics.fetches[4], fetches[4]);
     assert_eq!(table_entries(&machine), entries);
-    // The ITLB holds the page in both contexts, with the one key and the
-    // mark of its global leaf.
+    // The ITLB holds the page in both contexts, with the one key.
     for context in [first, second] {
         let held = machine.itlb.entry(machine.itlb.page_slot(BASE, context));
-        assert_eq!(held, chain::LookupEntry::global_page(BASE, context, key));
+        assert_eq!(held, chain::LookupEntry::page(BASE, context, key));
     }
     // An IC IVAU of the frame forgets the entry for both: the next fetch
     // in either compiles the page again.
     machine.invalidate_code_page(BASE);
     assert_eq!(table_entries(&machine), entries - 1);
-    paged_space(&mut machine, 0, &[BASE]);
+    private(&mut machine, 0);
     assert!(
         matches!(machine.fetch_block(BASE, false), Ok(Fetched::Block(index)) if index != block)
     );
@@ -3930,8 +4202,9 @@ fn a_remapped_page_runs_its_new_frame_and_a_removed_permission_faults() {
 }
 
 /// No block crosses a page: one at a page's last instruction ends there,
-/// and its fallthrough into the next page goes through a cell, whose
-/// entry holds only while the next page translates to its frame. A remap
+/// and its fallthrough into the next page goes through a cell, made at the
+/// fetch of the next page's block, whose entry holds only while the next
+/// page translates to its frame. A remap
 /// of that page and its TLBI leave the cell's entry unreachable, and the
 /// next fetch gives the cell the new frame's block.
 #[test]
@@ -3966,14 +4239,14 @@ fn a_fallthrough_into_the_next_page_follows_that_pages_translation() {
         ),
         (last, 4)
     );
-    // The fallthrough is linked through a cell, empty until the next
-    // page's block is fetched.
+    // The fallthrough waits for the fetch of the next page's block, whose
+    // translation its cell starts with, then links through the cell.
     let installed =
         &machine.host.installed[machine.code.blocks[ended].code.0 / NATIVE_CODE_STRIDE - 1];
     let exit_end = chain::without_failures(installed).len();
     let exit = (machine.code.blocks[ended].code.0 + exit_end - chain::DIRECT_EXIT_BYTES) as u64;
     let site = chain::direct_patch(exit);
-    assert_eq!(machine.code.cache().targets.site_cell(site).unwrap().key, 0);
+    assert_eq!(machine.code.cache().targets.site_cell(site), None);
     let Ok(Fetched::Block(old)) = machine.fetch_block(next, false) else {
         panic!("a block");
     };
@@ -4211,6 +4484,7 @@ fn a_tlbi_drops_the_cached_fetches_of_the_pages_it_reaches_alone() {
             physical: page,
             guarded: false,
             global: true,
+            size: 0x4000,
             el: 0,
             epoch,
         });
@@ -4588,6 +4862,111 @@ fn tlbi_invalidates_and_wfi_waits_for_the_virtual_timer() {
         .set(SystemRegister::CNTV_CTL_EL0, 0, 0);
     machine.derived_changed();
     assert_eq!(wait(&mut machine, 0xd503_207f), Err(Stop::Idle));
+}
+
+/// A machine at host count 5000 whose virtual timer has control `control`
+/// and compare value `compare`, with PSTATE.DAIF `daif`.
+pub(super) fn serving_timer(control: u64, compare: u64, daif: u8) -> Machine<FakeHost, NoDevices> {
+    let mut machine = machine_on(one_timer_bank(), &[]);
+    machine.host.now = 5000;
+    let registers = &mut machine.cpu.registers;
+    registers.set(SystemRegister::CNTV_CVAL_EL0, 0, compare);
+    registers.set(SystemRegister::CNTV_CTL_EL0, 0, control);
+    machine.cpu.pstate.daif = daif;
+    machine.derived_changed();
+    assert_eq!(machine.now(), 5000, "the count is the host's");
+    machine
+}
+
+/// What a service begun at host count 5000 sees: the count it marks for
+/// the shared count's hold, and the guest work its watch finds at host
+/// count `at`, with how long that waited.
+fn served_at(
+    machine: &mut Machine<FakeHost, NoDevices>,
+    at: u64,
+) -> (Option<u64>, Option<(parallel::Pending, Option<u64>)>) {
+    machine.serve_host(|machine| {
+        let now = machine.now();
+        let mark = machine.serving_mark(now);
+        let watch = machine.guest_watch();
+        machine.host.now = at;
+        (mark, watch.waited(at))
+    })
+}
+
+/// A timer that cannot fire is no guest work for a PE that serves: one
+/// disabled, one masked by its IMASK, and one whose FIQ the running PE
+/// masks at PSTATE neither end the service nor hold the shared count,
+/// however long ago their compare value passed (the boot's "Starting
+/// macOS" turns, whose timer had passed seconds before with FIQs masked).
+#[test]
+fn a_timer_that_cannot_fire_is_no_guest_work_for_a_serving_pe() {
+    use crate::machine::exception::{DAIF_F, DAIF_I};
+    for (control, daif, why) in [
+        (0, 0, "disabled"),
+        (timer::IMASK, 0, "disabled and masked"),
+        (timer::ENABLE | timer::IMASK, 0, "masked by IMASK"),
+        (timer::ENABLE, DAIF_F, "FIQ masked at the PE"),
+        (
+            timer::ENABLE,
+            DAIF_I | DAIF_F,
+            "IRQ and FIQ masked at the PE",
+        ),
+    ] {
+        let mut machine = serving_timer(control, 100, daif);
+        assert_eq!(served_at(&mut machine, 5100), (None, None), "{why}");
+    }
+    // With IRQs alone masked, the timer's FIQ is taken.
+    let mut machine = serving_timer(timer::ENABLE, 100, DAIF_I);
+    assert!(
+        served_at(&mut machine, 5100).1.is_some(),
+        "IRQ alone masked"
+    );
+}
+
+/// A PE that waits in WFI with its FIQ masked is still woken by its timer
+/// (Arm `AArch64_InterruptPending` ends WFI masked or not): that timer is
+/// guest work for it while it serves.
+#[test]
+fn a_waiting_pe_waits_for_its_timer_whatever_its_masks() {
+    use crate::machine::exception::{DAIF_F, DAIF_I};
+    let mut machine = serving_timer(timer::ENABLE, 6000, DAIF_I | DAIF_F);
+    machine.system_instruction(0xd503_207f).unwrap(); // wfi
+    assert!(machine.waiting.is_some(), "the timer is ahead");
+    assert_eq!(
+        served_at(&mut machine, 6500),
+        (Some(6000), Some((parallel::Pending::Timer, Some(500))))
+    );
+}
+
+/// A timer that can fire, due before the PE left its run loop (a stale
+/// deadline), waited for it only since it left: it ran guest code until
+/// then. One due during the service waits from its deadline.
+#[test]
+fn a_serving_pe_waits_for_its_timer_only_since_it_began_to_serve() {
+    // Due long before the service began at 5000.
+    let mut machine = serving_timer(timer::ENABLE, 100, 0);
+    assert_eq!(
+        served_at(&mut machine, 5070),
+        (Some(5000), Some((parallel::Pending::Timer, Some(70)))),
+        "the wait is the service's own, never the deadline's age"
+    );
+    // A real late timer: due at 6000, during the service.
+    let mut machine = serving_timer(timer::ENABLE, 6000, 0);
+    assert_eq!(served_at(&mut machine, 5999), (Some(6000), None));
+    let mut machine = serving_timer(timer::ENABLE, 6000, 0);
+    assert_eq!(
+        served_at(&mut machine, 7500),
+        (Some(6000), Some((parallel::Pending::Timer, Some(1500))))
+    );
+    // A nested service keeps the outer one's start.
+    let mut machine = serving_timer(timer::ENABLE, 100, 0);
+    let waited = machine.serve_host(|machine| {
+        machine.host.now = 5200;
+        served_at(machine, 5300).1
+    });
+    assert_eq!(waited, Some((parallel::Pending::Timer, Some(300))));
+    assert_eq!(machine.serving_since, None, "outside any service");
 }
 
 #[test]
@@ -6624,6 +7003,41 @@ fn implicit_pac_forms_repeat_their_results_until_the_keys_change() {
     assert_ne!(sign(&mut machine), signed);
 }
 
+/// Under step timing a block's install describes its code to the host
+/// (`Host::profile_code`): inline from its start, its direct exit apart,
+/// regions in ascending offsets within its code; without it nothing is
+/// described.
+#[test]
+fn block_installs_describe_their_code_under_step_timing() {
+    use step_timing::CodeRegion::{Exit, Inline};
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    for timing in [false, true] {
+        let mut machine = machine(&[ADD, ADD]);
+        machine.set_step_timing(timing);
+        let base = machine.cpu.pc;
+        machine.host.exits = vec![NativeExit::Exit {
+            next_pc: base + 8,
+            kind: ExitKind::Fallthrough as u64,
+        }];
+        machine.step().unwrap();
+        if !timing {
+            assert!(machine.host.described.is_empty());
+            continue;
+        }
+        let block = &machine.code.blocks[0];
+        let (code, bytes, regions) = &machine.host.described[0];
+        assert_eq!(*code, block.code.0);
+        assert_eq!(regions[0], (0, Inline));
+        assert!(regions.iter().any(|&(_, region)| region == Exit));
+        assert!(regions.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(
+            regions
+                .iter()
+                .all(|&(offset, _)| (offset as usize) < *bytes)
+        );
+    }
+}
+
 /// A system-mode block completes a PAC instruction that writes a register
 /// inside itself from the memo (`x86_64::pointer::inline`), with no PAC
 /// exit to redirect; a PAC exit opens the key's tag word under the current
@@ -6661,7 +7075,8 @@ fn pac_exits_complete_natively_from_the_memo_under_open_tags() {
         .unwrap()
         .unwrap();
     let ib = x86_64_pointer::key_index(PointerAuthenticationKey::Ib);
-    let open = x86_64_pointer::tag(machine.pointer.generation, ib, 0);
+    let generation = machine.pointer.key_generations[usize::from(ib)];
+    let open = x86_64_pointer::tag(generation, ib, 0);
     assert_eq!(machine.pointer.tags[usize::from(ib)], open);
     // A derived change that keeps the inputs, enable and trap reopens
     // the tag; clearing the key's enable makes it DISABLED.
@@ -6822,6 +7237,7 @@ fn what_follows_a_pac_exit_keeps_its_thunk() {
             GuestAddress(last),
             TAGS,
             SERVICE as usize as u64,
+            pointer::native_cipher(machine.target),
         );
         assert!(machine.host.installed.contains(&thunk.code), "{words:x?}");
     }
@@ -6842,6 +7258,7 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         GuestAddress(base),
         TAGS,
         SERVICE as usize as u64,
+        pointer::native_cipher(machine.target),
     );
     let at = machine
         .host
@@ -6852,14 +7269,15 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         + 1;
     let at = at * NATIVE_CODE_STRIDE;
     let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
-    // The probes, then the RET's own tail, which calls the table probe.
+    // The probes, then the RET's own tail, which takes its call's paired
+    // frame with the authenticated target or calls the table probe.
     let installed = machine.host.installed.len();
     let dispatcher = chain::lookup_dispatcher(0).unwrap();
     assert_eq!(machine.host.installed[installed - 2], dispatcher);
     let probes = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let tail = (installed * NATIVE_CODE_STRIDE) as u64;
     let probe = probes + chain::PROBE_ENTRY as u64;
-    let code = chain::lookup_tail(tail, ExitKind::Return, 1, probe, 0).unwrap();
+    let code = chain::paired_tail(tail, ExitKind::Return, 1, probe).unwrap();
     let exit = chain::jump(site, tail).unwrap();
     let patches = machine.host.patches.len();
     assert_eq!(
@@ -6879,21 +7297,36 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     assert!(!machine.code.blocks.record(0).dynamic_open());
 }
 
-/// The first branch through a BRAA X16, X17's PAC thunk gives its exit a
-/// tail of its own that predicts the authenticated target: its direct exit
-/// to it is linked through a cell, with the probes of the branch's BTYPE,
-/// before the exit jumps to the tail; any other target takes the table
-/// probe, as a lookup tail sends it.
+/// The first branch through a BRAA X16, X17's PAC thunk to a target this
+/// PE translates gives its exit a tail of its own that predicts the
+/// authenticated target: its direct exit to it is linked through a cell,
+/// which starts with the target's entry, with the probes of the branch's
+/// BTYPE, before the exit jumps to the tail; any other target takes the
+/// table probe, as a lookup tail sends it. A branch before the target's
+/// first fetch leaves the exit open.
 #[test]
 fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
-    let mut machine = machine(&[BRAA]);
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![0; 0x802];
+    words[0] = BRAA;
+    words[0x800] = RET;
+    let mut machine = machine(&words);
     let base = machine.cpu.pc;
     let target = base + 0x2000;
-    machine.host.exits = vec![NativeExit::Exit {
-        next_pc: target,
-        kind: ExitKind::Indirect as u64,
-    }];
+    let exit = |next_pc, kind: ExitKind| NativeExit::Exit {
+        next_pc,
+        kind: kind as u64,
+    };
+    machine.host.exits = vec![
+        exit(target, ExitKind::Indirect),
+        exit(base, ExitKind::Return),
+        exit(target, ExitKind::Indirect),
+    ];
+    machine.step().unwrap();
+    assert!(machine.code.blocks.record(0).dynamic_open());
+    assert_eq!(machine.statistics.predicted_tails, 0);
+    machine.step().unwrap();
     machine.step().unwrap();
     let thunk = x86_64_pointer::thunk(
         x86_64_pointer::Form::of(block::PointerAuthenticationOperation::Branch {
@@ -6906,6 +7339,7 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
         GuestAddress(base),
         TAGS,
         SERVICE as usize as u64,
+        pointer::native_cipher(machine.target),
     );
     let at = machine
         .host
@@ -6958,13 +7392,15 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
         linked[3],
         (site as usize, chain::jump(site, tail).unwrap().to_vec())
     );
+    assert_eq!(cell.key, target_key(&machine, target));
+    // The target's RET took a lookup too.
     assert_eq!(
         (
             machine.statistics.lookups,
             machine.statistics.predicted_tails,
             machine.statistics.links
         ),
-        (1, 1, 1)
+        (2, 1, 1)
     );
     assert!(!machine.code.blocks.record(0).dynamic_open());
 }
@@ -6990,9 +7426,14 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
             next_pc,
             kind: kind as u64,
         };
-        machine.host.exits = vec![exit(far, ExitKind::Indirect), exit(base, ExitKind::Return)];
-        machine.step().unwrap();
-        machine.step().unwrap();
+        machine.host.exits = vec![
+            exit(far, ExitKind::Indirect),
+            exit(base, ExitKind::Return),
+            exit(far, ExitKind::Indirect),
+        ];
+        for _ in 0..3 {
+            machine.step().unwrap();
+        }
         assert_eq!(machine.statistics.predicted_tails, 1);
         let target_key = machine.current_key(far).expect("a translated page");
         let tail = machine
@@ -7003,7 +7444,7 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
             .expect("the predicted tail")
             .0 as u64;
         let site = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
-        let (number, cells, held) = {
+        let (address, held) = {
             let mut cache = machine.code.cache();
             assert_eq!(cache.targets.site_cell(site).map(|cell| cell.pc), Some(far));
             let number = cache.targets.site_cell_number(site).expect("a cell");
@@ -7016,15 +7457,19 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
                 held.targets = 0b0101;
                 cache.targets.set(slot, held);
             }
-            (number, cache.targets.stamped_cells(), held)
+            (cache.targets.cell_address(number), held)
         };
-        let heat = (cells as usize + chain::CELL_HEAT + 4 * number as usize)
-            as *const core::sync::atomic::AtomicU32;
-        // SAFETY: the board's stamped cells live while it does; the word is an atomic.
-        unsafe { &*heat }.store(chain::HOT_CELL, Ordering::Relaxed);
         let patches = machine.host.patches.len();
-        for _ in 0..chain::STAMPED_CELLS / 256 {
-            machine.promote_hot_exits();
+        for _ in 0..scheduler::HOT_SAMPLES {
+            machine.cell_samples.push(address);
+        }
+        machine.promote_hot_exits();
+        if !accepts {
+            // Its cell tail stays: no stamped tail could enter the block,
+            // and a relink would only install the same tail again.
+            assert_eq!(machine.host.patches.len(), patches);
+            assert_eq!(machine.statistics.stamped_tails, 0);
+            continue;
         }
         assert_eq!(machine.host.patches.len(), patches + 2);
         let (tail, bytes) = machine.host.patches[patches].clone();
@@ -7035,18 +7480,13 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
                 chain::jump(site, tail as u64).unwrap().to_vec()
             )
         );
-        if accepts {
-            assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
-            assert_eq!(machine.statistics.stamped_tails, 1);
-            // mov r9, block | BTYPE 0b01 above it.
-            let named = u64::from(held.block) | 1 << chain::BLOCK_BTYPE_SHIFT;
-            let mut movabs = vec![0x49, 0xb9];
-            movabs.extend(named.to_le_bytes());
-            assert!(bytes.windows(10).any(|window| window == movabs));
-        } else {
-            assert_eq!(bytes.len(), chain::CELL_TAIL_BYTES);
-            assert_eq!(machine.statistics.stamped_tails, 0);
-        }
+        assert_eq!(bytes.len(), chain::STAMPED_TAIL_BYTES);
+        assert_eq!(machine.statistics.stamped_tails, 1);
+        // mov r9, block | BTYPE 0b01 above it.
+        let named = u64::from(held.block) | 1 << chain::BLOCK_BTYPE_SHIFT;
+        let mut movabs = vec![0x49, 0xb9];
+        movabs.extend(named.to_le_bytes());
+        assert!(bytes.windows(10).any(|window| window == movabs));
     }
 }
 
@@ -7648,6 +8088,7 @@ fn keys_native_code_wrote_reopen_together_at_the_next_pac_exit() {
     };
     let before = sign(&mut machine);
     let generation = machine.pointer.generation;
+    let generations = machine.pointer.key_generations;
     // What the thunk leaves: the new half, and every key closed.
     if !machine.cpu.write_el2_pointer_key(key, 0x1234) {
         machine.cpu.registers.set(key, 0, 0x1234);
@@ -7658,7 +8099,11 @@ fn keys_native_code_wrote_reopen_together_at_the_next_pac_exit() {
     assert_ne!(machine.pointer.generation, generation);
     let ia = x86_64_pointer::key_index(PointerAuthenticationKey::Ia);
     let ib = x86_64_pointer::key_index(PointerAuthenticationKey::Ib);
-    let open = |key| x86_64_pointer::tag(machine.pointer.generation, key, 0);
+    // Only the written key's results change; IA keeps its generation.
+    let keys = machine.pointer.key_generations;
+    assert_eq!(keys[usize::from(ia)], generations[usize::from(ia)]);
+    assert_ne!(keys[usize::from(ib)], generations[usize::from(ib)]);
+    let open = |key: u8| x86_64_pointer::tag(keys[usize::from(key)], key, 0);
     assert_eq!(machine.pointer.tags[usize::from(ia)], open(ia));
     assert_eq!(machine.pointer.tags[usize::from(ib)], open(ib));
 }

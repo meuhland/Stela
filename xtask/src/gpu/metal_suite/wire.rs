@@ -172,6 +172,8 @@ const OPERATIONS: &[(&str, Reach)] = &[
         Reach::Call("sampleCountersInBuffer:"),
     ),
     ("CommandBufferCode::LogBuffer", Reach::Call("logState")),
+    // Each commit of a command buffer that uses an IOSurface texture.
+    ("CommandBufferCode::SurfaceUse", Reach::Call("iosurface:")),
     ("ComputeCode::Begin", Reach::Call("computeCommandEncoder")),
     (
         "ComputeCode::SetPipeline",

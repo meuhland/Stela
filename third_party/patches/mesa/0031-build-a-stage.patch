@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:20:53 +0000
+Subject: [PATCH] radv: build a stage given as NIR in
+ VkPipelineShaderStageNirCreateInfoMESA, as the common runtime's pipelines do
+
+---
+ src/amd/vulkan/radv_pipeline.c | 10 +++++++++-
+ src/amd/vulkan/radv_shader.c   |  9 ++++++---
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index c73afe08e149f4fbdbce774fbe8afdfd24db54b1..1843bf52eae7db8f54f8d83f379938cc6a60e0b0 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -190,8 +190,10 @@ radv_pipeline_stage_init(VkPipelineCreateFlags2 pipeline_flags, const VkPipeline
+    const VkShaderModuleCreateInfo *minfo = vk_find_struct_const(sinfo->pNext, SHADER_MODULE_CREATE_INFO);
+    const VkPipelineShaderStageModuleIdentifierCreateInfoEXT *iinfo =
+       vk_find_struct_const(sinfo->pNext, PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT);
++   const VkPipelineShaderStageNirCreateInfoMESA *ninfo =
++      vk_find_struct_const(sinfo->pNext, PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA);
+ 
+-   if (sinfo->module == VK_NULL_HANDLE && !minfo && !iinfo)
++   if (sinfo->module == VK_NULL_HANDLE && !minfo && !iinfo && !ninfo)
+       return;
+ 
+    memset(out_stage, 0, sizeof(*out_stage));
+@@ -215,6 +217,12 @@ radv_pipeline_stage_init(VkPipelineCreateFlags2 pipeline_flags, const VkPipeline
+    } else if (minfo) {
+       out_stage->spirv.data = (const char *)minfo->pCode;
+       out_stage->spirv.size = minfo->codeSize;
++   } else if (ninfo) {
++      /* A stage given as NIR without a module, as the common runtime's
++       * vk_pipeline_shader_stage_to_nir takes it: compiled like a module's
++       * NIR, from a clone.
++       */
++      out_stage->internal_nir = ninfo->nir;
+    }
+ 
+    const VkShaderDescriptorSetAndBindingMappingInfoEXT *mapping =
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 312b7c092b2e1788a49e6feea87142adae7e5a1d..7a9109383e39c4e42ab686491a9d6f0b5a26f905 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -479,13 +479,16 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+    bool progress;
+ 
+    if (stage->internal_nir) {
+-      stage->internal_nir->options = &compiler_info->nir_options[stage->internal_nir->info.stage];
+-
+       /* Some things such as our meta clear/blit code will give us a NIR
+        * shader directly.  In that case, we just ignore the SPIR-V entirely
+        * and just use the NIR shader.  We don't want to alter meta and RT
+-       * shaders IR directly, so clone it first. */
++       * shaders IR directly, so clone it first. The device's options go on
++       * the clone, as the common runtime's vk_pipeline_shader_stage_to_nir
++       * does: a shader given in VkPipelineShaderStageNirCreateInfoMESA
++       * belongs to the caller and may outlive this device.
++       */
+       nir = nir_shader_clone(NULL, stage->internal_nir);
++      nir->options = &compiler_info->nir_options[nir->info.stage];
+       nir_validate_shader(nir, "in internal shader");
+ 
+       assert(exec_list_length(&nir->functions) == 1);

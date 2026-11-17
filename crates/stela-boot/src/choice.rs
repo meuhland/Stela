@@ -8,9 +8,10 @@
 //! highlight, Enter starts the highlighted entry, and an entry's key (`1`-`9`,
 //! then `a`-`z`) starts it at once; a firmware entry restarts the PC into it.
 //! When the first entry, the one `stela.cfg` holds, is the only Mac that
-//! can start now, it starts at once unless a key is held or pressed within
-//! [`GLANCE`], as a Mac shows its startup options only when asked
-//! (`mount_interface::opening`). When there is a choice to make, a
+//! can start now and the PC has no other system on its disks, it starts at
+//! once unless a key is held or pressed within [`GLANCE`], as a Mac shows
+//! its startup options only when asked (`mount_interface::opening`). When
+//! there is a choice to make, such as Windows or Linux beside the Mac, a
 //! countdown from the file's timeout starts the first entry; any key stops
 //! it. A timeout of 0 opens the menu only when a key is already pressed.
 //! A file that cannot be read or parsed is reported and
@@ -27,6 +28,7 @@ use crate::{
 };
 use alloc::{format, string::String, vec::Vec};
 use core::time::Duration;
+use stela_boot_core::chosen_disk::{Adopted, adopt};
 use stela_contracts::refuse;
 use stela_loader::mount_interface::{
     CHOICES_FILE, CHOSEN_DISK, ChoiceKind, Choices, DISK_FILE, Opening, opening, with_disk,
@@ -160,13 +162,93 @@ pub fn chosen_disk(volume: &mut FileSystem) -> Option<String> {
     }
 }
 
+/// The partition the macOS choices start from, and whether it was found on
+/// this PC's disks and not read from the record: the recorded one while
+/// macOS starts from it, else the one of Stela's macOS partitions on the
+/// PC's disks that macOS starts from (`chosen_disk::adopt`). A USB made new
+/// on a PC that already holds macOS then offers that macOS, where it
+/// offered only Install macOS, which erases it.
+fn startup_disk(
+    volume: &mut FileSystem,
+    choices: &Choices,
+    pending: &Pending,
+) -> (Option<String>, bool) {
+    let recorded = chosen_disk(volume);
+    let mut pending = pending.clone();
+    pending.replace_plan(None);
+    let starts = |disk: Option<&str>| {
+        choices.entries.iter().any(|entry| {
+            entry.kind() == ChoiceKind::Mac
+                && with_disk(&entry.options, disk).is_some_and(|options| {
+                    selection::ready(&options, ChoiceKind::Mac, &pending) == Readiness::Ready
+                })
+        })
+    };
+    // Only choices that take the chosen disk can take another.
+    let takes = choices
+        .entries
+        .iter()
+        .any(|entry| entry.kind() == ChoiceKind::Mac && unchosen(entry.options.as_bytes()));
+    // A record is kept whatever it starts: a disk taken out for now or an
+    // install not finished yet is still the one this USB was set up for, and
+    // Install macOS's picker is where another is chosen.
+    if !takes || recorded.is_some() {
+        return (recorded, false);
+    }
+    let found = crate::installer::installed();
+    let ready: Vec<bool> = found.iter().map(|disk| starts(Some(disk))).collect();
+    match adopt(false, &ready) {
+        Adopted::One(index) => {
+            output::arguments(format_args!(
+                "CHOSEN DISK found: the USB holds no record and one partition on this PC \
+                 starts macOS; the macOS choice starts from it\n"
+            ));
+            (found.get(index).cloned(), true)
+        }
+        Adopted::Several(count) => {
+            output::arguments(format_args!(
+                "CHOSEN DISK not found: {count} partitions on this PC start macOS and the \
+                 USB holds no record of one\n"
+            ));
+            (recorded, false)
+        }
+        Adopted::None | Adopted::Recorded => (recorded, false),
+    }
+}
+
+/// The disk a choice of `kind` takes ([`chosen_disk::disk_for`]).
+fn disk_for(kind: ChoiceKind, disk: Option<&str>, found: bool) -> Option<&str> {
+    stela_boot_core::chosen_disk::disk_for(kind == ChoiceKind::Mac, disk, found)
+}
+
+/// Record `disk` as the partition macOS starts from, once a macOS choice
+/// found on the PC's disks is taken.
+fn record(volume: &mut FileSystem, disk: &str) {
+    let written = CString16::try_from(DISK_FILE)
+        .map(PathBuf::from)
+        .ok()
+        .is_some_and(|path| volume.write(&path, format!("{disk}\n")).is_ok());
+    match written {
+        true => output::arguments(format_args!("CHOSEN DISK {disk}\n")),
+        false => output::arguments(format_args!(
+            "CHOSEN DISK not recorded: the USB could not be written\n"
+        )),
+    }
+}
+
 /// `options` with the chosen disk in place of [`CHOSEN_DISK`], or as they
 /// are while none is chosen, which the default boot then holds for.
-pub fn resolve(volume: &mut FileSystem, options: Vec<u8>) -> Vec<u8> {
+pub fn resolve(volume: &mut FileSystem, options: Vec<u8>, pending: &Pending) -> Vec<u8> {
     let Ok(text) = core::str::from_utf8(&options) else {
         return options;
     };
-    match with_disk(text, chosen_disk(volume).as_deref()) {
+    // The disk the startup choices take ([`startup_disk`]), so that the
+    // default boot is checked on the macOS this PC holds.
+    let disk = match read(volume) {
+        Some(choices) => startup_disk(volume, &choices, pending).0,
+        None => chosen_disk(volume),
+    };
+    match with_disk(text, disk.as_deref()) {
         Some(resolved) => resolved.into_bytes(),
         None => options,
     }
@@ -199,8 +281,11 @@ enum Item {
 /// The menu.
 struct Menu<'a> {
     choices: &'a Choices,
-    /// The partition Install macOS chose, when it chose one.
+    /// The partition Install macOS chose, when it chose one, or the one
+    /// found on this PC's disks ([`startup_disk`]).
     disk: Option<String>,
+    /// The partition was found, and the record does not name it yet.
+    found: bool,
     items: Vec<Item>,
     selected: usize,
     /// Seconds before the first entry starts, while the countdown runs.
@@ -221,7 +306,7 @@ impl<'a> Menu<'a> {
     fn new(
         choices: &'a Choices,
         held: Option<&'a str>,
-        disk: Option<String>,
+        (disk, found): (Option<String>, bool),
         pending: &Pending,
     ) -> Self {
         let mut pending = pending.clone();
@@ -231,7 +316,12 @@ impl<'a> Menu<'a> {
         let resolved: Vec<Option<String>> = choices
             .entries
             .iter()
-            .map(|entry| with_disk(&entry.options, disk.as_deref()))
+            .map(|entry| {
+                with_disk(
+                    &entry.options,
+                    disk_for(entry.kind(), disk.as_deref(), found),
+                )
+            })
             .collect();
         let readiness: Vec<Readiness> = choices
             .entries
@@ -307,13 +397,25 @@ impl<'a> Menu<'a> {
                 matches!(item, Item::Choice(n, ChoiceKind::Mac) if readiness[*n] == Readiness::Ready)
             })
             .count();
+        // The PC's other systems, such as Windows or Linux, which the
+        // menu offers beside the Mac.
+        let other_systems = items
+            .iter()
+            .filter(|item| matches!(item, Item::Firmware(entry) if entry.on_disk))
+            .count();
         let opens = match held {
             Some(_) => Opening::Wait,
-            None => opening(choices.timeout_seconds, first_mac, ready_macs),
+            None => opening(
+                choices.timeout_seconds,
+                first_mac,
+                ready_macs,
+                other_systems,
+            ),
         };
         Self {
             choices,
             disk,
+            found,
             countdown: match opens {
                 Opening::Countdown(seconds) => Some(seconds),
                 Opening::Glance | Opening::Wait => None,
@@ -466,8 +568,12 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
             {
                 *n
             }
-            Item::Choice(n, _) => {
-                return Some(chosen(choices, *n, menu.disk.as_deref()).into());
+            Item::Choice(n, kind) => {
+                if let (true, ChoiceKind::Mac, Some(disk)) = (menu.found, kind, &menu.disk) {
+                    record(volume, disk);
+                }
+                let disk = disk_for(*kind, menu.disk.as_deref(), menu.found);
+                return Some(chosen(choices, *n, disk).into());
             }
             Item::Firmware(entry) => {
                 output::arguments(format_args!("CHOICE firmware entry ({})\n", entry.name));
@@ -511,16 +617,30 @@ pub fn choose(
     let Some(choices) = read(volume) else {
         return options.into();
     };
+    let (disk, found) = startup_disk(volume, &choices, pending);
+    // The first choice as it starts with no menu, recording a found disk
+    // when it is a macOS choice.
+    let first = |volume: &mut FileSystem, n: usize| {
+        let kind = choices.entries.get(n).map(|entry| entry.kind());
+        if let (true, Some(ChoiceKind::Mac), Some(disk)) = (found, kind, &disk) {
+            record(volume, disk);
+        }
+        let disk = match kind {
+            Some(kind) => disk_for(kind, disk.as_deref(), found),
+            None => disk.as_deref(),
+        };
+        chosen(&choices, n, disk)
+    };
     // Only a key pressed before the menu opens asks for it.
     if choices.timeout_seconds == 0 && pressed().is_none() {
-        return chosen(&choices, 0, chosen_disk(volume).as_deref()).into();
+        return first(volume, 0).into();
     }
-    let opened = Menu::new(&choices, None, chosen_disk(volume), pending);
+    let opened = Menu::new(&choices, None, (disk.clone(), found), pending);
     if opened.glance
         && !asked()
         && let Some(Item::Choice(n, _)) = opened.items.first()
     {
-        return chosen(&choices, *n, opened.disk.as_deref()).into();
+        return first(volume, *n).into();
     }
     menu(volume, &choices, opened)
         .unwrap_or_else(|| chosen(&choices, 0, chosen_disk(volume).as_deref()).into())
@@ -534,6 +654,7 @@ pub fn choose(
 pub fn hold(volume: &mut FileSystem, reason: &str, pending: &Pending) -> Option<Chosen> {
     let choices = read(volume)?;
     output::arguments(format_args!("HOLD {reason}\n"));
-    let held = Menu::new(&choices, Some(reason), chosen_disk(volume), pending);
+    let disk = startup_disk(volume, &choices, pending);
+    let held = Menu::new(&choices, Some(reason), disk, pending);
     menu(volume, &choices, held)
 }

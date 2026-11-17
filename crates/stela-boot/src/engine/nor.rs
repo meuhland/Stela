@@ -14,8 +14,7 @@
 //! layout in that partition's last bytes ([`machine_state`]) and gives the
 //! ANS2 model only the rest, so the guest never sees the machine state.
 use crate::output;
-use alloc::{boxed::Box, collections::BTreeMap, format, vec::Vec};
-use stela_contracts::refuse;
+use alloc::{boxed::Box, format, vec::Vec};
 use stela_drivers::block::{BlockDevice, BlockError, Shared, Submission};
 use {
     stela_formats::boot_bundle::Nvram, stela_runtime::pc::board_flash, stela_runtime::pc::boot_log,
@@ -31,8 +30,9 @@ use {
 pub fn split(partition: Box<dyn BlockDevice>) -> (Box<dyn BlockDevice>, Box<dyn BlockDevice>) {
     let (namespace, state, layout) =
         machine_state::split_device(partition).unwrap_or_else(|error| {
-            output::arguments(format_args!("MACHINE STATE refusal: {error}\n"));
-            output::fatal("the --storage partition cannot also hold the machine state")
+            output::fatal(format_args!(
+                "the --storage partition cannot also hold the machine state: {error}"
+            ))
         });
     output::arguments(format_args!(
         "MACHINE STATE in the target's last {:#x} bytes (from {:#x}); the ANS2 namespace holds \
@@ -42,14 +42,40 @@ pub fn split(partition: Box<dyn BlockDevice>) -> (Box<dyn BlockDevice>, Box<dyn 
     (Box::new(namespace), Box::new(state))
 }
 
+/// The ECID the machine state on `device` names as its machine's
+/// ([`sep_state::recorded_ecid`]), read without changing anything: `device`
+/// is the machine-state partition, or with `in_storage` the Apple region
+/// that keeps it in its tail. None when it names none or cannot be read.
+pub fn recorded_ecid(device: &mut dyn BlockDevice, in_storage: bool) -> Option<u64> {
+    let block = u64::from(device.identity().block_size);
+    let state = match in_storage {
+        true => machine_state::split(device.identity().bytes())
+            .ok()?
+            .state_offset(),
+        false => 0,
+    };
+    let (roots, bytes) = sep_state::roots_area(CAPACITY as u64);
+    let at = state.checked_add(roots)?;
+    if block == 0 || !at.is_multiple_of(block) || !(bytes as u64).is_multiple_of(block) {
+        return None;
+    }
+    let mut area = alloc::vec![0; bytes];
+    device.read(at / block, &mut area).ok()?;
+    sep_state::recorded_ecid(&area)
+}
+
+/// The longest the stop waits for the NOR's stores, and then for the RTC
+/// anchor's: a disk that never completes a command must not keep the PC at
+/// the stop.
+const NOR_STOP_MILLIS: u64 = 5000;
+const ANCHOR_STOP_MILLIS: u64 = 2000;
+
 pub struct HostNor {
     device: Box<dyn BlockDevice>,
-    /// Changed sectors by offset, waiting for the store in progress; a
-    /// newer copy of a sector replaces the waiting one.
-    waiting: BTreeMap<usize, Vec<u8>>,
-    /// The store in progress: its sectors' writes run together, and they
-    /// are durable before the next store begins.
-    running: Option<Submission>,
+    /// Changed sectors waiting for the store in progress, and that store:
+    /// its sectors' writes run together, never both NVRAM banks', and they
+    /// are durable before the next store begins ([`persist::Stores`]).
+    stores: persist::Stores,
     /// The PMU upcount's anchor, when the partition holds its region.
     anchor: Option<AnchorStore>,
 }
@@ -115,21 +141,36 @@ impl AnchorStore {
     }
 
     /// Start the waiting anchor's store once the one in progress is done,
-    /// the caller waiting for both when `wait`. A failed store is reported
-    /// and ends the anchor's stores for this run: the next boot goes on
-    /// from the last stored anchor, which with a wall time loses nothing.
-    fn advance(slot: &mut Option<Self>, wait: bool) {
+    /// the caller waiting for both for at most `wait` counter ticks. A
+    /// failed store is reported and ends the anchor's stores for this run:
+    /// the next boot goes on from the last stored anchor, which with a wall
+    /// time loses nothing. So does a wait past its limit, reported once.
+    fn advance(slot: &mut Option<Self>, wait: Option<u64>) {
         let Some(store) = slot.as_mut() else {
             return;
         };
+        let started = super::host::fresh_counter();
         loop {
             if let Some(running) = store.running.as_mut() {
                 match running.poll(&mut *store.device) {
-                    None if wait => {
-                        core::hint::spin_loop();
-                        continue;
-                    }
-                    None => return,
+                    None => match wait {
+                        Some(limit)
+                            if super::host::fresh_counter().wrapping_sub(started) < limit =>
+                        {
+                            core::hint::spin_loop();
+                            continue;
+                        }
+                        Some(limit) => {
+                            output::arguments(format_args!(
+                                "RTC ANCHOR refusal: store at stop timed out after {} ms; the \
+                                 next boot goes on from the last stored anchor\n",
+                                limit / (super::host::COUNTER_HZ / 1000)
+                            ));
+                            *slot = None;
+                            return;
+                        }
+                        None => return,
+                    },
                     Some(Err(error)) => {
                         output::arguments(format_args!(
                             "RTC ANCHOR refusal: store: {error}; no more anchors this run\n"
@@ -182,8 +223,9 @@ impl HostNor {
                 .expect("the partition holds the NOR image"),
         );
         let (image, fresh) = persist::load(&mut *device).unwrap_or_else(|error| {
-            output::arguments(format_args!("NOR refusal: {error}\n"));
-            output::fatal("the NOR partition could not be loaded")
+            output::fatal(format_args!(
+                "the NOR partition could not be loaded: {error}"
+            ))
         });
         let (bank, proxy) = image
             .boot_bank()
@@ -200,8 +242,7 @@ impl HostNor {
         (
             Self {
                 device,
-                waiting: BTreeMap::new(),
-                running: None,
+                stores: persist::Stores::new(),
                 anchor,
             },
             image,
@@ -222,15 +263,45 @@ impl HostNor {
     /// progress is durable. A failed store stops the machine: NVRAM the
     /// guest believes committed must not be lost silently.
     pub fn store(&mut self, dirty: Vec<(usize, Vec<u8>)>) {
-        self.waiting.extend(dirty);
-        self.advance(false);
-        AnchorStore::advance(&mut self.anchor, false);
+        self.stores.add(dirty);
+        self.advance();
+        AnchorStore::advance(&mut self.anchor, None);
     }
 
-    /// Complete every store, the caller waiting: at the stop.
-    pub fn finish(&mut self) {
-        self.advance(true);
-        AnchorStore::advance(&mut self.anchor, true);
+    /// Complete every store, the caller waiting at most [`NOR_STOP_MILLIS`]
+    /// and [`ANCHOR_STOP_MILLIS`]: at the stop, and for a record that must
+    /// be durable before the guest starts. A disk that never completes is
+    /// reported once and the caller goes on; the sectors it did not store
+    /// are lost, as the line says. `Ok` once every NOR store is durable,
+    /// else why not, for a caller whose record must not be lost
+    /// (`bundle_repair::stored`).
+    pub fn finish(&mut self) -> Result<(), alloc::string::String> {
+        let limit = super::host::COUNTER_HZ / 1000 * NOR_STOP_MILLIS;
+        let finished = match self.stores.finish(
+            &mut *self.device,
+            super::host::fresh_counter,
+            limit,
+            core::hint::spin_loop,
+        ) {
+            Ok(persist::Finish::Done) => Ok(()),
+            Ok(persist::Finish::TimedOut { waited, sectors }) => {
+                let waited = waited / (super::host::COUNTER_HZ / 1000);
+                output::arguments(format_args!(
+                    "NOR refusal: store at stop timed out after {waited} ms; {sectors} sectors not stored\n",
+                ));
+                Err(format!(
+                    "the disk did not complete the store within {waited} ms"
+                ))
+            }
+            Err(error) => {
+                output::fatal(format_args!("a NOR sector could not be stored: {error}"));
+            }
+        };
+        AnchorStore::advance(
+            &mut self.anchor,
+            Some(super::host::COUNTER_HZ / 1000 * ANCHOR_STOP_MILLIS),
+        );
+        finished
     }
 
     /// The PMU upcount's anchor this boot starts from: `None` on a new
@@ -245,46 +316,13 @@ impl HostNor {
         if let Some(store) = self.anchor.as_mut() {
             store.waiting = Some(anchor);
         }
-        AnchorStore::advance(&mut self.anchor, false);
+        AnchorStore::advance(&mut self.anchor, None);
     }
 
-    fn advance(&mut self, wait: bool) {
-        loop {
-            if let Some(running) = self.running.as_mut() {
-                match running.poll(&mut *self.device) {
-                    None if wait => {
-                        core::hint::spin_loop();
-                        continue;
-                    }
-                    None => return,
-                    Some(Err(error)) => {
-                        output::arguments(format_args!(
-                            "NOR refusal: NOR partition store: {error}\n"
-                        ));
-                        output::fatal("a NOR sector could not be stored");
-                    }
-                    Some(Ok(_)) => self.running = None,
-                }
-            }
-            if self.waiting.is_empty() {
-                return;
-            }
-            let identity = self.device.identity();
-            let store = core::mem::take(&mut self.waiting)
-                .into_iter()
-                .map(|(offset, sector)| persist::request(identity, offset, sector))
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|requests| {
-                    Submission::batch(requests, identity)
-                        .map_err(|error| refuse!("NOR persistence batch: {error}", %error))
-                });
-            match store {
-                Ok(store) => self.running = Some(store),
-                Err(error) => {
-                    output::arguments(format_args!("NOR refusal: {error}\n"));
-                    output::fatal("a NOR sector could not be stored");
-                }
-            }
+    /// Move the stores on without waiting.
+    fn advance(&mut self) {
+        if let Err(error) = self.stores.advance(&mut *self.device) {
+            output::fatal(format_args!("a NOR sector could not be stored: {error}"));
         }
     }
 }

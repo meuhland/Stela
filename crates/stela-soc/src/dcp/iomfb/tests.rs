@@ -1,4 +1,4 @@
-use super::super::super::scanout::{Mode, PixelFormat};
+use super::super::super::scanout::{Mode, MonitorId, PixelFormat};
 use super::super::swap::tests::{fenced_submission, submission};
 use super::*;
 use crate::Result;
@@ -66,18 +66,31 @@ fn started(methods: &mut Methods) {
 }
 
 /// Make every queued callback, answering each with `answer`; returns
-/// their tags and inputs.
+/// their tags and inputs in the order they left. At most a vsync and one
+/// other callback are out at once.
 fn drain(methods: &mut Methods, answer: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
     let mut made = Vec::new();
-    while let Some(callback) = methods.take_callback() {
-        assert!(methods.take_callback().is_none(), "one callback at a time");
-        made.push((callback.tag, callback.input.clone()));
-        let mut output = alloc::vec![0u8; callback.output as usize];
-        let n = output.len().min(answer.len());
-        output[..n].copy_from_slice(&answer[..n]);
-        (callback.then)(methods, &output).unwrap();
+    loop {
+        let mut out = Vec::new();
+        while let Some(callback) = methods.take_callback() {
+            out.push(callback);
+        }
+        if out.is_empty() {
+            return made;
+        }
+        let vsyncs = out.iter().filter(|c| c.tag == SWAP_NOTIFY).count();
+        assert!(
+            vsyncs <= 1 && out.len() - vsyncs <= 1,
+            "one callback of each kind at a time"
+        );
+        for callback in out {
+            made.push((callback.tag, callback.input.clone()));
+            let mut output = alloc::vec![0u8; callback.output as usize];
+            let n = output.len().min(answer.len());
+            output[..n].copy_from_slice(&answer[..n]);
+            (callback.then)(methods, &output).unwrap();
+        }
     }
-    made
 }
 
 #[test]
@@ -182,10 +195,10 @@ fn the_boot_framebuffer_is_inherited_not_recreated() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        answer(row(b"A475"), &[], 4, FULL_HD).unwrap().unwrap(),
-        1u32.to_le_bytes()
-    );
+    // setDisplayRefreshProperties publishes, so the display answers it.
+    assert!(answer(row(b"A475"), &[], 4, FULL_HD).unwrap().is_none());
+    let mut methods = methods();
+    assert_eq!(returned(methods.call(*b"A475", &[], 4)), [1, 0, 0, 0]);
 }
 
 #[test]
@@ -573,6 +586,10 @@ fn start_publishes_the_mode_then_reports_the_monitor_plugged() {
                 if key == b"DisplayAttributes" {
                     assert!(text.contains("<key>ProductName</key><string>Stela</string>"));
                 }
+                // The identity is the advertised monitor's, as presented.
+                if key == b"IOMFBUUID" {
+                    assert_eq!(text, Advertised::new(FULL_HD).unwrap().uuid());
+                }
             }
             &HOTPLUG => {
                 assert_eq!(input.len(), 0x58);
@@ -594,6 +611,66 @@ fn start_publishes_the_mode_then_reports_the_monitor_plugged() {
         ]
     );
     assert!(!methods.callback_pending());
+    // The boot log names what macOS was given and the identity it keeps the
+    // display's settings under.
+    let advertised = Advertised::new(FULL_HD).unwrap();
+    let published = core::iter::from_fn(|| methods.take_log())
+        .find(|entry| matches!(entry, Log::Published { .. }))
+        .unwrap();
+    assert_eq!(
+        published.to_string(),
+        format!(
+            "DCP display published at 1920x1080, image 54x30 cm, as display {} \
+             (identity from the size: no monitor EDID)",
+            advertised.display_uuid()
+        )
+    );
+}
+
+#[test]
+fn each_scanouts_monitor_names_its_own_published_display() {
+    struct Known(Option<MonitorId>);
+    impl Scanout for Known {
+        fn mode(&self) -> Mode {
+            FULL_HD
+        }
+        fn monitor(&self) -> Option<MonitorId> {
+            self.0
+        }
+        fn present(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+    let monitor = |serial: u32| {
+        let mut edid = modes::edid(FULL_HD, 60_000).unwrap();
+        edid[12..16].copy_from_slice(&serial.to_le_bytes());
+        MonitorId::from_edid(&edid)
+    };
+    let mut seen = Vec::new();
+    for known in [monitor(5), monitor(6), None] {
+        let mut methods = Methods::new(Box::new(Known(known)), interface());
+        started(&mut methods);
+        let made = drain(&mut methods, &[1, 0, 0, 0]);
+        let uuid = published(&made)
+            .into_iter()
+            .find(|(key, _)| key == "IOMFBUUID")
+            .unwrap()
+            .1;
+        let expected = Advertised::of_monitor(FULL_HD, 60_000, None, known).unwrap();
+        assert_eq!(uuid, expected.uuid());
+        let logged = core::iter::from_fn(|| methods.take_log())
+            .find_map(|entry| match entry {
+                Log::Published {
+                    uuid, from_monitor, ..
+                } => Some((uuid, from_monitor)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(logged, (expected.display_uuid(), known.is_some()));
+        seen.push(uuid);
+    }
+    // Each output's monitor is its own display.
+    assert!(seen[0] != seen[1] && seen[1] != seen[2] && seen[0] != seen[2]);
 }
 
 /// The properties `made` published, as `(key, text)` in order, each
@@ -663,6 +740,35 @@ fn the_display_is_described_once_before_the_hotplug_and_the_same_after_a_reset()
     let again = drain(&mut methods, &[1, 0, 0, 0]);
     assert_eq!(published(&again), properties);
     assert_eq!(again, first);
+}
+
+#[test]
+fn set_display_refresh_properties_publishes_the_refresh_of_the_vblank_grid() {
+    struct Screen(u32);
+    impl Scanout for Screen {
+        fn mode(&self) -> Mode {
+            FULL_HD
+        }
+        fn refresh_millihertz(&self) -> u32 {
+            self.0
+        }
+        fn present(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+    for (refresh, ticks) in [(60_000u32, 400_000u64), (144_000, 166_667)] {
+        let mut methods = Methods::new(Box::new(Screen(refresh)), interface());
+        assert_eq!(returned(methods.call(*b"A475", &[], 4)), [1, 0, 0, 0]);
+        let made = drain(&mut methods, &[1, 0, 0, 0]);
+        let properties = published(&made);
+        assert_eq!(properties.len(), 1);
+        let (key, text) = &properties[0];
+        assert_eq!(key, "IOMFBDisplayRefresh");
+        assert_eq!(*text, modes::display_refresh(ticks, COUNTER_HZ));
+        assert!(text.contains(&format!(
+            "<key>displayMinRefreshIntervalMachTime</key><integer size=\"64\">{ticks}</integer>"
+        )));
+    }
 }
 
 #[test]
@@ -937,6 +1043,94 @@ fn clients_are_told_of_each_refresh_and_a_late_one_replaces_the_last() {
         (1000 + 2 * REFRESH_TICKS).to_le_bytes()
     );
     assert_eq!(callback.output, 0);
+}
+
+#[test]
+fn a_display_asleep_or_powered_off_sends_no_vsync_and_its_wake_resumes_the_grid() {
+    // 60 Hz on the 24 MHz counter.
+    const REFRESH_TICKS: u64 = 400_000;
+    let display = Rc::new(RefCell::new(DisplayState::new(true)));
+    let mut methods = Methods::with_display_state(
+        Box::new(TestScreen::default()),
+        Rc::clone(&display),
+        interface(),
+    );
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    methods.refresh(1000);
+    let first = methods.take_callback().unwrap();
+    assert_eq!(first.tag, SWAP_NOTIFY);
+    (first.then)(&mut methods, &[]).unwrap();
+    // Asleep: no vblank passes, so nothing is due and nothing is sent,
+    // however long it sleeps.
+    display.borrow_mut().asleep = true;
+    // One look applies the sleep to the scanout's monitor.
+    assert_eq!(methods.refresh_deadline(), Some(1000 + REFRESH_TICKS));
+    methods.refresh(1000 + REFRESH_TICKS / 2);
+    assert_eq!(methods.refresh_deadline(), None);
+    for period in 1..=120 {
+        methods.refresh(1000 + period * REFRESH_TICKS);
+        assert!(methods.take_callback().is_none());
+    }
+    // Awake: the next vblank on the grid sends its vsync.
+    display.borrow_mut().asleep = false;
+    assert_eq!(methods.refresh_deadline(), Some(1000 + 121 * REFRESH_TICKS));
+    methods.refresh(1000 + 121 * REFRESH_TICKS + 5);
+    let callback = methods.take_callback().unwrap();
+    assert_eq!(callback.tag, SWAP_NOTIFY);
+    assert_eq!(
+        callback.input[..8],
+        (1000 + 121 * REFRESH_TICKS).to_le_bytes()
+    );
+    (callback.then)(&mut methods, &[]).unwrap();
+    // Powered off: the same.
+    display.borrow_mut().powered = Some(false);
+    methods.refresh(1000 + 121 * REFRESH_TICKS + 6);
+    assert_eq!(methods.refresh_deadline(), None);
+    methods.refresh(1000 + 130 * REFRESH_TICKS);
+    assert!(methods.take_callback().is_none());
+    display.borrow_mut().powered = Some(true);
+    assert_eq!(methods.refresh_deadline(), Some(1000 + 131 * REFRESH_TICKS));
+}
+
+#[test]
+fn a_vsync_carries_its_vblanks_time_as_the_coprocessor_timestamp_the_ap_converts() {
+    const REFRESH_TICKS: u64 = 400_000;
+    // 3 ms of the 24 MHz counter.
+    const LATE: u64 = 72_000;
+    let mut methods = methods();
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    methods.refresh(1000);
+    let first = methods.take_callback().unwrap();
+    (first.then)(&mut methods, &[]).unwrap();
+    // A late look still stamps the vblank, not the look: a zero timestamp
+    // would leave the AP to put its own dispatch time there.
+    methods.refresh(1000 + REFRESH_TICKS + LATE);
+    let callback = methods.take_callback().unwrap();
+    assert_eq!(callback.tag, SWAP_NOTIFY);
+    let vblank = (1000 + REFRESH_TICKS).to_le_bytes();
+    assert_eq!(callback.input[..8], vblank);
+    assert_eq!(callback.input[8..16], vblank);
+    // The third value is the refresh period in counter ticks: sent as 0,
+    // the kernel's dispatch (`swap_notify_dispatch_gated`, 26A434
+    // 0xfffffe0009ab3764) asks a method of its own for a 60 Hz period.
+    assert_eq!(callback.input[16..], REFRESH_TICKS.to_le_bytes());
+}
+
+#[test]
+fn a_fast_displays_vsync_carries_its_own_refresh_period() {
+    let mut methods = Methods::new(Box::new(FastScreen(240_000)), interface());
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    methods.refresh(1000);
+    let callback = methods.take_callback().unwrap();
+    assert_eq!(callback.tag, SWAP_NOTIFY);
+    // 24 MHz / 240 Hz.
+    assert_eq!(callback.input[16..], 100_000u64.to_le_bytes());
 }
 
 #[test]
@@ -1451,9 +1645,39 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
     assert_eq!(pacing.late_longest, 100);
     assert_eq!(pacing.late_total, 100 * u64::from(pacing.presented - 1));
     assert_eq!(pacing.submitted, pacing.presented + 1);
-    let line = pacing.to_string();
+    // By refresh periods: every gap one but the three-period one, all of
+    // them inside a burst.
+    assert_eq!(pacing.refreshes, [pacing.gaps - 1, 0, 1, 0, 0]);
+    assert_eq!(
+        (pacing.burst_gaps, pacing.burst_ticks),
+        (pacing.gaps, pacing.total_gap)
+    );
+    // Each submit after the first two follows a completion the AP
+    // answered and a vblank, 100 ticks after the look that presented; only
+    // the second went out with an earlier swap unanswered.
+    assert_eq!(pacing.turnaround.count, pacing.submitted - 2);
+    assert_eq!(pacing.after_vsync.count, pacing.submitted - 2);
+    assert_eq!(pacing.after_vsync.longest, 100);
+    assert_eq!((pacing.overlapped, pacing.most_unanswered), (1, 1));
+    let text = pacing.to_string();
+    let mut lines = text.lines();
+    let line = lines.next().unwrap();
+    // The swaps sampled follow on a line of their own.
+    assert!(
+        lines
+            .next()
+            .is_some_and(|swaps| swaps.starts_with("DCP SWAPS ")),
+        "{text}"
+    );
+    assert_eq!(pacing.swaps.len(), SAMPLED_SWAPS);
     assert!(
         line.starts_with("DCP PACING seconds=10.0 presented=") && line.contains(" merged=1 "),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" gaps=1:{}/2:0/3:1/4-7:0/8+:0 ", pacing.gaps - 1))
+            && line.contains(" burst_fps=")
+            && line.ends_with(" overlapped=1/1"),
         "{line}"
     );
     // A window in which nothing was submitted or shown is not reported.
@@ -1508,6 +1732,79 @@ fn ready_swaps_latch_at_one_vblank_and_the_newest_is_shown() {
     methods.present(2 * period + 1, fill).unwrap();
     assert_eq!(frames.borrow().len(), 2);
     assert!(methods.frame_pending());
+}
+
+#[test]
+fn a_shown_swap_sends_its_frame_info_before_its_completion() {
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    // Clients for Presentation_time (6), Requested_presentation (8) and
+    // Min_FrameTime (11), which the model does not fill.
+    let mut clients = [0u8; 0x6c];
+    for key in [6, 8, 11] {
+        clients[4 * key] = 1;
+    }
+    returned(methods.call(*b"A033", &clients, 0));
+    returned(methods.call(*b"A033", &clients, 0));
+    let reports = methods.take_unmodeled();
+    assert_eq!(
+        reports,
+        ["IOMFB unmodeled D589 Min_FrameTime (0xb): not modeled; sent as 0"]
+    );
+    methods.refresh(0);
+    // Two swaps replaced by a third before the vblank: only the third was
+    // shown, so only it has frame info.
+    for (dva, requested) in [(0x1000, 11u64), (0x2000, 22), (0x3000, period + 33)] {
+        let id = start_swap(&mut methods);
+        let mut input = submission(id, &[(0, 4, 2, dva)]);
+        input[swap::REQUESTED..swap::REQUESTED + 8].copy_from_slice(&requested.to_le_bytes());
+        returned(methods.call(*b"A407", &input, 0xc));
+    }
+    methods.present(period + 7, |_, _| true).unwrap();
+    let made: Vec<_> = drain(&mut methods, &[])
+        .into_iter()
+        .filter(|(tag, _)| *tag != SWAP_NOTIFY)
+        .collect();
+    let tags: Vec<_> = made
+        .iter()
+        .map(|(tag, input)| match *tag {
+            SWAP_INFO => (*tag, input[SWAP_INFO_ID]),
+            _ => (*tag, input[0]),
+        })
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            (SWAP_COMPLETE, 1),
+            (SWAP_COMPLETE, 2),
+            (SWAP_INFO, 3),
+            (SWAP_COMPLETE, 3)
+        ]
+    );
+    let blob = &made[2].1;
+    assert_eq!(blob.len(), 0xe4);
+    let u64_at = |at: usize| u64::from_le_bytes(blob[at..at + 8].try_into().unwrap());
+    // Requested_presentation +0x08, Presentation_time +0x10 (the vblank's
+    // counter value), the swap ID at +0x38; the rest, null flag included, 0.
+    assert_eq!(u64_at(0x08), period + 33);
+    assert_eq!(u64_at(0x10), period);
+    assert_eq!(&blob[0x38..0x3c], &3u32.to_le_bytes());
+    let filled = [0x08..0x18, 0x38..0x3c];
+    for (at, &byte) in blob.iter().enumerate() {
+        if !filled.iter().any(|range| range.contains(&at)) {
+            assert_eq!(byte, 0, "byte {at:#x}");
+        }
+    }
+    // With no client left, swaps complete without frame info.
+    returned(methods.call(*b"A033", &[0; 0x6c], 0));
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x4000)]), 0xc));
+    methods.present(2 * period, |_, _| true).unwrap();
+    complete(&mut methods, id, true);
+    // Min_FrameTime was reported once, at the first count.
+    let later = methods.take_unmodeled();
+    assert!(!later.iter().any(|line| line.contains("D589")), "{later:?}");
 }
 
 #[test]
@@ -2191,6 +2488,87 @@ fn pacing_times_each_stage_of_a_swap_and_the_vsyncs() {
     );
 }
 
+#[test]
+fn the_pacing_report_samples_each_swaps_times_and_record_words() {
+    // 1 ms of the 24 MHz counter.
+    const MS: u64 = 24_000;
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let mut methods = Methods::new(Box::new(screen), interface());
+    methods.set_swap_tracing(false);
+    methods.notified = true;
+    let period = methods.refresh_ticks;
+    let answer_all = |methods: &mut Methods, at: u64| {
+        methods.observe(at);
+        while let Some(callback) = methods.take_callback() {
+            (callback.then)(methods, &[]).unwrap();
+        }
+    };
+    // The grid starts at 0.
+    methods.refresh(0);
+    answer_all(&mut methods, MS / 2);
+    // Submitted 7.5 ms after the vblank, its record naming 1 ms and the next
+    // vblank in its leading words and 4 and 2 in its small ones.
+    methods.observe(15 * MS / 2);
+    let id = start_swap(&mut methods);
+    let mut input = fenced_submission(id, &[(0, 4, 2, 0x1000)], 1, [5, 0, 0, 0]);
+    input[0x00..0x08].copy_from_slice(&MS.to_le_bytes());
+    input[0x08..0x10].copy_from_slice(&period.to_le_bytes());
+    input[0x48..0x50].copy_from_slice(&4u64.to_le_bytes());
+    input[0x50..0x58].copy_from_slice(&2u64.to_le_bytes());
+    returned(methods.call(*b"A407", &input, 0xc));
+    // Its fence is named at 12 ms, it is latched at the next vblank and both
+    // callbacks of that vblank are answered 2 ms after it.
+    let notice = 12 * MS;
+    methods.observe(notice);
+    let fence = Packed::new()
+        .u32(id)
+        .u32(5)
+        .u64(notice)
+        .u32(0)
+        .finish(0x14)
+        .unwrap();
+    returned(methods.call(*b"A470", &fence, 4));
+    methods
+        .present(period + 5, |_, bytes: &mut [u8]| {
+            bytes.fill(0x5a);
+            true
+        })
+        .unwrap();
+    answer_all(&mut methods, period + 2 * MS);
+    let pacing = Pacing {
+        refresh: period,
+        ..methods.pacing.clone()
+    };
+    assert_eq!(pacing.swaps.len(), 1);
+    let text = pacing.to_string();
+    let swaps = text.lines().nth(1).expect("a sample line");
+    assert!(
+        swaps.starts_with("DCP SWAPS refresh_ms=16.67 words48_50=4/2 "),
+        "{swaps}"
+    );
+    assert!(
+        swaps.ends_with(&alloc::format!(
+            " {id}:5:0:7.5/0.5/1.0/16.7/-/-/-/-/-/12.0/1/2.0/2.0"
+        )),
+        "{swaps}"
+    );
+    // Only the first swaps of a window are sampled. The next ones follow the
+    // next vblank, one refresh after the first swap's.
+    let next = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(next, &[(0, 4, 2, 0x1000)]), 0xc));
+    for _ in 1..SAMPLED_SWAPS {
+        let id = start_swap(&mut methods);
+        returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    }
+    assert_eq!(methods.pacing.swaps.len(), SAMPLED_SWAPS);
+    let pacing = Pacing {
+        refresh: period,
+        ..methods.pacing.clone()
+    };
+    let text = pacing.to_string();
+    assert!(text.contains(&alloc::format!(" {next}:0:1:2.0/")), "{text}");
+}
+
 /// A screen whose frames another thread can push, as a compose outside the
 /// devices' lock does.
 #[derive(Clone, Default)]
@@ -2455,7 +2833,7 @@ fn an_abort_never_waits_for_good_for_a_compose_that_does_not_run() {
 
 #[test]
 fn a_refresh_that_cannot_be_advertised_is_published_at_the_usual_rate_and_said() {
-    // 1920x1080 at 2000 Hz has no detailed timing.
+    // 1920x1080 at 2000 Hz has no timing record: its clock passes 4.29 GHz.
     assert!(Advertised::at(FULL_HD, 2_000_000).is_err());
     let methods = Methods::new(Box::new(FastScreen(2_000_000)), interface());
     let advertised = methods.advertised.as_ref().unwrap();
@@ -2469,4 +2847,355 @@ fn a_refresh_that_cannot_be_advertised_is_published_at_the_usual_rate_and_said()
         Advertised::at(FULL_HD, 240_000).unwrap().edid
     );
     assert!(methods.reported.is_empty());
+}
+
+/// A screen that records each power change and each present, in order.
+#[derive(Clone, Default)]
+struct PoweredScreen(Rc<RefCell<Vec<&'static str>>>, bool);
+impl Scanout for PoweredScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        self.0.borrow_mut().push("present");
+        Ok(())
+    }
+    fn set_power(&mut self, on: bool) -> Result<()> {
+        if self.1 {
+            return Err(refuse!("no power control"));
+        }
+        self.0.borrow_mut().push(if on { "on" } else { "off" });
+        Ok(())
+    }
+}
+
+#[test]
+fn display_sleep_turns_the_monitor_off_and_a_wake_lights_it_before_the_next_swap() {
+    let screen = PoweredScreen::default();
+    let events = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(1);
+        true
+    };
+    let on = Packed::new().u64(1).finish(0x10).unwrap();
+    let off = Packed::new().u64(0).finish(0x10).unwrap();
+    // The monitor is lit from the start: turning it on changes nothing.
+    returned(methods.call(*b"A484", &on, 8));
+    assert!(events.borrow().is_empty());
+    returned(methods.call(*b"A484", &off, 8));
+    returned(methods.call(*b"A484", &off, 8));
+    assert_eq!(*events.borrow(), ["off"]);
+    // A swap while the display sleeps is not shown.
+    methods.refresh(0);
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(period, fill).unwrap();
+    assert_eq!(*events.borrow(), ["off"]);
+    // The wake lights the monitor, then the next vblank shows the swap.
+    returned(methods.call(*b"A484", &on, 8));
+    methods.present(2 * period, fill).unwrap();
+    assert_eq!(*events.borrow(), ["off", "on", "present"]);
+    let reported = methods.take_unmodeled();
+    assert!(
+        reported
+            .iter()
+            .all(|line| !line.starts_with("IOMFB display")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn display_sleep_follows_the_controllers_sleep_and_a_refusing_sink_is_reported_once() {
+    let screen = PoweredScreen(Rc::default(), true);
+    let events = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let display = methods.display_state();
+    // The IOAV controller's display sleep reaches the scanout at the next look.
+    display.borrow_mut().asleep = true;
+    assert!(methods.refresh_deadline().is_some());
+    methods.refresh(0);
+    display.borrow_mut().asleep = false;
+    methods.refresh(1);
+    assert!(events.borrow().is_empty());
+    let reported = methods.take_unmodeled();
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(reported[0].contains("no power control"), "{reported:?}");
+}
+
+/// A screen that may have taken its display after the frames presented so
+/// far, and shows none of them until its next present: its wish for the
+/// frame on screen, and the size of each present.
+#[derive(Clone, Default)]
+struct LateScreen(Rc<RefCell<(bool, Vec<usize>)>>);
+impl Scanout for LateScreen {
+    fn mode(&self) -> Mode {
+        MODE
+    }
+    fn present(&mut self, rows: &[u8]) -> Result<()> {
+        let mut state = self.0.borrow_mut();
+        state.0 = false;
+        state.1.push(rows.len());
+        Ok(())
+    }
+    fn wants_frame(&self) -> bool {
+        self.0.borrow().0
+    }
+}
+
+#[test]
+fn a_display_taken_after_the_frame_on_screen_shows_it_without_a_new_swap() {
+    let screen = LateScreen::default();
+    let state = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(1);
+        true
+    };
+    // Nothing is on screen yet, so nothing is shown again.
+    state.borrow_mut().0 = true;
+    methods.refresh(0);
+    assert!(!methods.frame_ready(0));
+    state.borrow_mut().0 = false;
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(period, fill).unwrap();
+    assert_eq!(state.borrow().1, [32]);
+    let completed = methods.completed.len();
+    // A display taken now asks for the frame on screen: the next look shows
+    // it again, whole, and completes no swap.
+    state.borrow_mut().0 = true;
+    assert!(methods.refresh_deadline().is_some());
+    assert!(methods.frame_ready(period + 1));
+    methods.present(period + 1, fill).unwrap();
+    assert_eq!(state.borrow().1, [32, 32]);
+    assert_eq!(methods.completed.len(), completed);
+    assert!(!methods.frame_ready(period + 2));
+    assert!(methods.last_refusal.is_none(), "{:?}", methods.last_refusal);
+}
+
+#[test]
+fn a_frame_on_screen_that_cannot_be_read_again_waits_for_the_next_swap() {
+    let screen = LateScreen::default();
+    let state = screen.0.clone();
+    let mut methods = Methods::new(Box::new(screen), interface());
+    let period = methods.refresh_ticks;
+    let fill = |_: u64, bytes: &mut [u8]| {
+        bytes.fill(1);
+        true
+    };
+    methods.refresh(0);
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(period, fill).unwrap();
+    // The surface is gone: the present is not an error, is said once, and
+    // is not tried again while the display waits.
+    state.borrow_mut().0 = true;
+    methods.present(period + 1, |_, _| false).unwrap();
+    assert_eq!(state.borrow().1, [32]);
+    assert!(!methods.frame_ready(period + 2));
+    assert!(
+        methods
+            .last_refusal
+            .as_deref()
+            .is_some_and(|text| text.contains("the display shows the next swap")),
+        "{:?}",
+        methods.last_refusal
+    );
+    // The next swap shows whole, and a later display taken late is shown
+    // the frame on screen again.
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods.present(2 * period, fill).unwrap();
+    assert_eq!(state.borrow().1, [32, 32]);
+    state.borrow_mut().0 = true;
+    assert!(methods.frame_ready(2 * period + 1));
+}
+
+/// A 240 Hz screen that reads its monitor's last vertical blank as
+/// `age`'s nanoseconds ago, or none at `u64::MAX`.
+struct TimedScreen(alloc::sync::Arc<core::sync::atomic::AtomicU64>);
+impl Scanout for TimedScreen {
+    fn mode(&self) -> Mode {
+        FULL_HD
+    }
+    fn refresh_millihertz(&self) -> u32 {
+        240_000
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn vblank_age_ns(&self) -> Option<u64> {
+        let age = self.0.load(core::sync::atomic::Ordering::Relaxed);
+        (age != u64::MAX).then_some(age)
+    }
+}
+
+#[test]
+fn vblanks_follow_the_monitors_half_a_period_after_its_own() {
+    use core::sync::atomic::Ordering::Relaxed;
+    // 240 Hz: 100_000 ticks of the 24 MHz counter, 4_166_667 ns.
+    let period = 100_000;
+    // Rounded up, so the model's truncation reads the same ticks back.
+    let ns = |ticks: u64| (ticks * 1_000_000_000).div_ceil(24_000_000);
+    let age = alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(u64::MAX));
+    let mut methods = Methods::new(Box::new(TimedScreen(age.clone())), interface());
+    let mut clients = [0; 0x6c];
+    clients[24] = 1;
+    returned(methods.call(*b"A033", &clients, 0));
+    // The monitor's last blank 30_000 ticks before the first look: its grid
+    // is -29_000 + k periods, so the model's is 21_000 + k periods.
+    age.store(ns(30_000), Relaxed);
+    methods.refresh(1000);
+    assert_eq!(methods.refresh_deadline(), Some(121_000));
+    age.store(ns(50_000), Relaxed);
+    methods.refresh(121_000);
+    assert_eq!(methods.refresh_deadline(), Some(221_000));
+    // The monitor's clock ran 10_000 ticks slow against the counter: the
+    // grid moves with it, the gap within a period and a half.
+    age.store(ns(40_000), Relaxed);
+    methods.refresh(221_000);
+    assert_eq!(methods.refresh_deadline(), Some(331_000));
+    // An age past many periods is the same blank's.
+    age.store(ns(30 * period + 50_000), Relaxed);
+    methods.refresh(331_000);
+    assert_eq!(methods.refresh_deadline(), Some(431_000));
+    // The display unread again: the model's own grid from there.
+    age.store(u64::MAX, Relaxed);
+    methods.refresh(431_000);
+    assert_eq!(methods.refresh_deadline(), Some(531_000));
+}
+
+#[test]
+fn a_locked_vblank_falls_half_a_period_to_a_period_and_a_half_after_the_last() {
+    let period = 100_000;
+    assert_eq!(next_vblank(1000, 50_000, period, None), 101_000);
+    // A late look with the monitor's blank just now: half a period on.
+    assert_eq!(next_vblank(1000, 90_000, period, Some(0)), 140_000);
+    // The monitor's blank just after the model's: the next falls a period
+    // and a half on, never closer than half a period.
+    let tick_ns = 1_000_000_000 / 24_000_000 + 1;
+    assert_eq!(next_vblank(1000, 1000, period, Some(tick_ns)), 151_000 - 1);
+    // Half a period before it: a period on.
+    assert_eq!(next_vblank(1000, 1000, period, Some(2_083_334)), 101_000);
+}
+
+#[test]
+fn a_vsync_leaves_beside_an_unanswered_swap_callback_and_vsyncs_keep_their_order() {
+    let screen = TestScreen(Rc::default(), Some(MODE));
+    let mut methods = Methods::new(Box::new(screen), interface());
+    methods.set_swap_tracing(false);
+    methods.notified = true;
+    let period = methods.refresh_ticks;
+    methods.refresh(0);
+    let first = methods.take_callback().unwrap();
+    assert_eq!(first.tag, SWAP_NOTIFY);
+    (first.then)(&mut methods, &[]).unwrap();
+
+    // A swap presented at the next vblank: its completion goes out and
+    // stays unanswered.
+    methods.observe(1000);
+    let id = start_swap(&mut methods);
+    returned(methods.call(*b"A407", &submission(id, &[(0, 4, 2, 0x1000)]), 0xc));
+    methods
+        .present(period + 5, |_, bytes: &mut [u8]| {
+            bytes.fill(0x5a);
+            true
+        })
+        .unwrap();
+    let vsync = methods.take_callback().unwrap();
+    assert_eq!(vsync.tag, SWAP_NOTIFY);
+    let swap = methods.take_callback().unwrap();
+    assert_ne!(swap.tag, SWAP_NOTIFY);
+    // The next swap callback waits for that one's answer.
+    assert!(methods.take_callback().is_none());
+
+    // The next vblank's vsync waits for the last vsync's answer only.
+    methods.refresh(2 * period);
+    assert!(!methods.callback_pending() && methods.take_callback().is_none());
+    (vsync.then)(&mut methods, &[]).unwrap();
+    assert!(methods.callback_pending());
+    let next = methods.take_callback().unwrap();
+    assert_eq!(next.tag, SWAP_NOTIFY);
+    assert_eq!(next.input[..8], (2 * period).to_le_bytes());
+    (next.then)(&mut methods, &[]).unwrap();
+    (swap.then)(&mut methods, &[]).unwrap();
+    while let Some(callback) = methods.take_callback() {
+        assert_ne!(callback.tag, SWAP_NOTIFY);
+        (callback.then)(&mut methods, &[]).unwrap();
+    }
+    assert!(methods.check_reset().is_ok());
+}
+
+/// A 1920x1080 screen that runs 144 and 60 Hz and keeps the rate set.
+struct RatedScreen(alloc::sync::Arc<core::sync::atomic::AtomicU32>);
+impl Scanout for RatedScreen {
+    fn mode(&self) -> Mode {
+        FULL_HD
+    }
+    fn refresh_millihertz(&self) -> u32 {
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    fn refresh_rates(&self) -> Vec<u32> {
+        alloc::vec![144_000, 60_000]
+    }
+    fn set_refresh(&mut self, millihertz: u32) -> Result<()> {
+        if ![144_000, 60_000].contains(&millihertz) {
+            return Err(refuse!("not a rate of the screen"));
+        }
+        self.0
+            .store(millihertz, core::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_ap_switches_the_monitor_between_the_rates_of_its_size() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let rate = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(144_000));
+    let mut methods = Methods::new(Box::new(RatedScreen(rate.clone())), interface());
+    let set = |timing: u32| {
+        Packed::new()
+            .u32(modes::COLOR_ID)
+            .u32(timing)
+            .finish(8)
+            .unwrap()
+    };
+    // The preferred timing is the rate the monitor runs.
+    assert_eq!(
+        returned(methods.call(*b"A413", &set(modes::TIMING_ID), 4)),
+        [0; 4]
+    );
+    assert_eq!(methods.refresh_ticks, 166_667);
+    assert!(drain(&mut methods, &[1]).is_empty());
+    // 60 Hz: the monitor switches, the vblanks take its period and the
+    // refresh dictionary goes out again.
+    assert_eq!(
+        returned(methods.call(*b"A413", &set(modes::OTHER_TIMING_IDS), 4)),
+        [0; 4]
+    );
+    assert_eq!(rate.load(Relaxed), 60_000);
+    assert_eq!(methods.refresh_ticks, 400_000);
+    assert_eq!(
+        methods.digital_out(),
+        Some((modes::COLOR_ID, modes::OTHER_TIMING_IDS))
+    );
+    let made = drain(&mut methods, &[1]);
+    assert_eq!(made.last().map(|(tag, _)| *tag), Some(PROP_END));
+    // The preferred one again.
+    returned(methods.call(*b"A413", &set(modes::TIMING_ID), 4));
+    assert_eq!(rate.load(Relaxed), 144_000);
+    assert_eq!(methods.refresh_ticks, 166_667);
+    // A timing never advertised is refused, and the rate stays.
+    assert!(
+        methods
+            .call(*b"A413", &set(modes::OTHER_TIMING_IDS + 1), 4)
+            .is_err()
+    );
+    assert_eq!(rate.load(Relaxed), 144_000);
 }

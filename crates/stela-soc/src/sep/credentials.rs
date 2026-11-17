@@ -1,5 +1,5 @@
-//! The credential manager service `scrd`, which serves two commands and
-//! refuses the rest.
+//! The credential manager service `scrd`: ACM's context pool, with the
+//! credentials and the policy check a password authorization uses.
 //!
 //! **Wire.** 26A434 kernel VM addresses. `AppleCredentialManager` finds the
 //! `sep-endpoint,scrd` nub (`ACMKernelUtils::waitForSEPEndpoint`
@@ -17,31 +17,56 @@
 //! The bytes after the head are the command's output
 //! (`sendSEPCommand`+0x4e0..+0x5c0).
 //!
-//! **Commands.** An ACM command follows the 28-byte request payload: u32
-//! `SCRD`, the command byte and three bytes, then its input
-//! (`LibCall_BuildCommand` 0xfffffe00092e8c30).
-//! - [`INITIALIZE`] (`performSCRDInitialization` 0xfffffe00092debc8) has no
-//!   input and wants no output. A status of zero is the whole answer.
-//! - [`GET_ENVIRONMENT_VARIABLE`] (`LibCall_ACMGetEnvironmentVariable`
-//!   0xfffffe00092ed958) sends a u32 variable. Only [`LOCKDOWN_MODE`] is
-//!   served: one byte (`LDMCheckParity` 0xfffffe000986b758), which is
-//!   [`LOCKDOWN_OFF`], so enabling Lockdown Mode does not survive a reboot.
+//! **Status.** 26B123 VAs from here on. The kernel returns the reply's
+//! status word as the command's ACM error (`sendSEPCommand`
+//! 0xfffffe00092f0890, status at +0x158 of the manager, returned by
+//! `_performCommand` 0xfffffe00092f007c), and its callers compare it with
+//! ACM's own codes: `LibCall_ACMContextCreate` 0xfffffe00092fa928 falls back
+//! from command 36 to 1 on kACMErrorBadParameter, -3. So a modeled ACM
+//! failure is answered with its ACM code as the status.
 //!
-//! **Service.** No other command's body is recovered, so each is answered
-//! with [`UNSUPPORTED`]. A client gets its error at once where an absent
-//! service would cost it the 5 s nub wait, and a client that needs a
-//! credential, such as a passcode check, fails. The refusal is reported.
+//! **Commands.** An ACM command follows the 28-byte request payload: u32
+//! `SCRD`, the command byte, two bytes and the command version, then its
+//! input (`LibCall_BuildCommand` 0xfffffe00092fa718). The reference for
+//! every command is ACM's own executor, which the AppleCredentialManager
+//! kext carries for its simulated mode (`_ProcessRawCommand`
+//! 0xfffffe00092954b8, names in `__cmdTable` 0xfffffe000cb3cc78); [`acm`]
+//! cites it per command. [`acm::Credentials`] serves context create and
+//! delete, handle queries, externalization, PassphraseEntered credentials,
+//! credential queries and removal, DeviceOwner policy verification
+//! ([`policy`]), the logging level and the environment variables
+//! ([`environment`]).
+//! Every other command is refused with [`UNSUPPORTED`] and named once in the
+//! diagnostics.
+//!
+//! **Passwords.** ACM never checks a passphrase: `addCredential`
+//! 0xfffffe0009290c80 stores it, and `verifyPolicyDeviceOwnerAuthenticationImpl`
+//! 0xfffffe000929eeb0 looks only for a PasscodeValidated credential. The
+//! password is checked by the keystore's verify ([`super::keystore`]), which
+//! reads the PassphraseEntered credential of the context its secret names
+//! through [`Link`] and, when the passphrase opens the user's keybag, grants
+//! PasscodeValidated to the request's context.
+mod acm;
+mod environment;
+mod policy;
+#[cfg(test)]
+pub(crate) mod tests;
+
+pub use acm::{Credentials, HANDLE_BYTES, Handle, Link, Unlinked};
+
 use super::{
+    Entropy,
     endpoint::Service,
     message::Frame,
     transaction::{Answer, Payload, Refusal},
 };
 use alloc::vec::Vec;
 use stela_contracts::refuse;
+use zeroize::Zeroizing;
 
 /// `SCRD_ENDPOINT`.
 pub const ID: u8 = 10;
-/// `kIOReturnUnsupported`.
+/// `kIOReturnUnsupported`: the answer to a command this model refuses.
 const UNSUPPORTED: u32 = 0xe000_02c7;
 /// The request whose buffers carry SCRD payloads.
 const PAYLOAD: u8 = 4;
@@ -51,13 +76,11 @@ const REQUEST_BYTES: usize = 28;
 const COMMAND_MAGIC: &[u8; 4] = b"DRCS";
 /// An ACM command's bytes before its input.
 const COMMAND_BYTES: usize = 8;
-/// The largest served request: a u32 of input.
-const LARGEST_REQUEST: usize = REQUEST_BYTES + COMMAND_BYTES + 4;
-const INITIALIZE: u8 = 10;
-const GET_ENVIRONMENT_VARIABLE: u8 = 25;
-/// The environment variable `LDMCheckParity` compares with NVRAM.
-const LOCKDOWN_MODE: u32 = 41;
-const LOCKDOWN_OFF: u8 = 0;
+/// The request bytes observation may record: the payload and the command
+/// head, never an input, which may hold a passphrase.
+pub const OBSERVABLE_BYTES: usize = REQUEST_BYTES + COMMAND_BYTES;
+/// The largest request: the one 16 KiB buffer the kernel registers.
+const LARGEST_REQUEST: usize = 0x4000;
 /// `sizeof(SCRDResponsePayloadHead)` as `sendSEPCommand` requires it.
 const HEAD_BYTES: usize = 12;
 /// The version of `SCRDResponsePayload_v2`.
@@ -88,198 +111,73 @@ pub fn failure(frame: Frame) -> Frame {
     reply(frame, 0, UNSUPPORTED)
 }
 
-/// Serve `frame`, or refuse it with the response head its input asks for.
-pub fn request(frame: Frame, payload: &mut dyn Payload) -> Result<Frame, Refusal> {
-    let mut request = [0; LARGEST_REQUEST];
-    if frame.tag != PAYLOAD || payload.input(&mut request).is_err() {
+/// Serve `frame` from `credentials`: write the response head and the
+/// command's output and answer with its status, or refuse a command that is
+/// not modeled with the head alone.
+pub fn request(
+    frame: Frame,
+    payload: &mut dyn Payload,
+    credentials: &mut Credentials,
+    entropy: &mut dyn Entropy,
+) -> Result<Frame, Refusal> {
+    let length = usize::from(u16::from_le_bytes([frame.opcode, frame.parameter]));
+    if frame.tag != PAYLOAD || !(OBSERVABLE_BYTES..=LARGEST_REQUEST).contains(&length) {
         return Err(Refusal::answered(
             refuse!(
                 "SEP credential manager request is not an ACM command",
-                tag = frame.tag
+                tag = frame.tag,
+                length
             ),
             Answer::frame(failure(frame)),
         ));
     }
-    let mut output = head(&request);
-    let Some(served) = output_of(frame, &request) else {
-        let command = request[REQUEST_BYTES + COMMAND_MAGIC.len()];
-        let input = input_length(frame).unwrap_or(0);
-        let leading = u32::from_le_bytes(
-            request[REQUEST_BYTES + COMMAND_BYTES..]
-                .try_into()
-                .expect("a u32 of input"),
-        );
+    // The input may hold a passphrase: its bytes are zeroed when dropped.
+    let mut bytes = Zeroizing::new(alloc::vec![0; length]);
+    payload
+        .input(&mut bytes)
+        .map_err(|reason| Refusal::answered(reason, Answer::frame(failure(frame))))?;
+    let mut output = head(&bytes);
+    let command = &bytes[REQUEST_BYTES..];
+    if &command[..COMMAND_MAGIC.len()] != COMMAND_MAGIC {
         return Err(Refusal::answered(
-            refuse!(
-                "SEP credential manager command is not implemented",
-                command,
-                input,
-                leading = %format_args!("{leading:#x}")
-            ),
+            refuse!("SEP credential manager request is not an ACM command"),
             Answer {
                 frame: reply(frame, HEAD_BYTES as u16, UNSUPPORTED),
                 output,
             },
         ));
+    }
+    let head = acm::Head {
+        command: command[4],
+        argument: command[5],
+        version: command[7],
     };
-    output.extend_from_slice(served);
+    let status = match credentials.execute(head, &command[COMMAND_BYTES..], entropy) {
+        Ok(served) => {
+            output.extend_from_slice(&served);
+            0
+        }
+        Err(acm::Failure::Acm(code)) => code as u32,
+        Err(acm::Failure::Unmodeled(reason)) => {
+            return Err(Refusal::answered(
+                reason,
+                Answer {
+                    frame: reply(frame, HEAD_BYTES as u16, UNSUPPORTED),
+                    output,
+                },
+            ));
+        }
+    };
     payload
         .output(&output)
         .map_err(|reason| Refusal::answered(reason, Answer::frame(failure(frame))))?;
-    Ok(reply(frame, output.len() as u16, 0))
+    Ok(reply(frame, output.len() as u16, status))
 }
 
-/// The bytes of command input `frame` names after the command head.
-fn input_length(frame: Frame) -> Option<usize> {
-    usize::from(u16::from_le_bytes([frame.opcode, frame.parameter]))
-        .checked_sub(REQUEST_BYTES + COMMAND_BYTES)
-}
-
-/// The output of a served command, by the input length `frame` names.
-fn output_of(frame: Frame, request: &[u8; LARGEST_REQUEST]) -> Option<&'static [u8]> {
-    let command = &request[REQUEST_BYTES..];
-    if &command[..COMMAND_MAGIC.len()] != COMMAND_MAGIC {
-        return None;
-    }
-    let input = input_length(frame)?;
-    match (command[COMMAND_MAGIC.len()], input) {
-        (INITIALIZE, 0) => Some(&[]),
-        (GET_ENVIRONMENT_VARIABLE, 4)
-            if command[COMMAND_BYTES..] == LOCKDOWN_MODE.to_le_bytes() =>
-        {
-            Some(&[LOCKDOWN_OFF])
-        }
-        _ => None,
-    }
-}
-
-fn head(request: &[u8; LARGEST_REQUEST]) -> Vec<u8> {
+fn head(request: &[u8]) -> Vec<u8> {
     let mut head = alloc::vec![0; HEAD_BYTES];
     head[0] = RESPONSE_VERSION;
     head[2..4].copy_from_slice(&(HEAD_BYTES as u16).to_le_bytes());
     head[4..8].copy_from_slice(&request[4..8]);
     head
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Result;
-
-    struct Buffers {
-        input: Vec<u8>,
-        output: Vec<u8>,
-    }
-
-    impl Payload for Buffers {
-        fn input(&mut self, bytes: &mut [u8]) -> Result<()> {
-            bytes.copy_from_slice(&self.input[..bytes.len()]);
-            Ok(())
-        }
-        fn output(&mut self, bytes: &[u8]) -> Result<()> {
-            self.output.extend_from_slice(bytes);
-            Ok(())
-        }
-    }
-
-    fn frame(tag: u8, length: u8) -> Frame {
-        Frame {
-            service: ID,
-            tag,
-            opcode: length,
-            parameter: 0,
-            data: 0,
-        }
-    }
-
-    /// A request numbered 0x12345678 for `command` with `input`.
-    fn buffers(command: u8, input: &[u8]) -> Buffers {
-        let mut bytes = alloc::vec![0; LARGEST_REQUEST];
-        bytes[..8].copy_from_slice(&[1, 0, 28, 0, 0x78, 0x56, 0x34, 0x12]);
-        bytes[28..32].copy_from_slice(COMMAND_MAGIC);
-        bytes[32] = command;
-        bytes[36..36 + input.len()].copy_from_slice(input);
-        Buffers {
-            input: bytes,
-            output: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn initialization_succeeds_with_the_head_alone() {
-        let mut buffers = buffers(INITIALIZE, &[]);
-        let answer = request(frame(PAYLOAD, 36), &mut buffers).unwrap();
-        assert_eq!(answer, reply(frame(PAYLOAD, 36), 12, 0));
-        assert_eq!(
-            buffers.output,
-            [2, 0, 12, 0, 0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0]
-        );
-    }
-
-    #[test]
-    fn lockdown_mode_reads_as_off_after_the_head() {
-        let mut buffers = buffers(GET_ENVIRONMENT_VARIABLE, &LOCKDOWN_MODE.to_le_bytes());
-        let answer = request(frame(PAYLOAD, 40), &mut buffers).unwrap();
-        assert_eq!(answer, reply(frame(PAYLOAD, 40), 13, 0));
-        assert_eq!(buffers.output.len(), 13);
-        assert_eq!(buffers.output[12], LOCKDOWN_OFF);
-    }
-
-    #[test]
-    fn another_variable_or_a_foreign_command_is_refused() {
-        let mut other = buffers(GET_ENVIRONMENT_VARIABLE, &2u32.to_le_bytes());
-        let mut foreign = buffers(INITIALIZE, &[]);
-        foreign.input[28] = 0;
-        for (buffers, length) in [(&mut other, 40), (&mut foreign, 36)] {
-            let refusal = request(frame(PAYLOAD, length), buffers).unwrap_err();
-            assert_eq!(refusal.answer.unwrap().frame.data, UNSUPPORTED);
-            assert!(buffers.output.is_empty());
-        }
-    }
-
-    #[test]
-    fn a_payload_request_gets_a_failure_with_the_head_naming_its_id() {
-        let mut buffers = buffers(22, &[2]);
-        let answer = request(frame(PAYLOAD, 37), &mut buffers)
-            .unwrap_err()
-            .answer
-            .unwrap();
-        assert_eq!(
-            answer.output,
-            [2, 0, 12, 0, 0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            answer.frame,
-            Frame {
-                service: 10,
-                tag: PAYLOAD,
-                opcode: 12,
-                parameter: 0,
-                data: UNSUPPORTED,
-            }
-        );
-    }
-
-    #[test]
-    fn another_request_gets_the_failure_alone() {
-        let mut buffers = Buffers {
-            input: Vec::new(),
-            output: Vec::new(),
-        };
-        let answer = request(frame(1, 28), &mut buffers)
-            .unwrap_err()
-            .answer
-            .unwrap();
-        assert!(answer.output.is_empty());
-        assert_eq!(answer.frame, failure(frame(1, 28)));
-    }
-
-    #[test]
-    fn the_service_is_the_kernels_endpoint_with_its_16_kib_buffers() {
-        let scrd = service();
-        assert_eq!(scrd.id, 10);
-        assert!(scrd.accepts(true, 0x4000, 0x4000));
-        assert!(scrd.accepts(false, 0x4000, 0x4000));
-        assert!(!scrd.accepts(true, 0x8000, 0x4000));
-    }
 }

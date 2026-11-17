@@ -415,6 +415,34 @@ fn two_plane_ten_bit(plan: &mut Plan, library: &str, rng: &mut Random) {
     }
 }
 
+/// A compositor's frames over a 3840x2160 10-bit 4:2:0 video surface
+/// (`host_two_plane_frames`), as Mission Control draws a video wallpaper:
+/// eight frames each sample the whole surface into a private target, and
+/// the CPU rewrites the luma before the fifth. The probes, 16 texels a
+/// frame, agree with the Mac's, so each frame saw the surface's current
+/// rows; gpu_ms is the frames' GPU time.
+fn two_plane_frames(plan: &mut Plan, library: &str) {
+    let frames = 8;
+    plan.add(
+        Case::host(
+            "host.iosurface.two_plane_frames_4k",
+            library,
+            json!({"kind": "two_plane_frames", "format": 505, "width": 3840, "height": 2160,
+                   "frames": frames, "change": 4}),
+        )
+        .buffer(Buffer::zeroed("probes", 0, frames * 16 * 16).unbound())
+        // A 10-bit step of each read, and the conversion's 1/2048 twice.
+        .output(Output::new(
+            "probes",
+            Dtype::F32,
+            Tolerance::abs(1.0 / 1023.0 + 4.0 / 2048.0),
+        ))
+        .note(
+            "gpu_ms is eight frames sampling a 4K video surface, the last four after a CPU write",
+        ),
+    );
+}
+
 /// A 4:4:4 two-plane format's planes of an RGB color, in whole steps:
 /// green and blue-red, or full-range BT.601 luma and chroma whose chroma is
 /// scaled by 256 / 255 around 128, as Apple GPUs store them.
@@ -1658,6 +1686,7 @@ pub fn build(plan: &mut Plan) {
     iosurface_buffer(plan, &library, &mut Random::new(1320));
     two_plane_render(plan, &library, &mut Random::new(1304));
     two_plane_ten_bit(plan, &library, &mut Random::new(1305));
+    two_plane_frames(plan, &library);
     share(plan, &library, &mut rng);
     archive(plan, &library, &mut rng);
     errors(plan, &library);

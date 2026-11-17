@@ -15,6 +15,21 @@
 //! [`STEP_MICROS`], the next step going on from the part after it. The
 //! shared count stops at what its guest code earned while it serves
 //! (`clock`), so a step stops every PE's time for its length.
+//!
+//! A PE that serves answers no interrupt and runs no timer of its own, and
+//! another core's XNU times its answers. So every turn runs inside
+//! `Machine::serve_host`, which keeps its PE reachable: a wake that brings
+//! it an interrupt kicks its core and marks the shared count, as its own
+//! timer's deadline does, and the count holds a stall limit past that if
+//! the PE stays out. The turn looks for such guest work before each part
+//! after its first (`GuestWatch`, `service_watch::Turn`) and leaves the
+//! rest to a later turn, so the guest waits at most for the part that
+//! runs. Guest work is an interrupt the PE takes or that ends its wait, or
+//! its own timer that can fire, counted from no earlier than the moment it
+//! began to serve. A part whose own time kept that work waiting past
+//! [`LATE_MILLIS`] is named in the `HOST SERVICE SLOW` line with what
+//! waited; a wait that began before the part is the turn's, in one
+//! `HOST SERVICE LATE` line.
 use super::{bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
 use alloc::{format, string::String, vec::Vec};
 use core::{
@@ -22,9 +37,10 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use stela_boot_core::{
-    service_watch::SlowParts,
+    service_watch::{Late, SlowParts, Turn, blame},
     shutdown::{Mode as Shutdown, Requests as ShutdownRequests},
 };
+use stela_engine::machine::engine::{GuestWatch, Pending};
 
 static SHUTDOWN: ShutdownRequests = ShutdownRequests::new();
 
@@ -134,7 +150,9 @@ impl Service {
         power: power::HostPowerControl,
         tsc_hz: u64,
     ) -> Self {
-        let now = host::rdtsc();
+        // The service moves between cores: its stamps across turns are
+        // the corrected count, not one core's raw TSC.
+        let now = host::fresh_counter();
         Self {
             devices,
             restore,
@@ -180,7 +198,8 @@ impl Service {
             if let Some(anchor) = anchor {
                 nor.keep_anchor(anchor);
             }
-            nor.finish();
+            let durable = nor.finish();
+            super::bundle_repair::stored(&durable);
         }
         #[cfg(feature = "nvk")]
         super::gpu::gate::stop(|| self.devices.serve(|devices| devices.stop_gpu_gates()));
@@ -191,7 +210,7 @@ impl Service {
     /// verification and answers and another copy, which a waiting PE leaves
     /// to a later service once an interrupt comes for it (`boot` serves them
     /// whole); whether it ran the parts to the last.
-    fn serve(&mut self, boot: bool, step: bool) -> bool {
+    fn serve(&mut self, boot: bool, step: bool, watch: &GuestWatch) -> bool {
         if let Some(mode) = SHUTDOWN.take(boot) {
             output::arguments(format_args!("POWER native shutdown: {mode:?}\n"));
             match mode {
@@ -226,40 +245,42 @@ impl Service {
             #[cfg(feature = "diagnostics")]
             input_peak,
         } = self;
-        let mut lap = Lap::new(*tsc_hz, boot, step);
+        let mut lap = Lap::new(*tsc_hz, boot, step, watch);
         let now = host::rdtsc();
+        // What another turn, maybe on another core, compares: the corrected
+        // count, at `COUNTER_HZ`, as the raw TSCs of cores whose counters
+        // agree only through a software offset differ by seconds.
+        let stamp = host::fresh_counter();
+        let millis = host::COUNTER_HZ / 1000;
         // The guest console's input, which its device model takes under
         // the devices' lock and so cannot wait for the host's port there.
         super::feed_console_input();
         let fed = host::rdtsc();
         // A service runs the parts from where the last one stopped on: a
-        // step until one ends past its time, a waiting PE until an
-        // interrupt comes for it, as whoever sent it may time the answer and
-        // the count waits for it to look (`clock`).
-        let from = *next;
-        *next = 0;
+        // step until one ends past its time; any turn, once a part ran,
+        // until guest work comes for its PE (an interrupt for it or its own
+        // timer), and a waiting PE's until an interrupt comes for its core,
+        // as whoever sent it times the answer and the count holds for it
+        // only a stall limit (`clock`, `GuestWatch`).
+        let from = core::mem::take(next);
         let limit = *tsc_hz / 1_000_000 * STEP_MICROS;
-        let deferred = *tsc_hz / 1000 * DEFERRED_MILLIS;
-        let mut ended = false;
+        let deferred = millis * DEFERRED_MILLIS;
+        let mut turn = Turn::new(from, now, step.then_some(limit));
+        let guest = || watch.pending(host::fresh_counter()).is_some();
         // Whether `part` runs in this turn; `drivers` when it calls the host
-        // drivers, whose lock another core may hold.
-        let mut due = |part: usize, drivers: bool, next: &mut usize| {
-            if ended || part < from {
-                return false;
-            }
-            if (step && host::rdtsc().wrapping_sub(now) >= limit) || (!boot && host::interrupted())
-            {
-                ended = true;
-                *next = part;
-                return false;
-            }
+        // drivers, whose lock another core may hold: such a part is left
+        // to a later turn without ending this one.
+        let mut due = |part: usize, drivers: bool, turn: &mut Turn| {
             if drivers
                 && super::storage::host_drivers_taken()
-                && now.wrapping_sub(ran[part]) < deferred
+                && stamp.wrapping_sub(ran[part]) < deferred
             {
                 return false;
             }
-            ran[part] = now;
+            if !turn.due(part, host::rdtsc(), !boot && host::interrupted(), guest()) {
+                return false;
+            }
+            ran[part] = stamp;
             true
         };
         #[cfg(feature = "diagnostics")]
@@ -268,7 +289,7 @@ impl Service {
             boot,
             ..InputTurn::default()
         };
-        let inputs_due = due(INPUTS, false, next);
+        let inputs_due = due(INPUTS, false, &mut turn);
         if let Some(usb) = usb.as_mut().filter(|_| inputs_due) {
             let arrived = usb.poll();
             if let Some(input) = input.as_mut() {
@@ -330,23 +351,24 @@ impl Service {
                 }
             }
         }
-        if due(LOGS, true, next) {
+        if due(LOGS, true, &mut turn) {
             // The logs' disks are looked at without waiting for the host
             // drivers: a store another processor's driver call holds up
             // goes on at a later turn.
             let ((), drivers) = super::storage::without_waiting(*tsc_hz, || {
-                if now.wrapping_sub(*log_flushed) >= *tsc_hz {
+                if stamp.wrapping_sub(*log_flushed) >= host::COUNTER_HZ {
                     output::flush_due();
-                    *log_flushed = host::rdtsc();
+                    *log_flushed = host::fresh_counter();
                 } else {
                     output::advance_logs();
                 }
             });
             lap.part_of(Part::Log, |_| drivers);
         }
-        if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, next)) {
+        if let Some(network) = network.as_mut().filter(|_| due(NETWORK, true, &mut turn)) {
             // The host adapter's sends and receives wait outside the
             // devices' lock, which every PE's device accesses take.
+            let carrier = network.carrier();
             let (frames, status, room) = devices.with(|devices| {
                 let frames = network.queued(devices);
                 (frames, devices.network_status(), devices.network_room())
@@ -354,7 +376,12 @@ impl Service {
             network.status(status);
             let reusable = network.transmit(frames);
             network.receive(room);
+            // Served, as a received frame is: a carrier change is a
+            // notification the guest's controller must pick up.
             devices.serve(|devices| {
+                if let Some(carrier) = carrier {
+                    devices.network_carrier(carrier);
+                }
                 if let Some(frame) = reusable {
                     devices.network_recycle(frame);
                 }
@@ -362,7 +389,10 @@ impl Service {
             });
             lap.part(Part::Network);
         }
-        if let Some(bluetooth) = bluetooth.as_mut().filter(|_| due(BLUETOOTH, true, next)) {
+        if let Some(bluetooth) = bluetooth
+            .as_mut()
+            .filter(|_| due(BLUETOOTH, true, &mut turn))
+        {
             let (packets, room, status) = devices.with(|devices| bluetooth.queued(devices));
             bluetooth.status(status);
             bluetooth.transmit(packets);
@@ -376,17 +406,17 @@ impl Service {
             }
             lap.part(Part::Bluetooth);
         }
-        if due(NOR, true, next) {
+        if due(NOR, true, &mut turn) {
             let mut drivers = String::new();
             if let Some(nor) = nor {
-                let due =
-                    anchored.is_none_or(|at| now.wrapping_sub(at) >= ANCHOR_SECONDS * *tsc_hz);
+                let due = anchored
+                    .is_none_or(|at| stamp.wrapping_sub(at) >= ANCHOR_SECONDS * host::COUNTER_HZ);
                 let (dirty, anchor) = devices.with(|devices| {
                     let anchor = due.then(|| devices.rtc_anchor()).flatten();
                     (nor::HostNor::dirty(devices), anchor)
                 });
                 if anchor.is_some() {
-                    *anchored = Some(now);
+                    *anchored = Some(stamp);
                 }
                 // As the logs' stores: never waiting for the host drivers.
                 let ((), line) = super::storage::without_waiting(*tsc_hz, || {
@@ -402,8 +432,7 @@ impl Service {
             }
             lap.part_of(Part::Nor, |_| drivers);
         }
-        let interrupted = || !boot && host::interrupted();
-        if let Some(experiment) = restore.as_mut().filter(|_| due(RESTORE, false, next)) {
+        if let Some(experiment) = restore.as_mut().filter(|_| due(RESTORE, false, &mut turn)) {
             // What was read ahead goes to the guest first: a service is
             // usually due because the guest's window opened, and the read
             // ahead can take milliseconds. The source is then read, and the
@@ -413,7 +442,9 @@ impl Service {
             experiment.pump();
             devices.serve(|devices| experiment.poll(devices));
             lap.part(Part::Restore);
-            if !interrupted() {
+            // The read ahead and its work wait for a later turn once guest
+            // work came for this PE, or, on a waiting PE, an interrupt.
+            if turn.goes_on(host::rdtsc(), !boot && host::interrupted(), guest()) {
                 experiment.prefetch();
                 let prefetched = host::rdtsc();
                 experiment.work();
@@ -430,20 +461,27 @@ impl Service {
                 lap.part(Part::Restore);
             }
         }
-        if now.wrapping_sub(*reported) >= REPORT_SECONDS * *tsc_hz {
+        if stamp.wrapping_sub(*reported) >= REPORT_SECONDS * host::COUNTER_HZ {
             if let Some(line) = restore
                 .as_ref()
                 .and_then(|experiment| experiment.asr_report())
             {
                 output::arguments(format_args!("{line}\n"));
             }
-            if let Some(network) = network.as_ref() {
+            if let Some(network) = network.as_mut() {
                 network.report();
             }
             power.disks().report(*tsc_hz);
-            *reported = now;
+            *reported = stamp;
         }
-        !ended
+        lap.end_turn(now);
+        match turn.ended() {
+            Some((part, _)) => {
+                *next = part;
+                false
+            }
+            None => true,
+        }
     }
 }
 
@@ -490,25 +528,74 @@ static SLOW: SlowParts<PARTS> = SlowParts::new();
 /// line of its own: a fifth of what XNU's watchdog allows one exit.
 const SLOW_MILLIS: u64 = 100;
 
+/// The parts whose own time kept guest work waiting for their PE past
+/// [`LATE_MILLIS`], each reported a few times a boot at most, apart from
+/// the slow ones.
+static LATE: SlowParts<PARTS> = SlowParts::new();
+
+/// The turns at whose parts' ends guest work had waited past
+/// [`LATE_MILLIS`] although no part's own time covered it: the wait began
+/// in the host's work before them. Reported as [`LATE`] is.
+static LATE_TURNS: SlowParts<1> = SlowParts::new();
+
+/// How long guest work (an interrupt the serving PE takes, or its own
+/// timer that can fire) may wait for one part before the part is named
+/// although it was not slow: the stall limit after which the shared count
+/// holds for that PE (`clock`).
+const LATE_MILLIS: u64 = 50;
+
 /// When the running part started, and this core's posted pumps' ticks then
-/// (`gpu::posted_ticks_here`), in a turn of the kind [`serve`] was asked for.
-struct Lap {
+/// (`gpu::posted_ticks_here`), in a turn of the kind [`serve`] was asked for,
+/// on the PE `watch` looks after; the longest wait of guest work no part's
+/// own time covered in this turn.
+struct Lap<'a> {
     started: u64,
     pumped: u64,
     tsc_hz: u64,
     boot: bool,
     step: bool,
+    watch: &'a GuestWatch,
+    turn_late: Option<(Pending, u64)>,
+    /// This core's SMI count when the turn began (`pmu::smi_count`), for a
+    /// slow part's line: SMIs taken in the turn are firmware time.
+    smis: Option<u64>,
 }
 
-impl Lap {
-    fn new(tsc_hz: u64, boot: bool, step: bool) -> Self {
+impl<'a> Lap<'a> {
+    fn new(tsc_hz: u64, boot: bool, step: bool, watch: &'a GuestWatch) -> Self {
         Self {
             started: host::rdtsc(),
             pumped: super::gpu::posted_ticks_here(),
             tsc_hz,
             boot,
             step,
+            watch,
+            turn_late: None,
+            smis: host::pmu::smi_count(),
         }
+    }
+
+    /// The turn that began at TSC `began` ends: a wait of guest work that
+    /// no part's own time covered is reported once for the turn, with the
+    /// turn's length, so a wait longer than the turn shows that it began in
+    /// the host's work around it.
+    fn end_turn(&self, began: u64) {
+        let Some((pending, waited)) = self.turn_late else {
+            return;
+        };
+        if !LATE_TURNS.worth(0, waited, host::COUNTER_HZ / 1000 * LATE_MILLIS) {
+            return;
+        }
+        let turn = host::rdtsc().wrapping_sub(began);
+        output::arguments(format_args!(
+            "HOST SERVICE LATE turn_us={} boot={} step={} pe={} guest={} late_us={}\n",
+            u128::from(turn) * 1_000_000 / u128::from(self.tsc_hz.max(1)),
+            self.boot,
+            self.step,
+            self.watch.pe(),
+            pending.name(),
+            u128::from(waited) * 1_000_000 / u128::from(host::COUNTER_HZ),
+        ));
     }
 
     fn part(&mut self, part: Part) {
@@ -525,20 +612,69 @@ impl Lap {
         let took = now.wrapping_sub(self.started).saturating_sub(pumped);
         LONGEST[part as usize].fetch_max(took, Ordering::Relaxed);
         TOTAL[part as usize].fetch_add(took, Ordering::Relaxed);
-        if SLOW.worth(part as usize, took, self.tsc_hz / 1000 * SLOW_MILLIS) {
+        // The guest work that waited for this PE as the part ended: the part
+        // is named when it was slow, or when its own time kept that work
+        // waiting past the stall limit, with what waited and how long. A
+        // wait its time did not cover goes to the turn's line
+        // ([`Self::end_turn`]).
+        let waited = self.watch.waited(host::fresh_counter());
+        let slow = SLOW.worth(part as usize, took, self.tsc_hz / 1000 * SLOW_MILLIS);
+        let took_counts = (u128::from(took) * u128::from(host::COUNTER_HZ)
+            / u128::from(self.tsc_hz.max(1))) as u64;
+        let late = match (
+            waited,
+            blame(
+                waited.and_then(|(_, ticks)| ticks),
+                took_counts,
+                host::COUNTER_HZ / 1000 * LATE_MILLIS,
+            ),
+        ) {
+            (_, Late::Part(covered)) => LATE.worth(
+                part as usize,
+                covered,
+                host::COUNTER_HZ / 1000 * LATE_MILLIS,
+            ),
+            (Some((pending, _)), Late::Turn(ticks)) => {
+                if self.turn_late.is_none_or(|(_, longest)| ticks > longest) {
+                    self.turn_late = Some((pending, ticks));
+                }
+                false
+            }
+            _ => false,
+        };
+        if slow || late {
+            let guest = match waited {
+                None => String::from(" guest=-"),
+                Some((pending, None)) => format!(" guest={}", pending.name()),
+                Some((pending, Some(ticks))) => format!(
+                    " guest={} late_us={}",
+                    pending.name(),
+                    u128::from(ticks) * 1_000_000 / u128::from(host::COUNTER_HZ)
+                ),
+            };
+            // The SMIs from the turn's start to this part's end.
+            let smis = self
+                .smis
+                .zip(host::pmu::smi_count())
+                .map(|(before, after)| {
+                    format!(" turn_smis={}", stela_boot_core::smi::taken(before, after))
+                })
+                .unwrap_or_default();
             output::arguments(format_args!(
-                "HOST SERVICE SLOW part={} us={} boot={} step={}{}\n",
+                "HOST SERVICE SLOW part={} us={} boot={} step={} pe={}{guest}{}{smis}\n",
                 NAMES[part as usize],
                 u128::from(took) * 1_000_000 / u128::from(self.tsc_hz.max(1)),
                 self.boot,
                 self.step,
+                self.watch.pe(),
                 detail(took),
             ));
         }
         // A posted GPU call waits for the boot CPU, not for the remaining
         // parts; the pump's time is no part's.
         super::gpu::pump_posted();
-        *self = Self::new(self.tsc_hz, self.boot, self.step);
+        self.started = host::rdtsc();
+        self.pumped = super::gpu::posted_ticks_here();
     }
 }
 
@@ -638,7 +774,9 @@ pub(super) fn install(service: Service) {
 /// Serve the host unless another core is serving it; `boot` when the boot
 /// PE serves it. A `step` serves only for about [`STEP_MICROS`]: its core
 /// runs guest code that no other core can, and every PE's time waits for it.
-pub(super) fn serve(boot: bool, step: bool) {
+/// The turn ends at its next part once `watch` finds guest work for the
+/// serving PE (`Machine::guest_watch`), called within `Machine::serve_host`.
+pub(super) fn serve(boot: bool, step: bool, watch: &GuestWatch) {
     // Give the boot processor the next turn when it must perform a native
     // shutdown; an AP may not consume that request or enter firmware for it.
     if !boot && SHUTDOWN.pending() {
@@ -652,19 +790,19 @@ pub(super) fn serve(boot: bool, step: bool) {
         let Some(service) = slot else {
             return false;
         };
-        service.serve(boot, step)
+        service.serve(boot, step, watch)
     });
     // A step that left parts for the next keeps the host starved, so the
     // next step follows at the next slice.
     if served == Some(true) {
-        SERVED.store(host::rdtsc(), Ordering::Release);
+        SERVED.store(host::fresh_counter(), Ordering::Release);
         SERVICES[usize::from(boot)].fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// Whether no PE has served the host for [`STARVED_MILLIS`], or for
 /// [`REQUESTED_MILLIS`] with a device's request `requested`.
-pub(super) fn starved(tsc_hz: u64, requested: bool) -> bool {
+pub(super) fn starved(requested: bool) -> bool {
     if SHUTDOWN.pending() {
         return true;
     }
@@ -673,7 +811,10 @@ pub(super) fn starved(tsc_hz: u64, requested: bool) -> bool {
     } else {
         STARVED_MILLIS
     };
-    host::rdtsc().wrapping_sub(SERVED.load(Ordering::Acquire)) >= tsc_hz / 1000 * millis
+    // Stored by whichever core served last: the corrected count, which
+    // every core reads alike.
+    host::fresh_counter().wrapping_sub(SERVED.load(Ordering::Acquire))
+        >= host::COUNTER_HZ / 1000 * millis
 }
 
 /// The service, back from whichever core serves it, for the run's end.

@@ -13,6 +13,8 @@
 mod macros;
 
 pub mod abi;
+#[cfg(feature = "amdgpu-port")]
+pub mod amd;
 pub mod argument;
 pub mod binding;
 pub mod capabilities;
@@ -24,11 +26,14 @@ pub mod error;
 pub mod hazard;
 pub mod heap;
 pub mod indirect;
+#[cfg(feature = "xe-port")]
+pub mod intel;
 pub mod kms;
 pub mod library;
 #[cfg(feature = "metal-vulkan")]
 pub mod native;
 pub mod nvidia;
+pub mod open;
 pub mod pass;
 pub mod pipeline;
 pub mod pixel_format;

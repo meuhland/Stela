@@ -6,6 +6,7 @@
 //! require their presence. Board overrides and guest device binding are separate.
 //! Raw reports, accumulated positions and software tracking remain distinct.
 use super::*;
+use crate::input::touchpad::{Geometry, Touch, Translator};
 mod controls;
 mod device;
 mod trackpoint;
@@ -187,7 +188,8 @@ pub(super) struct Engine {
     last_fault: Option<([u8; 6], usize)>,
     frames: VecDeque<Frame>,
     sequence: u64,
-    buttons: u8,
+    /// The pad's mouse emulation, made with its first frame.
+    pointer: Option<Translator>,
     single_finger_reports: u8,
     head: Option<(u64, (i32, i32))>,
     multitouch: V4State,
@@ -206,6 +208,11 @@ impl Engine {
     pub(super) fn partial(&self) -> bool {
         self.position != 0
     }
+    /// Drop the packet in progress, as psmouse drops a packet that lost
+    /// synchronization, so the next byte starts a packet.
+    pub(super) fn resync(&mut self) {
+        self.position = 0;
+    }
     pub(super) fn expire(&mut self, now: u64, timeout: u64) -> Result<(), ErrorKind> {
         if self.partial() && now.wrapping_sub(self.start) >= timeout {
             self.last_fault = Some((self.packet, self.position));
@@ -221,20 +228,18 @@ impl Engine {
             self.trackpoint_buttons = 0;
             inputs.push(Input::MouseButtons(0));
         }
-        if self.buttons != 0 {
-            self.buttons = 0;
-            inputs.push(
-                if self
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|c| c.firmware < 0x020000 && c.capabilities[0] & 4 != 0)
-                {
-                    Input::MouseButtons(0)
-                } else {
-                    Input::Buttons(0)
-                },
-            );
+        if let Some(pointer) = &mut self.pointer {
+            pointer.release(inputs);
         }
+    }
+    /// One touchpad frame through the pad's mouse emulation.
+    fn touch(&mut self, touch: Option<Touch>, buttons: u8, now: u64, inputs: &mut Vec<Input>) {
+        let Some(c) = self.capabilities.as_ref() else {
+            return;
+        };
+        self.pointer
+            .get_or_insert_with(|| Translator::new(geometry(c)))
+            .frame(touch, buttons, now, inputs);
     }
     pub(super) fn feed(
         &mut self,
@@ -243,7 +248,11 @@ impl Engine {
         timeout: u64,
         inputs: &mut Vec<Input>,
     ) -> Result<(), ErrorKind> {
-        self.expire(now, timeout)?;
+        // A packet that expired before this byte is dropped, and the byte
+        // may start the next one.
+        if self.expire(now, timeout).is_err() {
+            self.resync();
+        }
         if self.frames.len() >= FRAME_LIMIT + QUEUE_LIMIT {
             return Err(ErrorKind::QueueFull);
         }
@@ -271,10 +280,10 @@ impl Engine {
             return self.report_trackpoint(inputs);
         }
         if c.hardware == 3 {
-            return self.report_v3(inputs);
+            return self.report_v3(now, inputs);
         }
         if c.hardware == 4 {
-            return self.report_v4(inputs);
+            return self.report_v4(now, inputs);
         }
         let debounce = c.hardware == 2 && p == [0x84, 0xff, 0xff, 0x02, 0xff, 0xff];
         let valid = if c.hardware == 1 {
@@ -385,25 +394,14 @@ impl Engine {
                         }),
                     )
                 };
-                if buttons != self.buttons {
-                    self.buttons = buttons;
-                    inputs.push(if rocker {
-                        Input::MouseButtons(buttons)
-                    } else {
-                        Input::Buttons(buttons)
-                    });
-                }
-                if let Some((x, y)) = primary {
-                    let scale = |value: i32, low: u16, high: u16| {
-                        ((value - i32::from(low)).clamp(0, i32::from(high - low)) as u32
-                            * u32::from(crate::input::POINTER_MAX)
-                            / u32::from(high - low)) as u16
-                    };
-                    inputs.push(Input::Move {
-                        x: scale(x, c.bounds.minimum.0, c.bounds.maximum.0),
-                        y: scale(y, c.bounds.minimum.1, c.bounds.maximum.1),
-                    });
-                }
+                // A touchpad is a mouse moved by finger travel, as libinput
+                // reads these absolute packets.
+                let touch = primary.map(|(x, y)| match secondary {
+                    Some(second) => Touch::of([(x, y), second])
+                        .map_or(Touch { x, y, fingers }, |touch| Touch { fingers, ..touch }),
+                    None => Touch { x, y, fingers },
+                });
+                self.touch(touch, buttons, now, inputs);
                 Report::Contacts(Contact {
                     fingers,
                     primary,
@@ -423,6 +421,18 @@ impl Engine {
         self.position = 0;
         Ok(())
     }
+}
+/// The pad's scale: its queried v4 resolution, else its bounds over
+/// libinput's assumed size, as Linux states no resolution for v1-v3.
+fn geometry(c: &Capabilities) -> Geometry {
+    let span = (
+        c.bounds.maximum.0.saturating_sub(c.bounds.minimum.0),
+        c.bounds.maximum.1.saturating_sub(c.bounds.minimum.1),
+    );
+    let resolution = c.v4.map_or((0, 0), |v4| {
+        (v4.counts_per_mm.0.into(), v4.counts_per_mm.1.into())
+    });
+    Geometry::resolution(span, resolution)
 }
 impl<R: Registers, T: Timer> Controller<R, T> {
     /// Explicit ordinary Elantech attachment under the same native i8042 grant.

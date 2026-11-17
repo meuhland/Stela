@@ -30,6 +30,10 @@ pub struct GpuTimes {
     pub placed: u64,
     pub queued_ticks: u64,
     pub longest_queued_ticks: u64,
+    /// Of `queued_ticks`, the ticks the GPU still ran earlier command
+    /// buffers: the rest is the host's way to the GPU (the submit thread,
+    /// the boot processor's pump, the driver's scheduler).
+    pub behind_ticks: u64,
     pub noticed_ticks: u64,
     pub longest_noticed_ticks: u64,
     /// Committed command buffers that wait on an event.
@@ -37,6 +41,11 @@ pub struct GpuTimes {
     /// The longest command buffer's serial and its pipelines' entry points.
     pub longest_serial: u64,
     pub longest_entries: String,
+    /// The `vkQueueSubmit2` calls the longest command buffer took. Its time
+    /// runs from its first submission's start to its last one's end, so with
+    /// more than one it holds the host's gaps between them (held segments,
+    /// sparse binds), not only the GPU's work.
+    pub longest_submits: u64,
     /// The longest span between two of a command buffer's marks (its start,
     /// the ends of its first passes and dispatches, its end): GPU
     /// nanoseconds, the command buffer, the span's index among its spans,
@@ -129,12 +138,14 @@ impl GpuClock {
 
     /// Counts a retired command buffer: committed at `committed` and seen
     /// complete at `seen`, platform ticks, run from `start` to `end`, GPU
-    /// nanoseconds. `entries` names its pipelines when it is the longest;
-    /// `spans` are the GPU nanoseconds between its marks with the entry
-    /// points each span bound.
+    /// nanoseconds, in `submits` submissions. `entries` names its pipelines
+    /// when it is the longest; `spans` are the GPU nanoseconds between its
+    /// marks with the entry points each span bound.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn retire(
         &mut self,
         serial: u64,
+        submits: u64,
         committed: u64,
         seen: u64,
         [start, end]: [u64; 2],
@@ -161,8 +172,10 @@ impl GpuClock {
             times.longest_ns = busy;
             times.longest_serial = serial;
             times.longest_entries = names(entries());
+            times.longest_submits = submits;
         }
-        if let Some(previous) = self.previous_end {
+        let earlier = self.previous_end;
+        if let Some(previous) = earlier {
             if start >= previous {
                 times.idle_ns += start - previous;
             } else {
@@ -173,10 +186,14 @@ impl GpuClock {
         let (Some(started), Some(ended)) = (self.ticks_at(start), self.ticks_at(end)) else {
             return;
         };
+        let behind = earlier
+            .and_then(|earlier| self.ticks_at(earlier))
+            .map_or(0, |earlier| earlier.min(started).saturating_sub(committed));
         let times = &mut self.times;
         let queued = started.saturating_sub(committed);
         let noticed = seen.saturating_sub(ended);
         times.placed += 1;
+        times.behind_ticks += behind.min(queued);
         times.queued_ticks += queued;
         times.longest_queued_ticks = times.longest_queued_ticks.max(queued);
         times.noticed_ticks += noticed;
@@ -205,6 +222,7 @@ mod tests {
         // later, ran 100 ns; seen 30 ticks after its end.
         clock.retire(
             7,
+            1,
             400_005_000,
             400_005_250,
             [200_001_010, 200_001_110],
@@ -241,17 +259,63 @@ mod tests {
         assert_eq!(clock.take(), GpuTimes::default());
     }
 
+    /// A command buffer committed while an earlier one still ran waits for
+    /// the GPU first: only what follows that one's end is the host's.
+    #[test]
+    fn splits_the_queue_into_earlier_work_and_the_hosts_way() {
+        let mut clock = GpuClock::default();
+        // One tick per GPU nanosecond, from GPU time 0 at tick 1000.
+        clock.calibrate(1_000, 1_000, 0);
+        clock.calibrate(200_001_000, 200_001_000, 200_000_000);
+        // The first ends at GPU 200_000_100 (tick 200_001_100).
+        clock.retire(
+            1,
+            1,
+            200_000_900,
+            200_001_200,
+            [200_000_000, 200_000_100],
+            Vec::new,
+            core::iter::empty(),
+        );
+        // The second, committed at tick 200_001_040 while the first ran,
+        // starts 30 ticks after its end.
+        clock.retire(
+            2,
+            1,
+            200_001_040,
+            200_001_300,
+            [200_000_130, 200_000_200],
+            Vec::new,
+            core::iter::empty(),
+        );
+        // A third, committed after both ended, waits on the host alone.
+        clock.retire(
+            3,
+            1,
+            200_001_250,
+            200_001_400,
+            [200_000_300, 200_000_310],
+            Vec::new,
+            core::iter::empty(),
+        );
+        let times = clock.take();
+        assert_eq!(times.placed, 3);
+        assert_eq!(times.queued_ticks, 100 + 90 + 50);
+        assert_eq!(times.behind_ticks, 60, "the second waited 60 for the first");
+    }
+
     #[test]
     fn counts_gaps_and_overlaps_between_command_buffers() {
         let mut clock = GpuClock::default();
-        clock.retire(1, 0, 0, [100, 200], Vec::new, core::iter::empty());
-        clock.retire(2, 0, 0, [250, 300], Vec::new, core::iter::empty());
-        clock.retire(3, 0, 0, [280, 400], Vec::new, core::iter::empty());
+        clock.retire(1, 1, 0, 0, [100, 200], Vec::new, core::iter::empty());
+        clock.retire(2, 1, 0, 0, [250, 300], Vec::new, core::iter::empty());
+        clock.retire(3, 3, 0, 0, [280, 400], Vec::new, core::iter::empty());
         let times = clock.take();
         assert_eq!(times.idle_ns, 50);
         assert_eq!(times.overlap_ns, 20);
         assert_eq!(times.busy_ns, 270);
         assert_eq!(times.longest_serial, 3);
+        assert_eq!(times.longest_submits, 3, "the longest's submissions");
         // Without two readings nothing is placed.
         assert_eq!(times.placed, 0);
     }

@@ -268,6 +268,11 @@ impl TexelBufferAlignment {
     }
 }
 
+/// The coarsest row alignment Metal answers for IOSurface textures
+/// ([`Capabilities::surface_row_alignment`]): NVIDIA's linear images' 32
+/// bytes, which the surfaces Core Image renders through are laid out to.
+pub const SURFACE_ROW_ALIGNMENT: u64 = 32;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
     pub name: String,
@@ -486,6 +491,24 @@ impl Capabilities {
         } else {
             0
         }
+    }
+
+    /// `iosurfaceTextureAlignmentBytes` and
+    /// `iosurfaceReadOnlyTextureAlignmentBytes`: what the rows of a surface
+    /// a texture uses must be a multiple of. A texture takes rows of any
+    /// whole number of pixels, the GPU sampling and rendering those its
+    /// linear images cannot address through an aligned copy
+    /// ([`resource::aligned_copy`]), so the answer need not be the linear
+    /// images' own alignment: it is that alignment, at most NVIDIA's 32
+    /// bytes. Core Image makes no texture of a surface whose rows miss it and
+    /// hands its image processors nil instead, so RADV's 256-byte linear
+    /// rows, answered here, left Core Image's blur without textures of the
+    /// icon services' surfaces (rows of 64 to 384 bytes), and
+    /// MPSImageGaussianBlur aborted iconservicesagent.
+    ///
+    /// [`resource::aligned_copy`]: crate::metal::resource::aligned_copy
+    pub fn surface_row_alignment(&self) -> u64 {
+        self.linear_row_alignment.min(SURFACE_ROW_ALIGNMENT)
     }
 
     /// Row-pitch and offset alignments of linear textures inside buffers.

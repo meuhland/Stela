@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:41:10 +0000
+Subject: [PATCH] fix(xe): a kernel without register maps runs the GPU without
+ its I2C controller, as on a part that has none, where the regmap refusal
+ failed the whole GPU's probe
+
+---
+ drivers/gpu/drm/xe/xe_i2c.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_i2c.c b/drivers/gpu/drm/xe/xe_i2c.c
+index 3127fb89d965fa0a5b3cb6afbc1e0537ab98b980..04f269a74d08ab0d0e49efd2e4741739f4166ecb 100644
+--- a/drivers/gpu/drm/xe/xe_i2c.c
++++ b/drivers/gpu/drm/xe/xe_i2c.c
+@@ -383,6 +383,16 @@ int xe_i2c_probe(struct xe_device *xe)
+ 	xe_i2c_pm_resume(xe, true);
+ 
+ 	regmap = devm_regmap_init(drm_dev, NULL, i2c, &i2c_regmap_config);
++	if (PTR_ERR_OR_ZERO(regmap) == -EOPNOTSUPP) {
++		/*
++		 * A kernel without register maps cannot drive the controller;
++		 * the GPU works without it, as on a part that has none.
++		 */
++		drm_notice(&xe->drm, "I2C controller left off: no register maps\n");
++		xe_i2c_pm_suspend(xe);
++		xe->i2c = NULL;
++		return 0;
++	}
+ 	if (IS_ERR(regmap))
+ 		return PTR_ERR(regmap);
+ 

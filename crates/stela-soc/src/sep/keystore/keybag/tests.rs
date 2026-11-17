@@ -1,5 +1,6 @@
 extern crate std;
 
+use super::super::super::credentials::{Credentials, Unlinked, tests as acm};
 use super::*;
 use alloc::{boxed::Box, vec, vec::Vec};
 
@@ -242,6 +243,7 @@ type TestEntropy = Box<dyn FnMut(&mut [u8]) -> crate::Result<()>>;
 struct Sep {
     keystore: KeyStore,
     entropy: TestEntropy,
+    credentials: Credentials,
 }
 
 impl Sep {
@@ -249,6 +251,7 @@ impl Sep {
         Self {
             keystore: KeyStore::with_keybag_iterations(Zeroizing::new(root), TEST_ITERATIONS),
             entropy: Box::new(counter()),
+            credentials: Credentials::default(),
         }
     }
 
@@ -267,9 +270,12 @@ impl Sep {
             input: input.clone(),
             output: Vec::new(),
         };
-        let reply = self
-            .keystore
-            .request(sent, &mut buffers, &mut self.entropy)?;
+        let reply = self.keystore.request_linked(
+            sent,
+            &mut buffers,
+            &mut self.entropy,
+            &mut self.credentials,
+        )?;
         assert_eq!(reply.tag, command | REPLY);
         assert_eq!((reply.opcode, reply.parameter), (7, 0));
         assert_eq!((reply.data >> 16) as usize, buffers.output.len());
@@ -418,7 +424,7 @@ fn an_empty_passcode_bag_is_answered_at_once_and_opens_unlocked() {
     let sent = frame(CREATE, 3, buffers.input.len());
     let reply = sep
         .keystore
-        .begin(sent, &mut buffers, &mut sep.entropy)
+        .begin(sent, &mut buffers, &mut sep.entropy, &mut Unlinked)
         .unwrap();
     assert!(reply.is_some());
     assert!(!sep.keystore.deriving());
@@ -529,13 +535,21 @@ fn a_passcode_derivation_runs_in_bounded_slices_and_holds_the_queue() {
         output: Vec::new(),
     };
     let mut entropy = counter();
-    assert_eq!(keystore.begin(sent, &mut buffers, &mut entropy), Ok(None));
+    assert_eq!(
+        keystore.begin(sent, &mut buffers, &mut entropy, &mut Unlinked),
+        Ok(None)
+    );
     assert!(keystore.deriving());
     assert_eq!(keystore.deferred_frame(), Some(sent));
     // Another request during the derivation is not taken.
     assert!(
         keystore
-            .begin(frame(UUID, 10, 0), &mut buffers, &mut entropy)
+            .begin(
+                frame(UUID, 10, 0),
+                &mut buffers,
+                &mut entropy,
+                &mut Unlinked
+            )
             .is_err()
     );
     // Each step runs at most SLICE iterations; its time stays far under the
@@ -548,7 +562,7 @@ fn a_passcode_derivation_runs_in_bounded_slices_and_holds_the_queue() {
     let mut durations = Vec::new();
     let reply = loop {
         let started = std::time::Instant::now();
-        let result = keystore.resume(&mut buffers);
+        let result = keystore.resume(&mut buffers, &mut Unlinked);
         durations.push(started.elapsed());
         match result {
             Some(result) => break result.unwrap(),
@@ -576,7 +590,7 @@ fn a_passcode_derivation_runs_in_bounded_slices_and_holds_the_queue() {
         buffers.output[buffers.output.len() - 8..],
         [16, 0, 0, 0, 0, 0, 0, 0]
     );
-    assert!(keystore.resume(&mut buffers).is_none());
+    assert!(keystore.resume(&mut buffers, &mut Unlinked).is_none());
 }
 
 fn bind_body(handle: i32, special: i32, secret: &[u8], flags: u64) -> Vec<u8> {
@@ -807,7 +821,12 @@ fn bind_lock_state_and_transition_refuse_shapes_outside_the_login_calls() {
         (
             DEVICE_STATE_TRANSITION,
             0,
-            transition_body_with(handle, 1, 1, &[]),
+            transition_body_with(handle, 1, 2, &[]),
+        ),
+        (
+            DEVICE_STATE_TRANSITION,
+            0,
+            transition_body_with(handle, 5, 1, &[]),
         ),
     ] {
         assert!(sep.ask(2, command, variant, &body).is_err());
@@ -1023,7 +1042,10 @@ fn a_change_runs_both_derivations_in_bounded_slices() {
         output: Vec::new(),
     };
     let mut entropy = counter();
-    assert_eq!(keystore.begin(sent, &mut buffers, &mut entropy), Ok(None));
+    assert_eq!(
+        keystore.begin(sent, &mut buffers, &mut entropy, &mut Unlinked),
+        Ok(None)
+    );
     let bound = if cfg!(debug_assertions) {
         std::time::Duration::from_millis(25)
     } else {
@@ -1032,7 +1054,7 @@ fn a_change_runs_both_derivations_in_bounded_slices() {
     let mut durations = Vec::new();
     let reply = loop {
         let started = std::time::Instant::now();
-        let result = keystore.resume(&mut buffers);
+        let result = keystore.resume(&mut buffers, &mut Unlinked);
         durations.push(started.elapsed());
         if let Some(result) = result {
             break result.unwrap();
@@ -1141,6 +1163,49 @@ fn lock_assertions_defer_a_lock_until_the_last_drop() {
     assert_eq!(sep.ss(open), (NO_PIN | BEEN_UNLOCKED) as u8);
 }
 
+/// Sel 32 (`MKBLockDeviceNow`, `LockDeviceNow`) sends the lock with
+/// argument 1: the same lock at once, deferred by held assertions.
+#[test]
+fn a_lock_now_locks_as_a_lock_does() {
+    let mut sep = Sep::new(ROOT);
+    let handle = sep.create(2, SECRET);
+    sep.bind(handle).unwrap();
+    let transition = |sep: &mut Sep, transition: u32, argument: u64| -> Result<u64, Refusal> {
+        let fields = sep.ask(
+            2,
+            DEVICE_STATE_TRANSITION,
+            0,
+            &transition_body_with(SESSION_BAG, transition, argument, &[]),
+        )?;
+        assert_eq!(fields.len(), 16);
+        assert_eq!(fields[8..], [0; 8]);
+        Ok(u64::from_le_bytes(fields[..8].try_into().unwrap()))
+    };
+    sep.lock_state(UNLOCK, SECRET).unwrap();
+    assert_eq!(sep.ss(SESSION_BAG), 4);
+    assert_eq!(
+        transition(&mut sep, LOCK_TRANSITION, 1),
+        Ok(NOTIFY_LOCK_STATE)
+    );
+    assert_eq!(sep.ss(SESSION_BAG), 5);
+    assert_eq!(transition(&mut sep, LOCK_TRANSITION, 1), Ok(0));
+    // A held assertion defers it to the last drop.
+    sep.lock_state(UNLOCK, SECRET).unwrap();
+    assert_eq!(transition(&mut sep, HOLD_ASSERTION, 0), Ok(0));
+    assert_eq!(transition(&mut sep, LOCK_TRANSITION, 1), Ok(0));
+    assert_eq!(sep.ss(SESSION_BAG), 4);
+    assert_eq!(
+        transition(&mut sep, DROP_ASSERTION, 0),
+        Ok(NOTIFY_LOCK_STATE)
+    );
+    assert_eq!(sep.ss(SESSION_BAG), 5);
+    // No other transition takes the argument, and no other argument.
+    sep.lock_state(UNLOCK, SECRET).unwrap();
+    assert!(transition(&mut sep, HOLD_ASSERTION, 1).is_err());
+    assert!(transition(&mut sep, LOCK_TRANSITION, 2).is_err());
+    assert_eq!(sep.ss(SESSION_BAG), 4);
+}
+
 fn verify_body(handle: i32, secret: &[u8], acm: &[u8], flags: u64) -> Vec<u8> {
     let mut bytes = handle_body(handle);
     blob(&mut bytes, secret);
@@ -1192,4 +1257,133 @@ fn verify_checks_the_passcode_without_unlocking() {
         1,
         "{notes:?}"
     );
+}
+
+/// The password check LocalAuthentication makes: ACM context P holds the
+/// typed password as PassphraseEntered, context A is the request's; verify
+/// with the ACM secret flag names P as the secret and A as the ACM blob.
+/// Only a passphrase that opens the user's bag gives A PasscodeValidated,
+/// which DeviceOwner policies then accept.
+#[test]
+fn an_acm_password_check_validates_the_requests_context_only_with_the_right_password() {
+    let mut sep = Sep::new(ROOT);
+    let handle = sep.create(2, SECRET);
+    sep.bind(handle).unwrap();
+    let mut entropy = acm::counter();
+    let context = |sep: &mut Sep, entropy: &mut dyn super::super::super::Entropy| {
+        let (handle, _) = acm::create(&mut sep.credentials, entropy);
+        assert_eq!(acm::ask(&mut sep.credentials, entropy, 19, &handle).0, 0);
+        handle
+    };
+    let satisfied = |sep: &mut Sep, request: &Handle| {
+        let input = acm::verify_policy(request, b"DeviceOwnerAuthentication", false);
+        let (status, output) = acm::ask(&mut sep.credentials, &mut acm::counter(), 3, &input);
+        assert_eq!(status, 0);
+        output[0] == 1
+    };
+    let verify = |sep: &mut Sep, passcode: &Handle, request: &[u8]| {
+        sep.ask(
+            2,
+            VERIFY,
+            1,
+            &verify_body(SESSION_BAG, passcode, request, VERIFY_FLAGS | ACM_SECRET),
+        )
+    };
+
+    let wrong = context(&mut sep, &mut entropy);
+    let typed = acm::add_passphrase(&wrong, b"wrong horse", 1);
+    assert_eq!(acm::ask(&mut sep.credentials, &mut entropy, 5, &typed).0, 0);
+    let request = context(&mut sep, &mut entropy);
+    let refusal = verify(&mut sep, &wrong, &request).unwrap_err();
+    assert_eq!(refusal.answer.unwrap().frame.parameter, BAD_PASSCODE_STATUS);
+    assert!(!satisfied(&mut sep, &request));
+
+    let right = context(&mut sep, &mut entropy);
+    let typed = acm::add_passphrase(&right, SECRET, 1);
+    assert_eq!(acm::ask(&mut sep.credentials, &mut entropy, 5, &typed).0, 0);
+    assert_eq!(verify(&mut sep, &right, &request), Ok(vec![0; 8]));
+    assert!(satisfied(&mut sep, &request));
+    // The bag stays locked and the passphrase's own context gains nothing.
+    assert_eq!(sep.ss(SESSION_BAG), 1);
+    assert!(!satisfied(&mut sep, &right));
+
+    // Without an ACM blob the check runs and grants nothing.
+    let other = context(&mut sep, &mut entropy);
+    assert_eq!(verify(&mut sep, &right, &[]), Ok(vec![0; 8]));
+    assert!(!satisfied(&mut sep, &other));
+    // A deleted or unknown context, a context without a passphrase and a
+    // secret that is no handle refuse with the generic failure.
+    let empty = context(&mut sep, &mut entropy);
+    for (passcode, request) in [
+        (&right[..], &[9; 16][..]),
+        (&[9; 16][..], &other[..]),
+        (&empty[..], &other[..]),
+        (SECRET, &other[..]),
+        (&right[..], &other[..15]),
+    ] {
+        let refusal = sep
+            .ask(
+                2,
+                VERIFY,
+                1,
+                &verify_body(SESSION_BAG, passcode, request, VERIFY_FLAGS | ACM_SECRET),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.answer.unwrap().frame.parameter, FAILURE);
+    }
+    assert!(!satisfied(&mut sep, &other));
+    // A plain password with a request context also grants it.
+    assert_eq!(
+        sep.ask(
+            2,
+            VERIFY,
+            1,
+            &verify_body(SESSION_BAG, SECRET, &other, VERIFY_FLAGS)
+        ),
+        Ok(vec![0; 8])
+    );
+    assert!(satisfied(&mut sep, &other));
+    let notes = sep.notes();
+    assert!(!notes.iter().any(|n| n.contains("horse")), "{notes:?}");
+}
+
+/// A request context deleted while the derivation runs gets no credential,
+/// and the verify answers the generic failure, not success.
+#[test]
+fn a_request_context_deleted_during_the_derivation_fails_the_verify() {
+    let mut sep = Sep::new(ROOT);
+    let handle = sep.create(2, SECRET);
+    sep.bind(handle).unwrap();
+    let mut entropy = acm::counter();
+    let (passcode, _) = acm::create(&mut sep.credentials, &mut entropy);
+    let (request, _) = acm::create(&mut sep.credentials, &mut entropy);
+    let typed = acm::add_passphrase(&passcode, SECRET, 1);
+    assert_eq!(acm::ask(&mut sep.credentials, &mut entropy, 5, &typed).0, 0);
+    let input = self::request(
+        2,
+        1,
+        &verify_body(SESSION_BAG, &passcode, &request, VERIFY_FLAGS | ACM_SECRET),
+    );
+    let sent = frame(VERIFY, 7, input.len());
+    let mut buffers = Buffers {
+        input,
+        output: Vec::new(),
+    };
+    assert_eq!(
+        sep.keystore
+            .begin(sent, &mut buffers, &mut sep.entropy, &mut sep.credentials)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        acm::ask(&mut sep.credentials, &mut entropy, 2, &request).0,
+        0
+    );
+    let result = loop {
+        if let Some(result) = sep.keystore.resume(&mut buffers, &mut sep.credentials) {
+            break result;
+        }
+    };
+    assert_eq!(result.unwrap_err().answer.unwrap().frame.parameter, FAILURE);
+    assert!(buffers.output.is_empty());
 }

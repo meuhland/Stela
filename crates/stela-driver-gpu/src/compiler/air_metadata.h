@@ -14,6 +14,9 @@ extern "C" {
 #define AIR_MAX_RENDER_TARGETS 8u
 #define AIR_MAX_PATCH_CONTROL_POINTS 32u
 #define AIR_MAX_METADATA_OPERANDS 256
+/* Operands of a module-wide list: its entry points or visible functions,
+ * which a library compiled from source lists all of in one module. */
+#define AIR_MAX_LISTED (1u << 16)
 #define AIR_MAX_GLOBALS 4096
 #define AIR_MAX_BITCODE_BYTES (64u * 1024u * 1024u)
 
@@ -635,6 +638,17 @@ bool stela_air_md_node(struct stela_air_metadata *m, LLVMValueRef node,
                        LLVMValueRef *operands, unsigned *count);
 bool stela_air_named_md(struct stela_air_metadata *m, const char *name,
                         LLVMValueRef *operands, unsigned *count);
+/* The operands of a module-wide named list (air.kernel, air.vertex,
+ * air.visible, ...), up to AIR_MAX_LISTED: in `small` when they fit, else
+ * in memory stela_air_list_release frees. */
+struct stela_air_list {
+   LLVMValueRef *nodes;
+   unsigned count;
+   LLVMValueRef small[8];
+};
+bool stela_air_named_list(struct stela_air_metadata *m, const char *name,
+                          struct stela_air_list *list);
+void stela_air_list_release(struct stela_air_list *list);
 /* Whether a triple names the module's AIR version; linked libraries of AIR 2.0
  * and older name none. */
 bool stela_air_metadata_target(const struct stela_air_metadata *t, const char *target);

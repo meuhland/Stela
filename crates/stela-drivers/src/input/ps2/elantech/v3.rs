@@ -4,7 +4,7 @@
 use super::*;
 
 impl Engine {
-    pub(super) fn report_v3(&mut self, inputs: &mut Vec<Input>) -> Result<(), ErrorKind> {
+    pub(super) fn report_v3(&mut self, now: u64, inputs: &mut Vec<Input>) -> Result<(), ErrorKind> {
         let c = self.capabilities.as_ref().unwrap();
         let p = self.packet;
         let debounce = p == [0xc4, 0xff, 0xff, 2, 0xff, 0xff];
@@ -56,23 +56,14 @@ impl Engine {
             } else {
                 p[0] & 3
             };
-            if buttons != self.buttons {
-                self.buttons = buttons;
-                inputs.push(Input::Buttons(buttons));
+            // Semi-MT: two fingers move their middle, or the second
+            // finger's point until a head reports the first.
+            let touch = match (primary, secondary) {
+                (Some(first), Some(second)) => Touch::of([first, second]),
+                (first, second) => first.or(second).map(|(x, y)| Touch { x, y, fingers: 1 }),
             }
-            // Original semi-MT initializes its cached coordinates to zero.
-            // Compatibility input follows that software default; the raw
-            // contact keeps None and no head sequence until one is observed.
-            if let Some((x, y)) = primary.or_else(|| (fingers == 2).then_some((0, 0))) {
-                let scale = |value: i32, high: u16| {
-                    (value.clamp(0, i32::from(high)) as u32 * u32::from(crate::input::POINTER_MAX)
-                        / u32::from(high)) as u16
-                };
-                inputs.push(Input::Move {
-                    x: scale(x, c.bounds.maximum.0),
-                    y: scale(y, c.bounds.maximum.1),
-                });
-            }
+            .map(|touch| Touch { fingers, ..touch });
+            self.touch(touch, buttons, now, inputs);
             Report::Contacts(Contact {
                 fingers,
                 primary,

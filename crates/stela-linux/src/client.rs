@@ -29,6 +29,7 @@ unsafe extern "C" {
     fn stela_linux_fd_close(fd: c_int);
     fn stela_linux_fd_dup(fd: c_int) -> c_int;
     fn stela_linux_fd_device(fd: c_int) -> c_long;
+    fn stela_linux_fd_seek(fd: c_int, offset: i64, whence: c_int) -> i64;
     fn stela_linux_ioctl(fd: c_int, request: c_uint, argument: *mut c_void) -> c_long;
     fn stela_linux_map(
         fd: c_int,
@@ -39,7 +40,7 @@ unsafe extern "C" {
         mapping: *mut *mut c_void,
     ) -> c_int;
     fn stela_linux_munmap(mapping: *mut c_void);
-    fn stela_linux_refault(mapping: *mut c_void, address: u64, write: bool) -> bool;
+    fn stela_linux_fill_around(mapping: *mut c_void, address: u64, write: bool) -> bool;
     fn stela_linux_wait(word: *const c_uint, value: c_uint, nanoseconds: u64);
     fn stela_linux_wake();
 }
@@ -105,6 +106,16 @@ pub unsafe fn device(fd: c_int) -> i64 {
     unsafe { stela_linux_fd_device(fd) }
 }
 
+/// The descriptor's llseek to `offset` from `whence`: the new offset, or a
+/// negative errno.
+///
+/// # Safety
+/// See the module.
+pub unsafe fn seek(fd: c_int, offset: i64, whence: c_int) -> i64 {
+    // SAFETY: the module's contract.
+    unsafe { stela_linux_fd_seek(fd, offset, whence) }
+}
+
 /// # Safety
 /// See the module. `argument` is what `request` says it is.
 pub unsafe fn control(fd: c_int, request: u32, argument: *mut c_void) -> i64 {
@@ -112,7 +123,9 @@ pub unsafe fn control(fd: c_int, request: u32, argument: *mut c_void) -> i64 {
     unsafe { stela_linux_ioctl(fd, request, argument) }
 }
 
-/// Map `size` bytes of the file at `offset` into `address`, every page present.
+/// Map `size` bytes of the file at `offset` into `address`, the first two
+/// megabytes present; the rest arrives a window at a time, as the client's
+/// first touch faults ([`fill_around`]).
 ///
 /// # Safety
 /// See the module. `address` is the caller's to map.
@@ -137,11 +150,13 @@ pub unsafe fn unmap(mapping: Mapping) {
     unsafe { stela_linux_munmap(mapping.0) };
 }
 
-/// Install the page at `address` again, after Linux moved what it maps.
+/// Install the page at `address`, on the client's first touch or after
+/// Linux moved it, then the rest of its two-megabyte window: whether the
+/// page itself came back.
 ///
 /// # Safety
 /// See the module. Keep `mapping` alive until this fault returns.
-pub unsafe fn fault(mapping: Mapping, address: u64, write: bool) -> bool {
+pub unsafe fn fill_around(mapping: Mapping, address: u64, write: bool) -> bool {
     // SAFETY: the module's contract.
-    unsafe { stela_linux_refault(mapping.0, address, write) }
+    unsafe { stela_linux_fill_around(mapping.0, address, write) }
 }

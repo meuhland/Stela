@@ -110,6 +110,92 @@ impl<'a> ContainedPci<'a> {
             .map_err(|_| Error::Busy)
     }
 
+    /// The buses of segment 0 whose functions cannot decode the firmware's
+    /// `screen`, when no function's BAR was matched to it: those with a
+    /// bridge on their route whose windows forward none of it
+    /// ([`stela_boot_core::firmware_screen`]). Those windows are held by the
+    /// bridges' routing seals. A refused or misconfigured bridge says
+    /// nothing, so a bus below only such bridges stays a possible owner.
+    ///
+    /// # Safety
+    /// The caller keeps the original configuration writers excluded, and no
+    /// bridge's forwarding has been restored yet (its configuration owner
+    /// would keep the page this reads through).
+    pub(crate) unsafe fn screen_apart(
+        &self,
+        screen: core::ops::Range<u64>,
+    ) -> Result<stela_boot_core::firmware_screen::BusesApart, Error> {
+        use stela_boot_core::firmware_screen::{BridgeWindows, BridgeWords, BusesApart};
+        let cohort = self
+            .source
+            .pci_slots
+            .0
+            .try_borrow()
+            .map_err(|_| Error::Busy)?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return Err(Error::Unavailable);
+        };
+        // SAFETY: the original source and its configuration exclusion are
+        // kept; these are reads of sealed Type 1 headers.
+        let bridges = unsafe {
+            self.source.with_config_inventory(|_, reader| {
+                let mut bridges = Vec::new();
+                for slot in &fabric.slots {
+                    let Some(buses) = slot.header.bridge else {
+                        continue;
+                    };
+                    if slot.refusal.is_some()
+                        || slot.misconfigured.is_some()
+                        || slot.header.layout >> 16 & 0x7f != 1
+                    {
+                        continue;
+                    }
+                    let address = slot.address;
+                    let words = BridgeWords {
+                        class_revision: slot.header.class_revision,
+                        buses,
+                        memory: reader.read32(address, 0x20)?,
+                        prefetchable: reader.read32(address, 0x24)?,
+                        prefetchable_upper: (
+                            reader.read32(address, 0x28)?,
+                            reader.read32(address, 0x2c)?,
+                        ),
+                        control: reader.read32(address, 0x3c)?,
+                    };
+                    if let Some(windows) = BridgeWindows::from_words(words) {
+                        bridges.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                        bridges.push((address, windows));
+                    }
+                }
+                Ok::<_, Error>(bridges)
+            })
+        }?;
+        let mut apart = BusesApart::on(0);
+        let mut upstream = Vec::new();
+        for slot in &fabric.slots {
+            upstream.clear();
+            let mut route = slot.route;
+            while let topology::Parent::Bridge(bridge) = route {
+                if let Ok(index) = bridges.binary_search_by_key(&bridge, |(address, _)| *address) {
+                    upstream.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                    upstream.push(&bridges[index].1);
+                }
+                let index = fabric
+                    .slots
+                    .binary_search_by_key(&bridge, |slot| slot.address)
+                    .expect("original parent remains in the fabric");
+                route = fabric.slots[index].route;
+            }
+            apart.mark(
+                slot.address.segment,
+                slot.address.bus,
+                upstream.iter().copied(),
+                &screen,
+            );
+        }
+        Ok(apart)
+    }
+
     pub(crate) fn check_observation(
         &self,
         address: Address,
@@ -128,6 +214,40 @@ impl<'a> ContainedPci<'a> {
             return Err(Error::InvalidPlatformReply);
         }
         Ok(())
+    }
+
+    /// The dword at `offset` of `address` for a read-only inventory of this
+    /// fabric through `reader`: None where the census left the function or
+    /// its bus out (`census::LeftOut`), as it read them, else the value,
+    /// which must match the parked header where the census held a function.
+    /// A function that answers where the census held none refuses, naming
+    /// its address.
+    pub(crate) fn inventory_read(
+        &self,
+        reader: &mut ConfigInventory<'_>,
+        address: Address,
+        offset: u16,
+    ) -> Result<Option<u32>, ContainmentError> {
+        let mut read = || {
+            if !core::ptr::eq(self.source, reader.source) {
+                return Err(Error::InvalidPlatformReply);
+            }
+            {
+                let cohort = self.source.pci_slots.0.borrow();
+                let Cohort::Parked(fabric) = &*cohort else {
+                    return Err(Error::Unavailable);
+                };
+                if fabric.left_out.holds(address) {
+                    return Ok(None);
+                }
+            }
+            let value = reader.read32(address, offset)?;
+            if offset != 0 || value as u16 != u16::MAX {
+                self.check_observation(address, offset, value)?;
+            }
+            Ok(Some(value))
+        };
+        read().map_err(|error| ContainmentError::from(error).at(address))
     }
 
     /// Observe the parked functions in `scope` through the same read-only
@@ -241,6 +361,12 @@ enum Cause {
     Topology(topology::Error),
     BridgeForwarding,
     BridgeAlias,
+    /// A bridge whose bus dword is not used (`census::admit`): it and the
+    /// buses behind it stay undriven.
+    BridgeBuses {
+        buses: u32,
+        reason: census::Misconfigured,
+    },
 }
 
 /// A plain sentence for the boot log: the function, what failed and what it
@@ -296,6 +422,19 @@ impl fmt::Display for ContainmentError {
                 "a bridge above it may forward its DMA under another requester ID, which \
                  its remapping unit cannot give the function's domain",
             ),
+            Cause::BridgeBuses { buses, reason } => {
+                let [_, secondary, subordinate, _] = buses.to_le_bytes();
+                write!(
+                    f,
+                    "the bridge {} (secondary bus {secondary:#04x}, subordinate bus \
+                     {subordinate:#04x})",
+                    reason.message()
+                )?;
+                if let census::Misconfigured::Overlaps(other) = reason {
+                    write!(f, " at {other}")?;
+                }
+                f.write_str(", so the buses behind it are not scanned")
+            }
         }
     }
 }
@@ -365,8 +504,9 @@ impl ContainmentError {
     /// Bus Master, a capability's enable, Secondary Bus Reset), a control
     /// left in a state Stela does not change, or transactions still
     /// pending after the wait, or a capability its plan left as found
-    /// (`Plan::refusal`). A configuration space that cannot be mapped
-    /// or owned, or a header that changed, still stops the whole fabric.
+    /// (`Plan::refusal`), or a bridge whose bus numbers are not used. A
+    /// configuration space that cannot be mapped or owned, or a header that
+    /// changed, still stops the whole fabric.
     fn per_function(&self) -> bool {
         match self.cause {
             Cause::Claim(
@@ -380,6 +520,7 @@ impl ContainmentError {
                 ConfigFailure::BusMasterSealed | ConfigFailure::UnqualifiedControl => true,
                 _ => false,
             },
+            Cause::BridgeBuses { .. } => true,
             _ => false,
         }
     }
@@ -393,6 +534,8 @@ struct Slot {
     plan: Rc<Plan>,
     ancestor: Parent,
     route: topology::Parent,
+    /// A bridge stopped, sealed and refused alone (`Cause::BridgeBuses`).
+    misconfigured: Option<census::Misconfigured>,
     forwarding: Option<Forwarding>,
     /// The writes a bus reset admits through this parked function's
     /// custody: its state saved before the reset, each written back once.
@@ -500,6 +643,8 @@ struct Fabric {
     refusal: Option<SlotRefusal>,
     /// See [`ContainedPci::unstopped_master`].
     unstopped_master: Option<Address>,
+    /// What answered at the census but is not in `slots`.
+    left_out: census::LeftOut,
 }
 
 impl Fabric {
@@ -597,8 +742,11 @@ impl SlotRefusal {
     }
 
     /// Refuse a function that is stopped and sealed, whose plan left a
-    /// capability's control as found.
-    fn left(cause: ClaimError, parked: PreparedConfig<PrepublicationGrant>) -> Self {
+    /// capability's control as found or whose bus numbers are not used.
+    fn left(
+        cause: impl Into<ContainmentError>,
+        parked: PreparedConfig<PrepublicationGrant>,
+    ) -> Self {
         Self {
             master_stopped: true,
             ..Self::new(cause, parked.into_parts())
@@ -654,6 +802,13 @@ impl PciSlots {
     pub(in crate::native_mmio::shared) const fn new() -> Self {
         Self(RefCell::new(Cohort::Unclaimed))
     }
+
+    /// Whether no census has begun: nothing is observed or parked.
+    pub(in crate::native_mmio::shared) fn unclaimed(&self) -> bool {
+        self.0
+            .try_borrow()
+            .is_ok_and(|cohort| matches!(*cohort, Cohort::Unclaimed))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -703,10 +858,18 @@ struct Input {
     span: PhysicalSpan,
     header: Header,
     plan: Rc<Plan>,
+    /// A bridge whose bus dword is not used: `header.bridge` keeps the
+    /// dword as found, the topology sees no forwarding, and containment
+    /// refuses it alone once it is stopped.
+    misconfigured: Option<census::Misconfigured>,
 }
 
 enum Observed {
+    /// Nothing answers.
     Absent,
+    /// Something answers that the census reads as no function
+    /// (`census::LeftOut`).
+    Skipped,
     Function(Input),
     /// A function the fabric does not drive, left idle with the buses
     /// behind it, and its layout dword.
@@ -733,35 +896,33 @@ fn repeats(
 impl Input {
     /// `root_bus`: no bridge the census found forwards to `address`'s bus.
     /// `single`: function 0 of this device, when it has no multifunction bit.
+    /// `admitted`: the bridges admitted so far with their buses.
     fn observe(
         reader: &mut ConfigInventory<'_>,
         address: Address,
         root_bus: bool,
         single: Option<Address>,
+        admitted: &[(Address, RangeInclusive<u8>)],
     ) -> Result<Observed, ContainmentError> {
         let identity = reader.read32(address, 0)?;
-        match census::presence(identity) {
-            census::Presence::Absent => return Ok(Observed::Absent),
-            census::Presence::NotReady => {
-                report_oddity(census::Oddity::NotReady, address);
-                return Ok(Observed::Absent);
+        // A function without a vendor is skipped only while its other
+        // registers show it cannot reach memory or raise INTx.
+        match census::found(identity, || reader.read32(address, 4))? {
+            census::Found::Absent => return Ok(Observed::Absent),
+            census::Found::Skipped(oddity) => {
+                report_oddity(oddity, address);
+                return Ok(Observed::Skipped);
             }
-            // Its other registers do answer; skip it only while they show
-            // it cannot reach memory or raise INTx.
-            census::Presence::NoVendor if census::quiet(reader.read32(address, 4)?) => {
-                report_oddity(census::Oddity::NoVendor, address);
-                return Ok(Observed::Absent);
-            }
-            census::Presence::NoVendor => {
+            census::Found::ActiveWithoutVendor => {
                 return Err(topology::Error::ActiveWithoutVendor(address).into());
             }
-            census::Presence::Present => {}
+            census::Found::Present => {}
         }
         if let Some(first) = single
             && repeats(reader, first, address)?
         {
             report_oddity(census::Oddity::Alias, address);
-            return Ok(Observed::Absent);
+            return Ok(Observed::Skipped);
         }
         let class_revision = reader.read32(address, 8)?;
         if class_revision == u32::MAX {
@@ -772,11 +933,12 @@ impl Input {
         if census::bridge_class(class_revision) != (kind == census::Layout::Bridge) {
             report_oddity(census::Oddity::BridgeClass, address);
         }
+        let mut misconfigured = None;
         let bridge = match kind {
             census::Layout::Endpoint => None,
             census::Layout::Bridge => {
                 let buses = reader.read32(address, 0x18)?;
-                reader.check_bridge(address, buses)?;
+                misconfigured = reader.check_bridge(address, buses, admitted).err();
                 Some(buses)
             }
             census::Layout::CardBus | census::Layout::Unknown(_) => {
@@ -789,17 +951,23 @@ impl Input {
                 report_oddity(census::Oddity::UnsupportedHeader, address);
                 // A CardBus bridge shares the Type 1 bus fields. With Bus
                 // Master clear it forwards no memory request from behind it.
-                // Buses it cannot own stay in the scan, where any function
-                // on them fails the topology.
+                // Buses it cannot own stay in the scan.
                 let behind = if kind == census::Layout::CardBus {
                     let buses = reader.read32(address, 0x18)?;
-                    reader.check_bridge(address, buses).ok().flatten()
+                    reader.check_bridge(address, buses, admitted).ok().flatten()
                 } else {
                     None
                 };
                 return Ok(Observed::Left { layout, behind });
             }
         };
+        let unrouted = bridge.is_some_and(|buses| {
+            !stela_boot_core::ecam::forwards_granted_bus(
+                reader.source.platform.wire().roots(),
+                address,
+                buses,
+            )
+        });
         let plan = Plan::read(
             |offset, width| {
                 reader
@@ -807,6 +975,7 @@ impl Input {
                     .map_err(ClaimError::Mapping)
             },
             root_bus,
+            unrouted,
         )?;
         let (window, span) = reader
             .geometry
@@ -822,6 +991,7 @@ impl Input {
                 bridge,
             },
             plan: Rc::new(plan),
+            misconfigured,
         }))
     }
 }
@@ -829,29 +999,38 @@ impl Input {
 fn census(
     windows: &[EcamWindow],
     reader: &mut ConfigInventory<'_>,
-) -> Result<Vec<Input>, ContainmentError> {
+) -> Result<(Vec<Input>, census::LeftOut), ContainmentError> {
     let mut inputs: Vec<Input> = Vec::new();
-    // Buses behind a function left undriven, with that function.
-    let mut left: Vec<(Address, RangeInclusive<u8>)> = Vec::new();
+    // What answers but is not in `inputs`, for a later inventory.
+    let mut left_out = census::LeftOut::default();
+    // Every bridge admitted so far with the buses it forwards, CardBus
+    // bridges included (`census::admit`).
+    let mut admitted: Vec<(Address, RangeInclusive<u8>)> = Vec::new();
+    // Buses behind a function left undriven: a CardBus or misconfigured
+    // bridge.
+    let mut left: Vec<RangeInclusive<u8>> = Vec::new();
     for window in windows {
         for bus in window.start_bus..=window.end_bus {
             // A bridge's secondary bus is above its own, so every bridge
-            // that forwards to `bus` is already in the census.
+            // that forwards to `bus` is already in the census. Only
+            // admitted Type 1 bridges are driven; a CardBus bridge's buses
+            // are in `left`.
             let root_bus = !inputs.iter().any(|input| {
                 input.address.segment == window.segment
-                    && input.header.bridge.is_some_and(|buses| {
-                        (buses >> 8 & 0xff..=buses >> 16 & 0xff).contains(&u32::from(bus))
-                    })
+                    && input.misconfigured.is_none()
+                    && input
+                        .header
+                        .bridge
+                        .and_then(|buses| census::forwarded(input.address.bus, buses))
+                        .is_some_and(|buses| buses.contains(&bus))
             });
-            if let Some((owner, _)) = left
-                .iter()
-                .find(|(owner, buses)| owner.segment == window.segment && buses.contains(&bus))
-            {
-                // A driven bridge forwarding here too would leave its
-                // functions uncontained.
-                if !root_bus {
-                    return Err(topology::Error::OverlappingBridges(*owner).into());
-                }
+            // A bus a driven bridge forwards to is scanned even when a
+            // bridge left undriven claims it too, so every function there
+            // is stopped.
+            if root_bus && left.iter().any(|buses| buses.contains(&bus)) {
+                left_out
+                    .bus(window.segment, bus)
+                    .map_err(|_| Error::Exhausted)?;
                 continue;
             }
             for device in 0..32 {
@@ -867,20 +1046,40 @@ fn census(
                     // device. Here they are read, and dropped only when
                     // they repeat function 0: ARI and nonconforming
                     // functions can reach memory too.
-                    let observed = Input::observe(reader, address, root_bus, single)
+                    let observed = Input::observe(reader, address, root_bus, single, &admitted)
                         .map_err(|error| error.at(address))?;
                     let layout = match observed {
                         Observed::Absent => continue,
+                        Observed::Skipped => {
+                            left_out.function(address).map_err(|_| Error::Exhausted)?;
+                            continue;
+                        }
                         Observed::Function(input) => {
                             let layout = input.header.layout;
+                            let behind = input
+                                .header
+                                .bridge
+                                .and_then(|buses| census::forwarded(address.bus, buses));
+                            if let Some(buses) = behind {
+                                if input.misconfigured.is_some() {
+                                    left.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                                    left.push(buses);
+                                } else {
+                                    admitted.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                                    admitted.push((address, buses));
+                                }
+                            }
                             inputs.try_reserve(1).map_err(|_| Error::Exhausted)?;
                             inputs.push(input);
                             layout
                         }
                         Observed::Left { layout, behind } => {
+                            left_out.function(address).map_err(|_| Error::Exhausted)?;
                             if let Some(buses) = behind {
+                                admitted.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                                admitted.push((address, buses.clone()));
                                 left.try_reserve(1).map_err(|_| Error::Exhausted)?;
-                                left.push((address, buses));
+                                left.push(buses);
                             }
                             layout
                         }
@@ -892,7 +1091,7 @@ fn census(
             }
         }
     }
-    Ok(inputs)
+    Ok((inputs, left_out))
 }
 
 #[derive(Clone)]
@@ -1160,6 +1359,40 @@ impl Source {
         result
     }
 
+    /// One register of a bridge whose forwarding is restored, read through
+    /// the configuration owner that keeps its page, beside which no other
+    /// map may open; `None` for any other function.
+    pub(in crate::native_mmio) fn read_forwarding_bridge(
+        &self,
+        address: Address,
+        offset: u16,
+        width: u16,
+    ) -> Option<Result<u32, Error>> {
+        let Ok(cohort) = self.pci_slots.0.try_borrow() else {
+            return Some(Err(Error::Busy));
+        };
+        let Cohort::Parked(fabric) = &*cohort else {
+            return None;
+        };
+        let index = fabric
+            .slots
+            .binary_search_by_key(&address, |slot| slot.address)
+            .ok()?;
+        let Some(Forwarding::Open { config, .. }) = &fabric.slots[index].forwarding else {
+            return None;
+        };
+        let value = match width {
+            1 => config.try_read8(offset).map(u32::from),
+            2 => config.try_read16(offset).map(u32::from),
+            4 => config.try_read32(offset),
+            _ => return Some(Err(Error::InvalidRange)),
+        };
+        Some(value.map_err(|error| match error.reason {
+            ConfigFailure::Mapping(error) => error,
+            _ => Error::Unavailable,
+        }))
+    }
+
     /// # Safety
     /// Caller holds the matching complete fabric and excludes all old PCI
     /// writers. Bridge promotion additionally requires parked descendants.
@@ -1266,13 +1499,13 @@ impl Source {
         }
         // SAFETY: the caller keeps the complete captured topology exclusive.
         // with_config_inventory retires the last read-only map before return.
-        let inputs = unsafe { self.with_config_inventory(census) }?;
+        let (inputs, left_out) = unsafe { self.with_config_inventory(census) }?;
         let count = inputs.len();
         let mut order = Vec::new();
         order
             .try_reserve_exact(count)
             .map_err(|_| Error::Exhausted)?;
-        self.prepare_fabric(inputs)?;
+        self.prepare_fabric(inputs, left_out)?;
         order.extend(0..count);
         // Stop endpoints while their bridges still forward. Stop downstream
         // bridges before their upstream parents.
@@ -1288,7 +1521,7 @@ impl Source {
         }
 
         for index in order {
-            let (address, prepared, header, plan) = {
+            let (address, prepared, header, plan, misconfigured) = {
                 let mut cohort = self.pci_slots.0.borrow_mut();
                 let Cohort::Incomplete(fabric) = &mut *cohort else {
                     unreachable!("exclusive containment owns the incomplete fabric");
@@ -1301,16 +1534,29 @@ impl Source {
                         .expect("one prepared configuration"),
                     slot.header,
                     slot.plan.clone(),
+                    slot.misconfigured,
                 )
             };
             // A function stopped and sealed with a capability its plan left
-            // as found is refused alone (`Plan::refusal`).
-            let result = self
-                .contain_slot(prepared, header, &plan, tsc_hz)
-                .and_then(|parked| match plan.refusal() {
-                    Some(cause) => Err(SlotRefusal::left(cause, parked)),
-                    None => Ok(parked),
-                });
+            // as found (`Plan::refusal`), or a bridge whose bus numbers are
+            // not used, is refused alone.
+            let result =
+                self.contain_slot(prepared, header, &plan, tsc_hz)
+                    .and_then(|parked| match (misconfigured, plan.refusal()) {
+                        (Some(reason), _) => Err(SlotRefusal::left(
+                            ContainmentError {
+                                address: None,
+                                cause: Cause::BridgeBuses {
+                                    buses: header.bridge.unwrap_or(0),
+                                    reason,
+                                },
+                                effect: ConfigEffect::None,
+                            },
+                            parked,
+                        )),
+                        (None, Some(cause)) => Err(SlotRefusal::left(cause, parked)),
+                        (None, None) => Ok(parked),
+                    });
             let mut cohort = self.pci_slots.0.borrow_mut();
             let Cohort::Incomplete(fabric) = &mut *cohort else {
                 unreachable!("exclusive containment owns the incomplete fabric");
@@ -1356,20 +1602,33 @@ impl Source {
         })
     }
 
-    fn prepare_fabric(&self, mut inputs: Vec<Input>) -> Result<(), ContainmentError> {
+    fn prepare_fabric(
+        &self,
+        mut inputs: Vec<Input>,
+        left_out: census::LeftOut,
+    ) -> Result<(), ContainmentError> {
         let roots = self.platform.wire().roots();
         let mut observed = Vec::new();
         observed
             .try_reserve_exact(inputs.len())
             .map_err(|_| Error::Exhausted)?;
-        observed.extend(inputs.iter().map(|input| topology::Function {
-            address: input.address,
-            bridge_buses: input.header.bridge,
+        // A misconfigured bridge forwards nothing the topology may use.
+        observed.extend(inputs.iter().map(|input| {
+            topology::Function {
+                address: input.address,
+                bridge_buses: input
+                    .header
+                    .bridge
+                    .filter(|_| input.misconfigured.is_none()),
+            }
         }));
         let parents = topology::resolve(roots, &observed)?;
         inputs.sort_unstable_by_key(|input| input.address);
 
-        let mut fabric = Fabric::default();
+        let mut fabric = Fabric {
+            left_out,
+            ..Fabric::default()
+        };
         fabric
             .roots
             .try_reserve_exact(roots.len())
@@ -1391,8 +1650,22 @@ impl Source {
         *self.pci_slots.0.borrow_mut() = Cohort::Incomplete(fabric);
         // Secondary bus numbers exceed their upstream bus. BDF order keeps
         // each real bridge assignment before any of its children.
+        let mut orphan = None;
         for ((address, route), input) in parents.into_iter().zip(inputs) {
             debug_assert_eq!(address, input.address);
+            // Reported once per bus: BDF order keeps a bus's functions
+            // together.
+            if let topology::Parent::Root(index) = route
+                && u64::from(address.bus) != roots[index].minimum
+                && orphan.replace((address.segment, address.bus))
+                    != Some((address.segment, address.bus))
+            {
+                crate::output::arguments(format_args!(
+                    "HOST PCI {address} is on bus {:#04x}, which no bridge forwards to; its \
+                     functions are placed under their root bridge\n",
+                    address.bus
+                ));
+            }
             let parent = {
                 let cohort = self.pci_slots.0.borrow();
                 let Cohort::Incomplete(fabric) = &*cohort else {
@@ -1461,6 +1734,7 @@ impl Source {
             plan: input.plan,
             ancestor,
             route,
+            misconfigured: input.misconfigured,
             forwarding: None,
             restore,
         })

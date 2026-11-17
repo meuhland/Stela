@@ -39,6 +39,7 @@
 //! **At rest.** The machine roots are on this disk, so the bag protects
 //! against a wrong passcode at the login window, not against someone who
 //! reads the disk; [`AT_REST`] says so once per boot.
+use super::super::credentials::{HANDLE_BYTES, Handle, Link};
 use super::Fields;
 use crate::Result;
 use crate::inline_key::{KEY_BYTES, SEALED_BYTES, open, seal};
@@ -78,9 +79,11 @@ pub(super) const MAKE_SYSTEM: u8 = 0x0d;
 /// `handle_device_state_return` as flags and deadline. The 26B123 kernel's
 /// senders (`device_state_transition` VA 0xfffffe0009d411f4 and its
 /// callers): `unlock_the_device` (sel 9) sends [`UNLOCK_TRANSITION`] with
-/// the passcode; sel 8 sends [`LOCK_TRANSITION`] with argument 0 (sel 32,
-/// which enters sel 8's code with argument 1, and sel 0x7a's transition 1,
-/// and transition 10 are not modeled);
+/// the passcode; sel 8 sends [`LOCK_TRANSITION`] with argument 0 and sel 32
+/// enters the same code (VA 0xfffffe0009d4f6a4) with argument
+/// [`LOCK_NOW`]; sel 0x7a's transition 1 (VA 0xfffffe0009d4eae4, the
+/// effective bag of request 0x7a) and sel 0x91's transition 10 are not
+/// modeled;
 /// `hold_device_lockassertion` (VA 0xfffffe0009d4143c, from the user
 /// client's `handleLockAssertion`, after the kernel checked the device
 /// state) sends [`HOLD_ASSERTION`] and `drop_device_lockassertion` (VA
@@ -95,13 +98,45 @@ pub(super) const DEVICE_STATE_TRANSITION: u8 = 0x18;
 /// u64 of flags (0x80, 0x100 and 0x200 from the function's three Booleans;
 /// sel 42 always sets the third, VA 0xfffffe0009d530bc); reply one u64,
 /// which `verify_password` passes to `handle_device_state_return` as flags.
+/// The Booleans are its fifth, sixth and seventh arguments in that order
+/// (VA 0xfffffe0009d43754..0xfffffe0009d43778): sel 42 passes its second
+/// scalar (memento), its fifth (ACM) and true (VA 0xfffffe0009d4fe4c..
+/// 0xfffffe0009d4fe7c with five scalars, VA 0xfffffe0009d530b4..
+/// 0xfffffe0009d530bc).
+///
+/// **ACM secret.** libaks `aks_verify_password_with_opts` (shared cache
+/// 0x187d74734) sets that fifth scalar when its first argument is set, which
+/// `MKBVerifyACMPasswordWithContext` (0x197f9c230) does. LocalAuthentication's
+/// macOS password check calls it (LocalAuthenticationCore 0x1b23b05b4) with
+/// the bag -uid (`_keybagHandleForUserId:`), the passcode object's
+/// `unsafeContextRef` as the secret and the request's `acmContext` as the
+/// ACM blob. An ACM context's external form is its 16-byte handle
+/// (`ACMContextGetExternalForm` 0x1b24ec670 sends command 19 with the handle
+/// and hands those 16 bytes on). So with [`ACM_SECRET`] the secret names the
+/// context whose PassphraseEntered credential holds the password, and the
+/// blob names the context that gains PasscodeValidated when it opens the
+/// bag. That the SEP's AppleKeyStore reads the passphrase from ACM and grants
+/// PasscodeValidated is inferred from this call shape and from ACM's own
+/// code, which checks no passphrase (see `credentials`): sepOS is not
+/// available to read.
 pub(super) const VERIFY: u8 = 0x21;
 /// Verify's flags from sel 42 with its two optional Booleans clear.
 const VERIFY_FLAGS: u64 = 0x200;
+/// Verify's flag for a secret that names an ACM context.
+const ACM_SECRET: u64 = 0x100;
 /// Unlock with the passcode.
 const UNLOCK_TRANSITION: u32 = 0;
 /// Lock now.
 const LOCK_TRANSITION: u32 = 1;
+/// [`LOCK_TRANSITION`]'s argument from sel 32: libaks `aks_lock_device`
+/// (shared cache 0x187d74a28) takes sel 32 rather than 8 when its second
+/// argument is set, which `MKBLockDeviceNow` (0x197f9bfe8) and
+/// `MKBLockDevice` with the option `LockDeviceNow` (0x197f9bf1c) set. The
+/// SEP's handling is not readable (sepOS is encrypted). Inferred: "now"
+/// skips a delay before the lock, and this model's lock has none, so it is
+/// the same lock, which held assertions defer as they do argument 0's: an
+/// assertion keeps the bag open until it is dropped.
+const LOCK_NOW: u64 = 1;
 /// Hold a lock assertion: the bag stays unlocked until it is dropped.
 const HOLD_ASSERTION: u32 = 5;
 /// Drop a lock assertion.
@@ -434,8 +469,13 @@ enum Then {
         reply: Unlocked,
     },
     /// Check the secret against the bag at `handle`; its lock state is
-    /// unchanged.
-    Verify { handle: i32, uuid: [u8; UUID_BYTES] },
+    /// unchanged. On success the ACM context `grant`, if any, gains
+    /// PasscodeValidated.
+    Verify {
+        handle: i32,
+        uuid: [u8; UUID_BYTES],
+        grant: Option<Handle>,
+    },
     /// The old secret's KEK is derived: open the passcode seed with it, then
     /// derive the new secret's KEK over `salt`.
     ChangeOld {
@@ -606,6 +646,8 @@ pub(super) struct Keybags {
     reported: Vec<&'static str>,
     /// Once-per-boot progress lines waiting for [`Keybags::drain`].
     queued: Vec<String>,
+    /// The ACM context the last successful verify grants PasscodeValidated.
+    granted: Option<Handle>,
 }
 
 fn mac(key: &[u8; 32], parts: &[&[u8]]) -> Zeroizing<[u8; 32]> {
@@ -637,7 +679,14 @@ impl Keybags {
             next: FIRST_HANDLE,
             reported: Vec::new(),
             queued: Vec::new(),
+            granted: None,
         }
+    }
+
+    /// The ACM context a verify just completed for gains PasscodeValidated:
+    /// taken once, by the keystore, before it answers.
+    pub(super) fn take_grant(&mut self) -> Option<Handle> {
+        self.granted.take()
     }
 
     /// Record that a login step succeeded, once per boot; no values.
@@ -781,6 +830,7 @@ impl Keybags {
         variant: u32,
         fields: &mut Fields<'_>,
         entropy: &mut dyn super::super::Entropy,
+        link: &dyn Link,
         note: &mut dyn FnMut(String),
     ) -> Result<Outcome> {
         match Request::parse(command, variant, fields)? {
@@ -958,28 +1008,50 @@ impl Keybags {
                 acm,
                 flags,
             } => {
-                if flags != VERIFY_FLAGS {
+                if flags != VERIFY_FLAGS && flags != VERIFY_FLAGS | ACM_SECRET {
                     return Err(self.refuse_shape("verify flags", flags, note));
                 }
-                if !acm.is_empty() {
-                    return Err(self.refuse_shape(
-                        "verify ACM blob length",
-                        acm.len() as u64,
-                        note,
-                    ));
-                }
+                let grant = match acm.len() {
+                    0 => None,
+                    HANDLE_BYTES => {
+                        let context: Handle = acm.try_into().expect("16 bytes");
+                        if !link.exists(&context) {
+                            return Err(refuse!(
+                                "SEP keybag verify names an ACM context that does not exist"
+                            ));
+                        }
+                        Some(context)
+                    }
+                    length => {
+                        return Err(self.refuse_shape(
+                            "verify ACM blob length",
+                            length as u64,
+                            note,
+                        ));
+                    }
+                };
+                let secret = if flags & ACM_SECRET != 0 {
+                    let context: &Handle = secret.try_into().map_err(|_| {
+                        refuse!("SEP keybag verify's ACM secret is not a context handle")
+                    })?;
+                    link.passphrase(context)?
+                } else {
+                    Zeroizing::new(secret.to_vec())
+                };
                 let bag = self.find(handle)?;
                 if !bag.header.has_passcode() {
                     if !secret.is_empty() {
                         return Err(BAD_PASSCODE.into());
                     }
+                    self.granted = grant;
                     return Ok(Outcome::Reply(0u64.to_le_bytes().to_vec()));
                 }
                 Ok(Outcome::Derive(alloc::boxed::Box::new(Pending {
-                    derivation: self.derivation(&bag.header, secret),
+                    derivation: self.derivation(&bag.header, &secret),
                     then: Some(Then::Verify {
                         handle,
                         uuid: bag.header.uuid,
+                        grant,
                     }),
                 })))
             }
@@ -1051,7 +1123,7 @@ impl Keybags {
                         note,
                     ));
                 }
-                if argument != 0 {
+                if argument != 0 && !(transition == LOCK_TRANSITION && argument == LOCK_NOW) {
                     return Err(self.refuse_shape("transition argument", argument, note));
                 }
                 if transition == UNLOCK_TRANSITION {
@@ -1203,7 +1275,11 @@ impl Keybags {
                     if changed { NOTIFY_LOCK_STATE } else { 0 },
                 )))
             }
-            Then::Verify { handle, uuid } => {
+            Then::Verify {
+                handle,
+                uuid,
+                grant,
+            } => {
                 let kek = kek.ok_or(refuse!("SEP keybag verify has no KEK"))?;
                 let bag = self.find(handle)?;
                 if bag.header.uuid != uuid {
@@ -1218,6 +1294,7 @@ impl Keybags {
                 )
                 .map_err(|_| stela_contracts::Refusal::from(BAD_PASSCODE))?;
                 self.progress(VERIFIED);
+                self.granted = grant;
                 // No state change to notify.
                 Ok(Outcome::Reply(0u64.to_le_bytes().to_vec()))
             }

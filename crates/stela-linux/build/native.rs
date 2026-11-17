@@ -192,6 +192,7 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/fs/mnt_idmapping.c")),
             PathBuf::from(format!("{LINUX}/drivers/base/map.c")),
             PathBuf::from(format!("{LINUX}/drivers/base/property.c")),
+            PathBuf::from(format!("{LINUX}/drivers/base/devres.c")),
             PathBuf::from(format!("{LINUX}/fs/char_dev.c")),
             PathBuf::from(format!("{LINUX}/fs/d_path.c")),
             PathBuf::from(format!("{LINUX}/fs/dcache.c")),
@@ -248,8 +249,15 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/lib/find_bit.c")),
             PathBuf::from(format!("{LINUX}/lib/bitmap.c")),
             PathBuf::from(format!("{LINUX}/lib/bitmap-parse.c")),
+            PathBuf::from(format!("{LINUX}/lib/bitmap-alloc.c")),
+            PathBuf::from(format!("{LINUX}/lib/kfifo.c")),
+            PathBuf::from(format!("{LINUX}/lib/math/gcd.c")),
+            PathBuf::from(format!("{LINUX}/mm/mempool.c")),
+            PathBuf::from(format!("{LINUX}/kernel/time/timeconv.c")),
+            PathBuf::from(format!("{LINUX}/kernel/locking/semaphore.c")),
             PathBuf::from(format!("{LINUX}/lib/kstrtox-parse.c")),
             PathBuf::from(format!("{LINUX}/lib/idr.c")),
+            PathBuf::from(format!("{LINUX}/lib/vsscanf.c")),
             PathBuf::from(format!("{LINUX}/lib/radix-tree.c")),
             PathBuf::from(format!("{LINUX}/lib/xarray.c")),
             PathBuf::from(format!("{LINUX}/lib/rbtree.c")),
@@ -317,6 +325,14 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/fs/seq_lifetime.c")),
             PathBuf::from(format!("{LINUX}/fs/task_comm.c")),
             PathBuf::from(format!("{LINUX}/lib/maple_tree.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/irqdesc.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/handle.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/chip.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/dummychip.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/irqdomain.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/msi.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/resend.c")),
+            PathBuf::from(format!("{LINUX}/kernel/irq/spurious.c")),
         ];
         let mut upstream = upstream;
         if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("uefi") {
@@ -328,6 +344,19 @@ impl Linux {
             DMA_BUF_SOURCES
                 .iter()
                 .map(|source| PathBuf::from(format!("{LINUX}/drivers/dma-buf/{source}.c"))),
+        );
+        // Library code the drivers' selected helpers call: a binary search,
+        // an integer square root and bounded text buffers.
+        upstream.extend(
+            ["lib/bsearch", "lib/math/int_sqrt", "lib/seq_buf"]
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
+        );
+        // What MMU_NOTIFIER builds: the notifiers of an address space, over
+        // the interval tree of the ranged ones and the lock-less list their
+        // deferred removals wait in.
+        upstream.extend(
+            ["mm/mmu_notifier", "lib/interval_tree", "lib/llist"]
+                .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
         );
         let hosted_upstream = upstream.clone();
         println!("cargo:rerun-if-changed={LINUX}/kernel/sched");
@@ -431,6 +460,7 @@ impl Linux {
                     format!("{COMPAT}/stela/timer_test.c"),
                     format!("{COMPAT}/stela/workqueue_test.c"),
                     format!("{COMPAT}/stela/i2c_test.c"),
+                    format!("{COMPAT}/stela/pci_reset_test.c"),
                     format!("{COMPAT}/stela/sync_test.c"),
                     format!("{COMPAT}/stela/srcu_test.c"),
                     format!("{COMPAT}/stela/rcu_original_test.c"),
@@ -498,6 +528,7 @@ impl Linux {
             ("linux_thread_initializers", "thread_initializers_test.c"),
             ("linux_acpi_client", "acpi_client_test.c"),
             ("linux_acpi_dsm", "acpi_dsm_test.c"),
+            ("linux_fpu", "fpu_test.c"),
             ("linux_random", "random_test.c"),
             ("linux_resources", "resources_test.c"),
             ("linux_seq_output", "seq_output_test.c"),

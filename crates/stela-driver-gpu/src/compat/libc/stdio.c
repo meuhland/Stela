@@ -577,6 +577,41 @@ int getc(FILE *file)
 	return EOF;
 }
 
+/* A line of what getc reads, growing the caller's buffer as POSIX's getdelim
+ * does; -1 when it reads nothing. */
+ssize_t getdelim(char **line, size_t *size, int delimiter, FILE *file)
+{
+	if (!line || !size || !file) {
+		errno = EINVAL;
+		return -1;
+	}
+	size_t length = 0;
+	for (int c; (c = getc(file)) != EOF;) {
+		if (length + 2 > *size) {
+			size_t grown = *size ? *size * 2 : 128;
+			char *bigger = realloc(*line, grown);
+			if (!bigger) {
+				errno = ENOMEM;
+				return -1;
+			}
+			*line = bigger;
+			*size = grown;
+		}
+		(*line)[length++] = (char)c;
+		if (c == delimiter)
+			break;
+	}
+	if (!length)
+		return -1;
+	(*line)[length] = '\0';
+	return (ssize_t)length;
+}
+
+ssize_t getline(char **line, size_t *size, FILE *file)
+{
+	return getdelim(line, size, '\n', file);
+}
+
 void rewind(FILE *file)
 {
 	(void)file;

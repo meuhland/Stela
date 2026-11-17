@@ -15,7 +15,7 @@ use crate::metal::{
     hazard::FULL,
     heap::{self, HeapAllocator, HeapDescriptor, SizeAndAlign},
     pass::{AttachmentView, TestedCopy},
-    pixel_format::{Description, Encoding},
+    pixel_format::{Description, Encoding, Kind},
     resource::{
         self, CpuAccess, ShaderViews, SubresourceLayout, TextureDescriptor, TexturePlan,
         TextureViewDescriptor,
@@ -44,9 +44,13 @@ use alloc::{
 use core::{num::NonZeroU64, ops::Range};
 use stela_contracts::gate::MemoryRange;
 
+mod aligned_copies;
 mod extended_planes;
+mod read_back;
+pub use aligned_copies::{RowCopy, SurfaceNote};
 pub(super) use extended_planes::PlaneActions;
 pub use extended_planes::PlaneChanges;
+pub use read_back::ReadBack;
 
 const TEXTURE_ARRAYS: [HeapArray; 2] = [HeapArray::SampledImages, HeapArray::StorageImages];
 const TEXEL_BUFFER_ARRAYS: [HeapArray; 2] = [
@@ -163,6 +167,10 @@ struct TextureObject {
     cpu_copy: Option<BufferAllocation>,
     /// A two-plane texture's second plane's image; `image` is its first's.
     second_plane: Option<Image>,
+    /// An extended-range IOSurface texture's staging memory, which large
+    /// encodes write before copying it into the planes
+    /// ([`PlaneStaging`](crate::metal::pass::PlaneStaging)).
+    plane_staging: Option<BufferAllocation>,
 }
 
 /// A depth or stencil subresource's storage copy ([`TestedCopy`]): what it
@@ -248,6 +256,9 @@ pub(super) struct Resources {
     /// The times textures encoded into each IOSurface's planes, by surface
     /// ID ([`extended_planes`]).
     extended_generations: BTreeMap<u32, u64>,
+    /// Linear textures' planes whose rows the GPU cannot address in place,
+    /// by texture: their aligned copies ([`aligned_copies`]).
+    aligned_copies: BTreeMap<u32, Vec<aligned_copies::AlignedCopy>>,
     /// Destroyed private textures kept for reuse, oldest first, and their
     /// bytes.
     recycled: VecDeque<Recycled>,
@@ -257,6 +268,20 @@ pub(super) struct Resources {
     recycle_hits: u64,
     recycle_misses: u64,
     heap_refusals: HeapRefusals,
+    /// Who may still read a live buffer's or texture's memory through the
+    /// destroyed textures over it or views of it, by buffer and by texture:
+    /// a view or buffer texture shared with other connections, or with an
+    /// aligned copy every commit refreshes from the rows, is read beyond
+    /// its owner's connection, and its memory is the buffer's or parent's.
+    buffer_readers: BTreeMap<u32, super::pins::Scope>,
+    texture_readers: BTreeMap<u32, super::pins::Scope>,
+    /// Who may still read a live heap's memory through the destroyed
+    /// resources placed in it, by heap: a resource read beyond the heap's
+    /// connection (CPU-copy uploads another connection's commit carried,
+    /// an aligned copy every commit refreshes, a view or buffer texture
+    /// over it others read) lies in the heap's memory, which goes with the
+    /// heap.
+    heap_readers: BTreeMap<u32, super::pins::Scope>,
 }
 
 /// What the device keeps of destroyed private textures, and how often
@@ -267,6 +292,15 @@ pub struct RecycleReport {
     pub bytes: u64,
     pub hits: u64,
     pub misses: u64,
+}
+
+/// Whose memory the readers of a destroyed resource read
+/// ([`Device::add_readers`]).
+#[derive(Clone, Copy, Debug)]
+enum Readers {
+    Buffer,
+    Texture,
+    Heap,
 }
 
 /// Resources automatic heaps answered nil for, as Metal does when a heap
@@ -307,6 +341,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             None => self.backend.import_memory(ranges, token)?,
         };
         self.allocated += bytes;
+        if let Some(key) = self.backend.kept_bound(memory) {
+            self.book.retaken(key);
+        }
         self.book_memory(memory, bytes, || {
             format!("imported memory of {bytes} bytes")
         });
@@ -523,8 +560,36 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "textures still alias the buffer",
         )?;
         let buffer = self.resources.buffers.remove(id.0)?;
-        self.defer(Object::Buffer(buffer.buffer));
-        self.release_backing(buffer.backing, Some(buffer.memory))
+        let readers = self.resources.buffer_readers.remove(&id.0);
+        let scope = self.with_readers(readers);
+        self.release_for(scope, |device| {
+            device.defer(Object::Buffer(buffer.buffer));
+            device.release_backing(buffer.backing, Some(buffer.memory))
+        })
+    }
+
+    /// The current release scope and `readers`: who read the object through
+    /// what was destroyed over it.
+    fn with_readers(&self, readers: Option<super::pins::Scope>) -> super::pins::Scope {
+        match readers {
+            Some(readers) => self.scope.union(&readers),
+            None => self.scope.clone(),
+        }
+    }
+
+    /// Notes that the readers of what is released now read the memory of
+    /// `owner`'s `slot`.
+    fn add_readers(&mut self, owner: Readers, slot: u32) {
+        let readers = match owner {
+            Readers::Buffer => &mut self.resources.buffer_readers,
+            Readers::Texture => &mut self.resources.texture_readers,
+            Readers::Heap => &mut self.resources.heap_readers,
+        };
+        let scope = match readers.remove(&slot) {
+            Some(known) => known.union(&self.scope),
+            None => self.scope.clone(),
+        };
+        readers.insert(slot, scope);
     }
 
     /// `newTextureWithDescriptor:`.
@@ -556,6 +621,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .add(Phase::TextureCreate, whole.saturating_sub(allocate + bind));
         self.time_texture(descriptor, bytes, false);
         self.allocated += bytes;
+        self.book_memory(memory, bytes, || {
+            format!(
+                "image memory of a {}x{} {:?} texture",
+                descriptor.width, descriptor.height, descriptor.pixel_format
+            )
+        });
         self.finish_texture(
             image,
             descriptor,
@@ -606,7 +677,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             Ok(created) => created,
             Err(error) => {
                 self.backend.destroy(Object::Image(image));
-                self.release_backing(backing, memory)?;
+                self.unwind_backing(backing, memory)?;
                 return Err(error);
             }
         };
@@ -626,6 +697,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy,
             second_plane: None,
+            plane_staging: None,
         };
         Ok(TextureId(self.resources.textures.insert(texture)))
     }
@@ -659,9 +731,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         let allocation = self.backend.create_buffer(&info, request)?;
         self.allocated += allocation.allocated;
+        self.book_memory(allocation.memory, allocation.allocated, || {
+            format!(
+                "CPU copy of a {}x{} {:?} texture",
+                descriptor.width, descriptor.height, descriptor.pixel_format
+            )
+        });
         Ok(allocation)
     }
 
+    /// Frees a texture's buffer of its own: a CPU copy, decoded blocks or
+    /// plane staging memory.
     fn destroy_cpu_copy(&mut self, copy: BufferAllocation) {
         self.defer(Object::Buffer(copy.buffer));
         self.release_memory(copy.memory, copy.allocated);
@@ -858,6 +938,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: None,
+            plane_staging: None,
         };
         Ok(TextureId(self.resources.textures.insert(view)))
     }
@@ -878,6 +959,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             buffer.memory_offset,
             buffer.length,
         );
+        let mut copies = Vec::new();
         let texture = if descriptor.texture_type == TextureType::TextureBuffer {
             let info = resource::texture_buffer(
                 &self.capabilities,
@@ -917,6 +999,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 dependents: 0,
                 cpu_copy: None,
                 second_plane: None,
+                plane_staging: None,
             }
         } else {
             let plan = resource::linear_texture(
@@ -926,23 +1009,26 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 offset,
                 bytes_per_row,
             )?;
-            let (_, linear) = self.capabilities.linear_texture_alignments();
-            let place = memory_offset
-                .checked_add(offset)
-                .filter(|place| place.is_multiple_of(linear))
-                .ok_or(Error::Invalid(
-                    "the buffer's memory is not aligned for a texture",
-                ))?;
-            let image = self
-                .backend
-                .create_placed_image(&plan.image, memory, place)?;
+            let rows = aligned_copies::Rows {
+                buffer: vk_buffer,
+                memory,
+                memory_offset,
+                layout: resource::PlaneLayout {
+                    offset,
+                    bytes_per_row,
+                },
+                texel_bytes: u64::from(descriptor.pixel_format.describe().block.bytes),
+            };
+            let (image, copy) = self.plane_image(&plan, rows, false)?;
             let (id, views) = match self.shader_views(image, &plan.views) {
                 Ok(created) => created,
                 Err(error) => {
                     self.backend.destroy(Object::Image(image));
+                    self.release_aligned_copies(copy);
                     return Err(error);
                 }
             };
+            copies.extend(copy);
             TextureObject {
                 image: Some(image),
                 descriptor: *descriptor,
@@ -959,11 +1045,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 dependents: 0,
                 cpu_copy: None,
                 second_plane: None,
+                plane_staging: None,
             }
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         self.book_texture_over(buffer_id, descriptor);
-        Ok(TextureId(self.resources.textures.insert(texture)))
+        let id = TextureId(self.resources.textures.insert(texture));
+        self.keep_aligned_copies(id, copies);
+        Ok(id)
     }
 
     /// Names the texture `descriptor` made over buffer `id` as what owns
@@ -1065,24 +1154,38 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             });
         }
         let buffer = self.resources.buffers.get(buffer_id.0)?;
-        let (memory, memory_offset, length) = (buffer.memory, buffer.memory_offset, buffer.length);
+        let (vk_buffer, memory, memory_offset, length) = (
+            buffer.buffer,
+            buffer.memory,
+            buffer.memory_offset,
+            buffer.length,
+        );
         let plans = resource::two_plane_texture(&self.capabilities, descriptor, length, planes)?;
-        let (_, linear) = self.capabilities.linear_texture_alignments();
+        // A large surface the GPU only samples is read from device memory
+        // (`aligned_copies`): sampled from guest RAM, every texel cache miss
+        // crosses the bus.
+        let sampled = !renders
+            && descriptor.width.saturating_mul(descriptor.height)
+                >= aligned_copies::DEVICE_COPY_TEXELS;
+        let formats = descriptor
+            .pixel_format
+            .plane_formats()
+            .ok_or(Error::Invalid("the format has one plane"))?;
         let mut images = Vec::with_capacity(2);
         let mut views = Vec::with_capacity(2);
+        let mut copies = Vec::new();
         let created = (|| -> Result<ResourceId> {
-            for (plan, layout) in plans.iter().zip(planes) {
-                let place = memory_offset
-                    .checked_add(layout.offset)
-                    .filter(|place| place.is_multiple_of(linear))
-                    .ok_or(Error::Invalid(
-                        "the surface's plane is not aligned for a texture",
-                    ))?;
-                images.push(
-                    self.backend
-                        .create_placed_image(&plan.image, memory, place)?,
-                );
-                let image = images[images.len() - 1];
+            for ((plan, layout), format) in plans.iter().zip(planes).zip(formats) {
+                let rows = aligned_copies::Rows {
+                    buffer: vk_buffer,
+                    memory,
+                    memory_offset,
+                    layout,
+                    texel_bytes: u64::from(format.describe().block.bytes),
+                };
+                let (image, copy) = self.plane_image(plan, rows, sampled)?;
+                images.push(image);
+                copies.extend(copy);
                 let info = plan
                     .views
                     .sampled
@@ -1115,6 +1218,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 for image in images {
                     self.backend.destroy(Object::Image(image));
                 }
+                self.release_aligned_copies(copies);
                 return Err(error);
             }
         };
@@ -1134,10 +1238,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: Some(images[1]),
+            plane_staging: None,
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         self.book_texture_over(buffer_id, descriptor);
-        Ok(TextureId(self.resources.textures.insert(texture)))
+        let id = TextureId(self.resources.textures.insert(texture));
+        self.keep_aligned_copies(id, copies);
+        Ok(id)
     }
 
     /// The view a render pass attaches, created on first use and kept with
@@ -1657,8 +1764,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok((run, packed))
     }
 
-    /// The copy of a color texture's `region` and the ranges of its rows in
-    /// `length` bytes laid out by `strides`.
+    /// The copy of a texture's `region`, of its color, depth or stencil
+    /// aspect, and the ranges of its rows in `length` bytes laid out by
+    /// `strides`.
     fn cpu_region(
         &self,
         id: TextureId,
@@ -1668,7 +1776,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     ) -> Result<(BufferImageCopy, CpuRows)> {
         let descriptor = &self.resources.textures.get(id.0)?.descriptor;
         let shape = RowShape::of(descriptor, region, strides)?;
-        let (subresource, offset, extent) = region.resolve(descriptor, ImageAspects::COLOR)?;
+        let aspect = cpu_aspect(descriptor.pixel_format.describe())?;
+        let (subresource, offset, extent) = region.resolve(descriptor, aspect)?;
         let end = if shape.images == 0 || shape.rows == 0 {
             0
         } else {
@@ -1706,6 +1815,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let image = texture.image.ok_or(Error::Invalid(
             "texture buffers are written through their buffer",
         ))?;
+        if self.write_aligned_rows(id, region, bytes)? {
+            return Ok(());
+        }
+        let texture = self.resources.textures.get(id.0)?;
         let Some(copy) = &texture.cpu_copy else {
             let description = texture.descriptor.pixel_format.describe();
             return match description.encoding() {
@@ -1726,6 +1839,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             cpu_copy_rows(&texture.descriptor, region, bytes.len())?,
         );
         let first = rows.first;
+        // Vulkan's own rule for depth and stencil copies, which the upload is.
+        if region.subresource.aspects != ImageAspects::COLOR && !first.is_multiple_of(4) {
+            return Err(Error::Unsupported(
+                "CPU writes of depth and stencil texels at offsets that are not multiples of four",
+            ));
+        }
         for (offset, packed) in rows {
             self.backend.write_memory(memory, offset, &bytes[packed])?;
         }
@@ -1764,6 +1883,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "texture buffers are read through their buffer",
         ))?;
         let start = self.timing.now();
+        if self.read_aligned_rows(id, region, bytes)? {
+            self.timing.since(Phase::BytesCopy, start);
+            return Ok(());
+        }
+        let texture = self.resources.textures.get(id.0)?;
         let Some(copy) = &texture.cpu_copy else {
             let description = texture.descriptor.pixel_format.describe();
             return match description.encoding() {
@@ -1782,6 +1906,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 }
             };
         };
+        // A shared texture's copy holds only the CPU's writes: its reads
+        // copy the image out on the GPU ([`Self::begin_read_back`]).
+        if gpu_read(texture) && !bytes.is_empty() {
+            return Err(Error::Unsupported(
+                "CPU reads of shared textures without host image copy outside a GPU read-back",
+            ));
+        }
         let (memory, rows) = (
             copy.memory,
             cpu_copy_rows(&texture.descriptor, region, bytes.len())?,
@@ -1963,7 +2094,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "views of the texture are still alive",
         )?;
         let texture = self.resources.textures.remove(id.0)?;
+        let readers = self.resources.texture_readers.remove(&id.0);
         self.forget_extended_planes(id);
+        // Every commit refreshes an aligned copy, whatever its connection.
+        let copies = self.take_aligned_copies(id);
         // Its decodes would write a view destroyed with it, and its uploads
         // would go to whatever texture takes its slot next.
         self.resources
@@ -1973,16 +2107,25 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .cpu_copy_uploads
             .retain(|(uploaded, _)| *uploaded != id);
         // Command buffers of any connection that carry its uploads read it.
-        let scope = self
+        let mut scope = self
             .queue
             .carriers(id)
-            .fold(self.scope.clone(), |scope, key| super::pins::Scope {
-                reach: scope.reach.with(key),
-                ..scope
+            .fold(self.with_readers(readers), |scope, key| {
+                super::pins::Scope {
+                    reach: scope.reach.with(key),
+                    ..scope
+                }
             });
-        self.release_for(scope, |device| match recyclable(&texture) {
-            Some(bytes) if !device.lost => device.recycle_texture(texture, bytes),
-            _ => device.free_texture(texture),
+        if copies.is_some() {
+            scope.reach = super::pins::Reach::All;
+        }
+        self.release_for(scope, |device| {
+            let freed = match recyclable(&texture) {
+                Some(bytes) if !device.lost => device.recycle_texture(texture, bytes),
+                _ => device.free_texture(texture),
+            };
+            device.release_aligned_copies(copies.into_iter().flatten());
+            freed
         })
     }
 
@@ -2066,12 +2209,15 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         } else {
             TEXEL_BUFFER_ARRAYS
         };
-        let low_length = if texture.second_plane.is_some() {
-            2
+        // A two-plane texture's high half holds no storage descriptors: its
+        // plane flags lie in the storage index's bits.
+        let (id, low_length) = if texture.second_plane.is_some() {
+            (ResourceId::new(texture.id.low(), NULL_DESCRIPTOR), 2)
         } else {
-            resource::sampled_descriptors(resource::view_type(texture.descriptor.texture_type))
+            let view_type = resource::view_type(texture.descriptor.texture_type);
+            (texture.id, resource::sampled_descriptors(view_type))
         };
-        self.release_id(texture.id, arrays, low_length);
+        self.release_id(id, arrays, low_length);
         for view in texture
             .views
             .iter()
@@ -2093,7 +2239,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             self.defer(Object::BufferView(view));
         }
         match texture.parent {
-            Some(parent) => self.resources.textures.get_mut(parent.0)?.dependents -= 1,
+            Some(parent) => {
+                self.resources.textures.get_mut(parent.0)?.dependents -= 1;
+                self.add_readers(Readers::Texture, parent.0);
+            }
             None => {
                 if let Some(image) = texture.image {
                     self.release_sparse(image)?;
@@ -2105,6 +2254,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 if let Some(copy) = texture.cpu_copy {
                     self.destroy_cpu_copy(copy);
                 }
+                if let Some(staging) = texture.plane_staging {
+                    self.destroy_cpu_copy(staging);
+                }
                 self.release_backing(texture.backing, texture.memory)?;
             }
         }
@@ -2112,6 +2264,18 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     fn release_backing(&mut self, backing: Backing, memory: Option<Memory>) -> Result<()> {
+        self.give_back(backing, memory, true)
+    }
+
+    /// Gives back what a resource that failed to be made reserved: nothing
+    /// read it.
+    fn unwind_backing(&mut self, backing: Backing, memory: Option<Memory>) -> Result<()> {
+        self.give_back(backing, memory, false)
+    }
+
+    /// Gives back a resource's backing; one that was `read` leaves its
+    /// readers to the heap it lay in.
+    fn give_back(&mut self, backing: Backing, memory: Option<Memory>, read: bool) -> Result<()> {
         match (backing, memory) {
             (Backing::Owned(bytes), Some(memory)) => self.release_memory(memory, bytes),
             (Backing::Owned(_), None) => {}
@@ -2126,7 +2290,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 },
                 memory,
             ) => {
-                let heap = self.resources.heaps.get_mut(heap.0)?;
+                let slot = heap.0;
+                let heap = self.resources.heaps.get_mut(slot)?;
                 heap.resources -= 1;
                 if let (Some(allocator), false) = (&mut heap.allocator, aliasable) {
                     allocator.free(offset, size)?;
@@ -2137,11 +2302,22 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 if let (Some(memory), true) = (memory, own != 0) {
                     self.release_memory(memory, own);
                 }
+                if read {
+                    self.add_readers(Readers::Heap, slot);
+                }
             }
             (Backing::Buffer(buffer), _) => {
-                self.resources.buffers.get_mut(buffer.0)?.dependents -= 1
+                self.resources.buffers.get_mut(buffer.0)?.dependents -= 1;
+                if read {
+                    self.add_readers(Readers::Buffer, buffer.0);
+                }
             }
-            (Backing::Sparse(heap), _) => self.resources.heaps.get_mut(heap.0)?.resources -= 1,
+            (Backing::Sparse(heap), _) => {
+                self.resources.heaps.get_mut(heap.0)?.resources -= 1;
+                if read {
+                    self.add_readers(Readers::Heap, heap.0);
+                }
+            }
         }
         Ok(())
     }
@@ -2502,7 +2678,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let (buffer, memory, memory_offset, address) = match created {
             Ok(created) => created,
             Err(error) => {
-                self.release_backing(backing, None)?;
+                self.unwind_backing(backing, None)?;
                 return Err(error);
             }
         };
@@ -2580,7 +2756,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let (image, own) = match created {
             Ok(created) => created,
             Err(error) => {
-                self.release_backing(backing, None)?;
+                self.unwind_backing(backing, None)?;
                 return Err(error);
             }
         };
@@ -2785,7 +2961,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "resources still live in the heap",
         )?;
         let heap = self.resources.heaps.remove(id.0)?;
-        self.release_memory(heap.memory, heap.bytes);
+        let readers = self.resources.heap_readers.remove(&id.0);
+        let scope = self.with_readers(readers);
+        self.release_for(scope, |device| {
+            device.release_memory(heap.memory, heap.bytes);
+        });
         Ok(())
     }
 }
@@ -3003,15 +3183,11 @@ struct RowShape {
 }
 
 impl RowShape {
-    /// Validates `strides` for `region` of a color texture. Every row's
-    /// start, at most the last one's, fits in `u64`.
+    /// Validates `strides` for `region` of a texture of one aspect. Every
+    /// row's start, at most the last one's, fits in `u64`.
     fn of(descriptor: &TextureDescriptor, region: &Region, strides: Strides) -> Result<Self> {
         let description = descriptor.pixel_format.describe();
-        ensure(
-            description.is_color(),
-            "the CPU reaches depth and stencil textures through blits",
-        )?;
-        region.resolve(descriptor, ImageAspects::COLOR)?;
+        region.resolve(descriptor, cpu_aspect(description)?)?;
         let block = description.block;
         let shape = Self {
             row_bytes: region.size[0].div_ceil(u64::from(block.width)) * u64::from(block.bytes),
@@ -3044,6 +3220,31 @@ impl RowShape {
             .and_then(|(image, row)| image.checked_add(row))
             .and_then(|start| start.checked_add(self.row_bytes).map(|_| start))
             .ok_or(Error::Invalid("the bytes end before the region"))
+    }
+}
+
+/// Whether the CPU reads `texture` by a GPU copy of its image into host
+/// memory: a shared texture whose image only host image copies reach, or
+/// whose CPU copy holds only the CPU's writes.
+fn gpu_read(texture: &TextureObject) -> bool {
+    match texture.cpu_access {
+        CpuAccess::HostImageCopy => texture.cpu_copy.is_none(),
+        CpuAccess::Staged => texture.descriptor.options.storage_mode == StorageMode::Shared,
+        _ => false,
+    }
+}
+
+/// The aspect CPU copies of a texture of `description`'s format reach:
+/// its one aspect. Metal lays out no CPU texels of a combined depth-stencil
+/// format; blits copy each of its aspects.
+fn cpu_aspect(description: &Description) -> Result<ImageAspects> {
+    match description.kind {
+        Kind::Color(_) => Ok(ImageAspects::COLOR),
+        Kind::Depth => Ok(ImageAspects::DEPTH),
+        Kind::Stencil => Ok(ImageAspects::STENCIL),
+        Kind::DepthStencil => Err(Error::Unsupported(
+            "CPU copies of combined depth-stencil textures, which blits reach",
+        )),
     }
 }
 

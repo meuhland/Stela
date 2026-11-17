@@ -68,8 +68,8 @@ use super::{
     wire::{self, GateCall, NewLibraryRequest, Operation, Span, Status},
 };
 use crate::metal::{
-    compiler::{self, AirCompiler, CompileLock},
-    deferred::{Done, Job, JobLock, Owner},
+    compiler::{self, AirCompiler, CompileLock, SharedHold},
+    deferred::{self, Done, Job, JobLock, Made, Owner, Sliced, Slicer},
     shader::Compiler,
     timing::CallPhases,
     vulkan::{
@@ -88,6 +88,9 @@ use core::{
 };
 use stela_contracts::gate::{BundleReport, CallerFault, CallerMemory, GateService, MemoryRange};
 use stela_crypto::{Sha256, digest::Digest};
+
+mod read_back;
+use read_back::{ReadBacks, Step};
 
 pub struct SharedService<B: Backend, C: Compiler> {
     service: UnsafeCell<Service<B, C>>,
@@ -127,6 +130,10 @@ pub struct SharedService<B: Backend, C: Compiler> {
     /// The stack jobs run on, zero while the platform runs none, and the
     /// lock they run under.
     compile_stack: AtomicU64,
+    /// The platform's [`Slicer`], as an address, zero while jobs run whole.
+    slicer: AtomicUsize,
+    /// Calls made again after a withdrawn host call, which name their jobs.
+    waited_calls: AtomicU64,
     /// The longest a frontend call waits for the turn before it is answered
     /// `Pending`, in ticks; 0 waits for as long as the holder holds it.
     wait_bound: AtomicU64,
@@ -162,6 +169,8 @@ pub struct SharedService<B: Backend, C: Compiler> {
     /// while it is not zero no poll is answered from the published serial,
     /// which cannot say which command buffer failed.
     refusals: Arc<AtomicU32>,
+    /// `GetBytes` calls whose GPU copies are finished outside the turn.
+    read_backs: ReadBacks,
     host: ServiceHost,
 }
 
@@ -171,11 +180,42 @@ struct Jobs {
     /// Jobs not yet run, each with when it was queued.
     queued: VecDeque<(Job, u64)>,
     running: Option<[u8; 32]>,
+    /// The job that ran a slice and gave its processor back, while no
+    /// processor resumes it.
+    active: Option<Active>,
     /// Jobs that ran, for the next turn to adopt.
     done: Vec<Done>,
     /// Calls answered `Pending`, by the key they wait for.
     parked: VecDeque<Parked>,
     report: JobReport,
+}
+
+/// A job run in slices ([`SharedService::set_job_slicer`]), between them.
+struct Active {
+    sliced: Box<dyn Sliced>,
+    /// What it made, once it ended.
+    made: Arc<Spin<Option<Done>>>,
+    /// The compile lock, from its first slice until what it made is
+    /// published.
+    _held: SharedHold,
+    /// From queueing to its first slice.
+    waited: u64,
+    /// When its last slice ended.
+    last: u64,
+    /// Its slices' ticks, and how many it ran.
+    ticks: u64,
+    slices: u64,
+}
+
+/// What one [`SharedService::run_job`] ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobSlice {
+    /// It began a job.
+    pub started: bool,
+    /// The job ended.
+    pub finished: bool,
+    /// Its ticks: one slice, or the whole job when it ran whole.
+    pub ticks: u64,
 }
 
 /// A call answered `Pending`: the same call made again is answered so
@@ -187,6 +227,8 @@ struct Parked {
     operation: u32,
     request: u64,
     key: [u8; 32],
+    /// When it was first answered `Pending`, in the platform's ticks.
+    at: u64,
 }
 
 /// More calls than wait at once; the oldest is forgotten, and asks again.
@@ -199,11 +241,22 @@ pub struct JobReport {
     pub ran: u64,
     pub ticks: u64,
     pub longest: u64,
-    /// From queueing to running, the longest.
+    /// The host steps jobs ran in, and the longest one: a job run whole is
+    /// one step.
+    pub slices: u64,
+    pub longest_slice: u64,
+    /// From queueing to running, the longest and the total over `ran`.
     pub longest_queued: u64,
+    pub queued: u64,
     /// Calls answered `Pending`, with a turn and without one.
     pub deferred: u64,
     pub repeated: u64,
+    /// Parked calls made again after their job ran: how many, and from
+    /// their first `Pending` to that call, the total and the longest. The
+    /// time a guest thread waited for its job.
+    pub resumed: u64,
+    pub resumed_after: u64,
+    pub longest_resumed_after: u64,
 }
 
 /// The operation [`Served`] names for the kext's import of wired memory,
@@ -254,19 +307,32 @@ impl RecentImports {
 /// The bytes of a library a `NewLibrary` call reads and digests at once,
 /// before its turn; a run reads pieces until its budget
 /// ([`SharedService::set_library_budget`]) is spent, at least one.
-const LIBRARY_PIECE_BYTES: usize = 1 << 20;
+pub(super) const LIBRARY_PIECE_BYTES: usize = 1 << 20;
 
 /// Libraries read in part at once; past this the oldest is dropped, and its
 /// call, made again, starts over.
 const STAGED: usize = 4;
 
-/// A `NewLibrary` call's bytes read so far ([`SharedService::stage_library`]).
+/// A `NewLibrary` call's library read so far ([`SharedService::stage_library`]).
+///
+/// A library is first read only to digest it, a piece at a time through one
+/// piece buffer, keeping no byte: the device shares the bytes of a library
+/// it already holds by their digest, and every process loads the same
+/// system libraries of hundreds of megabytes. Only when the turn finds the
+/// device holds no library of that digest is the library read again into
+/// `kept`, digested again as it is copied, so the kept bytes are what the
+/// digest names even when the caller changed them between the reads.
 struct Staging {
     connection: u64,
     record: u64,
     span: Span,
-    bytes: Vec<u8>,
+    /// The bytes read and digested so far.
+    read: usize,
     digest: Sha256,
+    /// The buffer each piece is read into while only digesting.
+    piece: Vec<u8>,
+    /// The bytes, once the turn asked for them.
+    kept: Option<Vec<u8>>,
 }
 
 /// What reading the next piece of a call's library found.
@@ -289,6 +355,10 @@ struct Spin<T> {
     value: UnsafeCell<T>,
 }
 
+// SAFETY: the flag gives one caller at a time the value, which may cross
+// processors.
+unsafe impl<T: Send> Sync for Spin<T> {}
+
 impl<T> Spin<T> {
     fn new(value: T) -> Self {
         Self {
@@ -297,7 +367,11 @@ impl<T> Spin<T> {
         }
     }
 
+    /// Runs `body` on the value under the lock, which counts as held
+    /// ([`deferred::hold_lock`]): a job's body publishes what it made
+    /// through one, and bodies allocate.
     fn with<R>(&self, body: impl FnOnce(&mut T) -> R) -> R {
+        let _held = deferred::hold_lock();
         while self
             .held
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -369,6 +443,12 @@ pub struct ServiceHost {
     /// Told what the kext found of the Metal plugin, which the platform's
     /// boot decides on: the plugin is the boot's.
     pub bundle: fn(BundleReport),
+    /// Told that a call answered `Pending` waits for a job no processor has
+    /// started: when it parks on the job, and each time it is made again
+    /// while the job stays queued. The platform may call an idle processor
+    /// to start it ([`SharedService::run_job`]) rather than leave it to the
+    /// next one that looks.
+    pub job_waiting: fn(),
 }
 
 /// A guest call the gate served, in the platform's ticks: the PE that rang
@@ -648,7 +728,13 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let lock = compile_lock.clone();
         let relax = host.relax;
         let counted = refusals.clone();
+        // Texture reads copy out of host memory outside the turn; none
+        // outlives the lost device's memory.
+        service.reads_back = true;
+        let read_backs = ReadBacks::new();
+        let generation = read_backs.generation.clone();
         service.prepare_reopened(Box::new(move |device| {
+            generation.end();
             device.count_failures(&counted);
             if let Some(lock) = &lock
                 && let Some(compiler) = air(device.compiler_mut())
@@ -677,6 +763,8 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             publishable: AtomicBool::new(publishable),
             early: [const { (AtomicU64::new(0), AtomicU64::new(0)) }; PENDING],
             compile_stack: AtomicU64::new(0),
+            slicer: AtomicUsize::new(0),
+            waited_calls: AtomicU64::new(0),
             wait_bound: AtomicU64::new(0),
             job_lock: JobLock {
                 lock: compile_lock.unwrap_or_default(),
@@ -695,6 +783,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             upkeep_asked: AtomicBool::new(false),
             look_budget: AtomicU64::new(0),
             refusals,
+            read_backs,
             host,
         }
     }
@@ -704,6 +793,33 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
     /// [`Self::run_job`].
     pub fn set_compile_stack(&self, stack: u64) {
         self.compile_stack.store(stack, Ordering::Release);
+    }
+
+    /// The top of the stack this service's turns run on.
+    pub fn stack(&self) -> u64 {
+        self.host.stack
+    }
+
+    /// The platform withdrew a host call of the call this service serves
+    /// now on this processor, as no task took it in time: whether that call
+    /// will be made again if it fails ([`CompileLock::defer_for_wait`]),
+    /// rather than failing for a wait.
+    pub fn defer_for_wait(&self) -> bool {
+        self.job_lock.lock.defer_for_wait()
+    }
+
+    /// Runs jobs in slices that `slicer` starts on the compile stack
+    /// ([`Self::run_job`]), instead of whole.
+    pub fn set_job_slicer(&self, slicer: Slicer) {
+        self.slicer.store(slicer as usize, Ordering::Release);
+    }
+
+    fn slicer(&self) -> Option<Slicer> {
+        match self.slicer.load(Ordering::Acquire) {
+            0 => None,
+            // SAFETY: only `set_job_slicer` stores a nonzero value, a `Slicer`.
+            address => Some(unsafe { core::mem::transmute::<usize, Slicer>(address) }),
+        }
     }
 
     /// Bounds a frontend call's wait for the turn to `ticks`: a call that
@@ -840,21 +956,27 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         done
     }
 
-    /// Runs the oldest deferred job, when one has waited `older_than` ticks
-    /// and no other runs: the platform calls it where long host work is
-    /// allowed, between guest slices and never inside a guest's call, as a
-    /// job runs whole, the compilers having no point to stop at. Whether
-    /// one ran.
-    pub fn run_job(&self, older_than: u64) -> bool {
+    /// Runs deferred jobs a step: the platform calls it where long host
+    /// work is allowed, between guest slices and never inside a guest's
+    /// call. With a [`Slicer`], it resumes the job that ran a slice once
+    /// `resume_after` ticks passed since that slice, else starts the oldest
+    /// job that waited `older_than` ticks, for one slice; without one, it
+    /// runs the oldest job whole. None when it ran nothing.
+    pub fn run_job(&self, older_than: u64, resume_after: u64) -> Option<JobSlice> {
         let stack = self.compile_stack.load(Ordering::Acquire);
         if stack == 0 {
-            return false;
+            return None;
         }
-        let Some(held) = self.job_lock.lock.try_hold() else {
-            return false;
-        };
-        let now = (self.host.ticks)();
-        let taken = self.jobs.with(|jobs| {
+        match self.slicer() {
+            Some(slicer) => self.run_slice(stack, slicer, older_than, resume_after),
+            None => self.run_whole(stack, older_than),
+        }
+    }
+
+    /// Takes the oldest job that waited `older_than` ticks at `now`, and
+    /// marks it running.
+    fn take_job(&self, now: u64, older_than: u64) -> Option<(Job, u64)> {
+        self.jobs.with(|jobs| {
             let &(_, queued) = jobs.queued.front()?;
             if now.wrapping_sub(queued) < older_than {
                 return None;
@@ -862,32 +984,134 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             let (job, queued) = jobs.queued.pop_front()?;
             jobs.running = Some(job.key);
             Some((job, queued))
-        });
-        let Some((job, queued)) = taken else {
-            return false;
-        };
-        let mut job = Some(job);
-        let mut done = None;
-        (self.host.run)(stack, &mut || {
-            done = job.take().map(|job| job.run(&held));
-        });
-        drop(held);
-        let ran = (self.host.ticks)().wrapping_sub(now);
+        })
+    }
+
+    /// Publishes what a job made, which ran `ticks` in `slices` steps after
+    /// waiting `waited`: only then may another processor take the next job,
+    /// which the caller's hold of the compile lock keeps from it.
+    fn publish_done(&self, done: Option<Done>, ticks: u64, slices: u64, waited: u64) {
         self.jobs.with(|jobs| {
             jobs.running = None;
             jobs.done.extend(done);
             let report = &mut jobs.report;
             report.ran += 1;
-            report.ticks += ran;
-            report.longest = report.longest.max(ran);
-            report.longest_queued = report.longest_queued.max(now.wrapping_sub(queued));
+            report.ticks += ticks;
+            report.longest = report.longest.max(ticks);
+            report.slices += slices;
+            report.longest_queued = report.longest_queued.max(waited);
+            report.queued += waited;
         });
-        true
+    }
+
+    fn run_whole(&self, stack: u64, older_than: u64) -> Option<JobSlice> {
+        let held = self.job_lock.lock.try_hold()?;
+        let now = (self.host.ticks)();
+        let (job, queued) = self.take_job(now, older_than)?;
+        let mut job = Some(job);
+        let mut done = None;
+        (self.host.run)(stack, &mut || {
+            done = job.take().map(|job| job.run(&held));
+        });
+        let ran = (self.host.ticks)().wrapping_sub(now);
+        self.jobs.with(|jobs| {
+            jobs.report.longest_slice = jobs.report.longest_slice.max(ran);
+        });
+        self.publish_done(done, ran, 1, now.wrapping_sub(queued));
+        drop(held);
+        Some(JobSlice {
+            started: true,
+            finished: true,
+            ticks: ran,
+        })
+    }
+
+    fn run_slice(
+        &self,
+        stack: u64,
+        slicer: Slicer,
+        older_than: u64,
+        resume_after: u64,
+    ) -> Option<JobSlice> {
+        let now = (self.host.ticks)();
+        // One processor at a time takes the job between its slices; while
+        // one does, the job's hold of the compile lock keeps others from
+        // starting another.
+        let (resumed, between) = self.jobs.with(|jobs| match &jobs.active {
+            Some(active) if now.wrapping_sub(active.last) >= resume_after => {
+                (jobs.active.take(), false)
+            }
+            Some(_) => (None, true),
+            None => (None, false),
+        });
+        if between {
+            return None;
+        }
+        let (mut active, started) = match resumed {
+            Some(active) => (active, false),
+            None => {
+                let held = self.job_lock.lock.try_hold_shared()?;
+                let (job, queued) = self.take_job(now, older_than)?;
+                let made = Arc::new(Spin::new(None));
+                let into = made.clone();
+                let sliced = slicer(
+                    stack,
+                    Box::new(move || {
+                        let done = job.run_sliced();
+                        into.with(|made| *made = Some(done));
+                    }),
+                );
+                let active = Active {
+                    sliced,
+                    made,
+                    _held: held,
+                    waited: now.wrapping_sub(queued),
+                    last: now,
+                    ticks: 0,
+                    slices: 0,
+                };
+                (active, true)
+            }
+        };
+        let began = (self.host.ticks)();
+        let finished = active.sliced.resume();
+        let ended = (self.host.ticks)();
+        let ran = ended.wrapping_sub(began);
+        active.ticks += ran;
+        active.slices += 1;
+        active.last = ended;
+        self.jobs.with(|jobs| {
+            jobs.report.longest_slice = jobs.report.longest_slice.max(ran);
+        });
+        if finished {
+            let done = active.made.with(Option::take);
+            self.publish_done(done, active.ticks, active.slices, active.waited);
+            // The compile lock goes with it, after the publication.
+            drop(active);
+        } else {
+            self.jobs.with(|jobs| jobs.active = Some(active));
+        }
+        Some(JobSlice {
+            started,
+            finished,
+            ticks: ran,
+        })
     }
 
     /// Whether a deferred job waits to run.
     pub fn jobs_waiting(&self) -> bool {
+        self.jobs
+            .with(|jobs| !jobs.queued.is_empty() || jobs.active.is_some())
+    }
+
+    /// Whether a job waits in the queue for a processor to start it.
+    pub fn job_queued(&self) -> bool {
         self.jobs.with(|jobs| !jobs.queued.is_empty())
+    }
+
+    /// Whether a job ran a slice and waits to be resumed.
+    pub fn job_between_slices(&self) -> bool {
+        self.jobs.with(|jobs| jobs.active.is_some())
     }
 
     /// What jobs did since the last call.
@@ -919,6 +1143,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let Some(call) = read_call(record, caller) else {
             return false;
         };
+        let mut unstarted = false;
         let pending = self.jobs.with(|jobs| {
             let at = jobs.parked.iter().position(|parked| {
                 (
@@ -933,16 +1158,27 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                     call.request.address,
                 )
             })?;
-            let key = jobs.parked[at].key;
+            let Parked { key, at: since, .. } = jobs.parked[at];
             let waits =
                 jobs.running == Some(key) || jobs.queued.iter().any(|(job, _)| job.key == key);
             if waits {
                 jobs.report.repeated += 1;
+                unstarted = !jobs.queued.is_empty();
             } else {
                 jobs.parked.remove(at);
+                let report = &mut jobs.report;
+                // Read only here: a call that parked nothing reads the
+                // clock as it rings, enters and leaves, no more.
+                let after = (self.host.ticks)().wrapping_sub(since);
+                report.resumed += 1;
+                report.resumed_after += after;
+                report.longest_resumed_after = report.longest_resumed_after.max(after);
             }
             Some(waits)
         });
+        if unstarted {
+            (self.host.job_waiting)();
+        }
         if pending != Some(true) {
             return false;
         }
@@ -994,42 +1230,63 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                 .position(|staged| (staged.connection, staged.record, staged.span) == at)?;
             Some(staging.remove(found))
         });
+        let piece = self.library_piece.load(Ordering::Acquire);
         let mut staged = match kept {
             Some(staged) => staged,
             None => {
-                let mut bytes = Vec::new();
+                let mut buffer = Vec::new();
                 // Without room the turn reports the failure.
-                if bytes.try_reserve_exact(length).is_err() {
+                if buffer.try_reserve_exact(piece.min(length)).is_err() {
                     return Staged::Not;
                 }
                 Staging {
                     connection: connection.get(),
                     record,
                     span,
-                    bytes,
+                    read: 0,
                     digest: Sha256::new(),
+                    piece: buffer,
+                    kept: None,
                 }
             }
         };
+        // The second read keeps every byte: the one allocation of the
+        // library's size, made only for a library the device does not hold.
+        if let Some(kept) = &mut staged.kept
+            && kept.capacity() < length
+            && kept.try_reserve_exact(length).is_err()
+        {
+            return Staged::Not;
+        }
         let budget = self.library_budget.load(Ordering::Acquire);
-        let piece = self.library_piece.load(Ordering::Acquire);
         let began = (self.host.ticks)();
         let found = loop {
-            let start = staged.bytes.len();
+            let start = staged.read;
             if start == length {
                 break Staged::Ready;
             }
             let end = start.saturating_add(piece).min(length);
-            staged.bytes.resize(end, 0);
-            if let Err(error) = caller.read(span.address + start as u64, &mut staged.bytes[start..])
-            {
-                staged.bytes.truncate(start);
+            let target = match &mut staged.kept {
+                Some(kept) => {
+                    kept.resize(end, 0);
+                    &mut kept[start..end]
+                }
+                None => {
+                    staged.piece.resize(end - start, 0);
+                    &mut staged.piece[..end - start]
+                }
+            };
+            if let Err(error) = caller.read(span.address + start as u64, target) {
+                if let Some(kept) = &mut staged.kept {
+                    kept.truncate(start);
+                }
                 match error {
                     CallerFault::Denied { .. } => break Staged::Unmapped,
                     _ => return Staged::Not,
                 }
             }
-            staged.digest.update(&staged.bytes[start..]);
+            staged.digest.update(&*target);
+            staged.read = end;
             if end < length && (self.host.ticks)().wrapping_sub(began) >= budget {
                 break Staged::Pending;
             }
@@ -1048,31 +1305,53 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let staged = self.staging.with(|staging| {
             let found = staging.iter().position(|staged| {
                 (staged.connection, staged.record) == (connection.get(), record)
-                    && staged.bytes.len() as u64 == staged.span.length
+                    && staged.read as u64 == staged.span.length
             })?;
             Some(staging.remove(found))
         })?;
         Some(StagedLibrary {
             span: staged.span,
-            bytes: staged.bytes,
+            bytes: staged.kept,
             digest: staged.digest.finalize().into(),
         })
     }
 
+    /// Reads the library of the call at `record` again, keeping its bytes,
+    /// once its turn found the device holds no library of its digest.
+    fn keep_library(&self, connection: NonZeroU64, record: u64, span: Span) {
+        let staged = Staging {
+            connection: connection.get(),
+            record,
+            span,
+            read: 0,
+            digest: Sha256::new(),
+            piece: Vec::new(),
+            kept: Some(Vec::new()),
+        };
+        self.staging.with(|staging| {
+            if staging.len() == STAGED {
+                staging.remove(0);
+            }
+            staging.push(staged);
+        });
+    }
+
     /// Queues each of `jobs` unless one of its key is queued, running or
-    /// done, and parks the call at `record` on the first.
+    /// done, and parks the call at `record` on the one that runs last: jobs
+    /// run one at a time, oldest first.
     fn park(&self, connection: NonZeroU64, record: u64, call: GateCall, jobs: Vec<Job>) {
-        let key = jobs[0].key;
-        let parked = Parked {
+        let keys: Vec<[u8; 32]> = jobs.iter().map(|job| job.key).collect();
+        let now = (self.host.ticks)();
+        let mut parked = Parked {
             connection: connection.get(),
             record,
             operation: call.operation,
             request: call.request.address,
-            key,
+            key: keys[0],
+            at: now,
         };
-        let now = (self.host.ticks)();
         let new = jobs;
-        let unwanted = self.jobs.with(|jobs| {
+        let (unwanted, unstarted) = self.jobs.with(|jobs| {
             jobs.report.deferred += 1;
             jobs.parked.retain(|other| {
                 (other.connection, other.record) != (parked.connection, parked.record)
@@ -1080,7 +1359,6 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             if jobs.parked.len() == PARKED {
                 jobs.parked.pop_front();
             }
-            jobs.parked.push_back(parked);
             let mut unwanted = Vec::new();
             for job in new {
                 let known = jobs.running == Some(job.key)
@@ -1092,10 +1370,24 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                     jobs.queued.push_back((job, now));
                 }
             }
-            unwanted
+            if let Some((last, _)) = jobs
+                .queued
+                .iter()
+                .rev()
+                .find(|(queued, _)| keys.contains(&queued.key))
+            {
+                parked.key = last.key;
+            } else if let Some(running) = jobs.running.filter(|running| keys.contains(running)) {
+                parked.key = running;
+            }
+            jobs.parked.push_back(parked);
+            (unwanted, !jobs.queued.is_empty())
         });
         // Dropped outside the lock: a job frees what it holds.
         drop(unwanted);
+        if unstarted {
+            (self.host.job_waiting)();
+        }
     }
 
     /// The compiler's counts, unless a call holds the service now.
@@ -1113,6 +1405,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             .try_turn()
             .and_then(|mut turn| turn.device().take_completion())?;
         Some((fd, self.timeline.fetch_add(1, Ordering::AcqRel) + 1))
+    }
+
+    /// Offers the device's completion timeline again
+    /// ([`Self::take_completion`]), for a waiter started in place of one that
+    /// left by itself ([`super::waiters`]): whether one is offered. False
+    /// while a call holds the service, or once the device is lost.
+    pub fn rearm_completion(&self) -> bool {
+        self.try_turn()
+            .is_some_and(|mut turn| turn.device().rearm_completion())
     }
 
     /// Whether work was submitted that is not yet published complete: a
@@ -1390,7 +1691,14 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
 
 impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedService<B, C> {
     fn connect(&self) -> Result<NonZeroU64, &'static str> {
-        self.call(|service| service.connect()).map_err(|fault| {
+        let (connected, refused) =
+            self.call(|service| (service.connect(), core::mem::take(&mut service.refused)));
+        // What opening met, such as why a lost device did not reopen: a
+        // refused connection serves no call that would report it later.
+        for reason in &refused {
+            (self.host.report)(reason);
+        }
+        connected.map_err(|fault| {
             (self.host.report)(&alloc::format!("{fault} in a connection"));
             fault.reason
         })
@@ -1403,14 +1711,24 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         });
         self.staging
             .with(|staging| staging.retain(|staged| staged.connection != connection.get()));
+        self.forget_read_backs(connection);
         // The gate closes only connections it opened and holds.
-        let closed = self.call(|service| {
+        let (closed, refused) = self.call(|service| {
+            self.free_read_backs(service);
             for slot in &self.polling {
                 let _ =
                     slot.compare_exchange(connection.get(), 0, Ordering::AcqRel, Ordering::Acquire);
             }
-            service.disconnect(connection)
+            (
+                service.disconnect(connection),
+                core::mem::take(&mut service.refused),
+            )
         });
+        // What the close met, such as a reopen it tried, whether or not any
+        // connection serves another call.
+        for reason in &refused {
+            (self.host.report)(reason);
+        }
         debug_assert!(closed.is_ok());
     }
 
@@ -1441,6 +1759,16 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             served_at_once(operation, Status::Pending);
             return Ok(());
         }
+        // A texture read's band whose GPU copy completed is copied to the
+        // caller here, holding no turn.
+        let read_back_from = match self.read_back_step(connection, record, caller)? {
+            Step::Not => None,
+            Step::From(band) => Some(band),
+            Step::Answered(status) => {
+                served_at_once(Operation::GetBytes.raw(), status);
+                return Ok(());
+            }
+        };
         // A poll answers from the completion a turn or the waiter published,
         // whether or not a call holds the service: a turn would ask the
         // device again, a timeline query the host's Linux environment
@@ -1467,6 +1795,9 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         let Some(mut turn) = self.turn_within(rang) else {
             // Nothing of the call ran: it is made again once the frontend
             // has had its processor back.
+            if let Some(band) = read_back_from {
+                self.resume_read_back(connection, record, caller, band);
+            }
             let call = read_record(record, caller)?;
             answer_pending(record, call, caller)?;
             let left = (self.host.ticks)();
@@ -1491,8 +1822,12 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         turn.catch_up();
         let job_lock = deferring.then_some(&self.job_lock);
         let mut answer = None;
+        let mut read_back = None;
         self.job_lock.lock.set_deferred(false);
+        self.job_lock.lock.take_waited();
+        self.job_lock.lock.set_may_defer(deferring);
         (self.host.run)(self.host.stack, &mut || {
+            self.free_read_backs(&mut turn);
             self.adopt_jobs(&mut turn);
             turn.device().compiler_mut().defer_compiles(deferring);
             turn.device().backend().defer_pipelines(job_lock);
@@ -1503,17 +1838,23 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             if staged {
                 turn.staged_library = self.staged_library(connection, record);
             }
+            turn.read_back_from = read_back_from;
             let served = turn.serve(connection, record, &mut deferrable);
+            turn.read_back_from = None;
+            // Read while the turn holds the device it came from.
+            read_back = turn
+                .read_back_started
+                .take()
+                .map(|started| (started, self.read_backs.generation.current()));
             turn.staged_library = None;
+            if let Some(span) = turn.library_wanted.take() {
+                self.keep_library(connection, record, span);
+            }
             let device = turn.device();
-            // A call that went on past a deferral may have left both.
-            let jobs: Vec<Job> = [
-                device.compiler_mut().take_job(),
-                device.backend().take_job(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
+            // A call that went on past a deferral may have left several.
+            let mut jobs: Vec<Job> =
+                core::iter::from_fn(|| device.compiler_mut().take_job()).collect();
+            jobs.extend(core::iter::from_fn(|| device.backend().take_job()));
             device.compiler_mut().defer_compiles(false);
             device.backend().defer_pipelines(None);
             answer = Some((
@@ -1524,8 +1865,27 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
                 jobs,
             ));
         });
-        let (mut served, mut refused, noted, (mut operation, mut status), jobs) =
+        let (mut served, mut refused, mut noted, (mut operation, mut status), mut jobs) =
             answer.expect("the platform runs what it is given");
+        self.job_lock.lock.set_may_defer(false);
+        // A call that failed only because a host call it made was withdrawn,
+        // no task having taken it in time, waited and did not fail: it is
+        // answered `Pending` and made again once a job that does nothing
+        // ran, as a call that waits for the compile lock is.
+        if self.job_lock.lock.take_waited()
+            && jobs.is_empty()
+            && !matches!(status, Status::Ok | Status::Pending)
+        {
+            let count = self.waited_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut key = [0xfd; 32];
+            key[..8].copy_from_slice(&count.to_le_bytes());
+            jobs.push(Job::new(key, Owner::Compiler, || Box::new(()) as Made));
+            refused.clear();
+            noted = None;
+        }
+        if let Some((started, epoch)) = read_back {
+            self.started_read_back(connection, record, caller, started, epoch);
+        }
         if !jobs.is_empty() {
             // The call left nothing but the compilation: it is answered
             // `Pending`, and made again once the job has run.
@@ -1801,6 +2161,7 @@ mod tests {
         served: |_| {},
         wake: || {},
         bundle: |_| {},
+        job_waiting: || {},
     };
 
     fn shared() -> SharedService<MockBackend, crate::metal::device::fixture::MockCompiler> {
@@ -1858,6 +2219,94 @@ mod tests {
         assert!(!shared.signaled());
         assert_eq!(shared.reached.load(Ordering::Acquire), 0);
         drop(held);
+    }
+
+    /// A job's completion is published before another processor can take
+    /// the next job: the next job stays marked running while it runs, so a
+    /// call parked on it is still answered `Pending` and its job is not
+    /// queued a second time.
+    #[test]
+    fn a_finished_job_leaves_the_next_job_marked_running() {
+        extern crate std;
+        use std::{
+            sync::{Mutex, OnceLock},
+            thread::JoinHandle,
+            time::{Duration, Instant},
+        };
+        type Mock = SharedService<MockBackend, crate::metal::device::fixture::MockCompiler>;
+        static SHARED: OnceLock<Arc<Mock>> = OnceLock::new();
+        static FIRST_RAN: AtomicBool = AtomicBool::new(false);
+        static SECOND_RUNS: AtomicBool = AtomicBool::new(false);
+        static SECOND_MAY_END: AtomicBool = AtomicBool::new(false);
+        static SECOND: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        /// Whether `done` came true within `within`.
+        fn within(within: Duration, done: impl Fn() -> bool) -> bool {
+            let started = Instant::now();
+            while !done() {
+                if started.elapsed() > within {
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+            true
+        }
+        const LONG: Duration = Duration::from_secs(10);
+        // The first reading after the first job ran: another processor
+        // tries to take the second job, and is given a short while to.
+        fn ticks() -> u64 {
+            if FIRST_RAN.swap(false, Ordering::AcqRel) {
+                let shared = SHARED.get().unwrap().clone();
+                let second = std::thread::spawn(move || {
+                    assert!(
+                        within(LONG, || shared.run_job(0, 0).is_some()),
+                        "the second job never ran"
+                    );
+                });
+                *SECOND.lock().unwrap() = Some(second);
+                within(Duration::from_millis(50), || {
+                    SECOND_RUNS.load(Ordering::Acquire)
+                });
+            }
+            7
+        }
+        let service = Service::new(
+            device_on(MockBackend::new()),
+            DeviceEpoch::from_registered(NonZeroU64::MIN),
+        );
+        let shared = Arc::new(SharedService::new(service, ServiceHost { ticks, ..HOST }));
+        assert!(SHARED.set(shared.clone()).is_ok());
+        shared.set_compile_stack(1);
+        shared.jobs.with(|jobs| {
+            jobs.queued.push_back((
+                Job::new([1; 32], Owner::Compiler, || {
+                    FIRST_RAN.store(true, Ordering::Release);
+                    Box::new(())
+                }),
+                0,
+            ));
+            jobs.queued.push_back((
+                Job::new([2; 32], Owner::Compiler, || {
+                    SECOND_RUNS.store(true, Ordering::Release);
+                    assert!(within(LONG, || SECOND_MAY_END.load(Ordering::Acquire)));
+                    Box::new(())
+                }),
+                0,
+            ));
+        });
+        assert!(shared.run_job(0, 0).is_some());
+        assert!(
+            within(LONG, || SECOND_RUNS.load(Ordering::Acquire)),
+            "the second job never started"
+        );
+        let running = shared.jobs.with(|jobs| jobs.running);
+        SECOND_MAY_END.store(true, Ordering::Release);
+        let second = SECOND.lock().unwrap().take().unwrap();
+        second.join().unwrap();
+        assert_eq!(running, Some([2; 32]));
+        shared.jobs.with(|jobs| {
+            assert_eq!(jobs.running, None);
+            assert_eq!(jobs.done.len(), 2);
+        });
     }
 
     #[test]

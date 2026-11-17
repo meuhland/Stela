@@ -410,6 +410,22 @@ fn a_hidden_controller_binds_no_driver_and_keeps_no_client_waiting() {
 }
 
 #[test]
+fn nonces_are_not_claimed_entangled_without_a_uid_key() {
+    let mut defaults = node("defaults", None, vec![]);
+    defaults
+        .set_property(ENTANGLE_NONCE, 1u32.to_le_bytes().to_vec())
+        .unwrap();
+    let mut tree = DeviceTree {
+        root: node("device-tree", None, vec![defaults]),
+    };
+    assert_eq!(hide_unmodeled(&mut tree), ["/defaults entangle-nonce"]);
+    assert!(tree.property(DEFAULTS, ENTANGLE_NONCE).is_none());
+    // Already gone: nothing more to say, and /defaults stays.
+    assert!(hide_unmodeled(&mut tree).is_empty());
+    assert!(tree.node(DEFAULTS).is_some());
+}
+
+#[test]
 fn a_watchdog_without_a_visible_pmu_says_no_pmu() {
     let tree = |pmu: Option<&[u8]>| DeviceTree {
         root: node(

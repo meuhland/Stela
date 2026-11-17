@@ -47,7 +47,7 @@
 //! Controller save/restore requires observed U3 roots and acknowledged CSS/CRS;
 //! reset-on-resume profiles require fresh lifecycle publication. Hub over-current
 //! recovery remains a separate topology operation.
-use super::{audio, bluetooth, cdc, ethernet, hid, storage};
+use super::{audio, bluetooth, cdc, ethernet, hid, storage, storage::settle};
 use crate::{
     Clock, Deadline, Handoff,
     block::BlockError,
@@ -64,6 +64,7 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 
+mod access;
 mod bind;
 mod command;
 mod configuration;
@@ -80,7 +81,9 @@ mod lifecycle;
 mod lpm;
 mod memory;
 mod minimum;
+use access::Access;
 use minimum::Minimum;
+use stela_driver_base::stepped::block_on;
 #[cfg(test)]
 pub(crate) mod model;
 pub mod native;
@@ -96,6 +99,8 @@ mod teardown;
 mod transfer;
 
 use super::descriptor::*;
+#[cfg(test)]
+pub(crate) use bind::AFTER_BOOT;
 pub use bind::Plan;
 use bind::bind_with_provider;
 pub use descriptor::Device;
@@ -103,6 +108,7 @@ pub use enumerate::PortProbe;
 pub use identity::{DeviceAccess, DeviceRef, SlotId};
 pub use iso::{IsoCompletion, IsoSchedule, IsoStatus, IsoTransfer};
 pub use lifecycle::{Changes, Host};
+pub(crate) use reset::departed;
 use ring::{Event, Ring};
 pub use streams::StreamTransfer;
 pub use transfer::{Operation, TransferCancellation, TransferTicket};
@@ -293,7 +299,9 @@ const QUIET_DRAINS: u8 = 64;
 const ABORT_US: u64 = 5_000_000;
 const RING_STOP_US: u64 = 2_000_000;
 const CONTROL_US: u64 = 5_000_000;
-const PORT_RESET_US: u64 = 500_000;
+/// Linux `HUB_RESET_TIMEOUT`: how long `hub_port_wait_reset` waits for a
+/// port's reset, hot or warm, to end.
+const PORT_RESET_US: u64 = 800_000;
 /// Linux `hub_port_reset`: 10 ms of reset recovery and 40 ms more, as the
 /// hub path here waits.
 const RESET_RECOVERY_US: u64 = 50_000;
@@ -388,6 +396,12 @@ struct Transfer {
     enabled: bool,
     /// Bulk and interrupt TDs submitted and not yet completed or cancelled.
     in_flight: usize,
+    /// An acknowledged cancellation left the endpoint Stopped and no
+    /// doorbell rang for it since: its output context's Stopped is current.
+    /// After a doorbell some controllers show Stopped in the output context
+    /// for a while although the endpoint runs again (Linux
+    /// `xhci_handle_cmd_stop_ep`), so only this says Stopped for sure.
+    stopped: bool,
 }
 
 struct Slot {
@@ -475,6 +489,10 @@ pub struct Controller {
     retry_resources: slot_resources::Cache,
     /// Class requests to reset and rebind a device, in arrival order.
     queued_resets: Vec<SlotId>,
+    /// Whether the boot handed the machine over ([`Host::poll_after_boot`]):
+    /// a device that arrives from then on gets only the classes the running
+    /// system takes, and the rest are reported unused, never started.
+    after_boot: bool,
     /// Transfer events that arrived while waiting for something else.
     pending: Vec<Event>,
     /// USBSTS once the controller reported a fatal error.
@@ -782,6 +800,7 @@ impl Controller {
             test_retired_numbers: vec![false; slots.len()],
             retry_resources: slot_resources::Cache::new(slots.len()),
             queued_resets: Vec::new(),
+            after_boot: false,
             power: power::Ledger::new(slots.len()),
             slots,
             pending: Vec::new(),
@@ -833,9 +852,23 @@ impl Controller {
     }
 
     fn doorbell(&mut self, slot: u8, target: u8) {
+        self.rang(slot, target);
         fence(Ordering::SeqCst);
         self.registers
             .write32(self.doorbells + 4 * usize::from(slot), u32::from(target));
+    }
+
+    /// A doorbell for endpoint `dci` of `slot` may restart it: its output
+    /// context no longer says for sure that it is Stopped.
+    fn rang(&mut self, slot: u8, dci: u8) {
+        if let Some(Some(endpoint)) = self
+            .slots
+            .get_mut(usize::from(slot))
+            .and_then(Option::as_mut)
+            .and_then(|state| state.endpoints.get_mut(usize::from(dci)))
+        {
+            endpoint.stopped = false;
+        }
     }
 
     /// The next event on the ring, if the controller has posted one.
@@ -1224,6 +1257,13 @@ pub struct Found {
     pub controller_firmware: Option<renesas::Receipt>,
     /// How long each root port took to debounce, reset and enumerate.
     pub probes: Vec<PortProbe>,
+    /// Bulk-Only interfaces configured and waiting out their settle time,
+    /// discovered by the device start or the [`Host`] that bound them.
+    pub(crate) settling: Vec<settle::Settling>,
+    /// Storage devices of disks in use that left the bus after boot and
+    /// came back, started again: each one's location and how many of its
+    /// units go on ([`Host::keep_storage`]).
+    pub resumed: Vec<(String, usize)>,
 }
 /// What an xHCI controller was doing when it stopped answering commands:
 /// the command left unanswered and the registers read before the halt.
@@ -1261,6 +1301,27 @@ impl core::fmt::Display for Death {
 }
 
 impl Found {
+    /// Take what settled interfaces' discovery found.
+    pub(crate) fn absorb_settled(&mut self, settled: settle::Settled) {
+        self.storage.extend(settled.storage);
+        self.disks.extend(settled.disks);
+        self.failures.extend(settled.failures);
+    }
+
+    /// Wait until the interfaces still settling have, then discover them.
+    pub(crate) fn settle(&mut self, dma: &mut dyn DmaAllocator) {
+        let mut settling = core::mem::take(&mut self.settling);
+        let settled = settle::settle(&mut settling, Some(dma), true);
+        self.absorb_settled(settled);
+    }
+
+    /// The Bulk-Only interfaces still settling, for a caller that waits
+    /// once for those of every controller it started: see
+    /// [`Started::finish_unsettled`].
+    pub fn take_settling(&mut self) -> Vec<settle::Settling> {
+        core::mem::take(&mut self.settling)
+    }
+
     /// What the controller that died while its devices started was doing.
     pub fn controller_death(&self) -> Option<Death> {
         self.hosts.iter().find_map(Host::death)
@@ -1477,8 +1538,23 @@ pub struct Started {
 }
 
 impl Started {
-    /// Enumerate the controller's devices and bind the class drivers.
+    /// Enumerate the controller's devices and bind the class drivers,
+    /// waiting out the Bulk-Only settle time.
     pub fn finish(
+        self,
+        dma: &mut dyn DmaAllocator,
+        firmware: &dyn crate::firmware::Provider,
+    ) -> Found {
+        let mut found = self.finish_unsettled(dma, firmware);
+        found.settle(dma);
+        found
+    }
+
+    /// [`Self::finish`] with the Bulk-Only interfaces left settling, each
+    /// from its own configuration: the caller takes them
+    /// ([`Found::take_settling`]) and discovers them with every other
+    /// controller's ([`settle::settle`]), so the waits overlap.
+    pub fn finish_unsettled(
         self,
         dma: &mut dyn DmaAllocator,
         firmware: &dyn crate::firmware::Provider,

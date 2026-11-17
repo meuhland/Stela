@@ -28,7 +28,11 @@ use core::fmt;
 use stela_driver_base::budget;
 
 #[cfg(feature = "native-acpi")]
+pub mod backlight;
+#[cfg(feature = "native-acpi")]
 mod companion;
+#[cfg(feature = "native-acpi")]
+pub mod d3cold;
 #[cfg(feature = "native-acpi")]
 mod i2c;
 #[cfg(feature = "native-acpi")]
@@ -60,6 +64,8 @@ pub enum Error {
     /// The original root refused a driver's quiescence receipt.
     Preparation(crate::bus::pci::requester::preparation::Error),
     Vmd(crate::bus::vmd::Error),
+    /// A refusal of a VMD host's own BARs or bus range, with what it read.
+    VmdResource(crate::bus::vmd::Error, native::VmdWords),
     Tg3(net::tg3::Error),
     Aqtion(net::aqtion::native::Error),
     Sfh(input::sfh::Error),
@@ -92,6 +98,7 @@ impl fmt::Display for Error {
             Self::Native(error) => error.fmt(f),
             Self::Preparation(error) => write!(f, "cold requester preparation: {error}"),
             Self::Vmd(error) => write!(f, "VMD: {error}"),
+            Self::VmdResource(error, words) => write!(f, "VMD: {error}; {words}"),
             Self::Tg3(error) => write!(f, "tg3: {error}"),
             Self::Aqtion(error) => write!(f, "atlantic: {error}"),
             Self::Sfh(error) => write!(f, "AMD SFH: {error:?}"),
@@ -228,6 +235,12 @@ pub enum Warning {
     Realtek(realtek::Warning),
     /// An Intel xHCI took its switchable ports from EHCI.
     IntelPortSwitch(usb::handoff::Switched),
+    /// An NVMe controller runs with Linux's quirks for its PCI ID, model or
+    /// board.
+    NvmeQuirks(nvme::Quirks),
+    /// An NVMe controller's namespaces were scanned one ID at a time in
+    /// place of its refused or garbage active namespace list.
+    NvmeScan(nvme::SequentialScan),
 }
 
 impl fmt::Display for Warning {
@@ -251,6 +264,8 @@ impl fmt::Display for Warning {
                 "Intel xHCI took its ports from EHCI: SuperSpeed {:#x}, USB 2 {:#x}",
                 switched.superspeed, switched.usb2
             ),
+            Self::NvmeQuirks(quirks) => f.write_str(&quirks.describe()),
+            Self::NvmeScan(scan) => write!(f, "{scan}"),
         }
     }
 }
@@ -332,6 +347,13 @@ impl Adapter {
 }
 
 impl Link for Adapter {
+    /// The driver's own state line, where it keeps one (RTL8168 family).
+    fn diagnostic(&mut self) -> Option<String> {
+        match self {
+            Self::Realtek(device) => device.diagnostic(),
+            _ => None,
+        }
+    }
     fn mac(&self) -> Mac {
         match self {
             Self::Virtio(device) => device.mac(),
@@ -410,6 +432,12 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.signals(),
             Self::MediatekWifi(device) => device.signals(),
             Self::RealtekWifi(device) => device.signals(),
+        }
+    }
+    fn retarget(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
+        match self {
+            Self::Virtio(device) => device.retarget(message),
+            _ => false,
         }
     }
     fn due_us(&self) -> Option<u64> {
@@ -548,6 +576,9 @@ pub fn plan(
     if class[0] == 0x03 {
         return Cow::Borrowed("GPU");
     }
+    if display_audio(class, function.address, displays) {
+        return Cow::Owned(alloc::format!("unsupported: {DISPLAY_AUDIO}"));
+    }
     #[cfg(feature = "native-acpi")]
     if smbus::matches_identity(function) {
         return Cow::Borrowed("i801 SMBus");
@@ -607,17 +638,30 @@ pub fn plan(
 
 /// An HD Audio function beside a display controller's function 0 is that
 /// GPU's HDMI/DP audio, as Linux `get_bound_vga` finds it. No HDMI/DP codec
-/// profile here serves one outside the admitted identities.
-const DISPLAY_AUDIO: &str = "HDMI/DP audio controller of a GPU outside the supported HD Audio identities (its outputs carry no audio)";
+/// profile here serves one, whatever its identity.
+const DISPLAY_AUDIO: &str = "HDMI/DP audio controller of a GPU: not driven, left parked for the GPU's start (its outputs carry no audio)";
+
+/// Whether the function of `class` at `address` is the HDMI/DP audio of a
+/// GPU, given the slots whose function 0 is a display controller.
+///
+/// The scan never claims one: no driver here serves GPU audio, and a claim
+/// takes the function out of the parked fabric, where the GPU's cold start
+/// needs it for a Secondary Bus Reset of the GPU's bus (a GPU without a
+/// function-local reset on a machine without DMA translation has no other
+/// reset). That reset contains the function and parks it again, quiesced.
+fn display_audio(class: [u8; 3], address: Address, displays: &[Address]) -> bool {
+    class[..2] == [0x04, 0x03]
+        && address.function != 0
+        && displays.iter().any(|display| {
+            (display.segment, display.bus, display.device)
+                == (address.segment, address.bus, address.device)
+        })
+}
 
 /// Why no driver here takes `class` at `address`, given the slots whose
 /// function 0 is a display controller.
 fn unclaimed(class: [u8; 3], address: Address, displays: &[Address]) -> Option<&'static str> {
-    let beside_display = displays.iter().any(|display| {
-        (display.segment, display.bus, display.device)
-            == (address.segment, address.bus, address.device)
-    });
-    if class[..2] == [0x04, 0x03] && address.function != 0 && beside_display {
+    if display_audio(class, address, displays) {
         return Some(DISPLAY_AUDIO);
     }
     unsupported(class)
@@ -657,6 +701,39 @@ fn unsupported(class: [u8; 3]) -> Option<&'static str> {
     }
 }
 
+/// A PCI-to-ISA bridge as the scan read it, without a write. Intel's display
+/// code finds the PCH by the bridge's IDs (`intel_pch.c`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IsaBridge {
+    pub identity: crate::bus::pci::Identity,
+    pub revision: u8,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+}
+
+impl IsaBridge {
+    /// `function`'s, when its class is a PCI-to-ISA bridge's and its
+    /// revision and subsystem IDs read.
+    fn read<C: crate::bus::pci::ConfigSpace>(
+        function: &mut crate::bus::pci::Function<C>,
+    ) -> Option<Self> {
+        use crate::bus::pci::regs;
+        if function.class[..2] != [0x06, 0x01] {
+            return None;
+        }
+        let identity = function.identity();
+        let config = function.config();
+        let revision = config.read8(regs::CLASS_REVISION).ok()?;
+        let subsystem = config.read32(regs::SUBSYSTEM_VENDOR_ID).ok()?;
+        Some(Self {
+            identity,
+            revision,
+            subsystem_vendor: subsystem as u16,
+            subsystem_device: (subsystem >> 16) as u16,
+        })
+    }
+}
+
 /// Every block and input device the drivers brought up, and every
 /// controller they could not.
 #[derive(Default)]
@@ -667,6 +744,13 @@ pub struct Devices {
     /// Display controllers, inventoried without changing firmware scanout.
     /// These are not initialized accelerators; each records its missing port.
     pub gpus: Vec<gpu::Adapter>,
+    /// The ACPI path of each display controller's companion, found as
+    /// Linux's `acpi_pci_find_companion` finds it ([`native::companion`]):
+    /// a GPU's kernel driver reads its firmware's methods there.
+    pub gpu_companions: Vec<(Address, String)>,
+    /// PCI-to-ISA bridges as their configuration reads, which no driver
+    /// here takes: a GPU's kernel driver names the chipset by them.
+    pub isa_bridges: Vec<IsaBridge>,
     /// Host keyboards and pointers: virtio-input devices, USB HID devices
     /// behind xHCI controllers, and the i8042 ports the ACPI namespace
     /// lists, each polled through [`InputDevice::poll`].
@@ -690,6 +774,10 @@ pub struct Devices {
     pub ahci_hosts: Vec<ahci::Host>,
     /// Storage class owners remain available for explicit media rescan.
     pub usb_storage: Vec<crate::usb::storage::UsbStorage>,
+    /// Bulk-Only interfaces of the controllers started after the scan,
+    /// each settling from its own configuration, discovered together once
+    /// the latest has ([`Self::settle_usb`]).
+    pub(crate) usb_settling: Vec<crate::usb::storage::settle::Settling>,
     /// USB HCI transports with kept device-specific initialization results.
     /// Historical evidence does not establish radio or guest readiness.
     pub bluetooth: Vec<UsbHci>,
@@ -932,7 +1020,7 @@ impl Devices {
         };
         match error {
             Error::Enumeration(_) => "PCI",
-            Error::Vmd(_) => "storage",
+            Error::Vmd(_) | Error::VmdResource(..) => "storage",
             // The r8169 Ethernet driver's; a Realtek card reader fails as a
             // device.
             Error::Realtek(_) | Error::Tg3(_) | Error::Aqtion(_) | Error::Pch(_) => "network",
@@ -970,6 +1058,7 @@ impl Devices {
         self.usb_devices.extend(found.devices);
         self.usb_hosts.extend(found.hosts);
         self.usb_storage.extend(found.storage);
+        self.usb_settling.extend(found.settling);
         self.audio.extend(found.audio);
         self.bluetooth_bootloaders.extend(found.bootloaders);
         for mut device in found.bluetooth {
@@ -994,6 +1083,21 @@ impl Devices {
             self.usb_port_probes
                 .extend(found.probes.into_iter().map(|probe| (address, probe)));
         }
+    }
+
+    /// Wait once until every settling Bulk-Only interface's second has
+    /// passed, then discover them all: the controllers started after the
+    /// scan wait together, not one after another.
+    fn settle_usb(&mut self, dma: &mut dyn DmaAllocator) {
+        let settled = crate::usb::storage::settle::settle(&mut self.usb_settling, Some(dma), true);
+        self.disks.extend(
+            settled
+                .disks
+                .into_iter()
+                .map(|disk| Box::new(disk) as Box<dyn BlockDevice>),
+        );
+        self.usb_storage.extend(settled.storage);
+        self.usb_failures.extend(settled.failures);
     }
 
     /// Failures from attempted native vendor initialization, USB and PCIe,
@@ -1518,6 +1622,17 @@ fn first_of(scanned: Vec<Vec<Function>>, first: Option<Address>) -> (Vec<Vec<Fun
     (rest, found)
 }
 
+/// The handoff a wired network adapter attaches with: it signals arriving
+/// frames with [`Handoff::network`] where the engine gave one, which makes
+/// the host's service due, rather than with a disk's completion signal,
+/// which only sends the disks looking for completions.
+fn network_handoff(handoff: &Handoff) -> Handoff {
+    Handoff {
+        completion: handoff.network.or(handoff.completion),
+        ..handoff.clone()
+    }
+}
+
 /// [`probe_with_provider`], with `observer` told of each start.
 ///
 /// # Safety
@@ -1533,6 +1648,7 @@ pub unsafe fn probe_observed(
     wifi: Option<&Network>,
     observer: &mut dyn Observer,
 ) -> Devices {
+    let network_handoff = network_handoff(handoff);
     let mut devices = Devices {
         bluetooth_platform: captures.bluetooth,
         native_services: services.is_some(),
@@ -1645,6 +1761,7 @@ pub unsafe fn probe_observed(
             if function.class[0] == 0x02 {
                 devices.network_functions.push(function.identity());
             }
+            devices.isa_bridges.extend(IsaBridge::read(&mut function));
             // A network adapter joins the links, or its failure is recorded.
             macro_rules! attach_link {
                 ($attached:expr, $variant:path) => {{
@@ -1719,6 +1836,12 @@ pub unsafe fn probe_observed(
             }
             if let Some(adapter) = gpu::Adapter::discover(&function) {
                 devices.gpus.push(adapter);
+                continue;
+            }
+            if display_audio(function.class, address, &displays) {
+                devices
+                    .unsupported
+                    .push((address, function.class, DISPLAY_AUDIO));
                 continue;
             }
             crate::working(&alloc::format!("PCI {address}"));
@@ -1805,11 +1928,26 @@ pub unsafe fn probe_observed(
                 attached.map(|device| vec![Box::new(device) as Box<dyn BlockDevice>])
             } else if function.class == nvme::CLASS {
                 let minimum = minimum_for_function!().clone();
-                let attached = nvme::attach(&mut function, handoff, dma, minimum.as_ref());
+                // Linux's board quirks read the SMBIOS system and baseboard.
+                let snapshot = crate::firmware::smbios::load(firmware).ok();
+                let platform = snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.identity)
+                    .unwrap_or_default();
+                let attached =
+                    nvme::attach(&mut function, handoff, dma, minimum.as_ref(), &platform);
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
                 attached.map(|attached| {
+                    if !attached.quirks.is_empty() {
+                        devices
+                            .warnings
+                            .push((address, Warning::NvmeQuirks(attached.quirks)));
+                    }
+                    if let Some(scan) = attached.sequential {
+                        devices.warnings.push((address, Warning::NvmeScan(scan)));
+                    }
                     devices
                         .device_failures
                         .extend(attached.failures.into_iter().map(|(namespace, error)| {
@@ -1869,7 +2007,8 @@ pub unsafe fn probe_observed(
                 continue;
             } else if net::virtio::matches(&function) {
                 let minimum = minimum_for_function!().clone();
-                let attached = VirtioNet::new(&mut function, handoff, dma, minimum.as_ref());
+                let attached =
+                    VirtioNet::new(&mut function, &network_handoff, dma, minimum.as_ref());
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -1878,7 +2017,8 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: the caller grants exclusive post-EBS controller,
                 // segment configuration and firmware/ASPM policy ownership.
-                let attached = unsafe { Igc::new(&mut function, handoff, dma, minimum.clone()) };
+                let attached =
+                    unsafe { Igc::new(&mut function, &network_handoff, dma, minimum.clone()) };
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -1887,7 +2027,8 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: the caller granted exclusive ownership of all mapped PCI
                 // functions and controllers after ExitBootServices.
-                let attached = unsafe { E1000e::new(&mut function, handoff, dma, minimum.clone()) };
+                let attached =
+                    unsafe { E1000e::new(&mut function, &network_handoff, dma, minimum.clone()) };
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -1933,7 +2074,8 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: as for e1000e, the caller granted exclusive ownership
                 // of the mapped PCI functions and their controllers.
-                let attached = unsafe { Igb::new(&mut function, handoff, dma, minimum.clone()) };
+                let attached =
+                    unsafe { Igb::new(&mut function, &network_handoff, dma, minimum.clone()) };
                 if let Ok(device) = &attached {
                     if device.warnings.nvm_autoload_timeout {
                         devices.warnings.push((
@@ -1976,8 +2118,15 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: the caller granted exclusive post-EBS ownership of
                 // mapped PCI/MMIO and DMA, including upstream ASPM configuration.
-                let attached =
-                    unsafe { Realtek::new(&mut function, handoff, dma, firmware, minimum.clone()) };
+                let attached = unsafe {
+                    Realtek::new(
+                        &mut function,
+                        &network_handoff,
+                        dma,
+                        firmware,
+                        minimum.clone(),
+                    )
+                };
                 if let Ok(device) = &attached {
                     devices.warnings.extend(
                         device
@@ -2059,6 +2208,11 @@ pub unsafe fn probe_observed(
                     Ok(attached) => attached,
                     Err(failure) => {
                         devices
+                            .device_failures
+                            .extend(failure.port_failures().iter().map(|(port, error)| {
+                                (alloc::format!("{address} port {port}"), error.clone())
+                            }));
+                        devices
                             .failures
                             .push((address, Error::Device(failure.error.clone())));
                         devices.owners.push(Box::new(failure));
@@ -2113,8 +2267,9 @@ pub unsafe fn probe_observed(
             continue;
         }
         let mut start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
+        // Its Bulk-Only disks settle with every later controller's.
         absorb_xhci(
-            Ok(started.finish(dma, firmware)),
+            Ok(started.finish_unsettled(dma, firmware)),
             &mut function,
             &XhciInputs {
                 handoff,
@@ -2138,7 +2293,35 @@ pub unsafe fn probe_observed(
         handoff,
         &mut devices,
     );
+    // A port still powered off after the power-on before the census
+    // (`d3cold`) is named.
+    #[cfg(feature = "native-acpi")]
+    if let Some(session) = services.and_then(|services| services.acpi()) {
+        for address in d3cold::powered_off_ports(session, &bridges, &devices.classes) {
+            let class = devices
+                .classes
+                .iter()
+                .find(|(found, _)| *found == address)
+                .map_or([6, 4, 0], |&(_, class)| class);
+            devices
+                .unsupported
+                .push((address, class, d3cold::POWERED_OFF_PORT));
+        }
+    }
     attach_usb4_hosts(usb4_hosts, services, &bridges, handoff, &mut devices);
+    // Each display controller's companion, once every bridge above it is
+    // known.
+    #[cfg(feature = "native-acpi")]
+    if let Some(session) = services.and_then(NativeServices::acpi) {
+        devices.gpu_companions = devices
+            .gpus
+            .iter()
+            .filter_map(|gpu| {
+                let companion = native::companion(session, gpu.address, &bridges)?;
+                Some((gpu.address, companion.path().ok()?))
+            })
+            .collect();
+    }
     attach_broadcom_bluetooth(
         broadcom_bluetooth,
         services,
@@ -2151,6 +2334,7 @@ pub unsafe fn probe_observed(
     // its PCI fixups.
     #[cfg(feature = "native-acpi")]
     attach_platform(services, smbus_functions, &bridges, handoff, &mut devices);
+    devices.settle_usb(dma);
     devices
 }
 
@@ -2503,9 +2687,14 @@ unsafe fn attach_native(
             return;
         }
         native::Kind::Vmd => {
+            let snapshot = crate::firmware::smbios::load(inputs.firmware).ok();
+            let platform = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.identity)
+                .unwrap_or_default();
             // SAFETY: as for tg3 below; the host's hierarchy is
             // stopped with it.
-            match unsafe { native::vmd(services, address, inputs.handoff.clock) } {
+            match unsafe { native::vmd(services, address, inputs.handoff.clock, &platform) } {
                 Ok(found) => {
                     for child in &found.others {
                         let location = alloc::format!(
@@ -2517,15 +2706,32 @@ unsafe fn attach_native(
                         devices.device_failures.push((
                             location,
                             BlockError::Unsupported(
-                                "device behind VMD other than its first NVMe controller",
+                                "device behind VMD other than an NVMe controller",
                             ),
                         ));
                     }
-                    if let Some(attached) = found.nvme {
+                    // Every controller's namespaces join the disks, among
+                    // which the chosen one is found by its identity.
+                    for (location, attached) in found.nvme {
+                        let attached = match attached {
+                            Ok(attached) => attached,
+                            Err(error) => {
+                                devices.device_failures.push((location, error));
+                                continue;
+                            }
+                        };
+                        if !attached.quirks.is_empty() {
+                            devices
+                                .warnings
+                                .push((address, Warning::NvmeQuirks(attached.quirks)));
+                        }
+                        if let Some(scan) = attached.sequential {
+                            devices.warnings.push((address, Warning::NvmeScan(scan)));
+                        }
                         devices
                             .device_failures
                             .extend(attached.failures.into_iter().map(|(namespace, error)| {
-                                (alloc::format!("{address} VMD namespace {namespace}"), error)
+                                (alloc::format!("{location} namespace {namespace}"), error)
                             }));
                         devices.disks.extend(
                             attached
@@ -2621,11 +2827,12 @@ fn attach_ehci_hosts(
                 continue;
             }
         };
-        let found = usb::ehci::host::enumerate(
+        let mut found = usb::ehci::host::enumerate_unsettled(
             &controller,
             &alloc::format!("{address} EHCI"),
             handoff.clock,
         );
+        devices.usb_settling.append(&mut found.take_settling());
         devices.disks.extend(
             found
                 .disks
@@ -2783,6 +2990,37 @@ fn attach_platform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wired adapter signals frames on the engine's network message, or
+    /// on the disks' completion message when the engine gave none.
+    #[test]
+    fn wired_adapters_signal_on_the_network_message() {
+        use crate::bus::irq::MsiMessage;
+        let disk = MsiMessage {
+            address: 0xfee0_0000,
+            data: 0x62,
+        };
+        let frames = MsiMessage {
+            address: 0xfee0_0000,
+            data: 0x63,
+        };
+        let mut handoff = Handoff {
+            ecam: Vec::new(),
+            mapped: alloc::vec![0x1000..0x2000],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: Some(disk),
+            network: Some(frames),
+        };
+        let wired = network_handoff(&handoff);
+        assert_eq!(wired.completion, Some(frames));
+        assert_eq!(wired.mapped, handoff.mapped);
+        handoff.network = None;
+        assert_eq!(network_handoff(&handoff).completion, Some(disk));
+    }
 
     /// The boot of issue 18: the mount refused both HD Audio controllers
     /// before their driver ran, and they are filed as audio, not with the
@@ -3066,6 +3304,10 @@ mod tests {
         let hdmi = identity(1, 1, 0x1234, 0x0001, 0x04_03_00);
         assert!(plan(&hdmi, &displays).starts_with("unsupported: HDMI/DP audio"));
         assert!(plan(&hdmi, &[]).starts_with("unsupported: HD Audio controller"));
+        // An admitted HD Audio identity beside a GPU is left parked too.
+        let nvidia = identity(1, 1, 0x10de, 0x22e9, 0x04_03_00);
+        assert!(plan(&nvidia, &displays).starts_with("unsupported: HDMI/DP audio"));
+        assert_eq!(plan(&nvidia, &[]), "HD Audio");
     }
 
     #[test]
@@ -3128,6 +3370,7 @@ mod tests {
                 },
                 firmware: None,
                 completion: None,
+                network: None,
             };
             let services = services::tests::Refusing::minimum_only();
             // SAFETY: the empty region can allocate no DMA pages. Only the
@@ -3287,6 +3530,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = |device| Address {
             segment: 0,
@@ -3403,6 +3647,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = |device| Address {
             segment: 0,
@@ -3438,6 +3683,96 @@ mod tests {
         assert!(!observer.seen.is_empty() && observer.seen.iter().all(|&forwarded| forwarded));
         assert_eq!(ecam[1] & 0xffff, 0x0006);
         assert_eq!(ecam[(1 << 15) / 4 + 1] & 0xffff, 0x0006);
+    }
+
+    /// A GPU's HDMI/DP audio function is recorded as not driven and never
+    /// prepared, so it stays parked for the GPU's Secondary Bus Reset. A
+    /// PCI-to-ISA bridge is recorded as it reads and not prepared either.
+    #[test]
+    fn a_gpus_audio_function_is_never_prepared() {
+        let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
+        // 00:00.0 a multi-function NVIDIA display controller, 00:00.1 its
+        // HD Audio function, whose identity the HD Audio driver admits,
+        // 00:00.2 a PCI-to-ISA bridge.
+        for (function, id, class, header) in [
+            (0, 0x10de_2c02u32, 0x0300_0000u32, 0x0080_0000u32),
+            (1, 0x10de_22e9, 0x0403_0000, 0x0080_0000),
+            (2, 0x8086_5182, 0x0601_0001, 0x0080_0000),
+        ] {
+            let start = function * 4096 / 4;
+            let page = &mut ecam[start..start + 4096 / 4];
+            page.fill(0);
+            page[0] = (id & 0xffff) << 16 | id >> 16;
+            page[2] = class;
+            page[3] = header;
+            page[11] = 0x22e7_17aa;
+        }
+        let window = EcamWindow {
+            base: ecam.as_mut_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 0,
+        };
+        let handoff = Handoff {
+            ecam: alloc::vec![window],
+            mapped: alloc::vec![window.range()],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: None,
+            network: None,
+        };
+        let services = services::tests::Refusing::minimum_only();
+        // SAFETY: no DMA pages, only the synthetic ECAM mapped, and every
+        // native grant refused.
+        let mut dma = unsafe { crate::bus::dma::RegionAllocator::new(0..0) };
+        // SAFETY: as above.
+        let devices = unsafe {
+            probe_with_provider(
+                &handoff,
+                PlatformCaptures::default(),
+                &mut dma,
+                handoff_provider(&handoff),
+                Some(&services),
+                None,
+            )
+        };
+        let audio = Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 1,
+        };
+        assert!(services.preparations.borrow().is_empty());
+        assert!(services.requests.borrow().is_empty());
+        assert_eq!(
+            devices.isa_bridges,
+            [IsaBridge {
+                identity: crate::bus::pci::Identity {
+                    address: Address {
+                        function: 2,
+                        ..audio
+                    },
+                    vendor: 0x8086,
+                    device: 0x5182,
+                    class: [0x06, 0x01, 0x00],
+                },
+                revision: 0x01,
+                subsystem_vendor: 0x17aa,
+                subsystem_device: 0x22e7,
+            }]
+        );
+        assert!(devices.failures.iter().all(|(at, _)| *at != audio));
+        assert!(
+            devices
+                .unsupported
+                .iter()
+                .any(|&(at, _, why)| at == audio && why == DISPLAY_AUDIO),
+            "{:?}",
+            devices.unsupported
+        );
     }
 
     /// Every function a driver here claims ends its probe with a record:
@@ -3478,6 +3813,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let services = services::tests::Refusing::minimum_only();
         // SAFETY: as in the EHCI fixture above: no DMA pages, only the
@@ -3640,6 +3976,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let firmware = handoff_provider(&handoff);
         let network = Network {
@@ -3715,6 +4052,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = Address {
             segment: 0,

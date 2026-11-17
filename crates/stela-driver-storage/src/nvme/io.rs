@@ -24,14 +24,24 @@ impl Controller {
         }
     }
 
-    /// The error for an I/O completion that names no command it may, or
-    /// whose entry changed under its read: the controller's own, when its
-    /// status says it is removed or fatally failed, otherwise a corrupt
-    /// queue.
+    /// The error for an I/O completion whose entry changed under its read:
+    /// the controller's own, when its status says it is removed or fatally
+    /// failed, otherwise a corrupt queue.
     fn invalid_completion(&self) -> BlockError {
-        parts::timed(parts::Part::Status, || self.check_fatal())
+        self.stray_completion()
             .err()
             .unwrap_or(BlockError::Device { status: 0xffff })
+    }
+
+    /// A completion that names no outstanding command, which Linux's
+    /// `nvme_handle_cqe` reports as an invalid ID and passes over: it is
+    /// passed over while the controller's status is good, each one counted
+    /// as a [`parts::Part::Status`] read. A command it should have ended
+    /// still runs to its deadline, whose Abort and reset recover it as
+    /// Linux's timeout does. A removed or fatally failed controller's status
+    /// is the error.
+    pub(super) fn stray_completion(&self) -> Result<(), BlockError> {
+        parts::timed(parts::Part::Status, || self.check_fatal())
     }
 
     /// Page `index` of those tag `tag` holds.
@@ -93,6 +103,7 @@ impl Controller {
     pub(super) fn outstanding(&self, id: u16) -> bool {
         self.events.request == Some(id)
             || self.aborts.contains(&id)
+            || self.errand.as_ref().is_some_and(|errand| errand.id == id)
             || self
                 .tags
                 .iter()
@@ -190,9 +201,11 @@ impl Controller {
     }
 
     /// The completion at queue `io`'s head, once the controller has posted
-    /// it: its identifier, admin result (zero for I/O), status and submission
-    /// head, which must not have moved back nor past the tail.
-    pub(super) fn posted(&mut self, io: bool) -> Result<Option<(u16, u32, u32, u16)>, BlockError> {
+    /// it: its identifier, admin result (zero for I/O) and status. Its
+    /// submission queue identifier and head are not checked, as Linux's
+    /// `nvme_handle_cqe` reads neither: controllers report the head when
+    /// they make the entry, which need not follow the order they post in.
+    pub(super) fn posted(&mut self, io: bool) -> Result<Option<(u16, u32, u32)>, BlockError> {
         let queue = if io { &mut self.io } else { &mut self.admin };
         let entry = usize::from(queue.head) * 16;
         if (queue.completions.coherent(entry + 12)? >> 16 & 1 == 1) != queue.phase {
@@ -208,26 +221,15 @@ impl Controller {
         } else {
             queue.completions.coherent(entry)?
         };
-        let submission = queue.completions.coherent(entry + 8)?;
         let tail_word = queue.completions.coherent(entry + 12)?;
-        let head = submission as u16;
-        if ((tail_word >> 16 & 1) == 1) != queue.phase
-            || submission >> 16 != u32::from(queue.id)
-            || !queue.consumes(head)
-        {
+        if ((tail_word >> 16 & 1) == 1) != queue.phase {
             return Err(BlockError::Device { status: 0xffff });
         }
-        queue.consumed = head;
         queue.head = queue.next(queue.head);
         if queue.head == 0 {
             queue.phase = !queue.phase;
         }
-        Ok(Some((
-            tail_word as u16,
-            result,
-            tail_word >> 17 & 0x7fff,
-            head,
-        )))
+        Ok(Some((tail_word as u16, result, tail_word >> 17 & 0x7fff)))
     }
 
     /// Whether a running command's completion is posted at the I/O
@@ -359,14 +361,17 @@ impl Controller {
     }
 
     /// Whether [`Self::start`] answers now: a tag and the pages of the
-    /// largest command are free and no reset runs, or the controller failed
-    /// or shut down, which it refuses at once rather than leaving the
-    /// command waiting for room it never gets.
+    /// largest command are free, or the controller failed or shut down,
+    /// which it refuses at once rather than leaving the command waiting
+    /// for room it never gets. During a reset a start waits for its end
+    /// under its tag, as Linux's quiesced queues hold requests, and the
+    /// looks for its result move the reset on: a reset that no command
+    /// waits for, as one an event or a lost errand began, has no other
+    /// caller to move it.
     pub(super) fn room(&self) -> bool {
         self.fault.is_some()
             || self.shut_down
-            || (self.recovery.is_none()
-                && self.pool.free.len() >= pages_for(self.max_transfer)
+            || (self.pool.free.len() >= pages_for(self.max_transfer)
                 && self.tags.iter().any(|tag| matches!(tag, Tag::Free)))
     }
 
@@ -393,13 +398,22 @@ impl Controller {
             .tags
             .iter()
             .position(|tag| matches!(tag, Tag::Free))
-            .filter(|_| self.recovery.is_none())
             .ok_or(BlockError::Protocol("every NVMe tag is in use"))?;
         debug_assert!(self.held[tag].is_empty());
         self.held[tag] = self
             .pool
             .take(command_pages(&command))
             .ok_or(BlockError::Protocol("every NVMe bounce page is in use"))?;
+        if self.recovery.is_some() {
+            // Sent once the reset ends ([`Self::restarted`]).
+            self.tags[tag] = Tag::Waiting {
+                namespace,
+                block,
+                command,
+                retries: 0,
+            };
+            return Ok(tag as u32);
+        }
         self.submit_with(tag, namespace, block, command, 0, ring);
         Ok(tag as u32)
     }
@@ -456,7 +470,6 @@ impl Controller {
         retries: u8,
         ring: bool,
     ) {
-        let slot = self.io.tail;
         // A command whose deadline cannot be kept is not sent; the deadline
         // runs from its doorbell.
         let published = self.deadline(self.command_timeout_us).and_then(|_| {
@@ -467,8 +480,6 @@ impl Controller {
         self.tags[tag] = match published {
             Ok((id, deadline)) => Tag::Running {
                 id,
-                slot,
-                fetched: false,
                 namespace,
                 block,
                 command,
@@ -508,8 +519,9 @@ impl Controller {
             }
             return;
         }
-        // Abort and event completions, which the I/O commands do not wait for.
-        if (self.events.request.is_some() || !self.aborts.is_empty())
+        // Abort, event and errand completions, which the I/O commands do not
+        // wait for.
+        if (self.events.request.is_some() || !self.aborts.is_empty() || self.errand.is_some())
             && let Err(error) = self.admin_completion(None)
         {
             self.poison(error);
@@ -526,20 +538,20 @@ impl Controller {
             if !running {
                 break;
             }
-            let (head, phase, consumed) = (self.io.head, self.io.phase, self.io.consumed);
+            let (head, phase) = (self.io.head, self.io.phase);
             // A valid completion is trusted as Linux's nvme_handle_cqe trusts
             // it, with no register read: the controller's status is read
             // where Linux reads it, at a command's timeout, a reset, an admin
-            // command's data, and a completion that looks invalid.
+            // command's data, and a completion that names no command.
             match self.posted(true) {
                 Ok(None) => break,
-                Ok(Some((id, _, status, sq_head))) => {
-                    if !self.complete(id, status, sq_head, &mut destination) {
-                        // A completion for no running command, or for one the
-                        // controller had not fetched: the queue is corrupt.
-                        // It stays unretired.
-                        (self.io.head, self.io.phase, self.io.consumed) = (head, phase, consumed);
-                        let error = self.invalid_completion();
+                Ok(Some((id, _, status))) => {
+                    if !self.complete(id, status, &mut destination)
+                        && let Err(error) = self.stray_completion()
+                    {
+                        // A removed or failed controller's entry stays
+                        // unretired.
+                        (self.io.head, self.io.phase) = (head, phase);
                         self.poison(error);
                         self.fail_all();
                         return;
@@ -629,31 +641,23 @@ impl Controller {
         expired
     }
 
-    /// Command `id` completed with `status`, the controller reporting
-    /// submission head `head`: its tag takes the result, or, for an error
-    /// without Do Not Retry and retries left, runs it again after the delay
-    /// its Command Retry Delay selects (`nvme_decide_disposition`). Whether
-    /// a running command matched.
+    /// Command `id` completed with `status`: its tag takes the result, or,
+    /// for an error without Do Not Retry and retries left, runs it again
+    /// after the delay its Command Retry Delay selects
+    /// (`nvme_decide_disposition`). Whether a running command matched: no
+    /// two outstanding commands share an identifier ([`Self::publish`]), so
+    /// the identifier names the command, as Linux's request tag does.
     fn complete(
         &mut self,
         id: u16,
         status: u32,
-        head: u16,
         destination: &mut Option<ReadDestination<'_>>,
     ) -> bool {
-        let io = &self.io;
-        // NVMe SQHD is a snapshot when the CQE is created, not the completed
-        // command's slot (Base 1.1, section 4.6). A fetched command may remain
-        // in flight while later commands carry the ring through another turn.
-        for tag in &mut self.tags {
-            if let Tag::Running { slot, fetched, .. } = tag {
-                *fetched |= io.fetched(*slot, head);
-            }
-        }
-        let Some(tag) = self.tags.iter().position(|tag| {
-            matches!(tag, Tag::Running { id: running, fetched: true, .. }
-                if *running == id)
-        }) else {
+        let Some(tag) = self
+            .tags
+            .iter()
+            .position(|tag| matches!(tag, Tag::Running { id: running, .. } if *running == id))
+        else {
             return false;
         };
         let Tag::Running {

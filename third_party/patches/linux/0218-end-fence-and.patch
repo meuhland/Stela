@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:35:18 +0000
+Subject: [PATCH] fix(nouveau): end fence and GSP RPC waits at once when the
+ GPU stops answering MMIO, and say once what its PCI configuration still
+ answers, where a GPU off the bus spun each channel's teardown for 15 s and
+ held each RPC 30 s until the step watchdog stopped the boot
+
+---
+ .../drm/nouveau/include/nvkm/core/device.h    |  3 ++
+ drivers/gpu/drm/nouveau/nouveau_fence.c       | 31 ++++++++++++++
+ .../gpu/drm/nouveau/nvkm/engine/device/base.c | 40 +++++++++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c | 32 ++++++++++++++-
+ 4 files changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+index f36e8432d29b8f3d6df4d4c12bfe6e1b0d025409..df4f8b1cf64be67a4adf9a0a401a0d82c5dee279 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/device.h
+@@ -30,6 +30,8 @@ struct nvkm_device {
+ 	void __iomem *pri;
+ 
+ 	u32 debug;
++	/* The device stopped answering MMIO (nvkm_device_gone()). */
++	bool gone;
+ 
+ 	const struct nvkm_device_chip *chip;
+ 	enum {
+@@ -140,6 +142,7 @@ struct nvkm_device *nvkm_device_find(u64 name);
+ 
+ int  nvkm_device_fini(struct nvkm_device *, enum nvkm_suspend_state);
+ void nvkm_device_del(struct nvkm_device **);
++bool nvkm_device_gone(struct nvkm_device *);
+ 
+ struct nvkm_device_oclass {
+ 	int (*ctor)(struct nvkm_device *, const struct nvkm_oclass *,
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.c b/drivers/gpu/drm/nouveau/nouveau_fence.c
+index edbe9e08ba0fd701d5f29123162989a8f2d284c4..8603e91673361837213d2cb9ca3fb1f27b0a0e2c 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.c
+@@ -295,9 +295,26 @@ nouveau_fence_wait_legacy(struct dma_fence *f, bool intr, long wait)
+ 	return timeout - t;
+ }
+ 
++/* The device of the channel a pending fence belongs to, or NULL. */
++static struct nvkm_device *
++nouveau_fence_device(struct nouveau_fence *fence)
++{
++	struct nouveau_channel *chan;
++	struct nvkm_device *device = NULL;
++
++	rcu_read_lock();
++	chan = rcu_dereference(fence->channel);
++	if (chan)
++		device = nvxx_device(chan->cli->drm);
++	rcu_read_unlock();
++	return device;
++}
++
+ static int
+ nouveau_fence_wait_busy(struct nouveau_fence *fence, bool intr)
+ {
++	unsigned long looked = jiffies;
++	struct nvkm_device *device;
+ 	int ret = 0;
+ 
+ 	while (!nouveau_fence_done(fence)) {
+@@ -306,6 +323,20 @@ nouveau_fence_wait_busy(struct nouveau_fence *fence, bool intr)
+ 			break;
+ 		}
+ 
++		/*
++		 * A GPU off the bus signals nothing: the spin would last its whole
++		 * 15 s for each fence, and a channel teardown idles every channel
++		 * of a file in turn. Look once a tick.
++		 */
++		if (jiffies != looked) {
++			looked = jiffies;
++			device = nouveau_fence_device(fence);
++			if (device && nvkm_device_gone(device)) {
++				ret = -ENODEV;
++				break;
++			}
++		}
++
+ 		__set_current_state(intr ?
+ 				    TASK_INTERRUPTIBLE :
+ 				    TASK_UNINTERRUPTIBLE);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+index 96c8a5b299999cf78df4092dca01467af6430426..4e5f865ccb55dbdf14e9b762e684a64a252eb99d 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+@@ -25,6 +25,7 @@
+ #include "acpi.h"
+ 
+ #include <core/option.h>
++#include <core/pci.h>
+ 
+ #include <subdev/bios.h>
+ #include <subdev/therm.h>
+@@ -3081,6 +3082,45 @@ fail:
+ 	return ret;
+ }
+ 
++/*
++ * Whether the device stopped answering MMIO, as nvkm_device_ctor() takes it
++ * to be absent: a GPU that answers never reads NV_PMC_BOOT_0 as all ones.
++ * A device off the bus completes no work and answers no RPC, so callers end
++ * their waits at once instead of each waiting its whole bound. Once gone it
++ * stays gone; the first sight says so once, with what PCI configuration
++ * space still answers, which tells a lost link or power (all ones there
++ * too) from a function that only stopped decoding (memory space or D-state).
++ */
++bool
++nvkm_device_gone(struct nvkm_device *device)
++{
++	struct nvkm_device_pci *pci = NULL;
++	u16 vendor = 0xffff, command = 0xffff, status = 0xffff, pmcsr = 0xffff, link = 0xffff;
++	u8 pm;
++
++	if (READ_ONCE(device->gone))
++		return true;
++	if (!device->pri || nvkm_rd32(device, 0x000000) != 0xffffffff)
++		return false;
++
++	WRITE_ONCE(device->gone, true);
++	if (device->func->pci)
++		pci = device->func->pci(device);
++	if (pci) {
++		pci_read_config_word(pci->pdev, PCI_VENDOR_ID, &vendor);
++		pci_read_config_word(pci->pdev, PCI_COMMAND, &command);
++		pci_read_config_word(pci->pdev, PCI_STATUS, &status);
++		pm = pci_find_capability(pci->pdev, PCI_CAP_ID_PM);
++		if (pm)
++			pci_read_config_word(pci->pdev, pm + PCI_PM_CTRL, &pmcsr);
++		pcie_capability_read_word(pci->pdev, PCI_EXP_LNKSTA, &link);
++	}
++	nvdev_error(device,
++		    "stopped answering: BOOT_0 reads ffffffff; config vendor %04x command %04x status %04x pmcsr %04x link status %04x; its waits end at once from here\n",
++		    vendor, command, status, pmcsr, link);
++	return true;
++}
++
+ void
+ nvkm_device_del(struct nvkm_device **pdevice)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c
+index 7e585f454d7882a506a41f16f5566b44e929d793..7c4653b7f0074bdde786c8a4265e8d5437f80cda 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/rpc.c
+@@ -155,6 +155,32 @@ r535_gsp_overdue(struct nvkm_gsp *gsp, ktime_t start)
+ 	return ktime_ms_delta(ktime_get(), start) >= limit;
+ }
+ 
++/*
++ * How long a wait for GSP runs before it looks whether the GPU still answers
++ * MMIO, and how often it looks again: an answer takes well under this.
++ */
++#define R535_GSP_GONE_MS 10
++
++/*
++ * Whether the GPU stopped answering MMIO during this wait (nvkm_device_gone(),
++ * which says so once): GSP answers nothing then, so later RPCs fail at once,
++ * where each waited its whole bound behind the command queue's mutex.
++ * Looks once each R535_GSP_GONE_MS of the wait; *looked is when it last did.
++ */
++static bool
++r535_gsp_gone(struct nvkm_gsp *gsp, ktime_t start, s64 *looked)
++{
++	s64 waited = ktime_ms_delta(ktime_get(), start);
++
++	if (waited < *looked + R535_GSP_GONE_MS)
++		return false;
++	*looked = waited;
++	if (!nvkm_device_gone(gsp->subdev.device))
++		return false;
++	WRITE_ONCE(gsp->dead, true);
++	return true;
++}
++
+ /*
+  * GSP did not answer in time: say so once, with the queue and core state,
+  * and fail every later RPC at once instead of waiting for each again.
+@@ -178,6 +204,7 @@ static int
+ r535_gsp_msgq_wait(struct nvkm_gsp *gsp, u32 gsp_rpc_len, ktime_t start)
+ {
+ 	u32 size, rptr = *gsp->msgq.rptr;
++	s64 looked = 0;
+ 	int used;
+ 
+ 	size = DIV_ROUND_UP(GSP_MSG_HDR_SIZE + gsp_rpc_len,
+@@ -194,7 +221,7 @@ r535_gsp_msgq_wait(struct nvkm_gsp *gsp, u32 gsp_rpc_len, ktime_t start)
+ 		if (used >= size)
+ 			return used;
+ 
+-		if (READ_ONCE(gsp->dead))
++		if (READ_ONCE(gsp->dead) || r535_gsp_gone(gsp, start, &looked))
+ 			return -ENODEV;
+ 		if (r535_gsp_overdue(gsp, start))
+ 			return -ETIMEDOUT;
+@@ -394,6 +421,7 @@ r535_gsp_cmdq_push(struct nvkm_gsp *gsp, void *rpc)
+ 	u64 *end;
+ 	u64 csum = 0;
+ 	ktime_t start = ktime_get();
++	s64 looked = 0;
+ 	int free;
+ 	u32 wptr, size, step, len;
+ 	u32 off = 0;
+@@ -420,7 +448,7 @@ r535_gsp_cmdq_push(struct nvkm_gsp *gsp, void *rpc)
+ 			if (free >= 1)
+ 				break;
+ 
+-			if (READ_ONCE(gsp->dead)) {
++			if (READ_ONCE(gsp->dead) || r535_gsp_gone(gsp, start, &looked)) {
+ 				kvfree(msg);
+ 				return -ENODEV;
+ 			}

@@ -127,7 +127,7 @@ impl V4State {
     }
 }
 impl Engine {
-    pub(super) fn report_v4(&mut self, inputs: &mut Vec<Input>) -> Result<(), ErrorKind> {
+    pub(super) fn report_v4(&mut self, now: u64, inputs: &mut Vec<Input>) -> Result<(), ErrorKind> {
         let c = self.capabilities.as_ref().unwrap();
         let p = self.packet;
         let valid = if c.crc_enabled {
@@ -215,20 +215,29 @@ impl Engine {
             } else {
                 p[0] & if c.v4.unwrap().middle_button { 7 } else { 3 }
             };
-            if state.buttons != self.buttons {
-                self.buttons = state.buttons;
-                inputs.push(Input::Buttons(self.buttons));
-            }
-            if state.pointer_emulation() {
-                let scale = |value: i32, high: u16| {
-                    (value.clamp(0, i32::from(high)) as u32 * u32::from(crate::input::POINTER_MAX)
-                        / u32::from(high)) as u16
-                };
-                inputs.push(Input::Move {
-                    x: scale(state.pointer.0, c.bounds.maximum.0),
-                    y: scale(state.pointer.1, c.bounds.maximum.1),
-                });
-            }
+            state.pointer_emulation();
+            let touch = Touch::of(
+                state
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.tracking_id.is_some())
+                    .map(|slot| (slot.position.0 as i32, slot.position.1 as i32)),
+            );
+            let buttons = state.buttons;
+            let state = *state;
+            self.touch(touch, buttons, now, inputs);
+            self.frames.push_back(Frame {
+                raw: p,
+                length: 6,
+                native_sequence: sequence,
+                report: Report::Multitouch(V4Frame {
+                    update,
+                    synchronized,
+                    state,
+                }),
+            });
+            self.position = 0;
+            return Ok(());
         }
         self.frames.push_back(Frame {
             raw: p,

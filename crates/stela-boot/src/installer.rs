@@ -26,12 +26,13 @@ use crate::{
     choice::{self, Press, Wait},
     console::{Framebuffer, font},
     output,
-    payload::{Aligned, device_path, disk_model, disk_serial},
+    payload::{Aligned, device_path, disk_model, disk_rotation, disk_serial, serial_sources},
     ui::{self, Canvas},
 };
 use alloc::string::ToString;
 use alloc::{format, string::String, vec, vec::Vec};
 use stela_boot_core::screen::{disk_size as size, window};
+use stela_boot_core::{chosen_disk, disk_speed};
 use stela_contracts::refuse;
 use stela_crypto::Sha256;
 use stela_crypto::digest::Digest;
@@ -72,6 +73,13 @@ struct Disk {
     foreign: bool,
     /// Why it cannot take macOS, when it cannot.
     refusal: Option<&'static str>,
+    /// Its nominal rotation rate, as it reports it.
+    rotation: stela_drivers::block::Rotation,
+    /// How fast it answered reads, once the picker measured it.
+    speed: Option<disk_speed::Speed>,
+    /// Why macOS may run too slowly on it, which does not refuse it
+    /// (`disk_speed::caution`).
+    caution: Option<String>,
 }
 
 impl Disk {
@@ -97,6 +105,32 @@ impl Disk {
             .read_blocks(self.media, lba, buffer.bytes())
             .map_err(|_| refuse!("the disk cannot be read"))?;
         Ok(buffer.bytes().to_vec())
+    }
+
+    /// How fast the disk answers reads (`disk_speed::measure`): read only,
+    /// about 1.5 s at most unless one read takes longer. `None` before the
+    /// counter's rate is known or when a read fails.
+    fn measure(&mut self) -> Option<disk_speed::Speed> {
+        let per_micro = output::counter_hz() / 1_000_000;
+        if per_micro == 0 {
+            return None;
+        }
+        let block_bytes = self.geometry.block_bytes;
+        let mut buffer = Aligned::new(disk_speed::SEQUENTIAL_BYTES as usize);
+        let (io, media) = (&mut self.io, self.media);
+        disk_speed::measure(
+            self.geometry.blocks,
+            block_bytes,
+            output::now(),
+            |lba, blocks| {
+                let bytes = usize::try_from(blocks * block_bytes).unwrap_or(usize::MAX);
+                buffer
+                    .bytes()
+                    .get_mut(..bytes)
+                    .is_some_and(|part| io.read_blocks(media, lba, part).is_ok())
+            },
+            || output::now() / per_micro,
+        )
     }
 
     /// The digest of the disk's first blocks as they are now, which the
@@ -194,8 +228,27 @@ pub fn choose() -> Option<Plan> {
         return None;
     };
     let mut canvas = Canvas::new(screen, font);
+    let mut disks = disks();
+    // Each disk that can be chosen answers a second or two of reads, so
+    // the list can say which are too slow for macOS to start on.
+    if disks.iter().any(|disk| disk.refusal.is_none()) {
+        let (width, height) = canvas.size();
+        canvas.fill(0, 0, width, height, ui::BACKGROUND);
+        canvas.text_centred(
+            width / 2,
+            height / 2,
+            "Checking the disks' speed",
+            1,
+            ui::DIM,
+        );
+        canvas.show();
+    }
+    for disk in disks.iter_mut().filter(|disk| disk.refusal.is_none()) {
+        disk.speed = disk.measure();
+        disk.caution = disk_speed::caution(disk.rotation, disk.speed);
+    }
     let mut picker = Picker {
-        disks: disks(),
+        disks,
         page: Page::Disks,
         disk: 0,
         row: 0,
@@ -208,11 +261,15 @@ pub fn choose() -> Option<Plan> {
     };
     for disk in &picker.disks {
         output::arguments(format_args!(
-            "INSTALLER disk {} {} serial={:?} bytes={} table={} refusal={:?}\n",
+            "INSTALLER disk {} {} serial={:?} bytes={} rotation={} random_us={} \
+             sequential_kib_s={} table={} refusal={:?}\n",
             disk.bus,
             disk.model,
             disk.serial,
             disk.bytes(),
+            disk.rotation,
+            disk.speed.map_or(0, |speed| speed.random_us),
+            disk.speed.map_or(0, |speed| speed.sequential_kib_s),
             disk.table.as_ref().map_or(0, |t| t.partitions.len()),
             disk.refusal
         ));
@@ -544,6 +601,15 @@ fn disks() -> Vec<Disk> {
             blocks: media.last_block() + 1,
         };
         let serial = disk_serial(handle, &path);
+        // What a disk without a serial number offers, which says why.
+        if serial.is_none() {
+            output::arguments(format_args!(
+                "INSTALLER disk {} without a serial number: {}\n",
+                bus(&path),
+                serial_sources(handle, &path)
+            ));
+        }
+        let rotation = disk_rotation(handle);
         let mut disk = Disk {
             media: media.media_id(),
             io,
@@ -554,6 +620,9 @@ fn disks() -> Vec<Disk> {
             table: None,
             foreign: false,
             refusal: None,
+            rotation,
+            speed: None,
+            caution: disk_speed::caution(rotation, None),
         };
         let found = gpt::read(geometry, |lba, blocks| {
             disk.read(lba, blocks)
@@ -564,22 +633,60 @@ fn disks() -> Vec<Disk> {
             Ok(Found::Blank | Found::Interrupted) => {}
             Err(_) => disk.foreign = true,
         }
-        // Stela's own drivers must reach the disk, and find it again by its
-        // serial number.
-        let controller = crate::pci_io::disk_controller(handle)
+        // Why Stela's own drivers cannot reach the disk, if they cannot.
+        disk.refusal = crate::pci_io::disk_controller(handle)
             .and_then(|function| stela_drivers::probe::disk_refusal(&function));
-        disk.refusal = match &disk.serial {
-            _ if controller.is_some() => controller,
-            None => Some("No serial number"),
-            Some(serial) if serial.contains(char::is_whitespace) => {
-                Some("Serial number has spaces")
-            }
-            Some(_) if disk.bytes() < MIN_BYTES => Some("Smaller than 60 GB"),
-            Some(_) => None,
-        };
         disks.push(disk);
     }
+    // Stela's own drivers must reach each disk, and find it again by a
+    // serial number no other listed disk reports.
+    let candidates: Vec<_> = disks
+        .iter()
+        .map(|disk| chosen_disk::Candidate {
+            serial: disk.serial.as_deref(),
+            bytes: disk.bytes(),
+            controller: disk.refusal,
+        })
+        .collect();
+    let refusals: Vec<_> = (0..disks.len())
+        .map(|index| chosen_disk::picker_refusal(&candidates, index, MIN_BYTES))
+        .collect();
+    for (disk, refusal) in disks.iter_mut().zip(refusals) {
+        disk.refusal = refusal;
+    }
     disks
+}
+
+/// Stela's macOS partitions on this PC's disks, each as the record names
+/// one (`SERIAL:GUID`), in the disks' order. A disk without a serial number
+/// of its own is passed over, as is one the picker refuses: Stela could not
+/// find it again, or its drivers cannot reach it.
+pub fn installed() -> Vec<String> {
+    let disks = disks();
+    let mut found = Vec::new();
+    for disk in &disks {
+        let (Some(serial), Some(table)) = (disk.serial.as_deref(), disk.table.as_ref()) else {
+            continue;
+        };
+        let alone = disks
+            .iter()
+            .filter(|other| other.serial.as_deref() == Some(serial))
+            .count()
+            == 1;
+        if !alone
+            || disk.refusal.is_some()
+            || serial.is_empty()
+            || serial.contains(char::is_whitespace)
+        {
+            continue;
+        }
+        for partition in &table.partitions {
+            if partition.role() == Some(Role::AppleRegion) {
+                found.push(format!("{serial}:{}", partition.unique_guid));
+            }
+        }
+    }
+    found
 }
 
 /// A partition type's name and colour.
@@ -750,9 +857,18 @@ impl Picker {
             };
             let segments = segments_of(disk, &[], false);
             self.draw_bar(canvas, n, &segments, &bar, None, None);
-            match disk.refusal {
-                Some(refusal) => canvas.text(inner, y + 64, refusal, 1, ui::ORANGE),
-                None => self.legend(canvas, n, &segments, inner, right, y + 64),
+            match (disk.refusal, &disk.caution) {
+                (Some(refusal), _) => canvas.text(inner, y + 64, refusal, 1, ui::ORANGE),
+                (None, None) => self.legend(canvas, n, &segments, inner, right, y + 64),
+                // The caution takes the line's right end; the legend keeps
+                // what fits before it.
+                (None, Some(caution)) => {
+                    canvas.text_right(right, y + 64, caution, 1, ui::ORANGE);
+                    let end = right.saturating_sub(canvas.text_width(caution, 1) + 24);
+                    if end > inner {
+                        self.legend(canvas, n, &segments, inner, end, y + 64);
+                    }
+                }
             }
         }
     }
@@ -991,6 +1107,9 @@ impl Picker {
         rows.push(("Disk", disk_line, ui::TEXT));
         if let Some(serial) = &disk.serial {
             rows.push(("Serial", serial.clone(), ui::TEXT));
+        }
+        if let Some(caution) = &disk.caution {
+            rows.push(("Speed", caution.clone(), ui::ORANGE));
         }
         rows.push((
             "macOS",

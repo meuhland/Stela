@@ -4,11 +4,15 @@ use anyhow::Result;
 use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod anv;
+mod clc;
 pub mod fetch;
+mod hosted;
 mod llvm;
 mod mesa;
 mod metal_suite;
 mod nvk;
+mod radv;
 mod support;
 mod sysroot;
 pub(crate) mod toolchain;
@@ -93,8 +97,28 @@ pub enum Command {
         render_inputs: Vec<PathBuf>,
     },
     /// Compile NVK, NIR and NAK's C for `stela.efi` against Stela's C library,
-    /// and generate the sources of Mesa's Rust crates.
+    /// with ANV and BRW when this host has the tools their build runs, and
+    /// generate the sources of Mesa's Rust crates.
     Nvk {
+        /// Maximum parallel native compiler processes.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
+    },
+    /// Build ANV for this machine with the image's options and run it on an
+    /// xe render node with no GPU behind it: device creation, a BRW compute
+    /// pipeline and one submission per platform xe binds, through Stela's
+    /// libdrm stand-in, each xe ioctl checked against Stela's xe.
+    AnvTest {
+        /// Maximum parallel native compiler processes.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: u16,
+    },
+    /// Build RADV for this machine with the image's options and run it on an
+    /// amdgpu render node with no GPU behind it: device creation, an ACO
+    /// compute pipeline and one submission per device of the test, through
+    /// Stela's libdrm stand-in and libdrm_amdgpu, each amdgpu ioctl checked
+    /// against Stela's amdgpu.
+    RadvTest {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
         jobs: u16,
@@ -141,6 +165,8 @@ pub fn run(command: Command) -> Result<()> {
         }),
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),
+        Command::AnvTest { jobs } => anv::test(jobs),
+        Command::RadvTest { jobs } => radv::test(jobs),
         Command::MetalSuite(command) => metal_suite::run(command),
         Command::Llvm { jobs, test } => llvm::build(&toolchain::discover()?, jobs, test),
     }
@@ -156,4 +182,17 @@ pub fn default_jobs() -> u16 {
 pub fn build_nvk(jobs: u16) -> Result<()> {
     nvk::build(jobs)?;
     crate::guest::run()
+}
+
+/// Fails unless the last `gpu nvk` linked the Vulkan driver `name` (Meson's
+/// name for it), which needs the build host's tools (`clc.rs`).
+pub fn require_vulkan_driver(name: &str) -> Result<()> {
+    let list = support::build_directory("nvk").join(nvk::LINKED);
+    let linked = std::fs::read_to_string(&list).unwrap_or_default();
+    anyhow::ensure!(
+        linked.lines().any(|linked| linked == name),
+        "Vulkan driver {name} is not built: `cargo xtask gpu nvk` says why ({})",
+        list.display()
+    );
+    Ok(())
 }

@@ -33,6 +33,28 @@ pub(super) const EXIT_NAMES: [&str; step_timing::EXIT_SLOTS] = [
     "check-translated",
 ];
 
+/// `PES PAC` for the beat's cipher runs of every PE together
+/// (`step_timing::PAC_CENSUS_WORDS`): `fills=N` then each key's
+/// `KEY=S/A/G` signings, authentications and PACGAs, then the causes
+/// `new=` (no PE computed that result before, as far as the shared table
+/// remembers), `here=` (this PE did and its memo lost it), `other=` (another
+/// PE did), `native=F/C` (the runs from native code, and its calls of the
+/// service) and the new key generations `generations=`.
+fn pac_census_line(census: &[u64; step_timing::PAC_CENSUS_WORDS]) -> String {
+    const KEYS: [&str; 5] = ["ia", "ib", "da", "db", "ga"];
+    let fills: u64 = census[..KEYS.len() * 3].iter().sum();
+    let mut line = format!("PES PAC fills={fills}");
+    for (key, [signed, authenticated, generic]) in KEYS.iter().zip(census.as_chunks::<3>().0) {
+        line.push_str(&format!(" {key}={signed}/{authenticated}/{generic}"));
+    }
+    let causes = &census[KEYS.len() * 3..];
+    line.push_str(&format!(
+        " new={} here={} other={} native={}/{} generations={}",
+        causes[0], causes[1], causes[2], causes[3], causes[4], causes[5]
+    ));
+    line
+}
+
 /// `--profile`'s heartbeat lines: of `elapsed` ticks, the share inside the
 /// engine (`sliced`) and in each of its phases, the rest of the engine's
 /// time unattributed, and each exit kind's count, share and mean cost.
@@ -559,6 +581,9 @@ fn hot_blocks_report<H: Host>(
     total.merge(&hot);
     if whole {
         hot_total_report(total);
+        // Address spaces are reused by later processes: the total by
+        // address space covers the beats since the last total report.
+        total.asids = Default::default();
     }
     if hot.is_empty() {
         return;
@@ -575,6 +600,50 @@ fn hot_blocks_report<H: Host>(
         let mut line = format!("PES HOT {name} samples={samples} other={}", hot.other);
         for block in hot.top(level, SHOWN) {
             push_hot_block(&mut line, level, &block);
+        }
+        output::arguments(format_args!("{line}\n"));
+    }
+    hot_asids_report("PES HOT", &hot.asids, 10, 3, 8);
+}
+
+/// `{prefix} ASIDS samples=N other=M asid:user/kernel/guarded ...`: the
+/// samples by the guest address space they ran in (`step_timing::AsidSamples`;
+/// per beat, and under `PES HOT TOTAL` over the [`HOT_TOTAL_BEATS`] beats
+/// since the last total),
+/// the `spaces` with most first, then for the `named` first of them a
+/// `{prefix} ASID asid pc:count ...` line of its `blocks` most sampled EL0
+/// blocks, whose frameworks name the process: how much of the guest's time
+/// one process takes, in user code and in the kernel on its behalf, where
+/// the per-level lines mix every process.
+fn hot_asids_report(
+    prefix: &str,
+    asids: &step_timing::AsidSamples,
+    spaces: usize,
+    named: usize,
+    blocks: usize,
+) {
+    let top = asids.top(spaces);
+    if top.is_empty() {
+        return;
+    }
+    let samples: u64 = asids.spaces.iter().map(|space| space.total()).sum();
+    let mut line = format!(
+        "{prefix} ASIDS samples={samples} other={} asid:user/kernel/guarded",
+        asids.other
+    );
+    for space in &top {
+        let [user, kernel, guarded] = space.samples;
+        line.push_str(&format!(" {:#x}:{user}/{kernel}/{guarded}", space.asid));
+    }
+    output::arguments(format_args!("{line}\n"));
+    for space in top.iter().take(named) {
+        let shown = asids.top_blocks(space.asid, blocks);
+        if shown.is_empty() {
+            continue;
+        }
+        let mut line = format!("{prefix} ASID {:#x}", space.asid);
+        for block in shown {
+            line.push_str(&format!(" {:#x}:{}", block.pc, block.count));
         }
         output::arguments(format_args!("{line}\n"));
     }
@@ -632,6 +701,7 @@ fn hot_total_report(total: &step_timing::HotBlocks) {
         }
         output::arguments(format_args!("{line}\n"));
     }
+    hot_asids_report("PES HOT TOTAL", &total.asids, 16, 6, 24);
 }
 
 /// The end of the `PES STAMPED` line under step timing: for RET, BLR, BR
@@ -827,7 +897,7 @@ pub(super) fn run<H: Host>(
         // The host's work between slices runs outside the boot PE's run: it
         // uses none of its translations, and another PE's maintenance
         // broadcast need not wait for it to end (it reads its mail first).
-        let (waiting, quiet) = host_work(machine, |machine| {
+        let (waiting, quiet) = host_work(machine, "slice end", |machine| {
             // One hold of the devices' lock, which every PE's device accesses
             // take, for everything they left for the reports. A PE whose access
             // waits on the host (a disk's MMIO) can hold it for milliseconds:
@@ -854,9 +924,11 @@ pub(super) fn run<H: Host>(
             // other PEs time (`clock`). Waiting PEs serve; with none for a while, it takes one
             // bounded step between slices.
             if !machine.runs_parallel() || idle {
-                machine.exclude_host_time(|_| service::serve(true, false));
-            } else if service::starved(tsc_hz, requested) {
-                machine.exclude_host_time(|_| service::serve(true, true));
+                let watch = machine.guest_watch();
+                machine.exclude_host_time(|_| service::serve(true, false, &watch));
+            } else if service::starved(requested) {
+                let watch = machine.guest_watch();
+                machine.exclude_host_time(|_| service::serve(true, true, &watch));
             }
             service.parts.lap(ServiceParts::SERVICE, host::rdtsc());
             // The GPUs' work waits for a boot PE that holds no lock, as the
@@ -894,7 +966,8 @@ pub(super) fn run<H: Host>(
                 service.parts.lap(ServiceParts::DISK, host::rdtsc());
             });
             if service::shutdown_pending() {
-                machine.exclude_host_time(|_| service::serve(true, false));
+                let watch = machine.guest_watch();
+                machine.exclude_host_time(|_| service::serve(true, false, &watch));
             }
             // A GPU compilation no other PE took (`gate::run_job`), while
             // this PE's guest waits, so the count need not wait for it.
@@ -912,7 +985,23 @@ pub(super) fn run<H: Host>(
         let sliced = waiting || matches!(stop, Stop::Budget) && !budget_reached;
         let now = host::rdtsc();
         if !sliced {
+            // Every guest line, the last ones before the stop first of all.
+            let taken = machine.devices.with(|_| super::take_guest_output());
+            super::write_guest_output(taken, || true);
             service.report(tsc_hz);
+            // The interval before the stop, which no beat reports: whether a
+            // PE was kept from guest code, and whether the count held for it.
+            if machine.runs_parallel() {
+                report_stalls(machine);
+                let hub = machine.devices.hub();
+                let millis = |counts: u64| u128::from(counts) * 1000 / u128::from(host::COUNTER_HZ);
+                output::arguments(format_args!(
+                    "CLOCK AT STOP stalled_ms={} leased_ms={} lag_ms={}\n",
+                    millis(hub.clock_stalled()),
+                    millis(hub.clock_leased()),
+                    millis(hub.clock_lag().0),
+                ));
+            }
             output::report_log_stores();
             return stop;
         }
@@ -923,9 +1012,11 @@ pub(super) fn run<H: Host>(
         let due = now - heartbeat.beat.at;
         if heartbeat.stage.is_some() {
             // The beat's later reports, one bounded stage per boundary.
-            host_work(machine, |machine| heartbeat.step(machine, tsc_hz));
+            host_work(machine, "beat step", |machine| {
+                heartbeat.step(machine, tsc_hz)
+            });
         } else if due >= BEAT_SECONDS * tsc_hz && (quiet || due >= 2 * BEAT_SECONDS * tsc_hz) {
-            host_work(machine, |machine| {
+            host_work(machine, "beat", |machine| {
                 heartbeat.beat(machine, &mut service, now, tsc_hz)
             });
             output::arguments(format_args!("{}", cursor.report(now, tsc_hz)));
@@ -941,13 +1032,102 @@ const DRAIN_MILLIS: u64 = 50;
 /// pump and beat; an AP's reports, service and serial drain) outside the
 /// PE's run, so that maintenance broadcasts do not wait for it. It uses
 /// none of the PE's translations, which the PE's mail updates before its
-/// next block.
+/// next block. A call of `part` that held the PE [`LONG_STEP_MILLIS`] gets
+/// a `HOST STEP LONG` line
+/// ([`stela_boot_core::service_watch::LongSteps`]); one that held it
+/// [`NAMED_STEP_MILLIS`] counts in the beat's `HOST STEPS` line.
 pub(super) fn host_work<H: Host, R>(
     machine: &mut Machine<H, parallel::Board>,
+    part: &'static str,
     work: impl FnOnce(&mut Machine<H, parallel::Board>) -> R,
 ) -> R {
-    machine.outside_run(work)
+    let started = host::fresh_counter();
+    // Out of its run loop, the PE stays reachable for guest work: a wake
+    // with an interrupt for it kicks its core, and the shared count holds
+    // for it a stall limit past that or its own timer's deadline.
+    let result = machine.serve_host(work);
+    let took = host::fresh_counter().wrapping_sub(started);
+    named_step(part, machine.processor(), took);
+    if LONG_STEPS.worth(took, host::COUNTER_HZ / 1000 * LONG_STEP_MILLIS) {
+        let pstate = &machine.cpu.pstate;
+        output::arguments(format_args!(
+            "HOST STEP LONG part={part} pe={} us={} el={} irqs_masked={}\n",
+            machine.processor(),
+            u128::from(took) * 1_000_000 / u128::from(host::COUNTER_HZ),
+            pstate.el,
+            pstate.daif & stela_engine::machine::exception::DAIF_I != 0,
+        ));
+    }
+    result
 }
+
+/// Host work between two slices that is no [`host_work`] call of its own,
+/// `part`, timed for the beat's `HOST STEPS` line: what else a gap in
+/// `PES STALLS` with phase `host` may hold.
+pub(super) fn host_part<R>(part: &'static str, pe: usize, work: impl FnOnce() -> R) -> R {
+    let started = host::fresh_counter();
+    let result = work();
+    named_step(part, pe, host::fresh_counter().wrapping_sub(started));
+    result
+}
+
+/// Count a step of `part` on PE `pe` that took `ticks` in the beat's
+/// `HOST STEPS` line once it reached [`NAMED_STEP_MILLIS`].
+fn named_step(part: &'static str, pe: usize, ticks: u64) {
+    if ticks >= host::COUNTER_HZ / 1000 * NAMED_STEP_MILLIS {
+        HOST_STEPS.record(part, pe, ticks);
+    }
+}
+
+/// Per PE: its longest gap between two progress marks with guest work since
+/// the last report, and the engine phase that took most of it (`host`
+/// outside the step loop, `?` without `--profile`); a PE that shows no
+/// progress for 50 ms holds the count (`stalled_ms`). Then the host steps
+/// over [`NAMED_STEP_MILLIS`] since the last report, by part, which a `host`
+/// gap is made of, if any.
+fn report_stalls<H: Host>(machine: &Machine<H, parallel::Board>) {
+    let mut stalls = String::from("PES STALLS longest_ms/phase");
+    for (pe, (ticks, phase)) in machine.devices.hub().clock_stalls().iter().enumerate() {
+        let millis = u128::from(*ticks) * 1000 / u128::from(host::COUNTER_HZ);
+        stalls.push_str(&format!(" {pe}:{millis}/{phase}"));
+    }
+    output::arguments(format_args!("{stalls}\n"));
+    if let Some(steps) = HOST_STEPS.line(NAMED_STEP_MILLIS, host::COUNTER_HZ) {
+        output::arguments(format_args!("{steps}\n"));
+    }
+}
+
+/// A host step that kept its PE from guest code this long counts in the
+/// beat's `HOST STEPS` line: a frame at 60 Hz has 16 ms.
+const NAMED_STEP_MILLIS: u64 = 2;
+
+/// The host steps over [`NAMED_STEP_MILLIS`] since the last beat, by part:
+/// every [`host_work`] and [`host_part`] name; the last takes any other.
+static HOST_STEPS: stela_boot_core::service_watch::HostSteps<13> =
+    stela_boot_core::service_watch::HostSteps::new([
+        "slice end",
+        "beat",
+        "beat step",
+        "reports",
+        "idle service",
+        "display",
+        "gpu job",
+        "drain",
+        "publish",
+        "profile",
+        "stored pages",
+        "watchdog",
+        "other",
+    ]);
+
+/// A single host step that kept its PE from guest code this long is named:
+/// XNU on another core times a lock that PE's guest may hold, a mutex
+/// interlock for 0.5 s (`lock_mtx.c`).
+const LONG_STEP_MILLIS: u64 = 250;
+
+/// The long host steps of the boot, of every PE.
+static LONG_STEPS: stela_boot_core::service_watch::LongSteps =
+    stela_boot_core::service_watch::LongSteps::new();
 
 /// What the boot PE runs at a slice's end, for the GPUs' pump: `quiet` as
 /// for the service, else whether its IRQs are masked, as XNU's spinlocks
@@ -964,6 +1144,10 @@ fn calm<H: Host>(machine: &Machine<H, parallel::Board>, quiet: bool) -> super::g
     }
 }
 
+/// The longest the boot PE writes the guest's console lines for between
+/// two slices; the rest wait for the next.
+const GUEST_OUTPUT_MICROS: u64 = 250;
+
 /// Report what the PEs' device accesses left since the last slice: the
 /// guest's console and the installer's step, the boot's progress, and the
 /// unmodeled requests and device logs.
@@ -974,6 +1158,11 @@ pub(super) fn report_drained<H: Host>(
     now: u64,
     tsc_hz: u64,
 ) {
+    let started = host::rdtsc();
+    let budget = tsc_hz / 1_000_000 * GUEST_OUTPUT_MICROS;
+    super::write_guest_output(drained.guest, || {
+        host::rdtsc().wrapping_sub(started) < budget
+    });
     let lines = drained.lines;
     if let Some(step) = lines.iter().rev().find_map(|line| installer_step(line)) {
         crate::status::progress(&step);
@@ -1132,6 +1321,9 @@ impl ServiceTimes {
         if let Some(line) = super::gpu::pump_report(tsc_hz) {
             output::arguments(format_args!("{line}\n"));
         }
+        if let Some(line) = host::stale_in_service_report() {
+            output::arguments(format_args!("{line}\n"));
+        }
         #[cfg(feature = "nvk")]
         super::gpu::gate::report_calls(tsc_hz);
     }
@@ -1218,6 +1410,9 @@ pub(super) struct Heartbeat {
     /// The beat's reports still to run, one stage per service boundary
     /// ([`Self::step`]), and what its stages took so far.
     pub(super) stage: Option<BeatStage>,
+    /// The `PES STAMPED` line the processors' report made, which the
+    /// last profile part ends ([`Self::profile_part`]).
+    stamped: Option<(String, u64, u64)>,
     pub(super) cost: BeatCost,
     /// The hardware counters at the last `PES PMU` line (`host::pmu`).
     pub(super) pmu: host::pmu::Seen,
@@ -1232,6 +1427,9 @@ pub(super) struct Heartbeat {
 /// order. Each runs at its own service boundary, so none holds the boot PE
 /// long; the walks of every block go on in steps of [`STEP_MICROS`].
 pub(super) enum BeatStage {
+    /// The `--profile` reports of the beat's processors, a part a step,
+    /// then the stamped line ([`Heartbeat::profile_part`]).
+    Profile(u8),
     /// The exits by instruction word, then their change since the last beat
     /// and the exit, translated and shadow lines.
     Exits(stela_engine::machine::engine::ExitWordsWalk),
@@ -1285,6 +1483,7 @@ impl Heartbeat {
             sliced_ticks: 0,
             timing: machine.step_timing().copied(),
             stage: None,
+            stamped: None,
             cost: BeatCost::new(),
             pmu: host::pmu::Seen::new(),
             dynamic: Default::default(),
@@ -1365,7 +1564,7 @@ impl Heartbeat {
         cost.step(at.wrapping_sub(now));
         self.cost = cost;
         self.beats += 1;
-        self.stage = Some(BeatStage::Exits(Default::default()));
+        self.stage = Some(BeatStage::Profile(0));
     }
 
     /// Run the beat's next stage, or the next step of its walk, for about
@@ -1378,6 +1577,14 @@ impl Heartbeat {
         let budget = tsc_hz / 1_000_000 * STEP_MICROS;
         let more = || host::rdtsc().wrapping_sub(started) < budget;
         let (name, next) = match stage {
+            BeatStage::Profile(part) => {
+                let next = if self.profile_part(machine, part, tsc_hz) {
+                    BeatStage::Profile(part + 1)
+                } else {
+                    BeatStage::Exits(Default::default())
+                };
+                ("profile", Some(next))
+            }
             // The walk of every block costs about 16 ms a beat on a booted
             // desktop: it runs only while profiling.
             BeatStage::Exits(_) if machine.step_timing().is_none() => (
@@ -1440,6 +1647,108 @@ impl Heartbeat {
                 for state in machine.devices.with(|devices| devices.usb_diagnostics()) {
                     output::arguments(format_args!("USB {state}\n"));
                 }
+                // The SPI NOR's work on every PE since the last beat: an
+                // NVRAM sync runs through it inside XNU's halt/restart timer.
+                if let Some(nor) = machine
+                    .devices
+                    .with(|devices| devices.take_nor_activity())
+                    .filter(|nor| nor.accesses != 0)
+                {
+                    let hz = stela_soc::counter::FREQUENCY_HZ;
+                    // Each wait split at the AIC's claim: rise to claim (the
+                    // host's delivery and the guest's masking), claim to the
+                    // driver's next access (the guest's handler and work
+                    // loop), the claiming PEs, and waits with no claim. Then
+                    // the accesses served under the controller's own lock and
+                    // those that found it held, the line changes handed to
+                    // the AIC, and the board holds that did it (host counter
+                    // ticks).
+                    let lock = host::COUNTER_HZ;
+                    let mut by_pe = alloc::string::String::new();
+                    for (pe, &count) in nor.claims_by_cpu.iter().enumerate() {
+                        if count != 0 {
+                            let sep = if by_pe.is_empty() { "" } else { "," };
+                            by_pe += &alloc::format!("{sep}{pe}:{count}");
+                        }
+                    }
+                    output::arguments(format_args!(
+                        "NOR SPI accesses={} commands={} bytes={} selected_ms={} interrupts={} \
+                         interrupt_wait_ms={} longest_interrupt_wait_us={} raised_in_access={} \
+                         claimed={} claim_ms={} longest_claim_us={} answer_ms={} \
+                         longest_answer_us={} by_raiser={} claims_by_pe={} unclaimed={} \
+                         unclaimed_ms={} own_accesses={} own_waits={} delivered={} locked={} \
+                         lock_waited_ms={} lock_held_ms={} longest_lock_held_us={}\n",
+                        nor.accesses,
+                        nor.commands,
+                        nor.bytes,
+                        nor.selected_ticks * 1000 / hz,
+                        nor.interrupts,
+                        nor.interrupt_ticks * 1000 / hz,
+                        nor.longest_interrupt_ticks * 1_000_000 / hz,
+                        nor.raised_in_access,
+                        nor.claimed,
+                        nor.claim_ticks * 1000 / hz,
+                        nor.longest_claim_ticks * 1_000_000 / hz,
+                        nor.answer_ticks * 1000 / hz,
+                        nor.longest_answer_ticks * 1_000_000 / hz,
+                        nor.claimed_by_raiser,
+                        if by_pe.is_empty() { "-" } else { &by_pe },
+                        nor.unclaimed,
+                        nor.unclaimed_ticks * 1000 / hz,
+                        nor.own_accesses,
+                        nor.own_waits,
+                        nor.delivered,
+                        nor.locked,
+                        nor.lock_waited_ticks * 1000 / lock,
+                        nor.lock_held_ticks * 1000 / lock,
+                        nor.longest_lock_held_ticks * 1_000_000 / lock,
+                    ));
+                }
+                // Deferred fast IPIs (XNU's wake of an idle core) fire when
+                // the devices are next advanced with time: how late they did.
+                if let Some(ipis) = machine
+                    .devices
+                    .with(|devices| devices.take_deferred_ipis())
+                    .filter(|ipis| ipis.sent != 0 || ipis.fired != 0)
+                {
+                    let hz = stela_soc::counter::FREQUENCY_HZ;
+                    output::arguments(format_args!(
+                        "FAST IPI deferred={} cancelled={} fired={} late_ms={} longest_late_us={}\n",
+                        ipis.sent,
+                        ipis.cancelled,
+                        ipis.fired,
+                        ipis.late_ticks * 1000 / hz,
+                        ipis.longest_late_ticks * 1_000_000 / hz,
+                    ));
+                }
+                // Sleeping PEs a wake kicked (an interrupt or IPI for an idle
+                // PE) and how long their host cores took to come back.
+                let (kicked, ticks, longest) = machine.devices.hub().take_wake_latency();
+                if let Some(average) = ticks.checked_div(kicked) {
+                    let micros =
+                        |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(host::COUNTER_HZ);
+                    output::arguments(format_args!(
+                        "PES WAKE kicked={kicked} average_us={} longest_us={}\n",
+                        micros(average),
+                        micros(longest),
+                    ));
+                }
+                // A core whose counter moved after its synchronization:
+                // the device clock held it at the last value given, once a
+                // boot past a millisecond.
+                static BEHIND_REPORTED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                let behind = host::device_counter_behind();
+                if behind > tsc_hz / 1000
+                    && !BEHIND_REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed)
+                {
+                    output::arguments(format_args!(
+                        "HOST CLOCK a processor's counter read {} us behind the device clock: \
+                         it moved after its TSC synchronization, and device times on it held \
+                         until it caught up\n",
+                        u128::from(behind) * 1_000_000 / u128::from(tsc_hz.max(1)),
+                    ));
+                }
                 survey_report(machine);
                 occupancy_report(machine, &mut self.occupancy);
                 let next = if self.beats.is_multiple_of(SUSPENSION_BEATS) {
@@ -1477,6 +1786,55 @@ impl Heartbeat {
         }
     }
 
+    /// Part `part` of the beat's `--profile` reports, the stamped line after
+    /// the last; whether more parts follow. Without `--profile`, only the
+    /// stamped line.
+    fn profile_part<H: Host>(
+        &mut self,
+        machine: &mut Machine<H, parallel::Board>,
+        part: u8,
+        tsc_hz: u64,
+    ) -> bool {
+        let profiling = machine.step_timing().is_some();
+        match part {
+            0 if profiling => {
+                let exits = parallel::system_exits(machine);
+                system_exits_report(&exits, tsc_hz);
+                barrier_waits_report(&exits.barriers, tsc_hz);
+                regime_syncs_report(&exits.regimes, tsc_hz);
+                device_exits_report(machine, &exits.devices, tsc_hz);
+                true
+            }
+            1 if profiling => {
+                transfer_times_report(machine, tsc_hz);
+                aic_counts_report(machine);
+                write_times_report(machine, tsc_hz);
+                true
+            }
+            _ => {
+                if profiling {
+                    hot_blocks_report(
+                        machine,
+                        &mut self.dynamic,
+                        &mut self.hot_total,
+                        self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    );
+                }
+                if let Some((mut line, predicted, pac_fills)) = self.stamped.take() {
+                    if profiling {
+                        line.push_str(&dynamic_sites(&self.dynamic));
+                    }
+                    // Exits of PAC branch thunks given a predicted tail this beat.
+                    line.push_str(&format!(" predicted={predicted}"));
+                    // PAC results computed this beat, all PEs: memo misses.
+                    line.push_str(&format!(" pac_fills={pac_fills}"));
+                    output::arguments(format_args!("{line}\n"));
+                }
+                false
+            }
+        }
+    }
+
     /// The guest instructions retired in the interval and, with each PE on
     /// a host core of its own, each PE's rate and time and the lock waits.
     pub(super) fn report_processors<H: Host>(
@@ -1496,6 +1854,8 @@ impl Heartbeat {
                 u128::from(elapsed) * u128::from(host::COUNTER_HZ) / u128::from(tsc_hz.max(1));
             let guest = count.wrapping_sub(self.clock_count);
             let stalled = machine.devices.hub().clock_stalled();
+            // The part of it a lease held while a kernel spin was old.
+            let leased = machine.devices.hub().clock_leased();
             // What the count still lags host time by after holds, and how
             // much of the lag it made up since the last beat.
             let (lag, repaid) = machine.devices.hub().clock_lag();
@@ -1503,26 +1863,18 @@ impl Heartbeat {
                 let rate = u128::from(guest) * 1000 / wall.max(1);
                 let millis = |counts: u64| u128::from(counts) * 1000 / u128::from(host::COUNTER_HZ);
                 output::arguments(format_args!(
-                    "CLOCK RATE guest_per_wall={}.{:03} stalled_ms={} lag_ms={} repaid_ms={}\n",
+                    "CLOCK RATE guest_per_wall={}.{:03} stalled_ms={} leased_ms={} lag_ms={} repaid_ms={}\n",
                     rate / 1000,
                     rate % 1000,
                     millis(stalled),
+                    millis(leased),
                     millis(lag),
                     millis(repaid),
                 ));
             }
             self.clock_count = count;
             output::arguments(format_args!("CLOCK count={count:#x}\n"));
-            // Per PE: its longest gap with guest work and no instruction
-            // retired since the last beat, and the engine phase that took
-            // most of it (`host` outside the step loop, `?` without
-            // `--profile`); one past 50 ms held the count (`stalled_ms`).
-            let mut stalls = String::from("PES STALLS longest_ms/phase");
-            for (pe, (ticks, phase)) in machine.devices.hub().clock_stalls().iter().enumerate() {
-                let millis = u128::from(*ticks) * 1000 / u128::from(host::COUNTER_HZ);
-                stalls.push_str(&format!(" {pe}:{millis}/{phase}"));
-            }
-            output::arguments(format_args!("{stalls}\n"));
+            report_stalls(machine);
         }
         let per_pe = parallel::counts(machine);
         let retired = per_pe
@@ -1597,8 +1949,11 @@ impl Heartbeat {
             // TLBIs of everything that forgot every context (its own, and
             // another PE's or its mail's), ones that reached nothing of the
             // regime it translates in (forgetting other regimes' contexts,
-            // or none), contexts made, TLBIs its mail merged, and pages
-            // walked again at once for contexts made anew.
+            // or none), contexts made, TLBIs its mail merged, pages
+            // walked again at once for contexts made anew, entries dropped
+            // in every context by where (the upper half, no ASID, a global
+            // page), pages taken with another page of their leaf, and
+            // lower-half global pages taken in the shared context.
             // Per PE: GENTER completed natively and by the engine, then
             // GEXIT's, SVC's and ERET's.
             let mut transitions =
@@ -1614,7 +1969,7 @@ impl Heartbeat {
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
-                "/drop_upper/drop_no_asid/drop_global",
+                "/drop_upper/drop_no_asid/drop_global/leaf_fills/shared_fills",
             ));
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered
@@ -1635,7 +1990,21 @@ impl Heartbeat {
             ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
+            // All PEs: cell probe transfers, then the cells held, those
+            // past the stamped ones and those holding no entry (levels),
+            // the hot exits promotion left waiting for their cell's entry,
+            // the cell samples promotion read and the hot exits it found
+            // every stamped cell held for.
+            let mut cell_probes = 0;
+            let mut waiting = 0;
+            let mut samples = 0;
+            let mut full = 0;
+            let mut cells = (0, 0, 0);
+            // All PEs: paired returns matched and missed, and calls past
+            // the frame bound (`chain::PairCount`).
+            let mut pairs = [0u64; stela_compiler::x86_64::chain::PAIR_COUNTS];
             let mut pac_fills = 0;
+            let mut pac_census = [0u64; step_timing::PAC_CENSUS_WORDS];
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
                 line.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.iter().zip(before).enumerate() {
@@ -1797,7 +2166,26 @@ impl Heartbeat {
                 ));
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                cell_probes +=
+                    now.stamped[promoted + 3].saturating_sub(before.stamped[promoted + 3]);
+                cells.0 = cells.0.max(now.stamped[promoted + 4]);
+                cells.1 = cells.1.max(now.stamped[promoted + 5]);
+                cells.2 = cells.2.max(now.stamped[promoted + 6]);
+                waiting += now.stamped[promoted + 7].saturating_sub(before.stamped[promoted + 7]);
+                samples += now.stamped[promoted + 8].saturating_sub(before.stamped[promoted + 8]);
+                full += now.stamped[promoted + 9].saturating_sub(before.stamped[promoted + 9]);
+                for (total, (now, before)) in
+                    pairs.iter_mut().zip(now.pairs.iter().zip(&before.pairs))
+                {
+                    *total += now.saturating_sub(*before);
+                }
                 pac_fills += now.pac_fills.saturating_sub(before.pac_fills);
+                for (sum, (now, before)) in pac_census
+                    .iter_mut()
+                    .zip(now.pac_census.iter().zip(&before.pac_census))
+                {
+                    *sum += now.saturating_sub(*before);
+                }
                 deltas(
                     &mut store,
                     pe,
@@ -1986,7 +2374,15 @@ impl Heartbeat {
                 ));
             }
             output::arguments(format_args!("{store}\n"));
-            stamped.push_str(&format!(" in_use={stamped_in_use}"));
+            if machine.step_timing().is_some() {
+                output::arguments(format_args!("{}\n", pac_census_line(&pac_census)));
+            }
+            stamped.push_str(&format!(
+                " in_use={stamped_in_use} cell_probes={cell_probes} cells={}/{}/{} waiting={waiting} samples={samples} full={full}",
+                cells.0, cells.1, cells.2
+            ));
+            let [matched, missed, refused] = pairs;
+            stamped.push_str(&format!(" pairs={matched}/{missed}/{refused}"));
             stamped_line = Some((stamped, predicted, pac_fills));
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{phases}\n"));
@@ -2012,32 +2408,9 @@ impl Heartbeat {
                 output::arguments(format_args!("{line}\n"));
             }
         }
-        if machine.step_timing().is_some() {
-            let exits = parallel::system_exits(machine);
-            system_exits_report(&exits, tsc_hz);
-            barrier_waits_report(&exits.barriers, tsc_hz);
-            regime_syncs_report(&exits.regimes, tsc_hz);
-            device_exits_report(machine, &exits.devices, tsc_hz);
-            transfer_times_report(machine, tsc_hz);
-            aic_counts_report(machine);
-            write_times_report(machine, tsc_hz);
-            hot_blocks_report(
-                machine,
-                &mut self.dynamic,
-                &mut self.hot_total,
-                self.beats.is_multiple_of(HOT_TOTAL_BEATS),
-            );
-        }
-        if let Some((mut line, predicted, pac_fills)) = stamped_line {
-            if machine.step_timing().is_some() {
-                line.push_str(&dynamic_sites(&self.dynamic));
-            }
-            // Exits of PAC branch thunks given a predicted tail this beat.
-            line.push_str(&format!(" predicted={predicted}"));
-            // PAC results computed this beat, all PEs: memo misses.
-            line.push_str(&format!(" pac_fills={pac_fills}"));
-            output::arguments(format_args!("{line}\n"));
-        }
+        // The `--profile` reports and the line that ends with what they
+        // gathered follow in stages of their own ([`BeatStage::Profile`]).
+        self.stamped = stamped_line;
         // Self-loops since boot, every PE together: compiled, then with
         // `--profile` their entries and the instructions their iterations
         // retired past each entry's first (0/0 without it).
@@ -2163,10 +2536,11 @@ fn board_code(
     )
 }
 
-/// `HEAP small=310M large=62M 128K:352/73M cores=300M/20M classes=16:8M,…`:
-/// the heap's live bytes in size-class blocks and free-list allocations,
-/// the latter by power of two where a size holds a megabyte or more, each
-/// tagged core's share, the tagged cores' bytes by size class, the failed
+/// `HEAP small=310M large=62M 128K:352/73M cores=300M/20M classes=16:8M,…
+/// slabs=4800/40M`: the heap's live bytes in size-class blocks and
+/// free-list allocations, the latter by power of two where a size holds a
+/// megabyte or more, each tagged core's share, the tagged cores' bytes by
+/// size class, the size-class slabs and their free blocks' bytes, the failed
 /// allocations so far and whether the heap is low.
 fn heap_report(heap: &stela_boot_core::heap::Usage) {
     let large: usize = heap.large.iter().map(|&(_, bytes)| bytes).sum();
@@ -2198,6 +2572,8 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
         .map(|(class, &bytes)| format!("{}:{}M", 16 << class, bytes >> 20))
         .collect();
     line.push_str(&format!(" classes={}", classes.join(",")));
+    // The size-class slabs, and the bytes of free blocks they keep.
+    line.push_str(&format!(" slabs={}/{}M", heap.slabs, heap.slab_free >> 20));
     // Allocations that found no memory, which fallible callers survive, and
     // whether the heap is low enough that the engine gives memory back.
     line.push_str(&format!(

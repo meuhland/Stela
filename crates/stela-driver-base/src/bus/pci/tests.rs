@@ -415,6 +415,7 @@ fn missing_msix_table_refuses_without_enabling_msi() {
     let handoff = crate::Handoff {
         firmware: None,
         completion: None,
+        network: None,
         ecam: Vec::new(),
         mapped: Vec::new(),
         dma: 0..0,
@@ -779,6 +780,20 @@ fn below_a_port_forwarding_ari_the_functions_follow_their_chain() {
     assert_eq!(ecam.found(), [(0, 1, 0), (1, 0, 0), (1, 1, 1)]);
 }
 
+/// A laptop's slot 3: function 0 has the multifunction bit, and functions
+/// 2 to 4, which firmware names, read all zeros.
+#[test]
+fn functions_that_read_all_zeros_are_not_functions() {
+    let mut ecam = Ecam::new();
+    ecam.present(0, 3, 0, 0x80);
+    for function in 2..=4 {
+        for offset in [0, 0x04, 0x08, 0x0c] {
+            *ecam.word(0, 3, function, offset) = 0;
+        }
+    }
+    assert_eq!(ecam.found(), [(0, 3, 0)]);
+}
+
 #[test]
 fn below_a_conventional_bridge_every_device_is_scanned() {
     let mut ecam = Ecam::new();
@@ -936,12 +951,15 @@ impl Address {
     }
 }
 
-/// A function a reset empties, silent for `silence` reads after one.
+/// A function a reset empties, silent for `silence` reads after one. A
+/// Resizable BAR capability at 0x100 goes back to its default size (256 MiB)
+/// at a reset, and keeps that size against writes when `rebar_fixed`.
 struct Resettable {
-    words: [u32; 64],
+    words: [u32; 1024],
     silence: u32,
     busy: core::cell::Cell<u32>,
     resets: u32,
+    rebar_fixed: bool,
 }
 
 impl ConfigSpace for Resettable {
@@ -957,6 +975,9 @@ impl ConfigSpace for Resettable {
 
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), crate::bus::pci::ConfigError> {
         let before = self.words[usize::from(offset / 4)];
+        if offset == 0x108 && self.rebar_fixed {
+            return Ok(());
+        }
         self.words[usize::from(offset / 4)] = value;
         let soft_reset = offset == 0x84
             && before & 3 == 3
@@ -972,6 +993,10 @@ impl ConfigSpace for Resettable {
             self.words[0x50 / 4] = 0;
             self.words[0x68 / 4] = 0;
             self.words[0x70 / 4] = 0;
+            if self.words[0x100 / 4] & 0xffff == 0x15 {
+                let control = &mut self.words[0x108 / 4];
+                *control = *control & !(0x3f << 8) | 8 << 8;
+            }
             self.busy.set(self.silence);
             self.resets += 1;
         }
@@ -1000,7 +1025,7 @@ impl ConfigSpace for Resettable {
 }
 
 fn resettable(capabilities: u32, silence: u32) -> Function<Resettable> {
-    let mut words = [0; 64];
+    let mut words = [0; 1024];
     words[0] = 0x1234_8086;
     words[1] = 0x0010_0006;
     words[4] = 0xfe00_0000;
@@ -1022,8 +1047,66 @@ fn resettable(capabilities: u32, silence: u32) -> Function<Resettable> {
             silence,
             busy: core::cell::Cell::new(0),
             resets: 0,
+            rebar_fixed: false,
         },
     }
+}
+
+/// [`resettable`] with FLR and a Resizable BAR capability for BAR 1, which
+/// firmware set to 16 GiB (BAR Size 14) where its default is 256 MiB.
+fn resizable() -> Function<Resettable> {
+    let mut function = resettable(1 << 28, 0);
+    let words = &mut function.config.words;
+    words[0x100 / 4] = 0x0001_0015;
+    words[0x104 / 4] = 0x0000_7ff0;
+    words[0x108 / 4] = 1 << 5 | 14 << 8 | 1;
+    function
+}
+
+#[test]
+fn a_reset_puts_back_the_resizable_bar_size_firmware_set() {
+    let mut function = resizable();
+    assert_eq!(
+        function.reset_with(|_| Ok(())),
+        Ok(Some(ResetMethod::FunctionLevel))
+    );
+    let config = &function.config;
+    assert_eq!(config.resets, 1);
+    assert_eq!(config.words[0x108 / 4], 1 << 5 | 14 << 8 | 1);
+    assert_eq!(config.words[4], 0xfe00_0000);
+}
+
+#[test]
+fn a_resizable_bar_that_keeps_its_default_size_after_a_reset_reads_back_at_it() {
+    let mut function = resizable();
+    assert_eq!(
+        function.resizable_bars(),
+        Ok(vec![ResizableBar {
+            bar: 1,
+            bytes: 16 << 30
+        }])
+    );
+    function.config.rebar_fixed = true;
+    // As Linux `pci_restore_rebar_state`: the size is written, not checked,
+    // and the rest of the function's state goes back after it.
+    assert_eq!(
+        function.reset_with(|_| Ok(())),
+        Ok(Some(ResetMethod::FunctionLevel))
+    );
+    let config = &function.config;
+    assert_eq!(config.words[0x108 / 4], 1 << 5 | 8 << 8 | 1);
+    assert_eq!(config.words[4], 0xfe00_0000);
+    assert_eq!(config.words[1] & 0xffff, 6);
+    // Its owner reads the size it kept, 256 MiB, and goes on with it.
+    assert_eq!(
+        function.resizable_bars(),
+        Ok(vec![ResizableBar {
+            bar: 1,
+            bytes: 256 << 20
+        }])
+    );
+    // A function without the capability has none.
+    assert_eq!(resettable(1 << 28, 0).resizable_bars(), Ok(vec![]));
 }
 
 #[test]
@@ -1106,6 +1189,40 @@ fn flr_is_preferred_and_no_soft_reset_or_a_low_power_state_offers_no_reset() {
         assert_eq!(function.config.resets, 0);
         assert_eq!(function.config.words[0x84 / 4], control);
     }
+}
+
+#[test]
+fn a_power_reset_linux_marks_ineffective_is_no_reset() {
+    // An AMD integrated GPU: a VGA function whose D3hot exit advertises a
+    // reset (No_Soft_Reset clear) and offers no FLR.
+    let mut gpu = resettable(0, 0);
+    (gpu.vendor, gpu.device, gpu.class) = (0x1002, 0x13c0, [3, 0, 0]);
+    assert!(!gpu.power_reset_resets());
+    assert_eq!(gpu.reset_method(), Ok(None));
+    assert_eq!(gpu.reset_with(|_| Ok(())), Ok(None));
+    assert_eq!(gpu.config.resets, 0);
+    // FLR is still that GPU's reset when it offers one.
+    let mut flr = resettable(1 << 28, 0);
+    (flr.vendor, flr.class) = (0x1002, [3, 0, 0]);
+    assert_eq!(flr.reset_method(), Ok(Some(ResetMethod::FunctionLevel)));
+    // The same vendor's other display class and audio function, and another
+    // vendor's VGA function, keep the transition as a reset.
+    for (vendor, device, class) in [
+        (0x1002, 0x13c0, [3, 0x80, 0]),
+        (0x1002, 0x1640, [4, 3, 0]),
+        (0x10de, 0x2c02, [3, 0, 0]),
+    ] {
+        let mut function = resettable(0, 0);
+        (function.vendor, function.device, function.class) = (vendor, device, class);
+        assert!(function.power_reset_resets());
+        assert_eq!(
+            function.reset_method(),
+            Ok(Some(ResetMethod::PowerManagement))
+        );
+    }
+    let mut switch = resettable(0, 0);
+    (switch.vendor, switch.device) = (0x15b3, 0xcf6c);
+    assert_eq!(switch.reset_method(), Ok(None));
 }
 
 #[test]

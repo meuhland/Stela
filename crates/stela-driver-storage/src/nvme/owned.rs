@@ -395,7 +395,8 @@ pub(super) struct Owner {
 /// exclusive controller, its requester and every DMA alias/root/reset
 /// epoch. Bind that real domain before entry, and keep the complete hierarchy
 /// BME-contained. This identity cannot be established from numeric BDFs or by
-/// combining independently obtained type-erased owners.
+/// combining independently obtained type-erased owners. `quirks` are the
+/// controller's by its PCI ID and board ([`super::Quirks`]).
 pub unsafe fn attach(
     registers: Box<dyn Registers>,
     lifecycle: Box<dyn Lifecycle>,
@@ -403,6 +404,7 @@ pub unsafe fn attach(
     domain: Arc<dyn DmaDomain>,
     clock: Clock,
     location: String,
+    quirks: super::Quirks,
 ) -> Result<Attached, BlockError> {
     // SAFETY: this is the same exclusive original-controller contract; the
     // production command budget is not exposed as an attachment capability.
@@ -415,10 +417,15 @@ pub unsafe fn attach(
             clock,
             location,
             COMMAND_TIMEOUT_US,
+            quirks,
         )
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep the independently supplied owners, clock, label, command budget and hardware quirks explicit."
+)]
 unsafe fn attach_with_timeout(
     registers: Box<dyn Registers>,
     lifecycle: Box<dyn Lifecycle>,
@@ -427,6 +434,7 @@ unsafe fn attach_with_timeout(
     clock: Clock,
     location: String,
     command_timeout_us: u64,
+    quirks: super::Quirks,
 ) -> Result<Attached, BlockError> {
     // Install the complete owner before fallible allocation or hardware effects.
     let mut controller = Controller {
@@ -440,7 +448,6 @@ unsafe fn attach_with_timeout(
             tail: 0,
             head: 0,
             phase: true,
-            consumed: 0,
         },
         io: Queue {
             submissions: Buffer::Empty,
@@ -450,7 +457,6 @@ unsafe fn attach_with_timeout(
             tail: 0,
             head: 0,
             phase: true,
-            consumed: 0,
         },
         admin_data: Buffer::Empty,
         pool: Pool::new(alloc::vec::Vec::new()),
@@ -486,7 +492,9 @@ unsafe fn attach_with_timeout(
         host_memory_enabled: false,
         events: super::Events::default(),
         aborts: alloc::vec::Vec::new(),
+        errand: None,
         limits: super::Limits::default(),
+        quirks,
     };
     validate_clock(clock)?;
     controller.teardown = Teardown::Unprepared;
@@ -560,8 +568,7 @@ impl Controller {
                 self.teardown = Teardown::Stopped;
             }
             Teardown::Active => {
-                self.registers.write32(CONFIGURATION, 0)?;
-                self.wait_status(self.ready_timeout_us, |status| status & READY == 0)?;
+                self.stop_and_wait()?;
                 self.teardown = Teardown::Stopped;
             }
             _ => {}

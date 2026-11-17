@@ -1,14 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Linux's interrupt requests, with the interface of Linux
- * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 kernel/irq/manage.c. A platform
- * ISR runs no Linux code: it raises the line on the owner's service, which
- * calls stela_linux_irq_run in process context, and the handlers run in a
- * hard-IRQ scope there. Threaded handlers run as work, which may sleep as an
- * IRQ thread does. The owner routes each line (irq_enable, irq_disable). */
+ * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 kernel/irq/manage.c, under Linux's
+ * own interrupt descriptors, chips, flow handlers and domains (kernel/irq
+ * irqdesc.c, chip.c, handle.c, irqdomain.c, unchanged). There are two kinds
+ * of line:
+ *
+ * An owner's line is one the owner routes (irq_enable, irq_disable), such as
+ * a PCI function's. A platform ISR runs no Linux code: it raises the line on
+ * the owner's service, which calls stela_linux_irq_run in process context,
+ * and the handlers run in a hard-IRQ scope there. Owners number their lines
+ * below STELA_LINUX_OWNER_LINES, where no domain allocates. Such a line has
+ * no descriptor: its requests, routing and delivery are all in this file, as
+ * before Linux's descriptors were built, and Linux code cannot raise it by
+ * number.
+ *
+ * A mapped line is one a driver made in an IRQ domain, with the driver's chip
+ * and flow handler. The driver raises it from its own handler
+ * (generic_handle_domain_irq), and the flow handler reaches this file through
+ * the one action it keeps on the descriptor.
+ *
+ * Threaded handlers run as work, which may sleep as an IRQ thread does. */
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <irq/internals.h>
 #include <stela/atomic_callback.h>
 #include <stela/irq.h>
 #include <stela/linux.h>
@@ -33,9 +51,22 @@ struct irq_line {
 	unsigned int irq;
 	struct mutex request_mutex;
 	bool oneshot_masked;
+	/* disable_irq's depth: the line is routed only at zero. */
+	unsigned int disabled;
+	/* What a mapped line's flow handler runs: this file's handlers. */
+	struct irqaction bottom;
 };
 static LIST_HEAD(lines);
 static DEFINE_MUTEX(lines_mutex);
+static void run_actions(unsigned int irq);
+
+/* The descriptor of a line a driver mapped in a domain, or NULL for an
+ * owner's line, which has none. */
+static struct irq_desc *mapped_desc(unsigned int irq)
+{
+	return irq >= STELA_LINUX_OWNER_LINES ? irq_to_desc(irq) : NULL;
+}
+
 static struct irq_line *line_owner(unsigned int irq, bool create)
 {
 	struct irq_line *line;
@@ -55,10 +86,78 @@ static struct irq_line *line_owner(unsigned int irq, bool create)
 	return line;
 }
 
+/* Linux's arch hook under freely allocated descriptors, which x86 uses to
+ * keep them out of its GSI space: lines drivers map start above the owners'. */
+unsigned int arch_dynirq_lower_bound(unsigned int from)
+{
+	return max(from, STELA_LINUX_OWNER_LINES);
+}
+
+static irqreturn_t bottom_handler(int irq, void *line)
+{
+	(void)line;
+	run_actions((unsigned int)irq);
+	return IRQ_HANDLED;
+}
+
+/* manage.c's __setup_irq and __free_irq for the one action of a mapped line. */
+static int attach_mapped(struct irq_line *line, struct irq_desc *desc, const char *name)
+{
+	struct irq_data *data = irq_desc_get_irq_data(desc);
+	struct irq_chip *chip = data->chip;
+
+	if (!chip || chip == &no_irq_chip)
+		return -ENOSYS;
+	if (chip->irq_request_resources) {
+		int error = chip->irq_request_resources(data);
+
+		if (error)
+			return error;
+	}
+	line->bottom = (struct irqaction){
+		.handler = bottom_handler,
+		.dev_id = line,
+		.irq = line->irq,
+		.name = name,
+	};
+	guard(raw_spinlock_irqsave)(&desc->lock);
+	int error = irq_activate(desc);
+
+	if (error) {
+		if (chip->irq_release_resources)
+			chip->irq_release_resources(data);
+		return error;
+	}
+	desc->action = &line->bottom;
+	return 0;
+}
+
+static void detach_mapped(struct irq_desc *desc)
+{
+	struct irq_data *data = irq_desc_get_irq_data(desc);
+
+	scoped_guard(raw_spinlock_irqsave, &desc->lock) {
+		irq_shutdown(desc);
+		desc->action = NULL;
+	}
+	if (data->chip->irq_release_resources)
+		data->chip->irq_release_resources(data);
+}
+
 static int enable_line(unsigned int irq, bool *unexposed)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
+	struct irq_desc *desc = mapped_desc(irq);
+
 	*unexposed = false;
+	if (desc) {
+		guard(raw_spinlock_irqsave)(&desc->lock);
+		/* A chip that refuses to start has delivered nothing. */
+		int error = irq_startup(desc, IRQ_RESEND, IRQ_START_FORCE);
+
+		*unexposed = error != 0;
+		return error;
+	}
 	if (!owner->services->irq_enable) {
 		/* No native callback was invoked or route published. */
 		*unexposed = true;
@@ -71,6 +170,13 @@ static int enable_line(unsigned int irq, bool *unexposed)
 static void disable_line(unsigned int irq)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
+	struct irq_desc *desc = mapped_desc(irq);
+
+	if (desc) {
+		guard(raw_spinlock_irqsave)(&desc->lock);
+		irq_disable(desc);
+		return;
+	}
 	if (!owner->services->irq_disable ||
 	    owner->services->irq_disable(owner->context, irq))
 		stela_linux_fatal("IRQ source mask unavailable; request retained");
@@ -79,6 +185,12 @@ static void disable_line(unsigned int irq)
 static void retire_line(unsigned int irq)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
+	struct irq_desc *desc = mapped_desc(irq);
+
+	if (desc) {
+		detach_mapped(desc);
+		return;
+	}
 	if (!owner->services->irq_retire ||
 	    owner->services->irq_retire(owner->context, irq))
 		/* Existing no-return fatal/trap boundary: no normal C return,
@@ -122,7 +234,8 @@ static void maybe_rearm(struct irq_line *line)
 	}
 	if (live) {
 		bool unexposed = false;
-		if (enable_line(line->irq, &unexposed))
+		/* A line disable_irq holds stays unrouted until enable_irq. */
+		if (!line->disabled && enable_line(line->irq, &unexposed))
 			stela_linux_fatal("IRQ oneshot rearm unavailable; action retained");
 		WRITE_ONCE(line->oneshot_masked, false);
 	}
@@ -183,8 +296,21 @@ static int request_irq_locked(struct irq_line *line, unsigned int irq, irq_handl
 	INIT_WORK(&request->thread, run_thread);
 	/* Publish the fully initialized action before enable can deliver a
 	 * synchronous notification or yield to this owner's real service task. */
+	struct irq_desc *mapped = first ? mapped_desc(irq) : NULL;
+	if (mapped) {
+		int error = attach_mapped(line, mapped, name);
+
+		if (error) {
+			kfree(request);
+			return error;
+		}
+	}
 	list_add_tail(&request->node, &requests);
-	if (first && !(flags & IRQF_NO_AUTOEN)) {
+	/* As manage.c: a line requested without enabling starts one disable
+	 * deep, and enable_irq routes it. */
+	if (first && (flags & IRQF_NO_AUTOEN))
+		line->disabled++;
+	if (first && !line->disabled) {
 		bool unexposed = false;
 		int error = enable_line(irq, &unexposed);
 		if (error) {
@@ -194,6 +320,8 @@ static int request_irq_locked(struct irq_line *line, unsigned int irq, irq_handl
 			 * returning an error that lets the caller reclaim dev_id. */
 			list_del(&request->node);
 			kfree(request);
+			if (mapped)
+				detach_mapped(mapped);
 			return error;
 		}
 	}
@@ -204,6 +332,10 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler, irq_handler_t 
 						unsigned long flags, const char *name, void *dev)
 {
 	if (in_interrupt())
+		return -EINVAL;
+	/* A number above the owners' is a line only while a driver has it
+	 * mapped; without a descriptor Linux has no such interrupt. */
+	if (irq >= STELA_LINUX_OWNER_LINES && !mapped_desc(irq))
 		return -EINVAL;
 	struct irq_line *line = line_owner(irq, true);
 	if (!line)
@@ -245,10 +377,13 @@ static const void *free_irq_locked(unsigned int irq, void *dev_id)
 		struct irq_line *line = request->line;
 		list_del(&request->node);
 		kfree(request);
-		if (last)
+		if (last) {
 			WRITE_ONCE(line->oneshot_masked, false);
-		else
+			/* The next request starts from manage.c's fresh depth. */
+			line->disabled = 0;
+		} else {
 			maybe_rearm(line);
+		}
 		return name;
 	}
 	WARN(1, "Trying to free already-free IRQ %u\n", irq);
@@ -277,12 +412,35 @@ const void *free_irq(unsigned int irq, void *dev_id)
 	return name;
 }
 
-void stela_linux_irq_run(unsigned int irq)
+/* A line's primary handlers run to completion in the one context Linux code
+ * runs in, so none is in progress in a caller that may sleep. What may still
+ * run is an action's thread, which is work: wait for each, as Linux waits
+ * for the line's active threads. */
+void synchronize_irq(unsigned int irq)
 {
-	struct stela_linux_atomic_callback scope;
+	struct irq_line *line = line_owner(irq, false);
 	struct requested *request;
 
-	stela_linux_atomic_callback_begin(&scope);
+	if (in_interrupt())
+		stela_linux_fatal("synchronize_irq in interrupt context");
+	if (!line)
+		return;
+	mutex_lock(&line->request_mutex);
+	list_for_each_entry(request, &requests, node) {
+		if (request->action.irq != irq)
+			continue;
+		if (current_work() == &request->thread)
+			stela_linux_fatal("synchronize_irq from the line's own IRQ thread");
+		flush_work(&request->thread);
+	}
+	mutex_unlock(&line->request_mutex);
+}
+
+/* Run a line's primary handlers. The caller is in a hard-IRQ scope. */
+static void run_actions(unsigned int irq)
+{
+	struct requested *request;
+
 	list_for_each_entry(request, &requests, node) {
 		struct irqaction *action = &request->action;
 		if (action->irq != irq || READ_ONCE(request->closing) ||
@@ -298,5 +456,111 @@ void stela_linux_irq_run(unsigned int irq)
 		WRITE_ONCE(request->thread_active, true);
 		queue_work(system_highpri_wq, &request->thread);
 	}
+}
+
+void stela_linux_irq_run(unsigned int irq)
+{
+	struct stela_linux_atomic_callback scope;
+
+	stela_linux_atomic_callback_begin(&scope);
+	run_actions(irq);
 	stela_linux_atomic_callback_end(&scope);
+}
+
+/* manage.c's disable depth. A held line is not routed: an owner's by its
+ * owner, a mapped one by its chip. */
+void disable_irq(unsigned int irq)
+{
+	struct irq_line *line = line_owner(irq, false);
+	struct requested *request;
+	bool requested = false;
+
+	if (in_interrupt())
+		stela_linux_fatal("disable_irq in interrupt context");
+	if (!line)
+		return;
+	mutex_lock(&line->request_mutex);
+	list_for_each_entry(request, &requests, node)
+		requested |= request->action.irq == irq && !request->closing;
+	if (!line->disabled++ && requested && !READ_ONCE(line->oneshot_masked))
+		disable_line(irq);
+	mutex_unlock(&line->request_mutex);
+	synchronize_irq(irq);
+}
+
+void enable_irq(unsigned int irq)
+{
+	struct irq_line *line = line_owner(irq, false);
+	struct requested *request;
+	bool requested = false;
+
+	if (!line)
+		return;
+	mutex_lock(&line->request_mutex);
+	list_for_each_entry(request, &requests, node)
+		requested |= request->action.irq == irq && !request->closing;
+	if (!line->disabled) {
+		WARN(1, "Unbalanced enable for IRQ %u\n", irq);
+	} else if (!--line->disabled && requested && !READ_ONCE(line->oneshot_masked)) {
+		bool unexposed = false;
+
+		if (enable_line(irq, &unexposed))
+			stela_linux_fatal("IRQ enable after disable_irq unavailable; action retained");
+	}
+	mutex_unlock(&line->request_mutex);
+}
+
+/* Adapted from manage.c: set a line's trigger through its chip, masked
+ * while it changes when the chip asks for that. */
+int __irq_set_trigger(struct irq_desc *desc, unsigned long flags)
+{
+	struct irq_chip *chip = desc->irq_data.chip;
+	int ret, unmask = 0;
+
+	if (!chip || !chip->irq_set_type) {
+		/* IRQF_TRIGGER_* but the PIC does not support multiple flow-types? */
+		pr_debug("No set_type function for IRQ %d (%s)\n", irq_desc_get_irq(desc),
+			 chip ? (chip->name ? : "unknown") : "unknown");
+		return 0;
+	}
+	if (chip->flags & IRQCHIP_SET_TYPE_MASKED) {
+		if (!irqd_irq_masked(&desc->irq_data))
+			mask_irq(desc);
+		if (!irqd_irq_disabled(&desc->irq_data))
+			unmask = 1;
+	}
+	/* Mask all flags except trigger mode */
+	flags &= IRQ_TYPE_SENSE_MASK;
+	ret = chip->irq_set_type(&desc->irq_data, (unsigned int)flags);
+	switch (ret) {
+	case IRQ_SET_MASK_OK:
+	case IRQ_SET_MASK_OK_DONE:
+		irqd_clear(&desc->irq_data, IRQD_TRIGGER_MASK);
+		irqd_set(&desc->irq_data, (unsigned int)flags);
+		fallthrough;
+	case IRQ_SET_MASK_OK_NOCOPY:
+		flags = irqd_get_trigger_type(&desc->irq_data);
+		irq_settings_set_trigger_mask(desc, (u32)flags);
+		irqd_clear(&desc->irq_data, IRQD_LEVEL);
+		irq_settings_clr_level(desc);
+		if (flags & IRQ_TYPE_LEVEL_MASK) {
+			irq_settings_set_level(desc);
+			irqd_set(&desc->irq_data, IRQD_LEVEL);
+		}
+		ret = 0;
+		break;
+	default:
+		pr_err("Setting trigger mode %lu for irq %u failed (%pS)\n", flags,
+		       irq_desc_get_irq(desc), chip->irq_set_type);
+	}
+	if (unmask)
+		unmask_irq(desc);
+	return ret;
+}
+
+/* manage.c: a nested handler's thread ended; wake synchronize_irq's waiters. */
+void wake_threads_waitq(struct irq_desc *desc)
+{
+	if (atomic_dec_and_test(&desc->threads_active))
+		wake_up(&desc->wait_for_threads);
 }

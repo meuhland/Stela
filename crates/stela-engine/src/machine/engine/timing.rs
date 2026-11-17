@@ -8,7 +8,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// time, so a serialized count does not advance across it. A parallel
     /// PE's count is the host's: stopped in the kernel, where it may hold a
     /// lock another PE times, the count waits for it only once it has been
-    /// stopped `clock::STALL_MILLIS`; at EL0 it holds no such lock.
+    /// stopped `clock::STALL_MILLIS` (`clock::LEASE_MILLIS` while a kernel
+    /// spin is old); at EL0 it holds no such lock.
     pub fn exclude_host_time<T>(&mut self, work: impl FnOnce(&mut D) -> T) -> T {
         let progress = self.work();
         let at_el0 = self.cpu.pstate.el == 0;
@@ -62,6 +63,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Time the step loop's phases and exits from now on ([`step_timing`]).
     pub fn set_step_timing(&mut self, on: bool) {
         self.step_timing = on.then(step_timing::StepTiming::default);
+        let pe = self.processor();
+        self.pointer.census = on.then(|| Box::new(pointer::census::Census::new(pe)));
         // Self-loops count their entries only while timing is on.
         self.native_system = None;
     }
@@ -69,6 +72,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The step loop's timing so far, while it is on.
     pub fn step_timing(&self) -> Option<&step_timing::StepTiming> {
         self.step_timing.as_ref()
+    }
+
+    /// Under step timing, describe the `bytes` of code at `code` to the host
+    /// as one `region` ([`super::Host::profile_code`]).
+    #[inline]
+    pub(super) fn profile_code(
+        &mut self,
+        code: NativeCode,
+        bytes: usize,
+        region: step_timing::CodeRegion,
+    ) {
+        if self.step_timing.is_some() {
+            self.host.profile_code(code, bytes, &[(0, region)]);
+        }
     }
 
     /// The profile clock, while timing is on.
@@ -132,7 +149,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             _ => slot,
         };
         let now = self.host.profile_ticks();
-        self.host.profile_boundary(step_timing::Phase::Exit, now);
+        self.host.profile_exit(slot, now);
         let closed = core::mem::take(&mut self.timed_closed);
         let waited = device.map_or(0, |_| self.devices.take_lock_wait());
         if let Some(timing) = &mut self.step_timing {
@@ -247,8 +264,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Add the hot-block samples since the last call to `hot`
     /// ([`step_timing::HotBlocks`]).
     pub fn take_hot_samples(&mut self, hot: &mut step_timing::HotBlocks) {
-        for (pc, level) in self.hot_samples.drain(..) {
+        for (pc, level, asid) in self.hot_samples.drain(..) {
             hot.add(pc, level, 1);
+            hot.asids.add(asid, pc, level, 1);
         }
         hot.add_dynamic(&self.dynamic_samples);
         self.dynamic_samples.clear();

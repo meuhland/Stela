@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 20:25:12 +0000
+Subject: [PATCH] fix(xe): refuse a user fence from a caller without an address
+ space, where its mm was taken unchecked and a kernel task serving a client
+ faulted on a null mm
+
+---
+ drivers/gpu/drm/xe/xe_sync.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_sync.c b/drivers/gpu/drm/xe/xe_sync.c
+index 37866768d64c23b7eec60159b4c10c044348d95f..63bbc18f7304ba5fa4c18f2dabb74a5de45f52a7 100644
+--- a/drivers/gpu/drm/xe/xe_sync.c
++++ b/drivers/gpu/drm/xe/xe_sync.c
+@@ -59,6 +59,17 @@ static struct xe_user_fence *user_fence_create(struct xe_device *xe, u64 addr,
+ 	if (get_user(prefetch_val, ptr))
+ 		return ERR_PTR(-EFAULT);
+ 
++	/* The value is written later by a worker that adopts the caller's
++	 * address space. A caller without one, a kernel task serving a client
++	 * whose memory is not a Linux address space, cannot be written to
++	 * then, and has no mm to hold until then.
++	 */
++	if (!current->mm) {
++		drm_warn_once(&xe->drm,
++			      "user fence refused: the caller has no address space\n");
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++
+ 	ufence = kzalloc_obj(*ufence);
+ 	if (!ufence)
+ 		return ERR_PTR(-ENOMEM);

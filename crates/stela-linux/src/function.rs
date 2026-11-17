@@ -97,6 +97,10 @@ pub struct Placement {
     /// The highest bus address `domain` hands out.
     pub dma_limit: u64,
     pub regions: [Region; BARS],
+    /// The function's platform ROM: a video BIOS image firmware publishes
+    /// apart from the function, which Linux keeps as `pci_dev::rom`. Empty
+    /// for none. The attach copies it.
+    pub rom: &'static [u8],
 }
 
 /// A function's MSI capability (PCI Local Bus 3.0 6.8.1), one message at most.
@@ -185,14 +189,66 @@ struct RawFunction {
     regions: [Region; BARS],
     release_context: Option<unsafe extern "C" fn(*mut c_void)>,
     enroll: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+    rom: *const u8,
+    rom_length: usize,
 }
 
-const _: () = assert!(size_of::<RawFunction>() == 240);
+const _: () = assert!(size_of::<RawFunction>() == 256);
+const _: () = assert!(core::mem::offset_of!(RawFunction, rom_length) == 248);
 const _: () = assert!(core::mem::offset_of!(RawFunction, enroll) == 232);
 const _: () = assert!(core::mem::offset_of!(RawFunction, release_context) == 224);
 
+/// What identifies a function its owner keeps to itself
+/// (`struct stela_linux_pci_identity`): enough for another function's driver
+/// to find it by address, class or ID and read who it is.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Identity {
+    pub bus: u32,
+    pub devfn: u32,
+    pub vendor: u16,
+    pub device: u16,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+    /// Configuration register 8: the class in the upper 24 bits.
+    pub class_revision: u32,
+}
+
+const _: () = assert!(size_of::<Identity>() == 20);
+
+/// A function presented to Linux for other drivers' searches only: no
+/// driver binds it and it has no configuration, resources, interrupt or DMA.
+pub struct Published {
+    device: NonNull<c_void>,
+}
+
+impl Published {
+    /// # Safety
+    /// In an entered Linux owner, on a Linux task. That owner outlives every
+    /// reference a driver's search takes, and the value is dropped there.
+    pub unsafe fn new(identity: Identity) -> Result<Self, Errno> {
+        let mut error: c_int = 0;
+        // SAFETY: the caller's contract; C copies the identity.
+        NonNull::new(unsafe { stela_linux_pci_publish_identity(&identity, &raw mut error) })
+            .map(|device| Self { device })
+            .ok_or(error)
+    }
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        // SAFETY: the type's contract; removal drops the registration's
+        // reference and C frees the device at its last one.
+        unsafe { stela_linux_pci_remove_device(self.device.as_ptr()) };
+    }
+}
+
 unsafe extern "C" {
     fn stela_linux_pci_attach(function: *const RawFunction, error: *mut c_int) -> *mut c_void;
+    fn stela_linux_pci_publish_identity(
+        identity: *const Identity,
+        error: *mut c_int,
+    ) -> *mut c_void;
     fn stela_linux_owner() -> *const super::owner::RawOwner;
     fn stela_linux_pci_bound(device: *const c_void) -> bool;
     fn stela_linux_pci_shutdown(device: *mut c_void);
@@ -812,6 +868,8 @@ impl<H: Host> Attached<H> {
             regions: placement.regions,
             release_context: Some(release_context::<H>),
             enroll: catalogued.then_some(enroll::<H>),
+            rom: placement.rom.as_ptr(),
+            rom_length: placement.rom.len(),
         };
         let mut error = 0;
         // SAFETY: caller's attach contract; C copies the table and returns a

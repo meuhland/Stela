@@ -10,6 +10,7 @@
  */
 #include "StelaGPU.h"
 #include "app_delivery.h"
+#include "compression.h"
 #include "files.h"
 #include "sandbox_cache.h"
 
@@ -113,6 +114,7 @@ StelaGPU::installPlugin(void *parameter, wait_result_t)
 	// volume is mounted whenever the plugin's report was reached unstopped.
 	if (!stopping && context && buffer) {
 		gpu->setProperty(STELA_APP_PROPERTY, stelaDeliverApp(context, buffer));
+		stelaTellNoCompression(context, buffer);
 		stelaDeliverSandboxPatch(context, buffer);
 	}
 	if (buffer) {

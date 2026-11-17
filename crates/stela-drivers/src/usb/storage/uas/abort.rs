@@ -98,17 +98,17 @@ impl Host {
     }
 }
 impl<I: Io> Engine<I> {
-    pub(super) fn abort_task(&mut self, lun: [u8; 8]) -> AbortTaskOutcome {
-        if let Err(error) = self.abort_response(lun) {
+    pub(super) fn abort_task(&mut self, lane: usize, lun: [u8; 8]) -> AbortTaskOutcome {
+        if let Err(error) = self.abort_response(lane, lun) {
             return AbortTaskOutcome::NotAcknowledged(error);
         }
         // A device task response cannot retire the xHC's outstanding data TD.
         // Clear each receipt only after native cancellation ACK/drain.
         let retirement = (|| {
             for pipe in [Pipe::Input, Pipe::Output] {
-                if self.pending[pipe.index()].is_some() {
+                if self.lanes[lane].pending[pipe.index()].is_some() {
                     self.io.cancel(pipe)?;
-                    self.pending[pipe.index()] = None;
+                    self.lanes[lane].pending[pipe.index()] = None;
                 }
             }
             self.io.ready()?;
@@ -116,21 +116,30 @@ impl<I: Io> Engine<I> {
         })();
         AbortTaskOutcome::Acknowledged { retirement }
     }
-    fn abort_response(&mut self, lun: [u8; 8]) -> Result<(), BlockError> {
+    fn abort_response(&mut self, lane: usize, lun: [u8; 8]) -> Result<(), BlockError> {
         // Validate the original attachment before any buffer access or effect.
         self.io.ready()?;
+        let slot = &self.lanes[lane];
+        // The task's own pipes are cancelled whole: no other command may
+        // have a transfer on them.
+        let alone = self
+            .lanes
+            .iter()
+            .enumerate()
+            .all(|(index, other)| index == lane || other.idle());
         if !self.buffers_present()
-            || self.pending[Pipe::Command.index()].is_some()
-            || !self.touched[Pipe::Command.index()]
-            || self.pending[Pipe::Status.index()].is_none()
+            || !alone
+            || slot.pending[Pipe::Command.index()].is_some()
+            || !slot.touched[Pipe::Command.index()]
+            || slot.pending[Pipe::Status.index()].is_none()
         {
             return Err(BlockError::Unsupported(
                 "UAS abort requires completed command and pending status",
             ));
         }
         let maximum = self.io.streams().unwrap_or(u16::MAX);
-        let (original, tag) = TaskTag::distinct(self.tag, maximum)?;
-        let command = self.command.bytes();
+        let (original, tag) = TaskTag::distinct(slot.tag, maximum)?;
+        let command = slot.command.bytes();
         if command[0] != COMMAND_IU
             || command[2..4] != original.0.to_be_bytes()
             || command[8..16] != lun
@@ -140,33 +149,39 @@ impl<I: Io> Engine<I> {
         // The original status TD may still own this allocation. Acknowledged
         // cancellation includes every stream dequeue and late-event drain.
         self.io.cancel(Pipe::Status)?;
-        self.pending[Pipe::Status.index()] = None;
-        self.touched[Pipe::Status.index()] = false;
+        let slot = &mut self.lanes[lane];
+        slot.pending[Pipe::Status.index()] = None;
+        slot.touched[Pipe::Status.index()] = false;
         let iu = task_iu(tag, original, lun);
-        self.command.bytes_mut()[..TASK_IU_BYTES].copy_from_slice(&iu);
-        self.status.bytes_mut().fill(0);
-        self.tag = tag.0;
-        self.post(Pipe::Status, self.status.physical(), IU_BUFFER_BYTES)?;
-        self.post(Pipe::Command, self.command.physical(), TASK_IU_BYTES)?;
+        slot.command.bytes_mut()[..TASK_IU_BYTES].copy_from_slice(&iu);
+        slot.status.bytes_mut().fill(0);
+        slot.tag = tag.0;
+        let (status, command) = (slot.status.physical(), slot.command.physical());
+        self.post(lane, Pipe::Status, status, IU_BUFFER_BYTES)?;
+        self.post(lane, Pipe::Command, command, TASK_IU_BYTES)?;
         let started = self.io.now();
         loop {
             // Do not consume the device response before the TMF's own command
             // TD has completed. No original data completion is polled.
-            if let Some(ticket) = &self.pending[Pipe::Command.index()]
+            if let Some(ticket) = &self.lanes[lane].pending[Pipe::Command.index()]
                 && let Some(completion) = self.io.completed(ticket)
             {
                 let count = completion?;
                 if count != TASK_IU_BYTES {
                     return Err(PROTOCOL_ERROR);
                 }
-                self.pending[Pipe::Command.index()] = None;
+                self.lanes[lane].pending[Pipe::Command.index()] = None;
             }
-            if self.pending[Pipe::Command.index()].is_none()
-                && let Some(ticket) = &self.pending[Pipe::Status.index()]
+            if self.lanes[lane].pending[Pipe::Command.index()].is_none()
+                && let Some(ticket) = &self.lanes[lane].pending[Pipe::Status.index()]
                 && let Some(completion) = self.io.completed(ticket)
             {
                 let count = completion?;
-                let response = self.status.bytes().get(..count).ok_or(PROTOCOL_ERROR)?;
+                let response = self.lanes[lane]
+                    .status
+                    .bytes()
+                    .get(..count)
+                    .ok_or(PROTOCOL_ERROR)?;
                 // A Response IU has no LUN field. Its fresh tag identifies the
                 // one TMF keeping the original task tag and exact LUN.
                 if response.len() != 8
@@ -178,7 +193,7 @@ impl<I: Io> Engine<I> {
                 {
                     return Err(PROTOCOL_ERROR);
                 }
-                self.pending[Pipe::Status.index()] = None;
+                self.lanes[lane].pending[Pipe::Status.index()] = None;
                 return Ok(());
             }
             if self.io.now().wrapping_sub(started) >= TIMEOUT_US {

@@ -58,6 +58,19 @@ use stela_engine::system::access::AccessKind;
 use stela_soc_data::board::PowerOwner;
 pub use usb::POWER_BUTTON_HELD;
 
+/// How a halt the board's own models made begins: a device that could not
+/// advance to the count, or the RTC service refusing its time. No guest
+/// request made it, so a stop shows it as the machine's, not macOS's.
+pub const MODEL_REFUSED: [&str; 2] = ["device advance refused: ", "RTC service time refused: "];
+
+/// Whether a reset's `reason` is a halt the board's models made
+/// ([`MODEL_REFUSED`]) rather than one the guest asked for.
+pub fn model_refused(reason: &str) -> bool {
+    MODEL_REFUSED
+        .iter()
+        .any(|prefix| reason.starts_with(prefix))
+}
+
 use crate::aes;
 use crate::aes::Aes;
 use crate::agx::firmware::Coprocessor as GfxCoprocessor;
@@ -152,6 +165,7 @@ mod canonical_reads;
 mod canonical_writes;
 mod display_resources;
 pub mod memory_resources;
+mod own_lock;
 mod pmp_dma;
 mod pmp_services;
 pub use pmp_dma::{ExplicitRuntimeConfiguration, SourceProvenance};
@@ -170,8 +184,8 @@ pub use {
     crate::asc::Lines as AscLines, crate::dcp::Log as DisplayLog, crate::nor,
     crate::pmp::native as native_pmp, crate::pmp::native::services::Clock as NativePmpClock,
     crate::scanout::ChannelMasks as ScanoutMasks, crate::scanout::Mode as ScanoutMode,
-    crate::scanout::PixelFormat as ScanoutFormat, crate::scanout::Scanout,
-    crate::sep::Entropy as SepEntropy,
+    crate::scanout::MonitorId, crate::scanout::PixelFormat as ScanoutFormat,
+    crate::scanout::Scanout, crate::sep::Entropy as SepEntropy,
     crate::sep::image::signature::Evidence as SepSignatureEvidence,
     crate::sep::image::signature::ManifestEvidence as SepManifestEvidence,
     crate::sep::image::signature::inspect as inspect_sep_signature,
@@ -200,8 +214,13 @@ pub struct AppleDevices {
     ipi: Option<FastIpi>,
     masters: Vec<Master>,
     coprocessors: Vec<(&'static str, DeviceId)>,
-    /// The SPI controller holding the NOR die.
+    /// The SPI controller holding the NOR die: its port on the bus and the
+    /// state it shares with the engine's handle ([`own_lock`]), and whether
+    /// the board's current hold handed on its line changes, for
+    /// [`Devices::lock_released`].
     nor: Option<DeviceId>,
+    nor_shared: Option<Arc<own_lock::Shared<Spi>>>,
+    nor_touch: core::cell::Cell<bool>,
     /// StelaGPU's call gates (`gpu_gate`), a GPU's each.
     gpu_gates: Vec<DeviceId>,
     storage_masters: Vec<(DeviceId, DeviceId)>,
@@ -539,6 +558,13 @@ fn describe(error: MmioError) -> DeviceError {
             )
             .because(reason),
         ),
+        MmioError::Advance {
+            device,
+            now,
+            reason,
+        } => DeviceError::Refused(
+            refuse!("{device} time at count {now:#x}", device, now).because(reason),
+        ),
     }
 }
 
@@ -647,6 +673,8 @@ impl AppleDevices {
             gfx_masters: Vec::new(),
             coprocessors: Vec::new(),
             nor: None,
+            nor_shared: None,
+            nor_touch: Default::default(),
             gpu_gates: Vec::new(),
             sep_masters: Vec::new(),
             dcp_masters: Vec::new(),
@@ -730,17 +758,37 @@ impl AppleDevices {
     /// The NOR sectors the guest changed since the last call, as (offset,
     /// bytes), for the host to persist.
     pub fn nor_dirty(&mut self) -> Vec<(usize, Vec<u8>)> {
-        self.nor
-            .and_then(|id| self.bus.device_mut::<Spi>(id))
-            .map_or_else(Vec::new, Spi::take_dirty)
+        self.nor_shared
+            .as_ref()
+            .map_or_else(Vec::new, |nor| nor.with(Spi::take_dirty))
+    }
+
+    /// The deferred fast IPIs' counts since the last call
+    /// ([`crate::ipi::DeferredCounts`]); `None` without fast IPIs.
+    pub fn take_deferred_ipis(&mut self) -> Option<crate::ipi::DeferredCounts> {
+        self.ipi.as_mut().map(FastIpi::take_deferred)
+    }
+
+    /// The SPI NOR controller's activity since the last call
+    /// ([`crate::spi::Activity`]); `None` without a NOR.
+    pub fn take_nor_activity(&mut self) -> Option<crate::spi::Activity> {
+        self.nor_shared.as_ref().map(|nor| {
+            let mut activity = nor.with(Spi::take_activity);
+            (
+                activity.own_accesses,
+                activity.own_waits,
+                activity.delivered,
+            ) = nor.take_counts();
+            activity
+        })
     }
 
     /// A copy of the NOR image as the guest left it, for the host to change
     /// NVRAM once the guest has stopped.
     pub fn nor_image(&mut self) -> Option<stela_soc_data::nor::Image> {
-        self.nor
-            .and_then(|id| self.bus.device_mut::<Spi>(id))
-            .map(|spi| spi.image().clone())
+        self.nor_shared
+            .as_ref()
+            .map(|nor| nor.with(|spi| spi.image().clone()))
     }
 
     /// Drain the `sks`/`pnon`/`scrd` traffic the SEP observed this run under
@@ -839,7 +887,7 @@ impl AppleDevices {
             // would, with the model's own reason.
             self.reset = Some(Reset {
                 transition: Transition::Halt,
-                reason: format!("device advance refused: {error:?}{}", self.rtc_regression()),
+                reason: format!("{}{error:?}{}", MODEL_REFUSED[0], self.rtc_regression()),
             });
         }
         self.watch_pmu();
@@ -932,6 +980,13 @@ impl LocalRegisters for PeRegisters {
             .is_some_and(|(signals, cpu)| signals.pending(*cpu) != 0)
     }
 
+    /// The deferred fast IPI armed for the PE ([`crate::ipi::Signals::deferred`]).
+    fn deadline(&self) -> Option<u64> {
+        self.ipi
+            .as_ref()
+            .and_then(|(signals, cpu)| signals.deferred(*cpu))
+    }
+
     fn storage(&self, encoding: Encoding) -> Option<u64> {
         use stela_engine::machine::fast_ipi::Register;
         self.counters
@@ -951,6 +1006,29 @@ impl Devices for AppleDevices {
         self.pc_samplers
             .iter()
             .find_map(|&(cpu, register, _)| (physical == register && bytes == 4).then_some(cpu))
+    }
+
+    /// A call that handed on the NOR controller's line changes counts its
+    /// lock time there; any other costs one load.
+    fn lock_released(&mut self, waited: u64, held: u64) {
+        if self.nor_touch.replace(false)
+            && let Some(nor) = &self.nor_shared
+        {
+            nor.with(|spi| spi.locked(waited, held));
+        }
+    }
+
+    fn own_lock_registers(
+        &self,
+    ) -> Option<Arc<dyn stela_engine::machine::engine::OwnLockRegisters>> {
+        self.nor_shared.as_ref().map(|nor| {
+            Arc::new(own_lock::Handle(Arc::clone(nor)))
+                as Arc<dyn stela_engine::machine::engine::OwnLockRegisters>
+        })
+    }
+
+    fn deliver_own(&mut self) -> Result<bool, DeviceError> {
+        self.deliver_own_queued()
     }
 
     fn observe_pc_sample(&mut self, physical: u64, pc: u64) {
@@ -1419,10 +1497,18 @@ impl Devices for AppleDevices {
         self.publish_rtc_time(now)?;
         self.settle_lifecycle(cpu, now);
         lap.end(&mut self.transfer_times, 0);
+        // A write that reached only its own model and lines leaves every
+        // master as the last transfer did ([`MmioDevice::reaches_only_itself`]):
+        // what a master's deadline brings, the home machine's DMA deadline
+        // runs.
+        let masters = !self
+            .written_device()
+            .flatten()
+            .is_some_and(|device| self.bus.reaches_only_itself(device));
         // A master's refused work stops only that master: the others and the
         // devices' timers go on, and the first refusal is what is reported.
         let mut results = [const { Ok(()) }; 7];
-        for (index, result) in results.iter_mut().enumerate() {
+        for (index, result) in results.iter_mut().enumerate().filter(|_| masters) {
             *result = match index {
                 0 => self.transfer_pmp(cpu, memory, now),
                 1 => self.transfer_aes(cpu, memory, now),

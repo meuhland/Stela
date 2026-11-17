@@ -5,7 +5,7 @@
 //! Apple's GPUs and NVIDIA's warps both have; the builtins case records the
 //! width. The order in which atomics return their values is the device's
 //! choice, so those outputs are compared sorted.
-use super::plan::{Buffer, Case, Output, Plan, Texture, Tolerance};
+use super::plan::{Buffer, Case, Output, Plan, Step, Texture, Tolerance};
 use super::values::{Dtype, Random, bits32, f16_bits, f16r, f32r, f32s, floats, ints, sum, u32s};
 use serde_json::json;
 
@@ -276,6 +276,219 @@ fn atomics(plan: &mut Plan, library: &str) {
                 .output(Output::exact("sums", Dtype::F32, floats(Dtype::F32, &sums))),
         );
     }
+}
+
+/// The word `store_linear` stores at an index.
+fn linear_word(i: u32) -> u32 {
+    i.wrapping_mul(2_654_435_761).wrapping_add(0x9e37_79b9)
+}
+
+/// Plain device stores: their bandwidth into Shared and Private buffers
+/// (gpu_ms of the two cases), and their visibility to the next dispatch
+/// and, through a fence or a barrier, to the last threadgroup.
+fn store_order(plan: &mut Plan, library: &str) {
+    // 4 MiB stored, then read back by 4096 threads in a strided sum.
+    let (words_n, threads) = (1u32 << 20, 4096u32);
+    let sums: Vec<u32> = (0..threads)
+        .map(|t| {
+            (t..words_n)
+                .step_by(threads as usize)
+                .fold(0u32, |s, i| s.wrapping_add(linear_word(i)))
+        })
+        .collect();
+    for mode in ["shared", "private"] {
+        plan.add(
+            Case::sequence(
+                &format!("compute.store_bandwidth.{mode}"),
+                library,
+                vec![
+                    Step::compute("store_linear", [words_n, 1, 1], [256, 1, 1])
+                        .bind(&[("data", 0)]),
+                    Step::compute("sum_strided", [threads, 1, 1], [256, 1, 1]).bind(&[
+                        ("data", 0),
+                        ("sums", 1),
+                        ("words", 2),
+                    ]),
+                ],
+            )
+            .buffer(
+                Buffer::zeroed("data", 0, words_n as usize * 4)
+                    .unbound()
+                    .set("storage", mode),
+            )
+            .buffer(Buffer::zeroed("sums", 0, threads as usize * 4).unbound())
+            .buffer(Buffer::data("words", 0, u32s(&[words_n])).unbound())
+            .output(Output::exact("sums", Dtype::U32, u32s(&sums)))
+            .note("the store kernel's gpu_ms is the store cost into this storage mode"),
+        );
+    }
+    let (groups, size) = (64usize, 256usize);
+    let data = values(24, groups * size, 1 << 16);
+    let total = data.iter().fold(0u64, |s, &v| (s + v) & 0xFFFF_FFFF);
+    for (name, function) in [
+        ("compute.last_group_reduction", "last_group_sum"),
+        ("compute.last_group_reduction.plain", "last_group_sum_plain"),
+        (
+            "compute.last_group_reduction.fenced",
+            "last_group_sum_fenced",
+        ),
+    ] {
+        let mut case = Case::compute(
+            name,
+            library,
+            function,
+            [(groups * size) as u32, 1, 1],
+            [size as u32, 1, 1],
+        )
+        .buffer(Buffer::data("in", 0, words(&data)))
+        .buffer(Buffer::zeroed("partials", 1, groups * 4))
+        .buffer(Buffer::data("cells", 2, u32s(&[0, 0])))
+        .output(Output::exact("cells", Dtype::U32, words(&[groups as u64, total])).set("length", 8))
+        .set(
+            "threadgroup_memory",
+            json!([{"index": 0, "length": size * 4}]),
+        );
+        if function.ends_with("plain") {
+            case = case
+                .informational()
+                .note("plain stores and a device barrier: Metal does not promise the last group sees them");
+        }
+        if function.ends_with("fenced") {
+            case = case
+                .informational()
+                .note("plain stores and loads between device fences, without coherent(device)");
+        }
+        plan.add(case);
+    }
+    // A store and a load of the same words through two arguments bound to
+    // one buffer.
+    let n = 1024u32;
+    plan.add(
+        Case::sequence(
+            "compute.store_order.alias",
+            library,
+            vec![
+                Step::compute("store_alias_load", [n, 1, 1], [64, 1, 1]).bind(&[
+                    ("data", 0),
+                    ("data", 1),
+                    ("out", 2),
+                ]),
+            ],
+        )
+        .buffer(Buffer::zeroed("data", 0, n as usize * 4).unbound())
+        .buffer(Buffer::zeroed("out", 0, n as usize * 4).unbound())
+        .output(Output::exact(
+            "out",
+            Dtype::U32,
+            u32s(&(0..n).map(|i| i * 7 + 3).collect::<Vec<_>>()),
+        )),
+    );
+    // Stores replacing each other in a loop, then the thread's own reload.
+    let rounds = 37u32;
+    let reloaded: Vec<u32> = (0..n)
+        .map(|id| {
+            (0..4)
+                .map(|w| {
+                    let last = (0..rounds).filter(|r| r & 3 == w).max().unwrap();
+                    id * 1000 + last
+                })
+                .fold(0, |x, v| x ^ v)
+        })
+        .collect();
+    plan.add(
+        Case::compute1("compute.store_order.loop", library, "store_loop_reload", n)
+            .buffer(Buffer::zeroed("data", 0, n as usize * 16))
+            .buffer(Buffer::zeroed("out", 1, n as usize * 4))
+            .buffer(Buffer::data("rounds", 2, u32s(&[rounds])))
+            .output(Output::exact("out", Dtype::U32, u32s(&reloaded))),
+    );
+    // A neighbour's word read before and after a device-memory barrier in
+    // between which the neighbour replaced it.
+    let (groups, size) = (16u32, 128u32);
+    let initial: Vec<u32> = values(25, (groups * size) as usize, 1 << 32)
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let next = |i: u32| i / size * size + (i % size + 1) % size;
+    let seen: Vec<u32> = (0..groups * size)
+        .map(|i| initial[next(next(i)) as usize] ^ next(i).wrapping_mul(2_654_435_761))
+        .collect();
+    plan.add(
+        Case::compute(
+            "compute.store_order.group_neighbour",
+            library,
+            "group_neighbour",
+            [groups * size, 1, 1],
+            [size, 1, 1],
+        )
+        .buffer(Buffer::data("data", 0, u32s(&initial)))
+        .buffer(Buffer::zeroed("out", 1, (groups * size) as usize * 4))
+        .output(Output::exact("out", Dtype::U32, u32s(&seen))),
+    );
+}
+
+/// Plain loads that 16 threads share, through a pointer that is not const
+/// in a kernel that writes, from Shared and Private buffers (gpu_ms of the
+/// two cases).
+fn load_reuse(plan: &mut Plan, library: &str) {
+    let n = 1u32 << 20;
+    let input: Vec<u32> = (0..n + 15).map(linear_word).collect();
+    let sums: Vec<u32> = (0..n as usize)
+        .map(|i| {
+            input[i..i + 16]
+                .iter()
+                .fold(0u32, |s, &v| s.wrapping_add(v))
+        })
+        .collect();
+    for mode in ["shared", "private"] {
+        plan.add(
+            Case::sequence(
+                &format!("compute.load_reuse.{mode}"),
+                library,
+                vec![
+                    Step::compute("window_sum", [n, 1, 1], [256, 1, 1])
+                        .bind(&[("in", 0), ("out", 1)]),
+                ],
+            )
+            .buffer(
+                Buffer::data("in", 0, u32s(&input))
+                    .unbound()
+                    .set("storage", mode),
+            )
+            .buffer(Buffer::zeroed("out", 0, n as usize * 4).unbound())
+            .output(Output::exact("out", Dtype::U32, u32s(&sums)))
+            .note("gpu_ms is the cost of loads that may hit in L1 from this storage mode"),
+        );
+    }
+    // The same in turn between two buffers: each dispatch reads, through
+    // plain loads, words that the one before replaced and that a processor
+    // may have read two dispatches ago.
+    let n = 4096u32;
+    let mut a: Vec<u32> = (0..n + 15).map(linear_word).collect();
+    let mut b = vec![0u32; (n + 15) as usize];
+    let first = a.clone();
+    let mut steps = vec![];
+    for k in 0..6 {
+        let (src, dst) = if k % 2 == 0 { ("a", "b") } else { ("b", "a") };
+        let step = Step::compute("window_sum", [n, 1, 1], [64, 1, 1]).bind(&[(src, 0), (dst, 1)]);
+        steps.push(if k == 0 { step } else { step.continues() });
+        let (from, to) = if k % 2 == 0 {
+            (&a, &mut b)
+        } else {
+            (&b, &mut a)
+        };
+        let next: Vec<u32> = (0..n as usize)
+            .map(|i| from[i..i + 16].iter().fold(0u32, |s, &v| s.wrapping_add(v)))
+            .collect();
+        to[..n as usize].copy_from_slice(&next);
+    }
+    plan.add(
+        Case::sequence("compute.load_order.ping_pong", library, steps)
+            .buffer(Buffer::data("a", 0, u32s(&first)).unbound())
+            .buffer(Buffer::zeroed("b", 0, (n + 15) as usize * 4).unbound())
+            .output(Output::exact("a", Dtype::U32, u32s(&a)))
+            .output(Output::exact("b", Dtype::U32, u32s(&b))),
+    );
 }
 
 fn simd(plan: &mut Plan, library: &str) {
@@ -997,6 +1210,8 @@ pub fn build(plan: &mut Plan) {
     builtins(plan, &library);
     reduction(plan, &library);
     atomics(plan, &library);
+    store_order(plan, &library);
+    load_reuse(plan, &library);
     simd(plan, &library);
     memory(plan, &library);
     control(plan, &library);

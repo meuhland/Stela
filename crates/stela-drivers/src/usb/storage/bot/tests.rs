@@ -1137,6 +1137,7 @@ fn native_poison_preflight_preserves_all_buffers() {
             recovery: None,
             begun: None,
             failed_data: None,
+            failure_status: None,
         };
         assert!(
             bot.command(1, &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0], Data::Out(&[1, 2, 3]))
@@ -1323,8 +1324,10 @@ fn real_block_api_chunks_units_checks_bounds_and_never_copies_short_reads() {
             },
             media: Rc::new(core::cell::Cell::new(true)),
             removable,
-            running: None,
+            running: Vec::new(),
             next_tag: 0,
+            cache_refused: false,
+            first_blocks: None,
         });
     }
     let mut bytes = vec![0; MAX_TD * 2 + 512];
@@ -1457,15 +1460,15 @@ fn synchronous_read_keeps_full_recovered_data_across_autosense() {
         "the class reset ends the read, not the disk"
     );
     assert_eq!(state.borrow().sense_polls, Some(18));
+    // The wrapper error resets the class each time and the read runs again
+    // within sd's retries, as Linux requeues a DID_ERROR command.
+    let mut expected = vec![(1, scsi::READ_10), (1, scsi::REQUEST_SENSE)];
+    expected.extend([(1, scsi::READ_10); 6]);
     assert!(
         state.borrow().history[first..]
             .iter()
             .map(|(lun, _, cdb)| (*lun, cdb[0]))
-            .eq([
-                (1, scsi::READ_10),
-                (1, scsi::REQUEST_SENSE),
-                (1, scsi::READ_10)
-            ])
+            .eq(expected)
     );
 }
 
@@ -1546,7 +1549,6 @@ fn invalid_identification_capacity_and_mode_never_publish_a_block_device() {
         (0x25, short_capacity),
         (0x25, bad_block),
         (0x9e, overflow),
-        (0x1a, vec![0; 4]),
     ] {
         let mut memory = vec![0u64; 32 * 1024];
         let start = memory.as_mut_ptr() as u64;
@@ -1557,6 +1559,31 @@ fn invalid_identification_capacity_and_mode_never_publish_a_block_device() {
         io.0.borrow_mut().override_payload.push((opcode, payload));
         let mut bot = Bot::new(io, 3, endpoints(), &mut dma).unwrap();
         assert!(super::super::probe(&mut bot, 0, "slot", "serial").is_err());
+    }
+}
+#[test]
+fn a_short_mode_sense_reply_reads_its_header_as_zero_filled_like_linux() {
+    // No data, part of the header, a header whose data length is 0, and a
+    // short header with write protection: the bytes that did not arrive read
+    // as zeros, as in Linux's zeroed mode buffer.
+    for (payload, read_only) in [
+        (vec![], false),
+        (vec![3, 0], false),
+        (vec![0; 4], false),
+        (vec![0, 0, 0x80], true),
+    ] {
+        let mut memory = vec![0u64; 32 * 1024];
+        let start = memory.as_mut_ptr() as u64;
+        let mut dma = dma(&mut memory);
+        let io = model(
+            start,
+            start + memory.len() as u64 * 8,
+            vec![Some(unit(0).unwrap())],
+        );
+        io.0.borrow_mut().override_payload.push((0x1a, payload));
+        let mut bot = Bot::new(io, 3, endpoints(), &mut dma).unwrap();
+        let (identity, _) = super::super::probe(&mut bot, 0, "slot", "serial").unwrap();
+        assert_eq!(identity.read_only, read_only);
     }
 }
 #[test]
@@ -1817,8 +1844,10 @@ fn metadata_warmup_limits_and_last_sector_split_reach_block_commands() {
         identity,
         media: Rc::new(core::cell::Cell::new(true)),
         removable: false,
-        running: None,
+        running: Vec::new(),
         next_tag: 0,
+        cache_refused: false,
+        first_blocks: None,
     };
     let before = state.borrow().history.len();
     let mut data = vec![0; 128 * 1024];
@@ -2041,19 +2070,21 @@ fn an_owned_begun_command_is_retried_as_a_waiting_one_is() {
             .find_map(|_| disk.finish(tag))
             .expect("a begun command ended")
     };
-    // A class reset ends one command; the device's UNIT ATTENTION after it
-    // is retried once.
+    // A phase error's class reset settles before the read runs again, as
+    // Linux requeues a DID_ERROR command; the device's UNIT ATTENTION
+    // after the reset is retried once.
+    // (A flush would send nothing: the unit reports no write cache.)
     state.borrow_mut().fault = Fault::Phase;
-    let tag = disks[1].start(Command::Flush).unwrap();
-    assert!(finish(&mut disks[1], tag).is_err());
-    state.borrow_mut().fault = Fault::None;
-    state.borrow_mut().now += RESET_RECOVERY_US;
-    state.borrow_mut().units[1].as_mut().unwrap().attention = true;
-    assert!(disks[1].room());
     let tag = disks[1]
         .start(Command::Read { lba: 0, bytes: 512 })
         .unwrap();
+    assert!((0..64).all(|_| disks[1].finish(tag).is_none()));
+    assert!(!disks[1].room(), "the waiting read goes first");
+    state.borrow_mut().fault = Fault::None;
+    state.borrow_mut().now += RESET_RECOVERY_US;
+    state.borrow_mut().units[1].as_mut().unwrap().attention = true;
     assert_eq!(finish(&mut disks[1], tag).unwrap().unwrap(), vec![2; 512]);
+    assert!(disks[1].room());
     // A failed class reset resets the port and runs the write once more.
     state.borrow_mut().port_reset = true;
     state.borrow_mut().fault = Fault::Reset;

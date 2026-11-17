@@ -2009,6 +2009,57 @@ fn depth(plan: &mut Plan, library: &str) {
             );
         }
     }
+    // Shared depth targets, which Apple GPUs keep in unified memory: the
+    // CPU writes the stored depths, the pass tests and writes them, and the
+    // CPU reads the result.
+    for format in ["depth32float", "depth16unorm"] {
+        let (d, c) = (stored(&mut rng), colors(&mut rng));
+        let unorm = format == "depth16unorm";
+        // Depth16Unorm holds the 1/64 lattice and z exactly.
+        let bits = |v: f64| i128::from((v * 65535.0).round() as u16);
+        let mut color = vec![];
+        let mut depth = vec![];
+        for i in 0..n {
+            let pass = compare("less", z, d[i]);
+            color.extend(if pass {
+                [c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]
+            } else {
+                [0.0; 4]
+            });
+            depth.push(if pass { z } else { d[i] });
+        }
+        let (stored_bytes, expected, dtype) = if unorm {
+            let ints16 =
+                |v: &[f64]| ints(Dtype::U16, &v.iter().map(|&v| bits(v)).collect::<Vec<_>>());
+            (ints16(&d), ints16(&depth), Dtype::U16)
+        } else {
+            (f32s(&d), f32s(&depth), Dtype::F32)
+        };
+        let z_at = if unorm {
+            f32r(bits(z) as f64 / 65535.0)
+        } else {
+            z
+        };
+        plan.add(
+            full_at(
+                &format!("render.depth.shared.{format}"),
+                library,
+                "frag_color",
+                &c,
+                z_at,
+                json!({"colors": [{"texture": "c", "clear": [0, 0, 0, 0]}],
+                        "depth": {"texture": "d", "compare": "less", "write": true}}),
+            )
+            .texture(target("c", "rgba32float"))
+            .texture(
+                target("d", format)
+                    .set("storage", "shared")
+                    .data(stored_bytes),
+            )
+            .output(Output::new("c", Dtype::F32, Tolerance::exact()).expect_same(f32s(&color)))
+            .output(Output::new("d", dtype, Tolerance::exact()).expect_same(expected)),
+        );
+    }
     // Fragment depth: any value, or one the qualifier bounds by the
     // interpolated depth; written depth stays within the viewport's range.
     for (fragment, label) in [
@@ -3883,6 +3934,32 @@ fn tiles(plan: &mut Plan, library: &str) {
 /// Early fragment tests: an occluding instance, then one over the whole
 /// target behind it, whose fragment function counts its runs. The hidden
 /// fragments are rejected before they run, so the counts are exact.
+/// A pass shaped as a path coverage pass: varyings without perspective, an
+/// output to color attachment 1 alone and early fragment tests. With
+/// p = (0.3, 0.4), p1p2 = (0.6, 0.8) and denom 0.5 every pixel's coverage
+/// is 0.375.
+fn second_target_coverage(plan: &mut Plan, library: &str) {
+    let n = (W * H) as usize;
+    let coverage: Vec<f64> = (0..n).flat_map(|_| [0.0, 0.375]).collect();
+    plan.add(
+        Case::render(
+            "render.targets.second_only_no_perspective",
+            library,
+            "vert_distance",
+            Some("frag_distance"),
+            json!({"colors": [{"texture": "c0", "clear": [0, 0, 0, 0]},
+                              {"texture": "c1", "clear": [1, 1, 1, 1]}],
+                   "vertex_count": 3}),
+        )
+        .texture(target("c0", "rgba8unorm"))
+        .texture(target("c1", "rg32float"))
+        .buffer(
+            Buffer::data("c", 0, f32s(&[0.3, 0.4, 0.6, 0.8, 0.5, 0.0, 0.0, 0.0])).stage("vertex"),
+        )
+        .output(Output::new("c1", Dtype::F32, Tolerance::abs(1e-5)).expect_same(f32s(&coverage))),
+    );
+}
+
 fn early_fragment_tests(plan: &mut Plan, library: &str) {
     let colors = [[0.25, 0.5, 0.75, 1.0], [1.0, 0.0, 0.5, 0.25]];
     let image: Vec<f64> = pixels()
@@ -4220,9 +4297,45 @@ fn extended_range_blends(plan: &mut Plan, library: &str) {
 /// clamps at the codes' ends; a tile function reads the fragment outputs
 /// unclamped from the imageblock, as half floats.
 fn extended_range_two_plane(plan: &mut Plan, library: &str) {
+    let values = extended_range_two_plane_reads(plan, library, [W, H], "");
+    // A surface past `PlaneStaging::MIN_TEXELS` (64K texels): its encodes
+    // go through device memory and the copy engine.
+    extended_range_two_plane_reads(plan, library, [512, 256], ".large");
+
+    // The fragment outputs as a tile function reads them in the pass: half
+    // floats, past the codes' range too.
+    let unclamped: Vec<f64> = values.iter().flatten().map(|&v| f16r(v)).collect();
+    let tiles = json!([{"function": "tile_store_colors", "threads": [16, 16]}]);
+    plan.add(
+        full(
+            "render.rgb10a8_2p_xr10.tile_read",
+            library,
+            "frag_color",
+            &values.concat(),
+            json!({"colors": [{"texture": "c", "clear": [0, 0, 0, 0]}], "tiles": tiles,
+                   "tile_size": [16, 16]}),
+        )
+        .buffer(Buffer::zeroed("out", 0, (W * H * 16) as usize).stage("tile"))
+        .buffer(Buffer::data("out_width", 1, u32s(&[W])).stage("tile"))
+        .texture(target("c", "rgb10a8_2p_xr10"))
+        .output(Output::new("out", Dtype::F32, Tolerance::exact()).expect_same(f32s(&unclamped))),
+    );
+}
+
+/// The two-plane extended-range reads of a `size` surface: written values
+/// and a blend over a clear, read back by a kernel through the planes, as
+/// `render.rgb10a8_2p_xr10.read{suffix}` and `.blend.over.read{suffix}`.
+/// Answers the written values.
+fn extended_range_two_plane_reads(
+    plan: &mut Plan,
+    library: &str,
+    size: [u32; 2],
+    suffix: &str,
+) -> Vec<[f64; 4]> {
     const FORMAT: &str = "rgb10a8_2p_xr10";
+    let [w, h] = size;
     let mut rng = Random::new(913);
-    let n = (W * H) as usize;
+    let n = (w * h) as usize;
     let alpha8 = |a: f64| (a.clamp(0.0, 1.0) * 255.0).round() / 255.0;
     let held = |t: [f64; 4]| -> [f64; 4] {
         std::array::from_fn(|lane| {
@@ -4257,15 +4370,15 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
                 Step::render("vert_full", "frag_color", state)
                     .bind_stage("fragment", &[("colors", 0), ("width", 1)])
                     .bind_stage("vertex", &[("depth", 2)]),
-                Step::compute("read_texels", [W, H, 1], [8, 8, 1])
+                Step::compute("read_texels", [w, h, 1], [8, 8, 1])
                     .bind_textures(&[("c", 0)])
                     .bind(&[("texels", 0)]),
             ],
         )
-        .buffer(Buffer::data("width", 0, u32s(&[W])).unbound())
+        .buffer(Buffer::data("width", 0, u32s(&[w])).unbound())
         .buffer(Buffer::data("depth", 0, f32s(&[0.5])).unbound())
-        .buffer(Buffer::zeroed("texels", 0, (W * H * 16) as usize).unbound())
-        .texture(Texture::d2("c", FORMAT, W, H).usage(&["render", "read"]))
+        .buffer(Buffer::zeroed("texels", 0, (w * h * 16) as usize).unbound())
+        .texture(Texture::d2("c", FORMAT, w, h).usage(&["render", "read"]))
         .output(
             Output::new("texels", Dtype::F32, tolerance.clone()).expect(f32s(&expected), tolerance),
         )
@@ -4275,7 +4388,7 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
     let expected: Vec<f64> = values.iter().flat_map(|t| held(*t)).collect();
     plan.add(
         read(
-            &format!("render.{FORMAT}.read"),
+            &format!("render.{FORMAT}.read{suffix}"),
             json!({"vertex_count": 3, "colors": [{"texture": "c", "clear": [0, 0, 0, 0]}]}),
             expected,
             Tolerance::abs(1e-4),
@@ -4301,7 +4414,7 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
         .collect();
     plan.add(
         read(
-            &format!("render.{FORMAT}.blend.over.read"),
+            &format!("render.{FORMAT}.blend.over.read{suffix}"),
             json!({"vertex_count": 3,
                    "colors": [{"texture": "c", "clear": clear, "blend": blend.json()}]}),
             blended,
@@ -4309,24 +4422,7 @@ fn extended_range_two_plane(plan: &mut Plan, library: &str) {
         )
         .buffer(Buffer::data("colors", 0, f32s(&sources.concat())).unbound()),
     );
-    // The fragment outputs as a tile function reads them in the pass: half
-    // floats, past the codes' range too.
-    let unclamped: Vec<f64> = values.iter().flatten().map(|&v| f16r(v)).collect();
-    let tiles = json!([{"function": "tile_store_colors", "threads": [16, 16]}]);
-    plan.add(
-        full(
-            &format!("render.{FORMAT}.tile_read"),
-            library,
-            "frag_color",
-            &values.concat(),
-            json!({"colors": [{"texture": "c", "clear": [0, 0, 0, 0]}], "tiles": tiles,
-                   "tile_size": [16, 16]}),
-        )
-        .buffer(Buffer::zeroed("out", 0, (W * H * 16) as usize).stage("tile"))
-        .buffer(Buffer::data("out_width", 1, u32s(&[W])).stage("tile"))
-        .texture(target("c", FORMAT))
-        .output(Output::new("out", Dtype::F32, Tolerance::exact()).expect_same(f32s(&unclamped))),
-    );
+    values
 }
 
 pub fn build(plan: &mut Plan) {
@@ -4334,6 +4430,7 @@ pub fn build(plan: &mut Plan) {
     extended_range_blends(plan, &library);
     extended_range_two_plane(plan, &library);
     early_fragment_tests(plan, &library);
+    second_target_coverage(plan, &library);
     interpolation(plan, &library);
     derivatives(plan, &library);
     branch_derivatives(plan, &library);

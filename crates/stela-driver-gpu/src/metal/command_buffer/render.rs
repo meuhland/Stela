@@ -31,18 +31,21 @@ use crate::metal::{
     capabilities::MAX_BUFFER_BINDINGS,
     error::{Error, Result, ensure},
     hazard::{RENDER_PASS, Use},
-    pass::{AttachmentSlot, ExtendedPlanes, FollowedStencil, RenderPassPlan, RenderingAttachment},
+    pass::{
+        AttachmentSlot, ExtendedPlanes, FollowedStencil, PlaneStaging, RenderPassPlan,
+        RenderingAttachment,
+    },
     pipeline::{DepthStencilState, MAX_COLOR_ATTACHMENTS},
     resource::raw_rendered,
     shader::{Interface, MAX_PATCH_CONTROL_POINTS, Stage},
     vertex::{STRIDE_DYNAMIC, VertexDescriptor},
     vulkan::{
-        Access, AttachmentLoadOp, AttachmentStoreOp, CullMode, FrontFace, IndexType,
+        Access, AttachmentLoadOp, AttachmentStoreOp, CullMode, FrontFace, ImageAspects, IndexType,
         PipelineBindPoint, PipelineStages, PolygonMode, PrimitiveTopology, ResolveModes,
         SampleCounts,
         command::{
-            Attachment, Barrier, BufferCopy, Command, DepthStencil, Rect, Rendering, VertexBuffer,
-            Viewport as VkViewport,
+            Attachment, Barrier, BufferCopy, BufferImageCopy, Command, DepthStencil, Rect,
+            Rendering, Subresource, VertexBuffer, Viewport as VkViewport,
         },
         object::{Buffer, ImageView, Pipeline, QueryPool, QueryType},
     },
@@ -657,8 +660,24 @@ impl CommandBuffer {
                 _ => 0,
             };
             let mut ordered = false;
+            // The staged encodes' areas, which copies move into the planes
+            // once every encode of the pass wrote its staging memory.
+            let mut staged = Vec::new();
             for &area in areas {
-                let Some((arguments, count)) = plane_conversion(planes, area, stamp)? else {
+                let staging = planes
+                    .staging
+                    .filter(|_| !begins && stamp == 0 && planes.color != 0 && planes.layers == 1)
+                    .filter(|_| planes.refreshes.iter().all(Option::is_none))
+                    .filter(|_| {
+                        let [width, height] = area.map_or(planes.extent, |[_, _, w, h]| [w, h]);
+                        u64::from(width) * u64::from(height) * u64::from(planes.layers)
+                            >= u64::from(PlaneStaging::MIN_TEXELS)
+                    });
+                let converted = match staging {
+                    Some(staging) => staged_conversion(planes, area, &staging)?,
+                    None => plane_conversion(planes, area, stamp)?,
+                };
+                let Some((arguments, count)) = converted else {
                     continue;
                 };
                 let upload = self.recorder.upload(
@@ -673,8 +692,22 @@ impl CommandBuffer {
                     ));
                     ordered = true;
                 }
+                let counts = &mut self.planes.counts;
                 if begins {
                     decodes.push((self.recorder.commands().len(), index));
+                    counts.decoded += 1;
+                    counts.decoded_texels += u64::from(count);
+                } else if let Some(staging) = staging {
+                    staged.push((staging, arguments));
+                    counts.copied += 1;
+                    counts.copied_texels += u64::from(count);
+                } else if stamp != 0 {
+                    counts.stamped += 1;
+                    let tile = TexelArguments::DIRTY_TILE;
+                    counts.stamped_tiles += u64::from(count / (tile * tile));
+                } else {
+                    counts.direct += 1;
+                    counts.direct_texels += u64::from(count);
                 }
                 self.recorder.push(if begins {
                     Command::StoreTexels {
@@ -687,6 +720,22 @@ impl CommandBuffer {
                         count,
                     }
                 });
+            }
+            if !staged.is_empty() {
+                self.recorder.access(super::blit::TRANSFER);
+                for (staging, arguments) in &staged {
+                    for command in staged_copies(planes, staging, arguments) {
+                        self.recorder.push(command);
+                    }
+                }
+            }
+            // The encode wrote the planes' rows: a plane the GPU samples
+            // through an aligned copy has it refreshed for later reads.
+            if !begins && ordered && planes.refreshes.iter().any(Option::is_some) {
+                self.recorder.access(super::blit::TRANSFER);
+                for refresh in planes.refreshes.iter().flatten() {
+                    self.recorder.push(refresh.refresh());
+                }
             }
         }
         Ok(decodes)
@@ -735,10 +784,13 @@ impl CommandBuffer {
                 },
             };
             let slot = &mut self.recorder.commands()[at];
-            ensure(
-                matches!(slot, Command::StoreTexels { .. }),
-                "a pass's plane decode moved",
-            )?;
+            let (Command::StoreTexels { count: before, .. }, Command::StoreTexels { count, .. }) =
+                (&*slot, &command)
+            else {
+                return Err(Error::Invalid("a pass's plane decode moved"));
+            };
+            let counts = &mut self.planes.counts;
+            counts.decoded_texels = counts.decoded_texels - u64::from(*before) + u64::from(*count);
             *slot = command;
         }
         Ok(())
@@ -1210,9 +1262,9 @@ fn narrows(planes: &ExtendedPlanes) -> bool {
 
 /// The texel kernels' arguments converting `planes` over `area`
 /// (`[x, y, width, height]`, all of the extent for `None`), and the threads;
-/// `None` for none. With a pass's `stamp` the area is the whole extent and
-/// a workgroup converts each tile its fragments marked
-/// ([`TexelArguments::stamp`]).
+/// `None` for none. With a pass's `stamp` the area is the whole extent,
+/// rounded up to whole tiles, and a thread converts each texel of the tiles
+/// its fragments marked ([`TexelArguments::stamp`]).
 fn plane_conversion(
     planes: &ExtendedPlanes,
     area: Option<[u32; 4]>,
@@ -1221,7 +1273,7 @@ fn plane_conversion(
     let [x, y, width, height] = area.unwrap_or([0, 0, planes.extent[0], planes.extent[1]]);
     let tile = TexelArguments::DIRTY_TILE;
     let count = if stamp != 0 {
-        width.div_ceil(tile) * height.div_ceil(tile) * TexelArguments::WORKGROUP_SIZE
+        width.div_ceil(tile) * height.div_ceil(tile) * tile * tile
     } else {
         width
             .checked_mul(height)
@@ -1257,6 +1309,82 @@ fn plane_conversion(
         },
         count,
     )))
+}
+
+/// The texel kernel's arguments encoding `planes` over `area` into their
+/// `staging` memory, and its threads: every texel of the area, whose
+/// copies then replace the planes' ([`staged_copies`]), and the mirror
+/// with them where the planes have one.
+fn staged_conversion(
+    planes: &ExtendedPlanes,
+    area: Option<[u32; 4]>,
+    staging: &PlaneStaging,
+) -> Result<Option<(TexelArguments, u32)>> {
+    let Some((arguments, count)) = plane_conversion(planes, area, 0)? else {
+        return Ok(None);
+    };
+    let [x, y, _] = arguments.origin.map(u64::from);
+    let color_row = u64::from(staging.color_bytes_per_row);
+    let alpha_row = u64::from(staging.alpha_bytes_per_row);
+    Ok(Some((
+        TexelArguments {
+            buffer: staging.address + y * color_row + x * 4,
+            bytes_per_row: staging.color_bytes_per_row,
+            alpha: if planes.alpha == 0 {
+                0
+            } else {
+                staging.address + staging.alpha_offset + y * alpha_row + x
+            },
+            alpha_bytes_per_row: staging.alpha_bytes_per_row,
+            // Everything it encodes reaches the planes.
+            mirror: if planes.mirror == 0 {
+                0
+            } else {
+                TexelArguments::MIRROR_WRITE
+            },
+            ..arguments
+        },
+        count,
+    )))
+}
+
+/// The copies of what a staged conversion of `arguments` wrote into
+/// `staging` to the planes' rows: the codes words, and the alpha bytes
+/// where the planes have them.
+fn staged_copies(
+    planes: &ExtendedPlanes,
+    staging: &PlaneStaging,
+    arguments: &TexelArguments,
+) -> Vec<Command> {
+    let [x, y, _] = arguments.origin;
+    let (width, height) = (arguments.width, arguments.height);
+    let copy = |offset: u64, row_bytes: u32, texel: u32, image| Command::CopyBufferToImage {
+        src: staging.buffer,
+        dst: image,
+        region: BufferImageCopy {
+            buffer_offset: offset + u64::from(y) * u64::from(row_bytes) + u64::from(x * texel),
+            buffer_row_length: row_bytes / texel,
+            buffer_image_height: 0,
+            subresource: Subresource {
+                aspects: ImageAspects::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            offset: [x as i32, y as i32, 0],
+            extent: [width, height, 1],
+        },
+    };
+    let mut copies = alloc::vec![copy(0, staging.color_bytes_per_row, 4, staging.planes[0])];
+    if planes.alpha != 0 {
+        copies.push(copy(
+            staging.alpha_offset,
+            staging.alpha_bytes_per_row,
+            1,
+            staging.planes[1],
+        ));
+    }
+    copies
 }
 
 /// The copies through which the pass's stencil resolve follows its depth
@@ -1311,6 +1439,7 @@ fn rendering(pass: &RenderPassPlan<ImageView>, first: bool, last: bool) -> Rende
             .stencil
             .as_ref()
             .map(|stencil| attachment(stencil, true)),
+        note: pass.note,
     }
 }
 

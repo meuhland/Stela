@@ -23,14 +23,16 @@ impl Unpublished {
     }
 }
 
-/// Retired root-leaf owner, never reconstructed from a current ledger.
-/// The original Slot stays in Controller until physical reset and final health.
-struct RetiredRoot {
+/// Retired leaf owner, never reconstructed from a current ledger: on a root
+/// port, or behind hubs with the parent port it is reset through. The
+/// original Slot stays in Controller until physical reset and final health.
+struct RetiredLeaf {
     id: SlotId,
     attachment: Attachment,
+    downstream: Option<reset::DownstreamPort>,
 }
 
-/// Complete published storage returned only by RetiredRoot::reset.
+/// Complete published storage returned only by RetiredLeaf::reset.
 pub(super) struct Published {
     slot: u8,
     state: Slot,
@@ -52,42 +54,61 @@ struct Quiesced<'a> {
 }
 
 impl Controller {
-    /// Exclusive root-leaf reset is the only published storage return producer.
+    /// Exclusive leaf reset is the only published storage return producer.
     /// Its private witness keeps the original generation/current/attachment
-    /// through whole-slot retirement and postsettle physical reset.
+    /// through whole-slot retirement and postsettle physical reset: a root
+    /// port's, or `downstream`, the parent hub port of a device behind hubs.
     #[expect(
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
     )]
-    pub(super) fn retire_reset_root(&mut self, id: SlotId) -> Result<Published, Failure> {
+    pub(super) fn retire_reset_leaf(
+        &mut self,
+        id: SlotId,
+        downstream: Option<reset::DownstreamPort>,
+    ) -> Result<Published, Failure> {
         let slot = self
             .validate_id(id)
             .map_err(|e| ("validate reusable generation", e))?;
         let state = self.slots[usize::from(slot)].as_ref().unwrap();
         let attachment = state.attachment;
-        if attachment.parent.is_some()
-            || state.parent_id.is_some()
-            || attachment.tier != 0
-            || attachment.route != 0
-            || attachment.translator.is_some()
-            || !self.retry_resources.can_offer(slot, state)
-        {
+        let path = match (&downstream, attachment.parent) {
+            (None, None) => {
+                state.parent_id.is_none()
+                    && attachment.tier == 0
+                    && attachment.route == 0
+                    && attachment.translator.is_none()
+            }
+            (Some(downstream), Some((_, port))) => {
+                state.parent_id == Some(downstream.parent)
+                    && downstream.port == port
+                    && attachment.tier != 0
+                    && attachment.route != 0
+            }
+            _ => false,
+        };
+        if !path || !self.retry_resources.can_offer(slot, state) {
             return Err((
-                "preflight reusable root storage",
+                "preflight reusable leaf storage",
                 BlockError::Unsupported(
-                    "USB reusable reset requires one complete root-leaf resource pool",
+                    "USB reusable reset requires one complete leaf resource pool",
                 ),
             ));
         }
         self.disable_slot(slot, Ownership::Retired)?;
-        RetiredRoot { id, attachment }.reset(self)
+        RetiredLeaf {
+            id,
+            attachment,
+            downstream,
+        }
+        .reset(self)
     }
 
     /// Retire every endpoint and its ordered events, then acknowledge
     /// Disable before clearing DCBAA. Generic Disable keeps published owners
     /// permanently; only unpublished EP0-only owners enter the retry cache.
-    /// The separate RetiredRoot witness additionally requires physical reset
-    /// and final health before Published can return complete root-leaf storage.
+    /// The separate RetiredLeaf witness additionally requires physical reset
+    /// and final health before Published can return complete leaf storage.
     #[expect(
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
@@ -97,7 +118,7 @@ impl Controller {
     }
 }
 
-impl RetiredRoot {
+impl RetiredLeaf {
     #[expect(
         clippy::result_large_err,
         reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
@@ -105,13 +126,18 @@ impl RetiredRoot {
     fn reset(self, controller: &mut Controller) -> Result<Published, Failure> {
         let slot = self.id.hardware_slot();
         let index = usize::from(slot);
+        let root = self.attachment.root_port;
+        let port = self
+            .downstream
+            .as_ref()
+            .map(|downstream| (downstream.parent, downstream.port));
         // The typed witness binds the Disable to these original owners;
         // the current grant is still present before the physical reset.
         if !controller.known_id(self.id)
             || controller.slot_ownership[index] != Ownership::Retired
             || controller.dcbaa.read::<u64>(index * 8) != 0
             || controller
-                .current_port_owner(None, self.attachment.root_port)
+                .current_port_owner(port, root)
                 .map_err(|e| ("retain reusable physical owner", e))?
                 != Some(self.id)
         {
@@ -120,31 +146,40 @@ impl RetiredRoot {
                 BlockError::Unsupported("USB reusable reset lost the original retired attachment"),
             ));
         }
-        controller
-            .reset_root_device(self.attachment)
-            .map_err(|e| ("acknowledge reusable root reset", e))?;
-        // reset_root_device includes its settling delay. Recheck health
-        // and link after that delay, before erasing a single retired DMA byte.
+        match &self.downstream {
+            None => controller
+                .reset_root_device(self.attachment)
+                .map_err(|e| ("acknowledge reusable root reset", e))?,
+            // The hub port's own status is checked there: enabled, no
+            // change, the original speed.
+            Some(downstream) => controller.reset_downstream_port(downstream, self.attachment)?,
+        }
+        // Both resets include their settling delay. Recheck health and link
+        // after that delay, before erasing a single retired DMA byte.
         controller
             .ready()
             .map_err(|e| ("post-reset reusable controller health", e))?;
-        let at = controller.port_offset(self.attachment.root_port);
-        let status = controller.registers.read32(at);
-        if status & (CCS | PED | PP) != CCS | PED | PP
-            || status & (PR | PORT_CHANGES | (1 << 3)) != 0
-            || (status >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8 != self.attachment.speed
-            || status & PLS != 0
-            || controller
-                .power
-                .port_owner(None, self.attachment.root_port)
-                .is_some()
+        let link = match &self.downstream {
+            None => {
+                let status = controller.registers.read32(controller.port_offset(root));
+                status & (CCS | PED | PP) == CCS | PED | PP
+                    && status & (PR | PORT_CHANGES | (1 << 3)) == 0
+                    && (status >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8
+                        == self.attachment.speed
+                    && status & PLS == 0
+            }
+            Some(_) => true,
+        };
+        let raw = port.map(|(parent, port)| (parent.hardware_slot(), port));
+        if !link
+            || controller.power.port_owner(raw, root).is_some()
             || controller
                 .pending
                 .iter()
                 .any(|e| e.kind() == TRANSFER_EVENT && e.slot() == slot)
         {
             return Err((
-                "verify reusable root reset settlement",
+                "verify reusable reset settlement",
                 BlockError::Unsupported("USB reusable reset lacks a stable original physical link"),
             ));
         }
