@@ -22,6 +22,7 @@ use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
+use stela_boot_core::gpu_loss::{self, SilentLines};
 use stela_contracts::gate::{BundleReport, GateService, MemoryRange, window};
 pub(in crate::engine) use stela_drivers::gpu::metal::deferred::Taker;
 use stela_drivers::gpu::metal::{
@@ -36,7 +37,10 @@ use stela_drivers::gpu::metal::{
         Attachment,
         open::{Gpu, OpenError, open, reopen},
     },
-    service::{JobSlice, Served, ServiceHost, SharedService, identity::DeviceEpoch, wire::Status},
+    service::{
+        JobSlice, REOPEN_FAILED, Served, ServiceHost, SharedService, identity::DeviceEpoch,
+        wire::Status,
+    },
     timing::{ExitWatch, Totals},
     vulkan::physical::PciBusInfo,
 };
@@ -59,6 +63,9 @@ const STOP_UNLOAD_SECONDS: u64 = 10;
 
 /// The services for the kernel's interrupts, once all are open.
 static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
+/// The bound GPU, by its index (its DRM minor), of each service, in the
+/// services' order.
+static SERVED: AtomicPtr<Vec<usize>> = AtomicPtr::new(ptr::null_mut());
 
 unsafe extern "C" {
     fn stela_nvk_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
@@ -391,6 +398,63 @@ fn report(reason: &str) {
     static SEEN: Seen<512> = Seen::new();
     if let Some(unheld) = SEEN.first_time(reason) {
         output::arguments(format_args!("GPU REFUSED {reason}{unheld}\n"));
+    }
+    // A reopen that failed may leave macOS no GPU: the next pump decides,
+    // outside the client's call.
+    if reason.starts_with(REOPEN_FAILED) {
+        LOSS_DUE.store(true, Ordering::Release);
+    }
+}
+
+/// A lost device's reopen failed since the pump last looked ([`report`]).
+static LOSS_DUE: AtomicBool = AtomicBool::new(false);
+
+/// The kernel drivers' lines that a GPU stopped answering, each GPU's
+/// first, for the reason of a stop that follows.
+static SILENT: SilentLines<4, 320> = SilentLines::new();
+
+/// A line a kernel driver printed: one that says its GPU stopped answering
+/// is kept for [`watch_losses`].
+pub(in crate::engine) fn driver_line(line: &str) {
+    SILENT.observe(line);
+}
+
+/// End the boot once no GPU can serve macOS again: every GPU that serves
+/// Metal is lost and did not reopen ([`gpu_loss::verdict`]). Until then each
+/// new WindowServer is refused and dies, on a frozen screen. The stop is
+/// the one a boot without a GPU makes, with which GPU was lost and what
+/// its driver said of it. A reopen that gives a device changes nothing.
+pub(super) fn watch_losses() {
+    if !LOSS_DUE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let Some(gpu) = installed() else {
+        return;
+    };
+    let mut losses = Vec::new();
+    for (index, service) in shared().iter().enumerate() {
+        let Some(loss) = service.loss() else {
+            // A call holds the service: the next pump looks again.
+            LOSS_DUE.store(true, Ordering::Release);
+            return;
+        };
+        let name = served_gpu(index)
+            .and_then(|bound| gpu.start.bound.get(bound))
+            .map_or("(unnamed)", |bound| bound.name.as_str());
+        losses.push((name, loss, SILENT.of(name)));
+    }
+    let gpus: Vec<gpu_loss::Gpu<'_>> = losses
+        .iter()
+        .map(|(name, loss, silent)| gpu_loss::Gpu {
+            name,
+            lost: loss.lost,
+            failed_reopens: loss.failed_reopens,
+            error: loss.error.as_deref(),
+            silent: silent.as_deref(),
+        })
+        .collect();
+    if let Some(reason) = gpu_loss::verdict(&gpus) {
+        output::fatal(reason);
     }
 }
 
@@ -1177,14 +1241,25 @@ pub(in crate::engine) fn open_service() {
         return;
     };
     let mut constructed = false;
-    let services: Vec<_> = gpu
+    let (served, services): (Vec<_>, Vec<_>) = gpu
         .start
         .bound
         .iter()
         .enumerate()
-        .filter_map(|(index, bound)| open_gpu(gpu, index, bound, &mut constructed))
-        .collect();
+        .filter_map(|(index, bound)| {
+            open_gpu(gpu, index, bound, &mut constructed).map(|service| (index, service))
+        })
+        .unzip();
+    SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
+}
+
+/// The bound GPU, by its index, that service `service` runs on: a GPU that
+/// did not open has no service, so it is not always the claims' order.
+pub(super) fn served_gpu(service: usize) -> Option<usize> {
+    // SAFETY: published once, before any service exists, and leaked.
+    unsafe { SERVED.load(Ordering::Acquire).as_ref() }
+        .and_then(|served| served.get(service).copied())
 }
 
 /// Runs the image's C constructors once, on the stack of whoever opens first.

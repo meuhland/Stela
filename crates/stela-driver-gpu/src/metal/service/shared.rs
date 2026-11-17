@@ -1687,6 +1687,12 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         result.expect("the platform runs what it is given")
     }
 
+    /// How the device stands after a loss ([`Service::loss`]), unless a
+    /// call holds the service now.
+    pub fn loss(&self) -> Option<super::Loss> {
+        self.try_turn().map(|turn| turn.loss())
+    }
+
     /// What the service holds, unless a call holds it now: a report never
     /// waits for the service.
     pub fn memory(&self) -> Option<super::MemoryReport> {

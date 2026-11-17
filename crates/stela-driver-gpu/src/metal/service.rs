@@ -252,6 +252,11 @@ impl Connection {
     }
 }
 
+/// How the reason a lost device did not reopen starts, which a refused
+/// connection reports: the platform reads it as a session that may have no
+/// GPU left ([`Service::loss`]).
+pub const REOPEN_FAILED: &str = "the lost device did not reopen: ";
+
 /// What a service holds at one moment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MemoryReport {
@@ -345,6 +350,17 @@ impl Call<'_> {
     }
 }
 
+/// How a service's device stands after a loss ([`Service::loss`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Loss {
+    /// Whether the device is lost now.
+    pub lost: bool,
+    /// The reopens that failed in a row since the loss.
+    pub failed_reopens: u32,
+    /// The last such reopen's error.
+    pub error: Option<String>,
+}
+
 pub struct Service<B: Backend, C: Compiler> {
     device: Device<B, C>,
     epoch: DeviceEpoch,
@@ -357,6 +373,10 @@ pub struct Service<B: Backend, C: Compiler> {
     /// Why the last call was refused, and what it left undone, for the
     /// platform's log.
     refused: Vec<String>,
+    /// The reopens of the lost device that failed in a row, and the last
+    /// one's error, for the platform to end a session no GPU serves.
+    failed_reopens: u32,
+    reopen_error: Option<String>,
     /// What the last call made, for the platform's log: a render pipeline's
     /// stages and vertex fetch.
     noted: Option<String>,
@@ -401,6 +421,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             shares: sharing::Shares::default(),
             signaled: 0,
             refused: Vec::new(),
+            failed_reopens: 0,
+            reopen_error: None,
             noted: None,
             served: (0, Status::Ok),
             loss_described: false,
@@ -533,11 +555,24 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 self.signaled = 0;
                 self.loss_described = false;
                 self.pins_reported = false;
+                self.failed_reopens = 0;
+                self.reopen_error = None;
             }
             Err(error) => {
-                self.refused
-                    .push(format!("the lost device did not reopen: {error:?}"));
+                self.failed_reopens = self.failed_reopens.saturating_add(1);
+                self.reopen_error = Some(format!("{error:?}"));
+                self.refused.push(format!("{REOPEN_FAILED}{error:?}"));
             }
+        }
+    }
+
+    /// How the device stands after a loss: whether it is lost, and the
+    /// reopens that failed in a row since.
+    pub fn loss(&self) -> Loss {
+        Loss {
+            lost: self.device.is_lost(),
+            failed_reopens: self.failed_reopens,
+            error: self.reopen_error.clone(),
         }
     }
 

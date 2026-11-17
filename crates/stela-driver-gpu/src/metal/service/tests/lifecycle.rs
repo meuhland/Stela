@@ -8,7 +8,7 @@ use crate::metal::{
     },
     error::Error,
     service::{
-        ServiceHost, SharedService,
+        Loss, REOPEN_FAILED, ServiceHost, SharedService,
         wire::{Empty, EventValueRequest, Handle, Operation, Status, Value},
     },
 };
@@ -280,6 +280,52 @@ fn a_device_that_does_not_reopen_stays_lost() {
     assert!(service.device().is_lost());
     assert_eq!(service.connect().unwrap_err().status, Status::DeviceLost);
     assert!(service.refused.pop().unwrap().contains("did not reopen"));
+}
+
+/// The platform ends a session no GPU serves by what the service counts:
+/// each reopen that failed since the loss, with the last error, and none
+/// once a reopen gave a device.
+#[test]
+fn failed_reopens_count_in_a_row_until_one_gives_a_device() {
+    let tries = alloc::sync::Arc::new(AtomicUsize::new(0));
+    let reopen = {
+        let tries = tries.clone();
+        Box::new(move || match tries.fetch_add(1, Ordering::Relaxed) {
+            0 | 1 => Err(Error::DeviceLost),
+            _ => Ok(device_on(MockBackend::new())),
+        })
+    };
+    let mut service = service().with_reopen(reopen);
+    assert_eq!(service.loss(), Loss::default());
+    let connection = connect(&mut service);
+    service.device().mark_lost();
+    // Lost, with no reopen tried while a connection holds the device.
+    assert_eq!(
+        service.loss(),
+        Loss {
+            lost: true,
+            failed_reopens: 0,
+            error: None
+        }
+    );
+    service.disconnect(connection).unwrap();
+    assert!(service.connect().is_err());
+    assert_eq!(
+        service.loss(),
+        Loss {
+            lost: true,
+            failed_reopens: 2,
+            error: Some("DeviceLost".into())
+        }
+    );
+    assert!(
+        service
+            .refused
+            .iter()
+            .all(|reason| reason.starts_with(REOPEN_FAILED))
+    );
+    connect(&mut service);
+    assert_eq!(service.loss(), Loss::default());
 }
 
 /// A replaced lost device is dropped only once its backend's idle steps

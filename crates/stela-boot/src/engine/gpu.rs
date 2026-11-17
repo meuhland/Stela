@@ -481,6 +481,8 @@ impl Platform for Host {
         super::step_watchdog::progress();
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         self.report(format_args!("<{level}> {message}"));
+        #[cfg(feature = "nvk")]
+        gate::driver_line(message);
         // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.
         self.gsp_start.borrow_mut().observe(message);
         if (1..=3).contains(&level) {
@@ -2448,6 +2450,9 @@ pub(super) fn pump() {
         Look::Waiters => gate::watch_completions(),
         Look::No => {}
     }
+    // A lost GPU that did not reopen, with no other to serve macOS.
+    #[cfg(feature = "nvk")]
+    gate::watch_losses();
     lap(PumpPart::Look);
     // The pipelines the device added go to the store's file, queued a
     // piece at a time.
