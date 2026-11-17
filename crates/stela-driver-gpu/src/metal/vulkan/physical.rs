@@ -333,20 +333,35 @@ pub struct MemoryType {
 }
 
 impl Memory {
-    /// Bytes of device-local heap memory, the GPU's own memory.
+    /// Bytes of the GPU's own memory: its largest device-local heap. A
+    /// driver may give the window the CPU reaches through a small PCI BAR a
+    /// device-local heap of its own that is part of the larger one (NVK
+    /// does), and Vulkan does not say whether two heaps share memory, so a
+    /// sum would count the window twice. Where a driver's heaps are
+    /// disjoint this leaves the window out: never more than the GPU has.
     pub fn device_local_bytes(&self) -> u64 {
-        self.heaps
-            .iter()
-            .filter(|heap| heap.flags.contains(MemoryHeapFlags::DEVICE_LOCAL))
-            .fold(0u64, |total, heap| total.saturating_add(heap.size))
+        self.device_local_heaps()
+            .map(|heap| heap.size)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// The driver's current budget for device-local heaps, if it reports one.
+    /// The driver's current budget for its largest device-local heap, as
+    /// [`Self::device_local_bytes`] counts it, if it reports budgets.
     pub fn device_local_budget(&self) -> Option<u64> {
+        let heaps = || self.device_local_heaps();
+        if heaps().any(|heap| heap.budget.is_none()) {
+            return None;
+        }
+        heaps()
+            .max_by_key(|heap| heap.size)
+            .and_then(|heap| heap.budget)
+    }
+
+    fn device_local_heaps(&self) -> impl Iterator<Item = &MemoryHeap> {
         self.heaps
             .iter()
             .filter(|heap| heap.flags.contains(MemoryHeapFlags::DEVICE_LOCAL))
-            .try_fold(0u64, |total, heap| Some(total.saturating_add(heap.budget?)))
     }
 
     /// Index of the first memory type holding every `required` property,
@@ -411,5 +426,39 @@ impl FormatTable {
             .iter()
             .find(|(known, _)| *known == format)
             .map_or_else(FormatSupport::default, |(_, support)| *support)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Without a resizable BAR, NVK gives the 256 MiB the CPU reaches a
+    /// device-local heap of its own inside VRAM: the GPU's memory is the
+    /// VRAM heap, where the sum of both said 8448 MiB of an 8 GiB card.
+    #[test]
+    fn the_gpus_memory_is_its_largest_device_local_heap() {
+        let heap = |size: u64, flags, budget: u64| MemoryHeap {
+            size,
+            flags,
+            budget: Some(budget),
+        };
+        let small_bar = Memory {
+            heaps: vec![
+                heap(8 << 30, MemoryHeapFlags::DEVICE_LOCAL, 7 << 30),
+                heap(256 << 20, MemoryHeapFlags::DEVICE_LOCAL, 230 << 20),
+                heap(32 << 30, MemoryHeapFlags::EMPTY, 24 << 30),
+            ],
+            types: Vec::new(),
+        };
+        assert_eq!(small_bar.device_local_bytes(), 8 << 30);
+        assert_eq!(small_bar.device_local_budget(), Some(7 << 30));
+        let host_only = Memory {
+            heaps: vec![heap(32 << 30, MemoryHeapFlags::EMPTY, 24 << 30)],
+            types: Vec::new(),
+        };
+        assert_eq!(host_only.device_local_bytes(), 0);
+        assert_eq!(host_only.device_local_budget(), None);
     }
 }
