@@ -59,7 +59,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .and_then(|address| self.code_owner(address))
             .map(|slot| self.board_slot(slot));
         let failure = Arc::new(NativeFailure {
-            pc: block.map_or(self.cpu.pc, |block| block.start_at(self.ran_page)),
+            pc: block.map_or(self.cpu.pc, |block| {
+                block.ran_at(self.ran_page, self.aliasing())
+            }),
             code: block.map(|block| block.code),
             native_offset: fault.offset,
             address: fault.address,
@@ -159,7 +161,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Err(self.fail_native(index, fault, NativeFailureReason::UnknownCode));
         };
         let (entry_pc, physical, source_bytes) = (
-            block.start_at(self.ran_page),
+            block.ran_at(self.ran_page, self.aliasing()),
             block.physical,
             block.source_bytes(),
         );

@@ -428,7 +428,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             && let Some(block) = self.code.blocks.get(last)
         {
             let level = step_timing::Level::of(self.cpu.pstate.el, self.cpu.pstate.guarded);
-            let ran = block.start_at(self.ran_page);
+            let ran = block.ran_at(self.ran_page, self.aliasing());
             // Kernel and guarded PCs as offsets from this PE's vector base
             // at its EL, which moves with the kernel's slide.
             let pc = if level == step_timing::Level::User {
@@ -629,7 +629,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let kind = ExitKind::try_from(kind).ok()?;
         let dynamic = dynamic_branch(block.terminal)
             .or_else(|| transitions::transition_branch(block.terminal));
-        let ran = block.start_at(self.ran_page);
+        let ran = block.ran_at(self.ran_page, self.aliasing());
         let unlinked = if dynamic.is_some() && kind != ExitKind::Direct {
             block.dynamic_site.is_some() && record.dynamic_open()
         } else if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0
@@ -692,7 +692,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // block's first PC where it ran.
         let (target, ran) = {
             let block = &self.code.blocks[index];
-            let ran = block.start_at(page);
+            let ran = block.ran_at(page, self.aliasing());
             (installed_target(block, ran, next_pc), ran)
         };
         let unlinked = |code: &board::Code| {
@@ -760,8 +760,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
-        if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0 {
-            if block.shared && self.shared_limits.no_cells {
+        // Blocks run at other pages than their own: a shared block's exits
+        // move with the page it runs at.
+        let aliasing = self.aliasing();
+        let limits = self.shared_limits;
+        // Through a cell, whose probe compares the target and translates
+        // its page: right at every page a block runs at. A shared block's
+        // never gets a stamped tail, whose hit compares neither.
+        // `wait`: an exit out of the page whose target this PE does not
+        // translate yet waits for the fetch of the target instead.
+        let through_cell = |machine: &mut Self, cache: &mut board::Cache, wait: bool| {
+            if block.shared && aliasing && limits.no_cells {
                 return false;
             }
             // A cell needs the entry this PE's translation of the target
@@ -771,22 +780,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // compiled never takes again. The fetch of the target that
             // follows translates its page and links the exit
             // ([`Self::link_direct_exit`]).
-            if self.translated_entry(&cache, next_pc).is_none() {
-                self.direct_exit = Some((index, record.incarnation(), next_pc, word));
-                self.direct_exit_page = page;
+            if wait && machine.translated_entry(cache, next_pc).is_none() {
+                machine.direct_exit = Some((index, record.incarnation(), next_pc, word));
+                machine.direct_exit_page = page;
                 return false;
             }
             let point = chain::direct_patch(block.successors[position].site);
-            let stampable = !block.shared;
-            if self.link_through_cell(&mut cache, point, next_pc, retired, word, 0, false, stampable)
+            let stampable = !block.shared || !aliasing;
+            if machine.link_through_cell(cache, point, next_pc, retired, word, 0, false, stampable)
             {
                 record.settle(position);
                 return true;
             }
-            return false;
+            false
+        };
+        if (next_pc ^ ran) & !(FETCH_PAGE - 1) != 0 {
+            return through_cell(self, &mut cache, true);
         }
         let physical = block.physical.wrapping_add(next_pc.wrapping_sub(ran));
-        let found = if block.shared {
+        let found = if block.shared && aliasing {
             cache
                 .index
                 .get_shared(&code.blocks, next_pc, physical, block.variant)
@@ -796,22 +808,32 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .index
                 .get(&code.blocks, next_pc, physical, block.variant, aliases)
         };
-        let Some(target) = found else {
-            // A shared block waits for a shared target, which a fetch of a
-            // block of its own PC does not give.
-            if !block.shared {
-                self.direct_exit = Some((index, record.incarnation(), next_pc, word));
-                self.direct_exit_page = page;
+        // A link in the page enters its target's body directly, at the page
+        // the source runs at: a shared source's target must serve every
+        // page (a shared block), and a shared target its PC here
+        // (`--shared-verify` checked it); `--shared-no-links` makes none.
+        let direct = found.filter(|&target| {
+            let into = code.blocks[target].shared;
+            !aliasing
+                || ((into || !block.shared)
+                    && !(limits.no_links && (into || block.shared))
+                    && self.alias_checked(target, next_pc))
+        });
+        let Some(target) = direct else {
+            // Any other goes through a cell, once: retried at every exit,
+            // each a hold of the lock, a shared block's exits into a
+            // block of one PC (a PAC or System terminal's) slowed the
+            // guest to a stall (shared1).
+            // The cell is made whether or not this PE translates the
+            // target yet: it takes the next entry the table takes, and the
+            // exit is settled either way.
+            if aliasing && (block.shared || found.is_some()) {
+                return through_cell(self, &mut cache, false);
             }
+            self.direct_exit = Some((index, record.incarnation(), next_pc, word));
+            self.direct_exit_page = page;
             return false;
         };
-        // `--shared-no-links`; and with `--shared-verify`, only into a
-        // shared block a fetch here checked.
-        if (block.shared || code.blocks[target].shared)
-            && (self.shared_limits.no_links || !self.alias_checked(target, next_pc))
-        {
-            return false;
-        }
         let exit = block.successors[position];
         let site = exit.site;
         let entry = code.blocks[target].code.0 as u64;
