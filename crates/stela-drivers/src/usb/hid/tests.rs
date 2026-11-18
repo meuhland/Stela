@@ -11,6 +11,36 @@ pub(super) const NUMBERED_KEYBOARD: [u8; 43] = [
     0xc0,
 ];
 
+/// Linux `hid_get_class_descriptor` asks for the report descriptor up to
+/// four times: a device that stalls the first three still starts, one that
+/// refuses all four does not.
+#[test]
+fn the_report_descriptor_is_asked_for_four_times() {
+    let interface = interface(&NUMBERED_KEYBOARD, 0, 0);
+    for refusals in [3, 4] {
+        let mut asked = 0;
+        let negotiated = stela_driver_base::stepped::block_on(UsbInput::negotiate(
+            &interface,
+            async |request: [u8; 8]| {
+                if request[1] != GET_DESCRIPTOR {
+                    return Ok(Vec::new());
+                }
+                asked += 1;
+                if asked <= refusals {
+                    Err(BlockError::Device { status: STALL })
+                } else {
+                    Ok(NUMBERED_KEYBOARD.to_vec())
+                }
+            },
+        ));
+        match refusals {
+            3 => assert!(negotiated.unwrap().descriptor.is_some()),
+            _ => assert_eq!(negotiated.err(), Some(BlockError::Device { status: STALL })),
+        }
+        assert_eq!(asked, 4);
+    }
+}
+
 #[test]
 fn transfer_errors_retry_with_linux_backoff_for_one_second() {
     let first = Retry::first(1_000);
