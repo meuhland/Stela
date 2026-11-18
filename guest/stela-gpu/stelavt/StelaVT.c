@@ -49,6 +49,27 @@
 
 /* ---- The private interface ---------------------------------------------- */
 
+/*
+ * On arm64e CoreMedia authenticates every pointer of these tables
+ * (CMDerivedObjectCreate: `autda` of the vtable's base class with the
+ * field's address and 0xb911; the class functions with their own
+ * discriminators), so each field is signed as Apple's encoder plugins sign
+ * it: the class pointers with the DA key and the functions with the IA key,
+ * both address-diversified, with the discriminators of AppleH264SW's
+ * kH264VideoEncoderVTable fixups (macOS 27.2). A process that enforces
+ * pointer authentication (WallpaperAerialsExtension did, for StelaVD) is
+ * killed with EXC_ARM_PAC_FAIL by unsigned tables; one that does not
+ * (avconvert) ran the old StelaVT. The arm64 slice signs nothing.
+ */
+#if __has_feature(ptrauth_qualifier)
+#include <ptrauth.h>
+#define SIGNED_CLASS(d) __ptrauth(ptrauth_key_asda, 1, d)
+#define SIGNED_CODE(d) __ptrauth(ptrauth_key_asia, 1, d)
+#else
+#define SIGNED_CLASS(d)
+#define SIGNED_CODE(d)
+#endif
+
 typedef CFTypeRef CMBaseObjectRef;
 typedef CMBaseObjectRef VTVideoEncoderRef;
 typedef struct OpaqueVTEncoderSession *VTEncoderSessionRef;
@@ -58,30 +79,33 @@ typedef const void *CMBaseClassID;
 typedef struct {
 	uintptr_t version;
 	size_t derivedStorageSize;
-	Boolean (*equal)(CMBaseObjectRef, CMBaseObjectRef);
-	OSStatus (*invalidate)(CMBaseObjectRef);
-	void (*finalize)(CMBaseObjectRef);
-	CFStringRef (*copyDebugDescription)(CMBaseObjectRef);
-	OSStatus (*copyProperty)(CMBaseObjectRef, CFStringRef, CFAllocatorRef, void *);
-	OSStatus (*setProperty)(CMBaseObjectRef, CFStringRef, CFTypeRef);
-	OSStatus (*notificationBarrier)(CMBaseObjectRef);
+	const void *equal; /* discriminator unknown: NULL */
+	OSStatus (*SIGNED_CODE(0x3af8) invalidate)(CMBaseObjectRef);
+	void (*SIGNED_CODE(0x5680) finalize)(CMBaseObjectRef);
+	CFStringRef (*SIGNED_CODE(0xf18e) copyDebugDescription)(CMBaseObjectRef);
+	OSStatus (*SIGNED_CODE(0x9725) copyProperty)(CMBaseObjectRef, CFStringRef, CFAllocatorRef, void *);
+	OSStatus (*SIGNED_CODE(0x2724) setProperty)(CMBaseObjectRef, CFStringRef, CFTypeRef);
+	/* Read from version 2 (0xd563); this class is version 1. */
+	const void *notificationBarrier;
 	const void *reserved[3];
 } CMBaseClass;
 
 typedef struct {
 	uintptr_t version;
-	OSStatus (*startSession)(VTVideoEncoderRef, VTEncoderSessionRef, CMVideoDimensions);
-	OSStatus (*encodeFrame)(VTVideoEncoderRef, VTEncoderFrameToken, CVImageBufferRef, CMTime, CMTime,
-	    CFDictionaryRef, VTEncodeInfoFlags *);
-	OSStatus (*completeFrames)(VTVideoEncoderRef, CMTime);
-	OSStatus (*copySupportedPropertyDictionary)(VTVideoEncoderRef, CFDictionaryRef *);
+	OSStatus (*SIGNED_CODE(0x6411) startSession)(VTVideoEncoderRef, VTEncoderSessionRef, CMVideoDimensions);
+	OSStatus (*SIGNED_CODE(0x89f7) encodeFrame)(VTVideoEncoderRef, VTEncoderFrameToken, CVImageBufferRef, CMTime,
+	    CMTime, CFDictionaryRef, VTEncodeInfoFlags *);
+	OSStatus (*SIGNED_CODE(0x434e) completeFrames)(VTVideoEncoderRef, CMTime);
+	OSStatus (*SIGNED_CODE(0x78fe) copySupportedPropertyDictionary)(VTVideoEncoderRef, CFDictionaryRef *);
+	/* Version 2 adds the multi-pass and preprocessing functions (0x98e1...),
+	 * which this version 1 class does not offer. */
 	const void *reserved[16];
 } VTVideoEncoderClass;
 
 typedef struct {
 	const void *reserved;
-	const CMBaseClass *baseClass;
-	const VTVideoEncoderClass *derivedClass;
+	const CMBaseClass *SIGNED_CLASS(0xb911) baseClass;
+	const VTVideoEncoderClass *SIGNED_CLASS(0x076b) derivedClass;
 } VTVideoEncoderVTable;
 
 static struct {
