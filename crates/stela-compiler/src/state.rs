@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn layout_matches_native_abi() {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
-            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v14-"));
+            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v15-"));
         }
         assert_eq!(size_of::<GuestState>(), 920);
         assert_eq!(align_of::<GuestState>(), 8);

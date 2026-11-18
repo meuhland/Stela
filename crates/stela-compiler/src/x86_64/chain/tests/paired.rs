@@ -696,3 +696,214 @@ fn paired_and_looked_up_return_costs() {
         );
     }
 }
+
+// Page-relative code (`NativeSystem::page_relative`): a block's guest
+// addresses add `GuestState::page_base`, which every transfer into another
+// page's block sets ([`enter_page`]). A matched return reaches its
+// continuation by a host `ret`, from a callee that may have run at any
+// page, so the continuation sets its caller's page again from the return's
+// target (`Asm::restore_page_base`) before its exit adds it.
+
+/// A page-relative caller's guest page, and another page its callee runs at.
+const CALLER_PAGE: u64 = 0x0000_7f12_3456_7000;
+const CALLEE_PAGE: u64 = 0x0000_7f12_9abc_d000;
+/// The calling block's instructions, which its continuation leaves unrun.
+const CALLER_RAN: usize = 3;
+
+/// A page-relative caller whose block starts at `block` and calls with
+/// return address `back`: the block's own paired exit
+/// (`block::paired_exit`), its call's exit linked into a callee that is
+/// entered as another page's block is, at [`CALLEE_PAGE`], and returns to
+/// the target in RSI. The guest-address fields hold their offsets from the
+/// block's page, as a page-relative compile leaves them. Without `restore`
+/// the continuation is v0.5.0's own, which leaves the page as the callee
+/// left it.
+fn page_relative_call(block: u64, back: u64, restore: bool) -> Vec<u8> {
+    let page = block & !(LINK_PAGE - 1);
+    let mut code = Code::pinned();
+    code.set_page_relative(true);
+    code.set_linked_block(block);
+    let mut to_callee: Option<Patch> = None;
+    if restore {
+        crate::x86_64::block::paired_exit(&mut code, GuestAddress(back), CALLER_RAN, |asm| {
+            to_callee = Some(asm.jmp());
+        });
+    } else {
+        let mut asm = code.asm();
+        let continuation = paired_call(&mut asm, GuestAddress(back));
+        to_callee = Some(asm.jmp());
+        asm.bind(continuation);
+        crate::x86_64::block::direct_exit_with(
+            &mut asm,
+            GuestAddress(back),
+            crate::x86_64::block::continuation_word(CALLER_RAN),
+        );
+    }
+    let mut asm = code.asm();
+    asm.bind(to_callee.expect("the call's exit"));
+    asm.mov_imm64(Rax, CALLEE_PAGE + 0x80);
+    enter_page(&mut asm);
+    returning(&mut asm);
+    let (mut bytes, fields) = code.into_parts();
+    for at in fields {
+        let at = at as usize;
+        let field = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        bytes[at..at + 8].copy_from_slice(&field.wrapping_sub(page).to_le_bytes());
+    }
+    bytes
+}
+
+/// What a page-relative run left: RAX and RDX of its exit, and the page
+/// base.
+#[derive(Debug, PartialEq, Eq)]
+struct PageRun {
+    exit: (u64, u64),
+    page_base: u64,
+}
+
+impl Run {
+    /// [`Self::enter`] with the page base the engine sets for the entered
+    /// block's page.
+    fn enter_at(&mut self, code: &Pages, page_base: u64, target: u64) -> PageRun {
+        let mut state = Box::new(GuestState::default());
+        state.anchors[Anchor::Control] = &raw mut *self.control as u64;
+        state.page_base = crate::PageBase(page_base);
+        let before = stack_pointer();
+        // SAFETY: as `Self::enter`.
+        let result = unsafe { crate::x86_64::native::enter(code.0, &mut *state, target, 0) };
+        assert_eq!(stack_pointer(), before);
+        PageRun {
+            exit: (result as u64, (result >> 64) as u64),
+            page_base: state.page_base.0,
+        }
+    }
+}
+
+/// The continuation's exit: to the call's return address, its block's
+/// instructions all unrun.
+fn continued_to(back: u64) -> (u64, u64) {
+    let word = crate::x86_64::block::continuation_word(CALLER_RAN).encoded();
+    (back, u64::from(word))
+}
+
+#[test]
+fn a_page_relative_continuation_runs_at_its_callers_page() {
+    let block = CALLER_PAGE + 0x400;
+    let back = block + 4 * CALLER_RAN as u64;
+    let code = pages(&page_relative_call(block, back, true));
+    let mut run = Run::new(DEFAULT_FRAME_BOUND);
+    assert_eq!(
+        run.enter_at(&code, CALLER_PAGE, back),
+        PageRun {
+            exit: continued_to(back),
+            page_base: CALLER_PAGE,
+        }
+    );
+    assert_eq!(run.pairs(), [1, 0, 0]);
+    // v0.5.0's continuation alone exits to the return address's offset at
+    // the callee's page, and leaves that page for whatever it links to.
+    let plain = pages(&page_relative_call(block, back, false));
+    let mut run = Run::new(DEFAULT_FRAME_BOUND);
+    let wrong = back - CALLER_PAGE + CALLEE_PAGE;
+    assert_eq!(
+        run.enter_at(&plain, CALLER_PAGE, back),
+        PageRun {
+            exit: continued_to(wrong),
+            page_base: CALLEE_PAGE,
+        }
+    );
+    assert_eq!(run.pairs(), [1, 0, 0]);
+}
+
+#[test]
+fn a_call_at_its_pages_last_word_continues_at_its_blocks_page() {
+    // The return address is the next page's first word: the block's page
+    // is the base, not the return address's.
+    let block = CALLER_PAGE + 0x1000 - 4 * CALLER_RAN as u64;
+    let back = CALLER_PAGE + 0x1000;
+    let code = pages(&page_relative_call(block, back, true));
+    let mut run = Run::new(DEFAULT_FRAME_BOUND);
+    assert_eq!(
+        run.enter_at(&code, CALLER_PAGE, back),
+        PageRun {
+            exit: continued_to(back),
+            page_base: CALLER_PAGE,
+        }
+    );
+    assert_eq!(run.pairs(), [1, 0, 0]);
+}
+
+#[test]
+fn one_shared_body_continues_at_each_page_it_runs_at() {
+    // One body (`--shared-aliases`) for every page that maps the frame: at
+    // its own page and at an ASLR-like slide of it.
+    let block = CALLER_PAGE + 0x400;
+    let offset = block - CALLER_PAGE + 4 * CALLER_RAN as u64;
+    let code = pages(&page_relative_call(block, CALLER_PAGE + offset, true));
+    for page in [CALLER_PAGE, CALLER_PAGE + 0x235_4000, 0x1_0000_0000] {
+        let mut run = Run::new(DEFAULT_FRAME_BOUND);
+        assert_eq!(
+            run.enter_at(&code, page, page + offset),
+            PageRun {
+                exit: continued_to(page + offset),
+                page_base: page,
+            },
+            "{page:#x}"
+        );
+        assert_eq!(run.pairs(), [1, 0, 0], "{page:#x}");
+    }
+    // A frame holds its call's whole return address: a return to the same
+    // offset at another page takes the lookup, the frame left.
+    let mut run = Run::new(DEFAULT_FRAME_BOUND);
+    let elsewhere = CALLER_PAGE + 0x235_4000 + offset;
+    assert_eq!(
+        run.enter_at(&code, CALLER_PAGE, elsewhere),
+        PageRun {
+            exit: (elsewhere, RETURNED),
+            page_base: CALLEE_PAGE,
+        }
+    );
+    assert_eq!(run.pairs(), [0, 1, 0]);
+}
+
+#[test]
+fn only_page_relative_continuations_restore_the_page() {
+    // Code that is not page-relative keeps v0.5.0's continuation, byte for
+    // byte; a page-relative one starts with the restore.
+    let emit = |relative: bool, restore: bool| {
+        let mut code = Code::pinned();
+        code.set_page_relative(relative);
+        code.set_linked_block(CALLER_PAGE + 0x400);
+        let back = GuestAddress(CALLER_PAGE + 0x40c);
+        if restore {
+            crate::x86_64::block::paired_exit(&mut code, back, CALLER_RAN, |asm| {
+                exit_return(asm);
+            });
+        } else {
+            let mut asm = code.asm();
+            let continuation = paired_call(&mut asm, back);
+            exit_return(&mut asm);
+            asm.bind(continuation);
+            crate::x86_64::block::direct_exit_with(
+                &mut asm,
+                back,
+                crate::x86_64::block::continuation_word(CALLER_RAN),
+            );
+        }
+        code.into_bytes()
+    };
+    assert_eq!(emit(false, true), emit(false, false));
+    let (with, without) = (emit(true, true), emit(true, false));
+    assert_eq!(
+        with.len(),
+        without.len() + crate::x86_64::chain::PAGE_RESTORE_BYTES
+    );
+    let at = (0..=with.len() - PAGE_RESTORE_BYTES)
+        .filter(|&at| is_page_restore(&with[at..at + PAGE_RESTORE_BYTES]))
+        .collect::<Vec<_>>();
+    assert_eq!(at.len(), 1, "one restore");
+    assert!(
+        !(0..=without.len() - PAGE_RESTORE_BYTES)
+            .any(|at| is_page_restore(&without[at..at + PAGE_RESTORE_BYTES]))
+    );
+}
