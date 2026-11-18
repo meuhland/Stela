@@ -159,6 +159,20 @@ fn display_fastest_is_off_by_default_and_round_trips() {
     assert!(round_trip(&format!("{usual} {DISPLAY_FASTEST}")).display_fastest);
 }
 
+/// Input is one part of a service turn's rotation by default;
+/// `--input-every-turn` reads it at every turn, and reads back the same.
+#[test]
+fn input_every_turn_is_off_by_default_and_round_trips() {
+    assert!(!System::default().input_every_turn);
+    let usual = "--system --storage @disk --nor @disk --preboot @disk --ecid 0x7217bd1d187e4e44 \
+                 --external-disks --guest-network-stelanet --guest-pes 8 --input";
+    assert!(!round_trip(usual).input_every_turn);
+    let options = round_trip(&format!("{usual} {INPUT_EVERY_TURN}"));
+    assert!(options.input_every_turn && options.input);
+    assert!(options.to_string().contains(INPUT_EVERY_TURN));
+    assert!(!round_trip(usual).to_string().contains(INPUT_EVERY_TURN));
+}
+
 #[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));

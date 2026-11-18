@@ -42,6 +42,9 @@ pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 /// Take a GPU's display in its monitor's fastest mode of the size
 /// ([`System::display_fastest`]).
 pub const DISPLAY_FASTEST: &str = "--display-fastest";
+/// Read the host's keyboards and pointers at every host service turn
+/// ([`System::input_every_turn`]).
+pub const INPUT_EVERY_TURN: &str = "--input-every-turn";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -312,6 +315,12 @@ pub struct System {
     /// Cable the native USB keyboard and pointer to the last USB-C
     /// controller and feed it the host's virtio-input devices (`--input`).
     pub input: bool,
+    /// Read the host's keyboards and pointers at the start of every host
+    /// service turn (`--input-every-turn`), where by default they are one
+    /// part of a turn's rotation: a turn an interrupt ended early resumes
+    /// at the part after the last one it ran, and the next turns read no
+    /// input until the rotation comes back to it.
+    pub input_every_turn: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -454,6 +463,7 @@ impl Default for System {
             survey: false,
             idle_skip: false,
             input: false,
+            input_every_turn: false,
             native_cores: None,
             guest_pes: None,
             native_bootstrap_check: false,
@@ -922,6 +932,7 @@ impl fmt::Display for System {
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
+        line.flag(INPUT_EVERY_TURN, self.input_every_turn)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;

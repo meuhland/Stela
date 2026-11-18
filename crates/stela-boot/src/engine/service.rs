@@ -64,6 +64,18 @@ pub(super) fn shutdown_pending() -> bool {
     SHUTDOWN.pending()
 }
 
+/// Whether every turn reads the host's inputs ahead of its rotation
+/// (`--input-every-turn`).
+static INPUT_EVERY_TURN: AtomicBool = AtomicBool::new(false);
+
+/// Read the host's keyboards and pointers at every turn, before the parts
+/// it resumes: a turn that an interrupt or guest work ends after one part
+/// otherwise leaves the inputs to a later turn that starts the rotation
+/// again, up to [`TURN_PARTS`] turns on.
+pub(super) fn set_input_every_turn(every: bool) {
+    INPUT_EVERY_TURN.store(every, Ordering::Relaxed);
+}
+
 /// How long the host may go unserved before the boot PE serves it: a PE's
 /// wait returns to its run loop at least this often
 /// (`WAIT_POLLS_PER_SECOND`), so with any PE idle it is served first. A
@@ -95,7 +107,9 @@ const ANCHOR_SECONDS: u64 = 600;
 const DEFERRED_MILLIS: u64 = 20;
 
 /// The parts a turn runs, in order: the inputs first, as a pointer's motion
-/// is what the guest's user waits on.
+/// is what the guest's user waits on. A turn runs them only when it starts
+/// the rotation, not when it resumes it after a turn that ended early,
+/// unless they run at every turn ([`set_input_every_turn`]).
 const INPUTS: usize = 0;
 const LOGS: usize = 1;
 const NETWORK: usize = 2;
@@ -292,7 +306,13 @@ impl Service {
             boot,
             ..InputTurn::default()
         };
-        let inputs_due = due(INPUTS, false, &mut turn);
+        // The inputs run ahead of a turn that resumes the rotation further
+        // on, with `--input-every-turn`: a key read waits for no other part.
+        let inputs_due = if from != INPUTS && INPUT_EVERY_TURN.load(Ordering::Relaxed) {
+            turn.ahead(host::rdtsc())
+        } else {
+            due(INPUTS, false, &mut turn)
+        };
         if let Some(usb) = usb.as_mut().filter(|_| inputs_due) {
             let arrived = usb.poll();
             if let Some(input) = input.as_mut() {

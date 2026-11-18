@@ -3201,6 +3201,7 @@ fn start_devices(
                 );
                 gpu::panel_brightness(host_acpi);
             }
+            super::service::set_input_every_turn(options.input_every_turn);
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
                 translations::set_partition(store);
