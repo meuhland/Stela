@@ -156,6 +156,7 @@ impl ParseState<'_> {
             "--development-restore" => options.development_restore = true,
             "--idle-skip" => options.idle_skip = true,
             "--input" => options.input = true,
+            INPUT_EVERY_TURN => options.input_every_turn = true,
             "--usb-storage" => {
                 let serial = value().ok_or(Error::MissingUsbStorage)?;
                 if options.usb_storage.iter().any(|other| other == serial) {
