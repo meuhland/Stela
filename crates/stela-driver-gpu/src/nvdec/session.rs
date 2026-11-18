@@ -18,14 +18,10 @@
 //! channel on this file ([`Session::node`]) and, when its own job never
 //! completes, makes the session keep everything ([`Session::hold`]).
 use super::fields::status as st;
-use super::layout::{CHROMA_OFFSET, KERNEL_VA_START, Layout, PUSH_BYTES, VA_TOP};
+use super::layout::{KERNEL_VA_START, Layout, PUSH_BYTES, VA_TOP};
 use super::push::{self, MOST_WORDS};
-use super::setup::{
-    self, H264_SLICE_OFFSETS, H264_STATUS, HEVC_STATUS, HEVC_TILE_SIZES, PAGE_BYTES,
-};
-use super::{
-    Codec, DECODER_CLASS, FIFO_ENGINE_NVDEC, OBJECT_HANDLE, Parsed, Picture, decoder_class,
-};
+use super::setup::{H264_STATUS, HEVC_STATUS, PAGE_BYTES};
+use super::{Codec, DECODER_CLASS, FIFO_ENGINE_NVDEC, OBJECT_HANDLE, Picture, decoder_class};
 use crate::nvenc::layout::{Domain, Geometry};
 use crate::nvenc::session::Closed;
 use crate::nvenc::{
@@ -180,6 +176,22 @@ impl<N: Node> Session<N> {
             Ok(layout) => layout,
             Err(why) => return Err((Error::Config(why), node)),
         };
+        Self::open_layout(node, chipset, geometry, layout, timeout_ns)
+    }
+
+    /// Opens a session on `node` with the buffers of `layout` (its codec,
+    /// surfaces and address map) for pictures of `geometry`.
+    pub fn open_layout(
+        node: N,
+        chipset: u16,
+        geometry: Geometry,
+        layout: Layout,
+        timeout_ns: u64,
+    ) -> Result<Self, (Error, N)> {
+        if decoder_class(chipset).is_none() {
+            return Err((Error::NoDecoder, node));
+        }
+        let codec = layout.codec;
         let mut session = Self {
             node,
             codec,
@@ -464,14 +476,18 @@ impl<N: Node> Session<N> {
         if picture.codec != self.codec {
             return Err(Error::Config("the picture is another codec's"));
         }
-        if usize::from(picture.slot) >= self.layout.surfaces.len() {
+        if usize::from(picture.surface) >= self.layout.surfaces.len()
+            || picture.bindings[..=usize::from(picture.high_water).min(15)]
+                .iter()
+                .any(|s| usize::from(*s) >= self.layout.surfaces.len())
+        {
             return Err(Error::Config(
-                "the picture's slot is past the session's surfaces",
+                "the picture's surfaces are past the session's",
             ));
         }
         let started = self.node.now_ns();
         let setup = picture
-            .setup(&self.geometry)
+            .page(&self.geometry)
             .map_err(|why| Error::Config(why.0))?;
         let data = picture.bitstream();
         let capacity = self.layout.bitstream_bytes() as usize;
@@ -493,20 +509,7 @@ impl<N: Node> Session<N> {
         let page = unsafe {
             core::slice::from_raw_parts_mut(self.cpu(self.layout.setup[ring]).as_ptr(), PAGE_BYTES)
         };
-        page.fill(0);
-        page[..setup.len()].copy_from_slice(&setup);
-        match &picture.parsed {
-            Parsed::H264(_) => {
-                for (k, offset) in picture.slice_offsets().iter().enumerate() {
-                    let at = H264_SLICE_OFFSETS + 4 * k;
-                    page[at..at + 4].copy_from_slice(&offset.to_le_bytes());
-                }
-            }
-            Parsed::Hevc(hevc) => {
-                page[HEVC_TILE_SIZES..HEVC_TILE_SIZES + 4]
-                    .copy_from_slice(&setup::hevc_tile_sizes(&hevc.sps));
-            }
-        }
+        page.copy_from_slice(&setup);
         self.fence_seq = self.fence_seq.wrapping_add(1).max(1);
         let payload = self.fence_seq;
         let words = push::words(&self.layout, picture, index, payload, index == 0);
@@ -548,7 +551,7 @@ impl<N: Node> Session<N> {
         let deadline = self.node.now_ns().saturating_add(self.timeout_ns);
         self.in_flight = Some(InFlight {
             index,
-            slot: picture.slot,
+            slot: picture.surface,
             ring,
             payload,
             written: written.saturating_sub(started),
@@ -664,7 +667,7 @@ impl<N: Node> Session<N> {
         let index = *self.layout.surfaces.get(usize::from(slot))?;
         let buffer = self.buffers.get(index)?;
         let cpu = buffer.cpu?;
-        let chroma_at = CHROMA_OFFSET as usize;
+        let chroma_at = self.layout.chroma_offset() as usize;
         if luma_bytes > chroma_at || chroma_at + chroma_bytes > buffer.bytes as usize {
             return None;
         }

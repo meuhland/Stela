@@ -1,10 +1,15 @@
 //! `--nvdec-selftest`: before macOS starts, each codec's clip (NVENC's own
-//! boot-1 streams, 1920x1080, an IDR and 29 P frames) is parsed on the host
-//! and decoded on NVDEC picture by picture; each decoded picture is read
-//! back as 1920x1080 NV12 and hashed, and the MD5 must equal the clip's
-//! golden checksum (FFmpeg's software decode, which NVIDIA's own NVDEC
-//! decode matched frame for frame in nvdec-cap-1118). Each frame and each
-//! clip is an `NVDEC SELFTEST` line; nothing stops the boot.
+//! boot-1 streams, 1920x1080, an IDR and 29 P frames) is fed to NVDEC as a
+//! guest's VideoToolbox session feeds the gate: its parameter sets as an
+//! `avcC`/`hvcC` record ([`Stream::open`]), then one length-prefixed sample
+//! per access unit ([`Stream::decode`]), each picture decoded on NVDEC and
+//! each picture it shows ([`Picture::outputs`], then [`Stream::flush`]'s)
+//! read back as 1920x1080 NV12 after its decode and before the next, as the
+//! stream's caller contract says. Each shown picture is hashed, and the MD5
+//! must equal the clip's golden checksum (FFmpeg's software decode, which
+//! NVIDIA's own NVDEC decode matched frame for frame in nvdec-cap-1118).
+//! Each frame and each clip is an `NVDEC SELFTEST` line; nothing stops the
+//! boot.
 //!
 //! **Readback** ([`Readback`]): the copy engine blits the picture's
 //! displayed rectangle block-linear to pitch-linear NV12 in system memory
@@ -23,9 +28,12 @@
 //! ([`surface::Tiling::ALL`]), so a wrong guess of the surface layout shows
 //! apart from a wrong decode.
 use super::copy::{self, Copier};
-use super::session::{Decoded, Error, Session};
-use super::surface::{self, Tiling};
-use super::{Codec, H264_CLIP, HEVC_CLIP, Picture, golden, md5};
+use super::layout::Layout;
+use super::session::{Error, Session};
+use super::stream::{self, Stream};
+use super::surface::{self, Crop, Tiling};
+use super::dpb::Output;
+use super::{Codec, H264_CLIP, HEVC_CLIP, golden, md5};
 use crate::nvenc::selftest::hex;
 use crate::nvenc::session::Closed;
 use crate::nvenc::{Log, Node, errno_name};
@@ -56,6 +64,10 @@ pub struct Clip {
     /// One MD5 per frame, in decoding order (the clips have no B-frames, so
     /// it is display order too).
     pub golden: Vec<[u8; 16]>,
+    /// The surfaces NVIDIA's driver's address map had room for
+    /// (`ulNumDecodeSurfaces`, FFmpeg's): the session's buffers sit at
+    /// NVIDIA's addresses for as many.
+    pub pool: usize,
 }
 
 /// The two clips, H.264 first.
@@ -65,11 +77,13 @@ pub fn clips() -> [Clip; 2] {
             codec: Codec::H264,
             stream: H264_CLIP,
             golden: golden(Codec::H264),
+            pool: 16,
         },
         Clip {
             codec: Codec::Hevc,
             stream: HEVC_CLIP,
             golden: golden(Codec::Hevc),
+            pool: 19,
         },
     ]
 }
@@ -153,12 +167,12 @@ impl Read {
     }
 }
 
-/// The NV12 MD5 of `picture`'s decoded surface under `tiling`, read out of
-/// BAR1; `None` when the planes could not be read.
+/// The NV12 MD5 of the picture `crop` of surface `surface`, under
+/// `tiling`, read out of BAR1; `None` when the planes could not be read.
 fn bar1<N: Node>(
     session: &mut Session<N>,
-    picture: &Picture,
-    decoded: &Decoded,
+    surface: u8,
+    crop: &Crop,
     tiling: Tiling,
 ) -> Option<Read> {
     let geometry = *session.geometry();
@@ -166,10 +180,10 @@ fn bar1<N: Node>(
     let luma_bytes = tiling.plane_bytes(pitch, geometry.coded_height);
     let chroma_bytes = tiling.plane_bytes(pitch, geometry.coded_height / 2);
     let started = session.now_ns();
-    let (luma, chroma) = session.planes(decoded.slot, luma_bytes, chroma_bytes)?;
+    let (luma, chroma) = session.planes(surface, luma_bytes, chroma_bytes)?;
     let read = session.now_ns().saturating_sub(started);
     let blank = luma.iter().all(|&b| b == 0);
-    let nv12 = surface::picture(&luma, &chroma, tiling, pitch, &picture.crop);
+    let nv12 = surface::picture(&luma, &chroma, tiling, pitch, crop);
     Some(Read {
         digest: md5::md5(&nv12),
         ce_ns: None,
@@ -178,25 +192,19 @@ fn bar1<N: Node>(
     })
 }
 
-/// The NV12 MD5 of `picture`'s decoded surface, blitted by `copier` to
-/// system memory and copied out by the CPU.
+/// The NV12 MD5 of the picture `crop` of surface `surface`, blitted by
+/// `copier` to system memory and copied out by the CPU.
 fn blit<N: Node>(
     session: &mut Session<N>,
     copier: &mut Copier,
-    picture: &Picture,
-    decoded: &Decoded,
+    surface: u8,
+    crop: &Crop,
 ) -> Result<Read, copy::Error> {
     let geometry = *session.geometry();
-    let (luma, chroma) = session.layout().surface(decoded.slot);
-    let blits = copy::nv12(
-        luma,
-        chroma,
-        &geometry,
-        &picture.crop,
-        copy::STAGING_ADDRESS,
-    );
+    let (luma, chroma) = session.layout().surface(surface);
+    let blits = copy::nv12(luma, chroma, &geometry, crop, copier.staging_address());
     let copied = copier.copy(session.node(), &blits)?;
-    let bytes = copy::nv12_bytes(&picture.crop) as usize;
+    let bytes = copy::nv12_bytes(crop) as usize;
     let started = session.now_ns();
     let nv12 = copier
         .output(bytes)
@@ -205,7 +213,7 @@ fn blit<N: Node>(
         ))?
         .to_vec();
     let cpu_ns = session.now_ns().saturating_sub(started);
-    let luma_bytes = (picture.crop.width * picture.crop.height) as usize;
+    let luma_bytes = (crop.width * crop.height) as usize;
     Ok(Read {
         digest: md5::md5(&nv12),
         ce_ns: Some(copied.ce_ns),
@@ -219,6 +227,172 @@ fn blit<N: Node>(
 /// with whether its file must stay open.
 pub fn run<N: Node>(node: N, chipset: u16, clip: &Clip, log: Log<'_>) -> (Report, Closed<N>) {
     run_with(node, chipset, clip, Readback::CopyEngine, log)
+}
+
+/// What the self-test knows of a decoded picture when it is shown.
+#[derive(Clone, Copy, Debug)]
+struct Shown {
+    kind: char,
+    slot: u8,
+    bytes: usize,
+    status: super::session::Status,
+    write_ns: u64,
+    gpu_ns: u64,
+}
+
+/// The run's readback and its checks, across the pictures shown.
+struct Reader {
+    name: &'static str,
+    copier: Option<Copier>,
+    blitting: bool,
+    probed: bool,
+    cross_checked: bool,
+    /// Pictures shown so far: the index of the next golden checksum.
+    shown: usize,
+}
+
+impl Reader {
+    /// Reads, hashes, checks and logs the shown picture `output` (with
+    /// `crop`); an error ends the run.
+    fn show<N: Node>(
+        &mut self,
+        session: &mut Session<N>,
+        clip: &Clip,
+        output: &Output,
+        crop: &Crop,
+        what: &Shown,
+        report: &mut Report,
+        log: Log<'_>,
+    ) -> Result<(), String> {
+        let name = self.name;
+        let n = self.shown;
+        self.shown += 1;
+        let Some(&golden) = clip.golden.get(n) else {
+            return Err(format!(
+                "frame {n}: shown past the clip's {} checksums",
+                clip.golden.len()
+            ));
+        };
+        let surface = output.surface;
+        let mut read = None;
+        if let (true, Some(engine)) = (self.blitting, self.copier.as_mut()) {
+            match blit(session, engine, surface, crop) {
+                Ok(blitted) => read = Some(blitted),
+                Err(error) => {
+                    self.blitting = false;
+                    if error.pending() {
+                        report.ce_hung = true;
+                        session.hold();
+                    }
+                    log(format_args!(
+                        "NVDEC SELFTEST {name} frame {n}: copy engine {error}; BAR1 reads this \
+                         frame and the rest"
+                    ));
+                }
+            }
+        }
+        // A blit that differs is told from a decode that differs by BAR1.
+        if let Some(blitted) = read
+            && blitted.digest != golden
+            && !self.cross_checked
+        {
+            self.cross_checked = true;
+            if let Some(direct) = bar1(session, surface, crop, Tiling::NVDEC) {
+                let verdict = if direct.digest == golden {
+                    self.blitting = false;
+                    read = Some(direct);
+                    "MATCHES: the copy engine's blit is wrong, so BAR1 reads this frame and the rest"
+                } else if direct.digest == blitted.digest {
+                    "agrees with the copy engine: the decode itself differs"
+                } else {
+                    "differs from both: the blit and the decode are both suspect"
+                };
+                log(format_args!(
+                    "NVDEC SELFTEST {name} frame {n} readback check: copy engine md5 {} in {} us, \
+                     BAR1 md5 {} in {} us {verdict}",
+                    hex(&blitted.digest),
+                    us(blitted.total()),
+                    hex(&direct.digest),
+                    us(direct.total())
+                ));
+            }
+        }
+        let read = match read {
+            Some(read) => Some(read),
+            None => bar1(session, surface, crop, Tiling::NVDEC),
+        };
+        let Some(read) = read else {
+            return Err(format!("frame {n}: its surface could not be read"));
+        };
+        report.read_ns += read.total();
+        let split = match read.ce_ns {
+            Some(ce_ns) => {
+                report.ce_frames += 1;
+                report.ce_ns += ce_ns;
+                report.ce_most = report.ce_most.max(ce_ns);
+                report.cpu_ns += read.cpu_ns;
+                format!("ce_us {} + cpu_us {}", us(ce_ns), us(read.cpu_ns))
+            }
+            None => {
+                report.bar1_frames += 1;
+                String::from("bar1")
+            }
+        };
+        let matched = read.digest == golden;
+        report.matched += u32::from(matched);
+        let status = what.status;
+        log(format_args!(
+            "NVDEC SELFTEST {name} frame {n}: {} slot {} poc {}, {} bytes, md5 {} {}, status \
+             mbs {} in_error {} error_status {:#x} slice_error {:#x} cycles {}, write_us {}, \
+             gpu_us {}, read_us {} ({split}){}",
+            what.kind,
+            what.slot,
+            output.poc,
+            what.bytes,
+            hex(&read.digest),
+            if matched { "MATCH" } else { "MISMATCH" },
+            status.mbs_correctly_decoded,
+            status.mbs_in_error,
+            status.error_status,
+            status.slice_header_error_code,
+            status.cycle_count,
+            us(what.write_ns),
+            us(what.gpu_ns),
+            us(read.total()),
+            if read.blank {
+                ", luma all zero: the engine wrote nothing"
+            } else {
+                ""
+            }
+        ));
+        if !matched && !self.probed {
+            self.probed = true;
+            let mut found = Vec::new();
+            let mut tried = String::new();
+            for tiling in Tiling::ALL.iter().skip(1) {
+                if let Some(other) = bar1(session, surface, crop, *tiling) {
+                    tried.push_str(&format!(" {} {}", tiling.name(), hex(&other.digest)));
+                    if other.digest == golden {
+                        found.push(tiling.name());
+                    }
+                }
+            }
+            log(format_args!(
+                "NVDEC SELFTEST {name} frame {n} layout probe: want {}, tried{}; {}",
+                hex(&golden),
+                tried,
+                if found.is_empty() {
+                    String::from("no layout matches: the decode itself differs")
+                } else {
+                    format!(
+                        "MATCHES as {}: the surface layout is not GOB_2",
+                        found.join(",")
+                    )
+                }
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// [`run`], reading pictures back as `readback` says.
@@ -239,8 +413,13 @@ pub fn run_with<N: Node>(
         node,
         keeps_file: false,
     };
-    let pictures = match Picture::all(clip.codec, clip.stream) {
-        Ok(pictures) => pictures,
+    // The clip as a VideoToolbox client hands it over: a record, then one
+    // sample per access unit.
+    let opened = stream::samples(clip.codec, clip.stream).and_then(|(record, samples)| {
+        Stream::open(clip.codec, &record).map(|stream| (stream, samples))
+    });
+    let (mut stream, samples) = match opened {
+        Ok(opened) => opened,
         Err(error) => {
             log(format_args!(
                 "NVDEC SELFTEST {name} FAIL at parse: {} ({})",
@@ -250,36 +429,45 @@ pub fn run_with<N: Node>(
             return (report, refuse(node));
         }
     };
-    if pictures.len() != clip.golden.len() {
+    let Some(sequence) = stream.sequence() else {
         log(format_args!(
-            "NVDEC SELFTEST {name} FAIL at parse: {} pictures for {} checksums",
-            pictures.len(),
-            clip.golden.len()
-        ));
-        return (report, refuse(node));
-    }
-    let Some(first) = pictures.first() else {
-        log(format_args!(
-            "NVDEC SELFTEST {name} FAIL at parse: no picture"
+            "NVDEC SELFTEST {name} FAIL at parse: no sequence"
         ));
         return (report, refuse(node));
     };
-    let geometry = match first.geometry() {
+    let geometry = match crate::nvenc::layout::Geometry::new(
+        sequence.coded.0.next_multiple_of(16),
+        sequence.coded.1.next_multiple_of(16),
+    ) {
         Ok(geometry) => geometry,
         Err(why) => {
             log(format_args!("NVDEC SELFTEST {name} FAIL at parse: {why}"));
             return (report, refuse(node));
         }
     };
-    let slots = pictures.iter().map(|p| p.slots).max().unwrap_or(1);
-    let mut session = match Session::open(
-        node,
-        chipset,
+    // Every surface the stream's slots may be bound to, on NVIDIA's address
+    // map for the clip's pool.
+    let slots = usize::from(sequence.surfaces.max(1));
+    let layout = match Layout::with(
         clip.codec,
-        geometry,
-        usize::from(slots),
-        FRAME_BOUND_NS,
+        &geometry,
+        sequence.bit_depth,
+        slots,
+        clip.pool.max(slots),
     ) {
+        Ok(layout) => layout,
+        Err(why) => {
+            log(format_args!("NVDEC SELFTEST {name} FAIL at open: {why}"));
+            return (report, refuse(node));
+        }
+    };
+    let Some(ring) = copy::ring_after(layout.end()) else {
+        log(format_args!(
+            "NVDEC SELFTEST {name} FAIL at open: no room for the copy engine's buffers"
+        ));
+        return (report, refuse(node));
+    };
+    let mut session = match Session::open_layout(node, chipset, geometry, layout, FRAME_BOUND_NS) {
         Ok(session) => session,
         Err((error, node)) => {
             log(format_args!(
@@ -289,25 +477,27 @@ pub fn run_with<N: Node>(
             return (report, refuse(node));
         }
     };
+    let mut crop = Crop {
+        left: 0,
+        top: 0,
+        width: sequence.display.0,
+        height: sequence.display.1,
+    };
     log(format_args!(
-        "NVDEC SELFTEST {name} open: {} pictures, coded {}x{} shown {}x{}, pitch {}, {} surface \
+        "NVDEC SELFTEST {name} open: {} samples, coded {}x{} shown {}x{}, pitch {}, {} surface \
          slots, {} buffers at NVIDIA's captured addresses, {} stream bytes",
-        pictures.len(),
+        samples.len(),
         geometry.coded_width,
         geometry.coded_height,
-        first.crop.width,
-        first.crop.height,
+        crop.width,
+        crop.height,
         geometry.pitch,
         slots,
         session.layout().plans.len(),
         clip.stream.len()
     ));
-    let staging = pictures
-        .iter()
-        .map(|p| copy::nv12_bytes(&p.crop))
-        .max()
-        .unwrap_or(0);
-    let mut copier = match readback {
+    let staging = copy::nv12_bytes(&crop);
+    let copier = match readback {
         Readback::Bar1 => {
             log(format_args!(
                 "NVDEC SELFTEST {name} readback: BAR1, since an earlier clip left a copy-engine \
@@ -315,7 +505,8 @@ pub fn run_with<N: Node>(
             ));
             None
         }
-        Readback::CopyEngine => match Copier::open(session.node(), staging, COPY_BOUND_NS) {
+        Readback::CopyEngine => match Copier::open_at(session.node(), ring, staging, COPY_BOUND_NS)
+        {
             Ok(copier) => {
                 log(format_args!(
                     "NVDEC SELFTEST {name} readback: copy engine, channel {} class {:#06x}, \
@@ -323,10 +514,10 @@ pub fn run_with<N: Node>(
                      bound {} ms",
                     copier.channel(),
                     copy::COPY_CLASS,
-                    first.crop.width,
-                    first.crop.height,
+                    crop.width,
+                    crop.height,
                     staging,
-                    copy::STAGING_ADDRESS,
+                    copier.staging_address(),
                     COPY_BOUND_NS / 1_000_000
                 ));
                 Some(copier)
@@ -340,14 +531,36 @@ pub fn run_with<N: Node>(
             }
         },
     };
-    let mut blitting = copier.is_some();
+    let mut reader = Reader {
+        name,
+        blitting: copier.is_some(),
+        copier,
+        probed: false,
+        cross_checked: false,
+        shown: 0,
+    };
     let mut failure: Option<String> = None;
-    let mut probed = false;
-    let mut cross_checked = false;
     let mut gpu_most = 0u64;
-    for (n, picture) in pictures.iter().enumerate() {
-        let decoded = match session.decode(picture) {
-            Ok(decoded) => decoded,
+    // Each decode's line facts, by decode index, until it is shown.
+    let mut decoded: Vec<Option<Shown>> = Vec::new();
+    for sample in &samples {
+        let picture = match stream.decode(sample) {
+            Ok(Some(picture)) => picture,
+            Ok(None) => continue,
+            Err(error) => {
+                let n = report.frames;
+                failure = Some(format!(
+                    "frame {n}: parse: {} ({})",
+                    error.describe(),
+                    error.kind()
+                ));
+                break;
+            }
+        };
+        crop = picture.crop;
+        let n = picture.decoded;
+        let done = match session.decode(&picture) {
+            Ok(done) => done,
             Err(error) => {
                 report.timed_out = matches!(error, Error::Timeout { .. });
                 log(format_args!(
@@ -361,126 +574,49 @@ pub fn run_with<N: Node>(
             }
         };
         report.frames += 1;
-        report.gpu_ns += decoded.timing.gpu_ns;
-        gpu_most = gpu_most.max(decoded.timing.gpu_ns);
-        let status = decoded.status;
-        let golden = clip.golden[n];
-        let mut read = None;
-        if let (true, Some(engine)) = (blitting, copier.as_mut()) {
-            match blit(&mut session, engine, picture, &decoded) {
-                Ok(blitted) => read = Some(blitted),
-                Err(error) => {
-                    blitting = false;
-                    if error.pending() {
-                        report.ce_hung = true;
-                        session.hold();
-                    }
-                    log(format_args!(
-                        "NVDEC SELFTEST {name} frame {n}: copy engine {error}; BAR1 reads this \
-                         frame and the rest"
-                    ));
-                }
-            }
+        report.gpu_ns += done.timing.gpu_ns;
+        gpu_most = gpu_most.max(done.timing.gpu_ns);
+        let index = n as usize;
+        if decoded.len() <= index {
+            decoded.resize(index + 1, None);
         }
-        // A blit that differs is told from a decode that differs by BAR1.
-        if let Some(blitted) = read
-            && blitted.digest != golden
-            && !cross_checked
-        {
-            cross_checked = true;
-            if let Some(direct) = bar1(&mut session, picture, &decoded, Tiling::NVDEC) {
-                let verdict = if direct.digest == golden {
-                    blitting = false;
-                    read = Some(direct);
-                    "MATCHES: the copy engine's blit is wrong, so BAR1 reads this frame and the rest"
-                } else if direct.digest == blitted.digest {
-                    "agrees with the copy engine: the decode itself differs"
-                } else {
-                    "differs from both: the blit and the decode are both suspect"
-                };
-                log(format_args!(
-                    "NVDEC SELFTEST {name} frame {n} readback check: copy engine md5 {} in {} us, \
-                     BAR1 md5 {} in {} us {verdict}",
-                    hex(&blitted.digest),
-                    us(blitted.total()),
-                    hex(&direct.digest),
-                    us(direct.total())
-                ));
-            }
-        }
-        let read = match read {
-            Some(read) => Some(read),
-            None => bar1(&mut session, picture, &decoded, Tiling::NVDEC),
-        };
-        let Some(read) = read else {
-            failure = Some(format!("frame {n}: its surface could not be read"));
+        decoded[index] = Some(Shown {
+            kind: picture.kind,
+            slot: picture.slot,
+            bytes: picture.bitstream().len(),
+            status: done.status,
+            write_ns: done.timing.write_ns,
+            gpu_ns: done.timing.gpu_ns,
+        });
+        // The caller's contract: every output copied out now, before the
+        // next picture's submit.
+        if let Err(why) = show_all(
+            &mut reader,
+            &mut session,
+            clip,
+            &picture.outputs,
+            &crop,
+            &decoded,
+            &mut report,
+            log,
+        ) {
+            failure = Some(why);
             break;
-        };
-        report.read_ns += read.total();
-        let split = match read.ce_ns {
-            Some(ce_ns) => {
-                report.ce_frames += 1;
-                report.ce_ns += ce_ns;
-                report.ce_most = report.ce_most.max(ce_ns);
-                report.cpu_ns += read.cpu_ns;
-                format!("ce_us {} + cpu_us {}", us(ce_ns), us(read.cpu_ns))
-            }
-            None => {
-                report.bar1_frames += 1;
-                String::from("bar1")
-            }
-        };
-        let matched = read.digest == golden;
-        report.matched += u32::from(matched);
-        log(format_args!(
-            "NVDEC SELFTEST {name} frame {n}: {} slot {} poc {}, {} bytes, md5 {} {}, status \
-             mbs {} in_error {} error_status {:#x} slice_error {:#x} cycles {}, write_us {}, \
-             gpu_us {}, read_us {} ({split}){}",
-            picture.kind,
-            picture.slot,
-            picture.poc,
-            picture.bitstream().len(),
-            hex(&read.digest),
-            if matched { "MATCH" } else { "MISMATCH" },
-            status.mbs_correctly_decoded,
-            status.mbs_in_error,
-            status.error_status,
-            status.slice_header_error_code,
-            status.cycle_count,
-            us(decoded.timing.write_ns),
-            us(decoded.timing.gpu_ns),
-            us(read.total()),
-            if read.blank {
-                ", luma all zero: the engine wrote nothing"
-            } else {
-                ""
-            }
-        ));
-        if !matched && !probed {
-            probed = true;
-            let mut found = Vec::new();
-            let mut tried = String::new();
-            for tiling in Tiling::ALL.iter().skip(1) {
-                if let Some(other) = bar1(&mut session, picture, &decoded, *tiling) {
-                    tried.push_str(&format!(" {} {}", tiling.name(), hex(&other.digest)));
-                    if other.digest == golden {
-                        found.push(tiling.name());
-                    }
-                }
-            }
-            log(format_args!(
-                "NVDEC SELFTEST {name} frame {n} layout probe: want {}, tried{}; {}",
-                hex(&golden),
-                tried,
-                if found.is_empty() {
-                    String::from("no layout matches: the decode itself differs")
-                } else {
-                    format!(
-                        "MATCHES as {}: the surface layout is not GOB_2",
-                        found.join(",")
-                    )
-                }
-            ));
+        }
+    }
+    if failure.is_none() {
+        let rest = stream.flush();
+        if let Err(why) = show_all(
+            &mut reader,
+            &mut session,
+            clip,
+            &rest,
+            &crop,
+            &decoded,
+            &mut report,
+            log,
+        ) {
+            failure = Some(why);
         }
     }
     let frames = u64::from(report.frames.max(1));
@@ -507,7 +643,7 @@ pub fn run_with<N: Node>(
             .map(|why| format!("; stopped at {why}"))
             .unwrap_or_default()
     ));
-    if let Some(copier) = copier.take() {
+    if let Some(copier) = reader.copier.take() {
         if session.dead() == Some(true) {
             // The decoder's channel keeps the file open anyway.
             copier.leave(session.node());
@@ -525,6 +661,30 @@ pub fn run_with<N: Node>(
         ));
     }
     (report, closed)
+}
+
+/// Shows each of `outputs` in order through `reader`.
+#[allow(clippy::too_many_arguments)]
+fn show_all<N: Node>(
+    reader: &mut Reader,
+    session: &mut Session<N>,
+    clip: &Clip,
+    outputs: &[Output],
+    crop: &Crop,
+    decoded: &[Option<Shown>],
+    report: &mut Report,
+    log: Log<'_>,
+) -> Result<(), String> {
+    for output in outputs {
+        let Some(Some(what)) = decoded.get(output.decoded as usize) else {
+            return Err(format!(
+                "frame {}: shows decode {}, never decoded",
+                reader.shown, output.decoded
+            ));
+        };
+        reader.show(session, clip, output, crop, what, report, log)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

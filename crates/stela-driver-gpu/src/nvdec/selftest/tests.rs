@@ -1,6 +1,6 @@
 use super::*;
 use crate::nvdec::mock::{self, Ce, Engine, Gpu};
-use crate::nvdec::surface::Crop;
+use crate::nvdec::Picture;
 use crate::nvenc::{CHANNEL_ALLOC, CHANNEL_FREE, EXEC};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -34,6 +34,10 @@ fn clip(codec: Codec, golden: Vec<[u8; 16]>) -> Clip {
             Codec::Hevc => HEVC_CLIP,
         },
         golden,
+        pool: match codec {
+            Codec::H264 => 16,
+            Codec::Hevc => 19,
+        },
     }
 }
 
@@ -67,7 +71,7 @@ fn both_clips_decode_and_match_on_the_mock() {
         let name = codec.name();
         assert!(
             lines[0].starts_with(&format!(
-                "NVDEC SELFTEST {name} open: 30 pictures, coded 1920x1088 shown 1920x1080"
+                "NVDEC SELFTEST {name} open: 30 samples, coded 1920x1088 shown 1920x1080"
             )),
             "{}",
             lines[0]
