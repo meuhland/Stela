@@ -8,6 +8,15 @@
 //! P-state, so the line shows whether the link follows load too. Clocks are
 //! not read: GSP-RM 570.144's headers define no clock control, and RM refused
 //! the 615.78.08 one.
+//!
+//! **Now** ([`Report::current`]): the P-state and link as last sampled,
+//! without taking anything, for lines that time the GPU's own work (NVENC's
+//! self-test frames and session reports): `pstate=P8 pcie=gen1x16`.
+//!
+//! **Boost** ([`Report::request_boost`], `--gpu-boost`): the rounds ask RM
+//! to hold the GPU at its highest performance level
+//! (`NV2080_CTRL_CMD_PERF_BOOST`) while the host asks, and the lines say
+//! RM's answer: `boost=max`, `boost=cleared` or `boost=refused(error E)`.
 use alloc::{format, string::String};
 use core::{
     fmt,
@@ -27,6 +36,11 @@ pub struct Report {
     link_control: AtomicU32,
     link_speeds: AtomicU32,
     link_cap: AtomicU32,
+    /// Set by the host: nouveau's rounds ask RM for the boost while it is
+    /// nonzero.
+    boost: AtomicU32,
+    /// RM's answer to the boost ([`Boost`]).
+    boost_status: AtomicI32,
 }
 
 impl Report {
@@ -42,7 +56,29 @@ impl Report {
             link_control: AtomicU32::new(0),
             link_speeds: AtomicU32::new(0),
             link_cap: AtomicU32::new(0),
+            boost: AtomicU32::new(0),
+            boost_status: AtomicI32::new(0),
         }
+    }
+
+    /// Has nouveau's next rounds ask RM to hold the GPU at its highest
+    /// performance level (`on`), or to let go.
+    pub fn request_boost(&self, on: bool) {
+        self.boost.store(u32::from(on), Ordering::Relaxed);
+    }
+
+    /// The P-state, link and boost as nouveau last sampled them, taking
+    /// nothing; `None` before GSP started.
+    pub fn current(&self) -> Option<Current> {
+        if self.started.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(Current {
+            pstate: self.pstate.load(Ordering::Relaxed),
+            status: self.pstate_status.load(Ordering::Relaxed),
+            link_status: self.link_status.load(Ordering::Relaxed) as u16,
+            boost: Boost(self.boost_status.load(Ordering::Relaxed)),
+        })
     }
 
     /// What nouveau sampled since the last take, cleared; `None` before GSP
@@ -65,7 +101,62 @@ impl Report {
                 speeds: link_speeds,
                 cap: self.link_cap.load(Ordering::Relaxed) as u16,
             },
+            boost: Boost(self.boost_status.load(Ordering::Relaxed)),
         })
+    }
+}
+
+/// RM's answer to the boost, as nouveau keeps it: 0 before anything was
+/// asked, 1 while RM holds it, 2 once it let go, else the errno of RM's
+/// refusal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Boost(pub i32);
+
+/// ` boost=max`, ` boost=cleared`, ` boost=refused(error E)`, or nothing
+/// before anything was asked.
+impl fmt::Display for Boost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0 => Ok(()),
+            1 => f.write_str(" boost=max"),
+            2 => f.write_str(" boost=cleared"),
+            error => write!(f, " boost=refused(error {error})"),
+        }
+    }
+}
+
+/// The GPU's state as nouveau last sampled it ([`Report::current`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Current {
+    /// The current P-state's bit, zero while unknown.
+    pub pstate: u32,
+    /// The errno of the P-state control RM refused, else zero.
+    pub status: i32,
+    /// Link Status as last read, zero when nothing was.
+    pub link_status: u16,
+    pub boost: Boost,
+}
+
+/// `pstate=P8 pcie=gen1x16`, `pstate=unknown pcie=unknown` before a round
+/// read either, or `pstate=unknown(error E) …` once RM refused the control;
+/// then the boost, once asked.
+impl fmt::Display for Current {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.status, self.pstate) {
+            (0, 0) => f.write_str("pstate=unknown")?,
+            (0, pstate) => write!(f, "pstate={}", Pstates(pstate))?,
+            (error, _) => write!(f, "pstate=unknown(error {error})")?,
+        }
+        let link = Link {
+            status: self.link_status,
+            ..Link::default()
+        };
+        if link.read() {
+            write!(f, " pcie={}", Lane(link.speed(), link.width()))?;
+        } else {
+            f.write_str(" pcie=unknown")?;
+        }
+        write!(f, "{}", self.boost)
     }
 }
 
@@ -89,12 +180,14 @@ pub struct Taken {
     pub status: i32,
     /// The GPU's PCIe link.
     pub link: Link,
+    /// RM's answer to the boost.
+    pub boost: Boost,
 }
 
 impl Taken {
-    /// What a change is judged by: the P-states, the status and the link,
-    /// not the count of rounds.
-    fn state(&self) -> [u64; 2] {
+    /// What a change is judged by: the P-states, the status, the link and
+    /// the boost, not the count of rounds.
+    fn state(&self) -> [u64; 3] {
         let link = &self.link;
         [
             u64::from(self.pstate) << 32 | u64::from(self.pstates),
@@ -103,6 +196,7 @@ impl Taken {
                 | u64::from(link.width()) << 16
                 | u64::from(link.aspm()) << 14
                 | u64::from(link.speeds & 0x3ff),
+            u64::from(self.boost.0 as u32),
         ]
     }
 }
@@ -200,7 +294,7 @@ impl fmt::Display for Pstates {
 }
 
 /// `pstate=P8 seen=P5+P8 <link> rounds=N`, or
-/// `pstate=unknown(error E) <link> rounds=N`.
+/// `pstate=unknown(error E) <link> rounds=N`, then the boost once asked.
 impl fmt::Display for Taken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.status {
@@ -212,7 +306,7 @@ impl fmt::Display for Taken {
             )?,
             error => write!(f, "pstate=unknown(error {error})")?,
         }
-        write!(f, " {} rounds={}", self.link, self.rounds)
+        write!(f, " {} rounds={}{}", self.link, self.rounds, self.boost)
     }
 }
 
@@ -254,7 +348,7 @@ mod spin_cell {
 
     pub struct Cell {
         held: AtomicBool,
-        value: UnsafeCell<Option<[u64; 2]>>,
+        value: UnsafeCell<Option<[u64; 3]>>,
     }
 
     // SAFETY: `replace` holds `held` for every access to the value.
@@ -269,7 +363,7 @@ mod spin_cell {
         }
 
         /// Stores `value`, giving the one before.
-        pub fn replace(&self, value: [u64; 2]) -> Option<[u64; 2]> {
+        pub fn replace(&self, value: [u64; 3]) -> Option<[u64; 3]> {
             while self
                 .held
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)

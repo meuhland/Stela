@@ -6,7 +6,9 @@
 //!   `NVENC PROBE` lines.
 //! - `--nvenc-selftest`: each such GPU encodes a moving pattern at
 //!   1920x1080, H.264 then HEVC, at QP 25 then 20 Mb/s CBR, every frame
-//!   checked and logged as `NVENC SELFTEST` lines. The fixed-QP streams are
+//!   checked and logged as `NVENC SELFTEST` lines, each ending with the
+//!   GPU's P-state and PCIe link (`| gpu pstate=P0 pcie=gen4x16`), which
+//!   the engine's time follows. The fixed-QP streams are
 //!   also logged as base64 (`NVENC SELFTEST DATA`), since the engine cannot
 //!   create a file on the stick: its FAT32 is read-only to Stela's drivers,
 //!   which write only the clusters the stela tool preallocated for the log.
@@ -212,8 +214,13 @@ pub(in crate::engine) fn selftest() {
                 summary.push(alloc::format!("{name} no-node"));
                 continue;
             };
+            // Each line carries the GPU's P-state and PCIe link as nouveau
+            // last sampled them: the engine's time and the stores into the
+            // GPU's memory follow both.
             let (report, closed) =
-                selftest::run(RenderFile(fd), chipset, codec, rate, &mut |text| line(text));
+                selftest::run(RenderFile(fd), chipset, codec, rate, &mut |text| {
+                    line(format_args!("{text} | gpu {}", super::perf_now()));
+                });
             if closed.keeps_file {
                 wedged = true;
             } else {
@@ -323,6 +330,10 @@ impl EncoderPlatform for GateGpu {
 
     fn relax(&self) {
         super::gate::relax();
+    }
+
+    fn gpu_state(&self) -> Option<String> {
+        Some(super::perf_now())
     }
 
     fn run(&self, body: &mut dyn FnMut()) {

@@ -46,7 +46,10 @@
 //!
 //! **Report.** Each session logs `NVENC SESSION` lines: when it opens, at
 //! each platform report while it encodes ([`GateEncoders::report`]), when it
-//! is lost and when it closes.
+//! is lost and when it closes. The open and report lines end with the GPU's
+//! P-state and PCIe link when the platform knows them
+//! ([`EncoderPlatform::gpu_state`]): the engine's time follows the P-state's
+//! clocks, which GSP-RM's own policy picks.
 use super::gate::fault;
 use super::wire::{
     self, ENCODE_FORCE_IDR, ENCODER_OPEN_FULL_RANGE, EncoderCapabilitiesResponse, EncoderCodec,
@@ -133,6 +136,12 @@ pub trait EncoderPlatform: Send + Sync + 'static {
     /// CPU), the encoders ask nouveau's fence instead, a posted call.
     fn kick(&self) -> bool {
         false
+    }
+    /// The GPU's performance state now, as GSP-RM last reported it
+    /// (`pstate=P8 pcie=gen1x16`), which the session lines end with: the
+    /// engine's time follows the P-state's clocks. `None` leaves it out.
+    fn gpu_state(&self) -> Option<alloc::string::String> {
+        None
     }
     /// Waits a moment for another holder of the encoders, in a wait with
     /// no bound: it may do the platform's work the holder waits for.
@@ -504,6 +513,14 @@ impl<P: EncoderPlatform> Encoders<P> {
         ));
     }
 
+    /// ` | gpu pstate=… pcie=…` from the platform, or nothing.
+    fn gpu_state(&self) -> alloc::string::String {
+        self.platform
+            .gpu_state()
+            .map(|state| alloc::format!(" | gpu {state}"))
+            .unwrap_or_default()
+    }
+
     /// Closes the session of slot `index`, which leaves the table.
     fn close_slot(&self, state: &mut State<P::Node>, index: usize, why: &str) {
         let slot = state.sessions.remove(index);
@@ -571,13 +588,14 @@ impl<P: EncoderPlatform> Encoders<P> {
                     let took = self.platform.now_ns().saturating_sub(slot.opened_at);
                     let line = alloc::format!(
                         "{} open for connection {connection}: {}, coded {}x{}, {buffers} \
-                         buffers in {} ms, {} bytes of parameter sets",
+                         buffers in {} ms, {} bytes of parameter sets{}",
                         slot.id,
                         slot.describe(),
                         slot.session.geometry().coded_width,
                         slot.session.geometry().coded_height,
                         took / 1_000_000,
-                        slot.session.headers().len()
+                        slot.session.headers().len(),
+                        self.gpu_state()
                     );
                     self.log(format_args!("{line}"));
                 }
@@ -1326,14 +1344,16 @@ impl<P: EncoderPlatform> GateEncoders for Encoders<P> {
             return;
         };
         let state = held.state();
+        let mut gpu = None;
         for slot in &mut state.sessions {
             if slot.period.calls == 0 {
                 continue;
             }
             let period = core::mem::take(&mut slot.period);
             slot.total.add(&period);
+            let gpu = gpu.get_or_insert_with(|| self.gpu_state());
             let line = alloc::format!(
-                "{} {}: {period}{}",
+                "{} {}: {period}{}{gpu}",
                 slot.id,
                 slot.describe(),
                 if slot.lost { " LOST" } else { "" }

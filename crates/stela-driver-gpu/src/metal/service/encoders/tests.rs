@@ -43,6 +43,8 @@ struct Platform {
     /// and whether `kick` runs Linux here.
     timing: Option<Timing>,
     kicks: bool,
+    /// The GPU's state the platform reports, if any.
+    state: Option<&'static str>,
 }
 
 impl Platform {
@@ -58,6 +60,7 @@ impl Platform {
             lines: Mutex::new(Vec::new()),
             timing: None,
             kicks: false,
+            state: None,
         }
     }
 
@@ -139,6 +142,10 @@ impl EncoderPlatform for Platform {
 
     fn relax(&self) {
         core::hint::spin_loop();
+    }
+
+    fn gpu_state(&self) -> Option<String> {
+        self.state.map(String::from)
     }
 
     fn run(&self, body: &mut dyn FnMut()) {
@@ -967,8 +974,42 @@ fn timed_h264_frames_take_one_call_each() {
     encoders.report();
     assert!(encoders.platform().logged("engine_us=23"));
     assert!(encoders.platform().logged("asks=0 kicks="));
+    // A platform that knows no GPU state ends no line with one.
+    assert!(!encoders.platform().logged(" | gpu "));
     close(&encoders, ONE, opened.encoder, &mut memory);
     assert_eq!(asks_of(&encoders), 0);
+}
+
+/// The open and heartbeat lines end with the GPU's P-state and link where
+/// the platform knows them, which the engine's time follows; a beat without
+/// calls gives no line.
+#[test]
+fn session_lines_end_with_the_gpus_state() {
+    let mut platform = Platform::timed(2_300_000, true);
+    platform.state = Some("pstate=P8 pcie=gen1x16");
+    let encoders = Encoders::new(platform);
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    assert!(
+        encoders
+            .platform()
+            .logged("bytes of parameter sets | gpu pstate=P8 pcie=gen1x16")
+    );
+    let request = encode_request(opened.encoder, 1, 0);
+    timed_frame(&encoders, &request, &mut memory);
+    encoders.report();
+    let lines = encoders.platform().lines.lock().unwrap().clone();
+    let beat = lines
+        .iter()
+        .find(|line| line.contains("frames=1"))
+        .expect("a heartbeat line");
+    assert!(
+        beat.ends_with(" kicks=1 | gpu pstate=P8 pcie=gen1x16"),
+        "{beat}"
+    );
+    encoders.report();
+    assert_eq!(encoders.platform().lines.lock().unwrap().len(), lines.len());
+    close(&encoders, ONE, opened.encoder, &mut memory);
 }
 
 /// HEVC at 5.8 ms, past one call's budget: the call that submits answers

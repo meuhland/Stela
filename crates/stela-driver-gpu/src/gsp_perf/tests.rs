@@ -39,13 +39,77 @@ const fn lane(speed: u16, width: u16) -> u16 {
 
 #[test]
 fn the_layout_is_nouveaus() {
-    // `struct nvkm_perf_report`: nine 32-bit words.
-    assert_eq!(core::mem::size_of::<Report>(), 36);
+    // `struct nvkm_perf_report`: eleven 32-bit words.
+    assert_eq!(core::mem::size_of::<Report>(), 44);
     assert_eq!(core::mem::offset_of!(Report, pstate_status), 16);
     assert_eq!(core::mem::offset_of!(Report, link_status), 20);
     assert_eq!(core::mem::offset_of!(Report, link_control), 24);
     assert_eq!(core::mem::offset_of!(Report, link_speeds), 28);
     assert_eq!(core::mem::offset_of!(Report, link_cap), 32);
+    assert_eq!(core::mem::offset_of!(Report, boost), 36);
+    assert_eq!(core::mem::offset_of!(Report, boost_status), 40);
+}
+
+/// The state now takes nothing, so the beat's line still comes; it is
+/// unknown before a round read it, and nothing before GSP starts.
+#[test]
+fn the_state_now_is_the_last_sample_and_takes_nothing() {
+    assert_eq!(Report::new().current(), None);
+    let report = linked(sampled(3, P8, P0), lane(1, 16), 0, 0, lane(4, 16));
+    let now = report.current().unwrap();
+    assert_eq!(now.to_string(), "pstate=P8 pcie=gen1x16");
+    assert_eq!(report.current(), Some(now));
+    assert_eq!(report.take().unwrap().rounds, 3);
+    assert_eq!(
+        sampled(0, 0, 0).current().unwrap().to_string(),
+        "pstate=unknown pcie=unknown"
+    );
+    let refused = sampled(1, 0, 0);
+    refused.pstate_status.store(-22, Ordering::Relaxed);
+    assert_eq!(
+        refused.current().unwrap().to_string(),
+        "pstate=unknown(error -22) pcie=unknown"
+    );
+}
+
+/// `--gpu-boost`: the host's request is what nouveau's rounds read, and
+/// RM's answer reaches both lines; a new answer alone gives a beat's line.
+#[test]
+fn the_boost_is_asked_through_the_report_and_its_answer_shown() {
+    let report = sampled(1, P8, 0);
+    report.request_boost(true);
+    assert_eq!(report.boost.load(Ordering::Relaxed), 1);
+    let reported = Reported::new();
+    assert_eq!(
+        reported.line(&report.take().unwrap()).as_deref(),
+        Some("GPU PERF pstate=P8 seen=P8 pcie=unknown rounds=1")
+    );
+    // RM held it: P0, and the answer.
+    report.boost_status.store(1, Ordering::Relaxed);
+    report.pstate.store(P0, Ordering::Relaxed);
+    report.rounds.store(1, Ordering::Relaxed);
+    assert_eq!(
+        reported.line(&report.take().unwrap()).as_deref(),
+        Some("GPU PERF pstate=P0 seen=- pcie=unknown rounds=1 boost=max")
+    );
+    assert_eq!(
+        report.current().unwrap().to_string(),
+        "pstate=P0 pcie=unknown boost=max"
+    );
+    // A refusal alone is a change.
+    report.boost_status.store(-22, Ordering::Relaxed);
+    report.rounds.store(1, Ordering::Relaxed);
+    assert_eq!(
+        reported.line(&report.take().unwrap()).as_deref(),
+        Some("GPU PERF pstate=P0 seen=- pcie=unknown rounds=1 boost=refused(error -22)")
+    );
+    report.boost_status.store(2, Ordering::Relaxed);
+    assert_eq!(
+        report.current().unwrap().to_string(),
+        "pstate=P0 pcie=unknown boost=cleared"
+    );
+    report.request_boost(false);
+    assert_eq!(report.boost.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -68,6 +132,7 @@ fn a_take_clears_the_counts_and_keeps_the_current_pstate() {
             pstates: P5 | P8,
             status: 0,
             link: Link::default(),
+            boost: Boost(0),
         }
     );
     assert_eq!(
