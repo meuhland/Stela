@@ -151,6 +151,19 @@ fn input_every_turn_is_off_by_default_and_round_trips() {
     assert!(!round_trip(usual).to_string().contains(INPUT_EVERY_TURN));
 }
 
+/// `--input-kick` is off by default, reads back the same, and goes with
+/// `--input-every-turn` or alone.
+#[test]
+fn input_kick_is_off_by_default_and_round_trips() {
+    assert!(!System::default().input_kick);
+    assert!(!round_trip("--system --input").input_kick);
+    let alone = round_trip(&format!("--system --input {INPUT_KICK}"));
+    assert!(alone.input_kick && !alone.input_every_turn);
+    let both = round_trip(&format!("--system --input {INPUT_EVERY_TURN} {INPUT_KICK}"));
+    assert!(both.input_kick && both.input_every_turn);
+    assert!(both.to_string().contains(INPUT_KICK));
+}
+
 #[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));
