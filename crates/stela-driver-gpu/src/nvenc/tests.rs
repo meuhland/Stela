@@ -103,7 +103,7 @@ fn the_codecs_send_nvidias_captured_controls() {
 }
 
 /// The `(subchannel, method, data)` writes of incrementing method runs.
-pub(super) fn decode(words: &[u32]) -> Vec<(u32, u32, u32)> {
+pub(crate) fn decode(words: &[u32]) -> Vec<(u32, u32, u32)> {
     let mut methods = Vec::new();
     let mut index = 0;
     while index < words.len() {
@@ -120,9 +120,9 @@ pub(super) fn decode(words: &[u32]) -> Vec<(u32, u32, u32)> {
     methods
 }
 
-/// What the mock's encoder does with a push.
+/// What the mock's video engine does with a push.
 #[derive(Clone, Copy, PartialEq)]
-enum Engine {
+pub(crate) enum Engine {
     /// Releases the semaphore it is given, and the fence after it.
     Alive,
     /// Takes the methods and signals the fence, but writes nothing.
@@ -131,28 +131,36 @@ enum Engine {
     Hung,
 }
 
-/// A GA106 render node of the patched nouveau, with an encoder.
-struct Gpu {
+/// A GA106 render node of the patched nouveau, with the video engine a
+/// probe's [`Target`] names: the encoder unless [`Gpu::probing`] says.
+pub(crate) struct Gpu {
     engine: Engine,
+    target: Target,
     /// Errnos to answer each request with, instead of performing it.
-    refuse: Vec<(u32, i64)>,
-    requests: Vec<u32>,
+    pub(crate) refuse: Vec<(u32, i64)>,
+    pub(crate) requests: Vec<u32>,
     /// Buffers by handle (index + 1), with their GPU addresses.
     buffers: Vec<(Box<[u32; BUFFER_BYTES / 4]>, u64)>,
-    closed: Vec<u32>,
-    mapped: usize,
-    unmapped: usize,
+    pub(crate) closed: Vec<u32>,
+    pub(crate) mapped: usize,
+    pub(crate) unmapped: usize,
     clock: u64,
     /// The fence signals after this many queries.
     fence_after: u32,
-    queries: u32,
-    channel_freed: bool,
+    pub(crate) queries: u32,
+    pub(crate) channel_freed: bool,
 }
 
 impl Gpu {
     fn new(engine: Engine) -> Self {
+        Self::probing(engine, PROBE)
+    }
+
+    /// A GPU whose `target` engine does `engine`'s with a push.
+    pub(crate) fn probing(engine: Engine, target: Target) -> Self {
         Self {
             engine,
+            target,
             refuse: Vec::new(),
             requests: Vec::new(),
             buffers: Vec::new(),
@@ -194,10 +202,13 @@ impl Gpu {
         let handle = buffers[push.bo_index as usize].handle;
         let words = &self.buffers[handle as usize - 1].0[..push.length as usize / 4];
         let methods = decode(words);
-        assert_eq!(methods[0], (4, method::SET_OBJECT, ENCODER_CLASS));
+        assert_eq!(
+            methods[0],
+            (4, method::SET_OBJECT, (self.target.class)(0x176).unwrap())
+        );
         assert_eq!(
             methods[1],
-            (4, method::SET_APPLICATION_ID, APPLICATION_H264)
+            (4, method::SET_APPLICATION_ID, self.target.application)
         );
         let field = |method: u32| {
             methods
@@ -229,14 +240,21 @@ unsafe impl Node for Gpu {
                 // SAFETY: the request's own argument.
                 let alloc = unsafe { &mut *argument.cast::<ChannelAlloc>() };
                 assert_eq!(alloc.fb_ctxdma_handle, !0);
-                assert_eq!(alloc.tt_ctxdma_handle, FIFO_ENGINE_NVENC);
+                assert_eq!(alloc.tt_ctxdma_handle, self.target.fifo_engine);
                 alloc.channel = 5;
                 alloc.pushbuf_domains = DOMAIN_VRAM | DOMAIN_GART;
             }
             GROBJ_ALLOC => {
                 // SAFETY: as above.
                 let object = unsafe { &*argument.cast::<GrobjAlloc>() };
-                assert_eq!((object.channel, object.class), (5, 0xc7b7));
+                assert_eq!(
+                    (object.channel, object.class as u32, object.handle),
+                    (
+                        5,
+                        (self.target.class)(0x176).unwrap(),
+                        self.target.object_handle
+                    )
+                );
             }
             GEM_NEW => {
                 // SAFETY: as above.
@@ -293,7 +311,7 @@ unsafe impl Node for Gpu {
     }
 }
 
-const BOUND_NS: u64 = 500_000_000;
+pub(crate) const BOUND_NS: u64 = 500_000_000;
 
 fn run(gpu: &mut Gpu, chipset: u16) -> (Outcome, Vec<String>) {
     let mut lines = Vec::new();
@@ -303,7 +321,7 @@ fn run(gpu: &mut Gpu, chipset: u16) -> (Outcome, Vec<String>) {
     (outcome, lines)
 }
 
-fn has(lines: &[String], text: &str) -> bool {
+pub(crate) fn has(lines: &[String], text: &str) -> bool {
     lines.iter().any(|line| line.contains(text))
 }
 

@@ -54,6 +54,7 @@ impl ParseState<'_> {
             "--display-trace" => options.display_trace = true,
             PROBE_NVENC => options.probe_nvenc = true,
             NVENC_SELFTEST => options.nvenc_selftest = true,
+            PROBE_NVDEC => options.probe_nvdec = true,
             NO_NVENC => options.nvenc = false,
             GPU_BOOST => options.gpu_boost = true,
             "--native-shared-check" => flag(

@@ -33,7 +33,10 @@ mod kext {
     ));
 }
 #[cfg(feature = "nvk")]
+pub(super) mod nvdec;
+#[cfg(feature = "nvk")]
 mod refused;
+#[cfg(feature = "nvk")]
 pub(super) mod nvenc;
 #[cfg(feature = "nvk")]
 mod slice;

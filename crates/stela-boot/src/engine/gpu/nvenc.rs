@@ -70,8 +70,9 @@ fn failed(index: u32) {
     FAILED.fetch_or(1 << index.min(63), Ordering::Relaxed);
 }
 
-/// A render node file of the probe's, the self-test's or a session's own.
-struct RenderFile(c_int);
+/// A render node file of the probe's, the self-test's or a session's own,
+/// and of NVDEC's probe (`super::nvdec`).
+pub(super) struct RenderFile(pub(super) c_int);
 
 // SAFETY: Linux's DRM ioctls honor their UAPI bounds, and `client::map`
 // keeps a mapping until `client::unmap` removes it.
@@ -100,14 +101,14 @@ unsafe impl Node for RenderFile {
     }
 }
 
-fn line(args: core::fmt::Arguments<'_>) {
+pub(super) fn line(args: core::fmt::Arguments<'_>) {
     output::arguments(format_args!("{args}\n"));
 }
 
-/// The GPUs nouveau bound, by index, with their chipset. Every one is
-/// NVIDIA's, since this build gives GPUs to nouveau only, and bound GPU
+/// The GPUs nouveau bound, by index, with their chipset and name. Every one
+/// is NVIDIA's, since this build gives GPUs to nouveau only, and bound GPU
 /// `index` has render node `RENDER_MINOR + index`.
-fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16)> {
+pub(super) fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16, String)> {
     let Some(installed) = super::installed() else {
         line(format_args!("{prefix} skipped: no GPU answers"));
         return Vec::new();
@@ -116,7 +117,7 @@ fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16)> {
     for (index, bound) in installed.start.bound.iter().enumerate() {
         let index = index as u32;
         match client::chipset(index) {
-            Some(chipset) => found.push((index, chipset)),
+            Some(chipset) => found.push((index, chipset, bound.name.clone())),
             None => line(format_args!(
                 "{prefix} GPU {index} ({}): nouveau did not say its chipset",
                 bound.name
@@ -130,7 +131,7 @@ fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16)> {
 }
 
 /// A render node file of GPU `index`.
-fn open(prefix: &str, index: u32) -> Option<c_int> {
+pub(super) fn open(prefix: &str, index: u32) -> Option<c_int> {
     let fd = client::open_node(RENDER_MINOR + index);
     if fd.is_none() {
         line(format_args!(
@@ -142,7 +143,7 @@ fn open(prefix: &str, index: u32) -> Option<c_int> {
 
 /// Probes the encoder of every NVIDIA GPU nouveau bound, in order.
 pub(in crate::engine) fn probe() {
-    for (index, chipset) in nvidia_gpus("NVENC PROBE") {
+    for (index, chipset, _) in nvidia_gpus("NVENC PROBE") {
         let Some(fd) = open("NVENC PROBE", index) else {
             continue;
         };
@@ -174,7 +175,7 @@ pub(in crate::engine) fn probe() {
 /// port drives.
 pub(in crate::engine) fn selftest() {
     let started = client::now_ns();
-    for (index, chipset) in nvidia_gpus("NVENC SELFTEST") {
+    for (index, chipset, _) in nvidia_gpus("NVENC SELFTEST") {
         if nvenc::encoder_class(chipset).is_none() {
             line(format_args!(
                 "NVENC SELFTEST GPU {index}: chipset {chipset:#x} has no encoder this port drives \

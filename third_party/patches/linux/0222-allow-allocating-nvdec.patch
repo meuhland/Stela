@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Louis-Philippe Gauthier <6123610+meuhland@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:50:06 +0000
+Subject: [PATCH] feat(nouveau): allow allocating NVDEC channels via abi16
+
+DRM_NOUVEAU_CHANNEL_ALLOC's engine hack (fb_ctxdma_handle = ~0) names
+GR, VP, PPP, BSP, CE and, with Stela's NVENC patch, NVENC, so no client
+can open a channel on the video decoder's runlist and asking for one is
+-ENOSYS, though NVKM already exposes it under GSP-RM (r570 maps
+RM_ENGINE_TYPE_NVDEC0..7 to NVKM's NVDEC runlists, and rm/engine.c
+creates the NVC7B0 object through r535_nvdec). Name it as
+NOUVEAU_FIFO_ENGINE_NVDEC, mapped to NV_DEVICE_HOST_RUNLIST_ENGINES_NVDEC,
+and leave the Volta/Turing copy-engine workaround off such a channel too,
+whose runlist has no copy engine.
+
+The value, 0x800, is provisional: the NVDEC patch queued upstream for 7.3
+is not in this tree, so its value is unknown here. This one is the next
+free bit after NOUVEAU_FIFO_ENGINE_NVENC's 0x400, to be aligned with
+upstream's once it is seen.
+
+Once the channel exists, DRM_NOUVEAU_GROBJ_ALLOC or NVIF NEW creates
+the decoder class on it unchanged. Stela's --probe-nvdec uses it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_abi16.c | 8 ++++++--
+ include/uapi/drm/nouveau_drm.h          | 6 ++++++
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_abi16.c b/drivers/gpu/drm/nouveau/nouveau_abi16.c
+index 78317a928d88498a66ea8ef2114734a9febb73d9..7eca63c14435fd417e383c063eb631aa28be5775 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_abi16.c
++++ b/drivers/gpu/drm/nouveau/nouveau_abi16.c
+@@ -411,6 +411,9 @@ nouveau_abi16_ioctl_channel_alloc(ABI16_IOCTL_ARGS)
+ 			case NOUVEAU_FIFO_ENGINE_NVENC:
+ 				engine = NV_DEVICE_HOST_RUNLIST_ENGINES_NVENC;
+ 				break;
++			case NOUVEAU_FIFO_ENGINE_NVDEC:
++				engine = NV_DEVICE_HOST_RUNLIST_ENGINES_NVDEC;
++				break;
+ 			default:
+ 				return nouveau_abi16_put(abi16, -ENOSYS);
+ 			}
+@@ -480,9 +483,10 @@ nouveau_abi16_ioctl_channel_alloc(ABI16_IOCTL_ARGS)
+ 	 *
+ 	 * Userspace was fixed prior to adding Ampere support.
+ 	 *
+-	 * An NVENC channel's runlist has no copy engine to create it on.
++	 * An NVENC or NVDEC channel's runlist has no copy engine to create it on.
+ 	 */
+-	switch (engine == NV_DEVICE_HOST_RUNLIST_ENGINES_NVENC ? 0 : device->info.family) {
++	switch (engine == NV_DEVICE_HOST_RUNLIST_ENGINES_NVENC ||
++		engine == NV_DEVICE_HOST_RUNLIST_ENGINES_NVDEC ? 0 : device->info.family) {
+ 	case NV_DEVICE_INFO_V0_VOLTA:
+ 		ret = nvif_object_ctor(&chan->chan->user, "abi16CeWar", 0, VOLTA_DMA_COPY_A,
+ 				       NULL, 0, &chan->ce);
+diff --git a/include/uapi/drm/nouveau_drm.h b/include/uapi/drm/nouveau_drm.h
+index 74ea77f459198427b14d17b4c7019b4e335aeb7b..9252966e3d616cce91d2044e7a99cc7fad1be06b 100644
+--- a/include/uapi/drm/nouveau_drm.h
++++ b/include/uapi/drm/nouveau_drm.h
+@@ -91,6 +91,12 @@ struct drm_nouveau_getparam {
+ #define NOUVEAU_FIFO_ENGINE_CE  0x30
+ /* Stela: the video encoder's runlist (NVENC), as NVDEC's has its own. */
+ #define NOUVEAU_FIFO_ENGINE_NVENC 0x400
++/*
++ * Stela: the video decoder's runlist (NVDEC). Provisional: upstream's value
++ * for its NVDEC engine is not in this tree, so this one is Stela's own, the
++ * next free bit after NVENC's, until it can be aligned with upstream's.
++ */
++#define NOUVEAU_FIFO_ENGINE_NVDEC 0x800
+ 
+ struct drm_nouveau_channel_alloc {
+ 	__u32     fb_ctxdma_handle;

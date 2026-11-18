@@ -20,6 +20,7 @@ pub mod cold;
 pub mod gsp_perf;
 pub mod nouveau_chip;
 pub mod stack;
+pub mod nvdec;
 pub mod nvenc;
 
 #[cfg(feature = "linux-kernel")]
