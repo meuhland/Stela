@@ -3064,6 +3064,25 @@ fn serve_posted(gpu: &Installed, waiting: &dyn Fn() -> bool) -> Option<bool> {
     Some(stepped)
 }
 
+/// Runs Linux's ready work on this processor, in the boot CPU's place as a
+/// poster does ([`serve_posted`]), for `ns` at most or until nothing runs:
+/// for a guest's encoder call whose `EXEC` queued a job, which nouveau's
+/// scheduler pushes to the channel from a work item, so that it reaches
+/// the GPU now rather than at the boot CPU's next pump (up to
+/// [`DEFER_LONGEST_NS`] later). Whether it ran Linux here: not on the boot
+/// CPU, in a job's slice or an interrupt handler, or while another
+/// processor runs Linux, whose pass takes the work anyway.
+#[cfg(feature = "nvk")]
+pub(super) fn run_ready_here(ns: u64) -> bool {
+    let Some(gpu) = installed() else {
+        return false;
+    };
+    let started = host::rdtsc();
+    let budget = gpu.tsc_after(ns);
+    let within = || host::rdtsc().wrapping_sub(started) < budget;
+    serve_posted(gpu, &within).is_some()
+}
+
 /// How long a poster that found nothing to run ([`serve_posted`]) spins
 /// before it enters again: with work raised or due, which the processor it
 /// woke may be taking, and without, for a call no other processor took.

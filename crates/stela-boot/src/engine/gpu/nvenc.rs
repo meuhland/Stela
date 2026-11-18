@@ -54,6 +54,9 @@ static FAILED: AtomicU64 = AtomicU64::new(0);
 /// The pause between two looks at a guest frame's semaphore, within one
 /// gate call's budget.
 const GATE_PAUSE_NS: u64 = 10_000;
+/// The longest an encoder call runs the host's Linux in place to push its
+/// job ([`EncoderPlatform::kick`]); it stops sooner once nothing runs.
+const KICK_NS: u64 = 200_000;
 /// The stack each GPU's encoder calls run on, one at a time under the
 /// encoders' lock: session code is shallow.
 const ENCODER_STACK_BYTES: usize = 1 << 20;
@@ -322,6 +325,10 @@ impl EncoderPlatform for GateGpu {
         while client::now_ns() < until {
             hint::spin_loop();
         }
+    }
+
+    fn kick(&self) -> bool {
+        super::run_ready_here(KICK_NS)
     }
 
     fn relax(&self) {
