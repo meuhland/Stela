@@ -137,6 +137,8 @@ const PUSH_BYTES: u32 = 0xf000;
 pub const SEMAPHORE_OFFSET: u64 = 0xf000;
 /// Where the staging buffer is.
 pub const STAGING_ADDRESS: u64 = 0x1_3010_0000;
+/// The staging buffer's distance from the ring.
+const STAGING_FROM_RING: u64 = STAGING_ADDRESS - RING_ADDRESS;
 /// The most staging a copier takes: a 4096x4096 picture of 16-bit samples,
 /// 4:2:0.
 pub const MOST_STAGING: u64 = 0x300_0000;
@@ -145,6 +147,16 @@ const _: () = assert!(
     RING_ADDRESS + RING_BYTES <= STAGING_ADDRESS
         && STAGING_ADDRESS + MOST_STAGING <= crate::nvenc::layout::KERNEL_VA_START
 );
+
+/// Where a copier's ring goes in a session's VM whose buffers end at
+/// `end`: [`RING_ADDRESS`] when they end below it (every captured layout),
+/// else the next 2 MiB past them; none when the ring and the most staging
+/// would reach the kernel's addresses.
+pub fn ring_after(end: u64) -> Option<u64> {
+    let ring = RING_ADDRESS.max(end.next_multiple_of(0x20_0000));
+    (ring + STAGING_FROM_RING + MOST_STAGING <= crate::nvenc::layout::KERNEL_VA_START)
+        .then_some(ring)
+}
 /// The most planes in one copy.
 pub const MOST_BLITS: usize = 4;
 /// The words of one plane's copy.
@@ -388,6 +400,8 @@ enum State {
 /// A copy-engine channel on a decoding session's file, with its ring and
 /// staging buffer.
 pub struct Copier {
+    /// Where its ring is bound; the staging buffer is 1 MiB past it.
+    ring: u64,
     channel: i32,
     syncobj: u32,
     buffers: Vec<Buffer>,
@@ -409,10 +423,27 @@ impl Copier {
     /// nothing was submitted, so nothing waits. One copier a file: as the
     /// session's, its buffers' addresses stay bound until the file closes.
     pub fn open<N: Node>(node: &mut N, staging: u64, timeout_ns: u64) -> Result<Self, Error> {
+        Self::open_at(node, RING_ADDRESS, staging, timeout_ns)
+    }
+
+    /// [`Copier::open`] with the ring at `ring` ([`ring_after`]) and the
+    /// staging buffer 1 MiB past it.
+    pub fn open_at<N: Node>(
+        node: &mut N,
+        ring: u64,
+        staging: u64,
+        timeout_ns: u64,
+    ) -> Result<Self, Error> {
+        if !ring.is_multiple_of(0x1_0000)
+            || ring + STAGING_FROM_RING + MOST_STAGING > crate::nvenc::layout::KERNEL_VA_START
+        {
+            return Err(Error::Config("a copy ring outside the session's addresses"));
+        }
         if staging == 0 || staging > MOST_STAGING {
             return Err(Error::Config("a staging buffer of 1 byte to 48 MiB"));
         }
         let mut copier = Self {
+            ring,
             channel: -1,
             syncobj: 0,
             buffers: Vec::new(),
@@ -454,7 +485,7 @@ impl Copier {
             "copy ring",
             RING_BYTES,
             RING_BYTES,
-            RING_ADDRESS,
+            self.ring,
             &mut self.buffers,
         )?;
         let bytes = self.staging.next_multiple_of(0x1000);
@@ -463,7 +494,7 @@ impl Copier {
             "copy staging",
             bytes,
             MOST_STAGING,
-            STAGING_ADDRESS,
+            self.staging_address(),
             &mut self.buffers,
         )?;
         Ok(())
@@ -472,6 +503,16 @@ impl Copier {
     /// The channel nouveau gave.
     pub fn channel(&self) -> i32 {
         self.channel
+    }
+
+    /// The staging buffer's GPU address: where blits write.
+    pub fn staging_address(&self) -> u64 {
+        self.ring + STAGING_FROM_RING
+    }
+
+    /// The ring's GPU address.
+    pub fn ring_address(&self) -> u64 {
+        self.ring
     }
 
     /// The staging bytes asked for.
@@ -536,10 +577,9 @@ impl Copier {
         if blits.is_empty() || blits.len() > MOST_BLITS {
             return Err(Error::Config("1 to 4 planes a copy"));
         }
-        let end = STAGING_ADDRESS + self.staging;
-        if let Some(why) = blits
-            .iter()
-            .find_map(|blit| blit.refusal(STAGING_ADDRESS, end))
+        let start = self.staging_address();
+        let end = start + self.staging;
+        if let Some(why) = blits.iter().find_map(|blit| blit.refusal(start, end))
         {
             return Err(Error::Config(why));
         }
@@ -548,7 +588,7 @@ impl Copier {
         let payload = self.sequence;
         let words = words(
             blits,
-            RING_ADDRESS + SEMAPHORE_OFFSET,
+            self.ring + SEMAPHORE_OFFSET,
             payload,
             self.copies == 0,
         );
@@ -571,7 +611,7 @@ impl Copier {
         // The words land before the doorbell.
         fence(Ordering::SeqCst);
         let mut exec_push = ExecPush {
-            va: RING_ADDRESS + u64::from(self.push_at),
+            va: self.ring + u64::from(self.push_at),
             va_len: bytes,
             flags: 0,
         };

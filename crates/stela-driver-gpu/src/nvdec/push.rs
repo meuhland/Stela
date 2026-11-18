@@ -10,10 +10,10 @@
 //!   macroblock timers, error concealment from the previous picture's
 //!   slot, a production run);
 //! - the setup page, the bitstream, and for H.264 the slice offsets;
-//! - the surfaces, luma then chroma per entry: H.264 sends the stream's
-//!   slots and one more, HEVC entries 0 to 15; an entry whose slot the
-//!   stream has not reached yet names the current picture (H.264) or slot 0
-//!   (HEVC), as NVIDIA's driver does;
+//! - the surfaces, luma then chroma per entry: H.264 sends
+//!   [`super::layout::h264_entries`] (5 at 1080p, 9 at 720p), HEVC entries
+//!   0 to 15; an entry whose slot the stream has not reached yet names the
+//!   current picture (H.264) or slot 0 (HEVC), as NVIDIA's driver does;
 //! - the co-located buffer, the status, the picture index (the session's
 //!   decode count);
 //! - H.264: the macroblock history and the history; HEVC: the scaling list,
@@ -68,7 +68,7 @@ pub fn words(
     let mut words = Vec::with_capacity(MOST_WORDS);
     let ring = index as usize % layout.setup.len();
     let page = layout.address(layout.setup[ring]);
-    let current = layout.surface(picture.slot);
+    let current = layout.surface(picture.surface);
     if preamble {
         emit(&mut words, m::SET_OBJECT, DECODER_CLASS);
         emit(&mut words, m::SET_WATCHDOG_TIMER, WATCHDOG);
@@ -96,14 +96,15 @@ pub fn words(
                 m::SET_SLICE_OFFSETS_BUF_OFFSET,
                 a8(page + H264_SLICE_OFFSETS as u64),
             );
-            (usize::from(picture.slots) + 1, current)
+            let reached = usize::from(picture.high_water) + 1;
+            (layout.entries.max(reached).min(17), current)
         }
         Codec::Hevc => (16, layout.surface(0)),
     };
     for entry in 0..entries {
         let (luma, chroma) =
-            if entry <= usize::from(picture.high_water) && entry < layout.surfaces.len() {
-                layout.surface(entry as u8)
+            if entry <= usize::from(picture.high_water) && entry < picture.bindings.len() {
+                layout.surface(picture.bindings[entry])
             } else {
                 fallback
             };

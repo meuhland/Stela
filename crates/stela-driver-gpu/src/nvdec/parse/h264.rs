@@ -1,13 +1,30 @@
-//! H.264 (Rec. ITU-T H.264): sequence and picture parameter sets, the slice
-//! header up to `dec_ref_pic_marking()`, the picture order count (8.2.1)
-//! and the decoded reference pictures (8.2.5), frame pictures only.
+//! H.264 (Rec. ITU-T H.264): sequence and picture parameter sets (with the
+//! VUI's reorder bound and the scaling matrices), the slice header up to
+//! `dec_ref_pic_marking()`, the picture order count (8.2.1), the decoded
+//! reference pictures (8.2.5) and the output order, frame pictures only.
 //!
 //! The reference pictures sit at fixed places of NVDEC's `dpb[16]`, as
 //! NVIDIA's driver keeps them (`nvdec-conventions.md`): a picture keeps its
 //! place while it is a reference, and a new reference takes the first free
 //! one once the sliding window or `memory_management_control_operation`s
-//! freed theirs. Each picture is written to a surface slot: the lowest slot
-//! no reference holds, out of `max_num_ref_frames + 1`.
+//! freed theirs.
+//!
+//! Surface slots, order counts and output order are FFmpeg's, the
+//! application NVIDIA's driver was captured under ([`super::super::dpb`]):
+//!
+//! - **Picture order count type 0 starts at 65536:** FFmpeg's `idr()` sets
+//!   `prev_poc_msb = 1 << 16` and `prev_poc_lsb = -1`, so an IDR's POC is
+//!   65536 + its LSBs and every later one follows. Types 1 and 2 count from
+//!   `frame_num` and get no offset. Only differences matter to the engine.
+//! - **Slots** come off a stack; a picture holds its slot while it is a
+//!   reference or waits to be shown, and the slots no picture holds any
+//!   more are given back at the start of the next picture, in the order of
+//!   FFmpeg's picture array (a picture takes the array's first free place).
+//! - **Output:** a picture waits until more than `has_b_frames` do (the
+//!   VUI's `max_num_reorder_frames`, or FFmpeg's guess from the order
+//!   counts without it); then the lowest order count is shown, never across
+//!   an IDR or a `memory_management_control_operation` 5.
+use super::super::dpb::{Output, Pool};
 use super::{Bits, Error, Nal, Result};
 use alloc::vec::Vec;
 
@@ -18,11 +35,18 @@ pub const NAL_SEI: u8 = 6;
 pub const NAL_SPS: u8 = 7;
 pub const NAL_PPS: u8 = 8;
 pub const NAL_AUD: u8 = 9;
+pub const NAL_END_OF_SEQUENCE: u8 = 10;
 
 /// The largest pictures NVDEC takes for H.264: 4096x4096.
 pub const MAX_MBS_SIDE: u32 = 256;
 /// The most slices a picture may have: the slice offsets buffer's words.
 pub const MAX_SLICES: usize = 256;
+/// The most surface slots a stream gets.
+pub const MAX_SLOTS: u8 = 16;
+/// FFmpeg's `H264_MAX_PICTURE_COUNT`: the places of its picture array.
+const PICTURE_PLACES: u8 = 36;
+/// FFmpeg's `MAX_DELAYED_PIC_COUNT`.
+const MAX_DELAYED: usize = 16;
 
 /// The cropping of a picture's coded frame, in luma samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,7 +57,78 @@ pub struct Crop {
     pub bottom: u32,
 }
 
-/// A sequence parameter set (7.3.2.1.1), VUI left out.
+/// The scaling matrices of a parameter set (7.4.2.1.1.1), in raster order:
+/// the six 4x4 lists (intra Y, Cb, Cr, inter Y, Cb, Cr) and the two 8x8
+/// lists of 4:2:0 (intra Y, inter Y).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scaling {
+    pub list4x4: [[u8; 16]; 6],
+    pub list8x8: [[u8; 64]; 2],
+}
+
+impl Scaling {
+    /// `Flat_4x4_16` and `Flat_8x8_16`: no scaling.
+    pub const FLAT: Self = Self {
+        list4x4: [[16; 16]; 6],
+        list8x8: [[16; 64]; 2],
+    };
+}
+
+impl Default for Scaling {
+    fn default() -> Self {
+        Self::FLAT
+    }
+}
+
+/// The 4x4 zig-zag scan: raster position of each coded coefficient.
+const ZIGZAG4: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+/// The 8x8 zig-zag (frame) scan.
+const ZIGZAG8: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+/// Table 7-3 and 7-4, in zig-zag order: `Default_4x4_Intra`/`_Inter`,
+/// `Default_8x8_Intra`/`_Inter`.
+const DEFAULT_4X4: [[u8; 16]; 2] = [
+    [
+        6, 13, 13, 20, 20, 20, 28, 28, 28, 28, 32, 32, 32, 37, 37, 42,
+    ],
+    [
+        10, 14, 14, 20, 20, 20, 24, 24, 24, 24, 27, 27, 27, 30, 30, 34,
+    ],
+];
+const DEFAULT_8X8: [[u8; 64]; 2] = [
+    [
+        6, 10, 10, 13, 11, 13, 16, 16, 16, 16, 18, 18, 18, 18, 18, 23, 23, 23, 23, 23, 23, 25, 25,
+        25, 25, 25, 25, 25, 27, 27, 27, 27, 27, 27, 27, 27, 29, 29, 29, 29, 29, 29, 29, 31, 31, 31,
+        31, 31, 31, 33, 33, 33, 33, 33, 36, 36, 36, 36, 38, 38, 38, 40, 40, 42,
+    ],
+    [
+        9, 13, 13, 15, 13, 15, 17, 17, 17, 17, 19, 19, 19, 19, 19, 21, 21, 21, 21, 21, 21, 22, 22,
+        22, 22, 22, 22, 22, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 27, 27, 27,
+        27, 27, 27, 28, 28, 28, 28, 28, 30, 30, 30, 30, 32, 32, 32, 33, 33, 35,
+    ],
+];
+
+/// A zig-zag list in raster order.
+fn raster<const N: usize>(coded: &[u8; N], scan: &[usize; N]) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (k, &value) in coded.iter().enumerate() {
+        out[scan[k]] = value;
+    }
+    out
+}
+
+/// The VUI's `bitstream_restriction()` (E.1.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Restriction {
+    pub max_num_reorder_frames: u32,
+    pub max_dec_frame_buffering: u32,
+}
+
+/// A sequence parameter set (7.3.2.1.1), of the VUI only the bitstream
+/// restriction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sps {
     pub profile_idc: u8,
@@ -46,6 +141,8 @@ pub struct Sps {
     pub bit_depth_chroma: u8,
     pub qpprime_y_zero_transform_bypass: bool,
     pub scaling_matrix_present: bool,
+    /// The sequence's matrices: flat without `seq_scaling_matrix_present`.
+    pub scaling: Scaling,
     pub log2_max_frame_num: u8,
     pub pic_order_cnt_type: u8,
     pub log2_max_poc_lsb: u8,
@@ -61,6 +158,7 @@ pub struct Sps {
     pub mb_adaptive_frame_field: bool,
     pub direct_8x8_inference: bool,
     pub crop: Crop,
+    pub restriction: Option<Restriction>,
 }
 
 impl Sps {
@@ -88,6 +186,43 @@ impl Sps {
     fn max_frame_num(&self) -> u32 {
         1 << self.log2_max_frame_num
     }
+
+    /// `MaxDpbFrames` of the level (A.3.1, Table A-1), at most 16.
+    pub fn max_dpb_frames(&self) -> u32 {
+        let max_dpb_mbs: u32 = match self.level_idc {
+            9 | 10 => 396,
+            11 if self.constraint_flags & 0x10 != 0 => 396,
+            11 => 900,
+            12 | 13 | 20 => 2376,
+            21 => 4752,
+            22 | 30 => 8100,
+            31 => 18000,
+            32 => 20480,
+            40 | 41 => 32768,
+            42 => 34816,
+            50 => 110400,
+            51 | 52 => 184320,
+            _ => 696320,
+        };
+        (max_dpb_mbs / (self.width_mbs * self.height_mbs()).max(1)).clamp(1, 16)
+    }
+
+    /// The pictures that may wait to be shown: the VUI's bound, else the
+    /// level's.
+    pub fn reorder_bound(&self) -> u32 {
+        match self.restriction {
+            Some(r) => r.max_num_reorder_frames.min(16),
+            None => self.max_dpb_frames(),
+        }
+    }
+
+    /// The surface slots a stream of this sequence may hold at once: its
+    /// references, the pictures waiting to be shown and the one being
+    /// decoded, plus one a picture waiting to be given back holds.
+    pub fn slots(&self) -> u8 {
+        let refs = u32::from(self.max_num_ref_frames.max(1));
+        (refs + self.reorder_bound() + 2).min(u32::from(MAX_SLOTS)) as u8
+    }
 }
 
 /// A picture parameter set (7.3.2.2).
@@ -109,6 +244,9 @@ pub struct Pps {
     pub redundant_pic_cnt_present: bool,
     pub transform_8x8_mode: bool,
     pub scaling_matrix_present: bool,
+    /// The matrices pictures of this set use: the set's own, else the
+    /// sequence's.
+    pub scaling: Scaling,
     pub second_chroma_qp_index_offset: i32,
 }
 
@@ -166,18 +304,133 @@ fn profile_has_chroma_info(profile: u8) -> bool {
     )
 }
 
-/// Skips a `scaling_list()` of `size` coefficients.
-fn skip_scaling_list(bits: &mut Bits, size: usize) -> Result<()> {
+/// A `scaling_list()` of `N` coefficients (7.3.2.1.1.1), in zig-zag order;
+/// `None` when it says `useDefaultScalingMatrixFlag`.
+fn scaling_list<const N: usize>(bits: &mut Bits) -> Result<Option<[u8; N]>> {
+    let mut list = [0u8; N];
     let mut last = 8i32;
     let mut next = 8i32;
-    for _ in 0..size {
+    for (j, entry) in list.iter_mut().enumerate() {
         if next != 0 {
             let delta = bits.se_in(-128..=127, "delta_scale out of range")?;
             next = (last + delta + 256) % 256;
+            if j == 0 && next == 0 {
+                return Ok(None);
+            }
         }
-        last = if next == 0 { last } else { next };
+        let value = if next == 0 { last } else { next };
+        *entry = value as u8;
+        last = value;
     }
-    Ok(())
+    Ok(Some(list))
+}
+
+/// The scaling matrices a parameter set signals (`count` lists: 6, and 2
+/// 8x8 ones when they are coded), each absent one per fall-back rule A
+/// (`fallback` is `None`: the defaults) or B (the sequence's).
+fn scaling_matrices(
+    bits: &mut Bits,
+    count: usize,
+    fallback: Option<&Scaling>,
+    eight_from: &Scaling,
+) -> Result<Scaling> {
+    let mut out = Scaling {
+        list8x8: eight_from.list8x8,
+        ..Scaling::FLAT
+    };
+    for i in 0..count {
+        let present = bits.flag()?;
+        if i < 6 {
+            let inter = usize::from(i >= 3);
+            let default = raster(&DEFAULT_4X4[inter], &ZIGZAG4);
+            out.list4x4[i] = if present {
+                match scaling_list::<16>(bits)? {
+                    Some(list) => raster(&list, &ZIGZAG4),
+                    None => default,
+                }
+            } else if i == 0 || i == 3 {
+                fallback.map_or(default, |f| f.list4x4[i])
+            } else {
+                out.list4x4[i - 1]
+            };
+        } else if i < 8 {
+            let inter = i - 6;
+            let default = raster(&DEFAULT_8X8[inter], &ZIGZAG8);
+            out.list8x8[inter] = if present {
+                match scaling_list::<64>(bits)? {
+                    Some(list) => raster(&list, &ZIGZAG8),
+                    None => default,
+                }
+            } else {
+                fallback.map_or(default, |f| f.list8x8[inter])
+            };
+        } else if present {
+            // 4:4:4's chroma 8x8 lists: parsed past, the stream is refused
+            // for its chroma format anyway.
+            scaling_list::<64>(bits)?;
+        }
+    }
+    Ok(out)
+}
+
+/// `hrd_parameters()` (E.1.2), skipped.
+fn skip_hrd(b: &mut Bits) -> Result<()> {
+    let count = b.ue_max(31, "cpb_cnt_minus1 above 31")? + 1;
+    b.skip(8)?;
+    for _ in 0..count {
+        b.ue()?;
+        b.ue()?;
+        b.skip(1)?;
+    }
+    b.skip(20)
+}
+
+/// `vui_parameters()` (E.1.1): the bitstream restriction, if any.
+fn vui(b: &mut Bits) -> Result<Option<Restriction>> {
+    if b.flag()? && b.u(8)? == 255 {
+        b.skip(32)?;
+    }
+    if b.flag()? {
+        b.skip(1)?;
+    }
+    if b.flag()? {
+        b.skip(4)?;
+        if b.flag()? {
+            b.skip(24)?;
+        }
+    }
+    if b.flag()? {
+        b.ue()?;
+        b.ue()?;
+    }
+    if b.flag()? {
+        b.skip(65)?;
+    }
+    let nal_hrd = b.flag()?;
+    if nal_hrd {
+        skip_hrd(b)?;
+    }
+    let vcl_hrd = b.flag()?;
+    if vcl_hrd {
+        skip_hrd(b)?;
+    }
+    if nal_hrd || vcl_hrd {
+        b.skip(1)?;
+    }
+    b.skip(1)?; // pic_struct_present_flag
+    if !b.flag()? {
+        return Ok(None);
+    }
+    b.skip(1)?;
+    for _ in 0..4 {
+        b.ue()?;
+    }
+    let max_num_reorder_frames = b.ue()?;
+    let max_dec_frame_buffering = b.ue()?;
+    Ok(Some(Restriction {
+        max_num_reorder_frames,
+        max_dec_frame_buffering,
+    }))
 }
 
 /// Parses a sequence parameter set's RBSP (`escaped`, after the NAL header).
@@ -204,11 +457,7 @@ pub fn sps(escaped: &[u8]) -> Result<Sps> {
         sps.scaling_matrix_present = b.flag()?;
         if sps.scaling_matrix_present {
             let lists = if sps.chroma_format_idc == 3 { 12 } else { 8 };
-            for i in 0..lists {
-                if b.flag()? {
-                    skip_scaling_list(&mut b, if i < 6 { 16 } else { 64 })?;
-                }
-            }
+            sps.scaling = scaling_matrices(&mut b, lists, None, &Scaling::FLAT)?;
         }
     }
     sps.log2_max_frame_num = 4 + b.ue_max(12, "log2_max_frame_num_minus4 above 12")? as u8;
@@ -261,6 +510,11 @@ pub fn sps(escaped: &[u8]) -> Result<Sps> {
             return Err(Error::Invalid("the cropping leaves no picture"));
         }
     }
+    // A VUI that does not parse costs only the reorder bound, which then
+    // comes from the level, as without one.
+    if b.flag()? {
+        sps.restriction = vui(&mut b).ok().flatten();
+    }
     Ok(sps)
 }
 
@@ -299,17 +553,17 @@ pub fn pps(escaped: &[u8], sps: &[Option<Sps>]) -> Result<Pps> {
     pps.constrained_intra_pred = b.flag()?;
     pps.redundant_pic_cnt_present = b.flag()?;
     pps.second_chroma_qp_index_offset = pps.chroma_qp_index_offset;
+    pps.scaling = seq.scaling;
     if b.more_rbsp_data() {
         pps.transform_8x8_mode = b.flag()?;
         pps.scaling_matrix_present = b.flag()?;
         if pps.scaling_matrix_present {
             let lists = 6 + if seq.chroma_format_idc == 3 { 6 } else { 2 }
                 * usize::from(pps.transform_8x8_mode);
-            for i in 0..lists {
-                if b.flag()? {
-                    skip_scaling_list(&mut b, if i < 6 { 16 } else { 64 })?;
-                }
-            }
+            // Rule A without the sequence's matrices, rule B with them
+            // (7.4.2.2, Table 7-2).
+            let fallback = seq.scaling_matrix_present.then_some(&seq.scaling);
+            pps.scaling = scaling_matrices(&mut b, lists, fallback, &seq.scaling)?;
         }
         pps.second_chroma_qp_index_offset =
             b.se_in(-12..=12, "second_chroma_qp_index_offset out of range")?;
@@ -513,17 +767,43 @@ pub struct Picture {
     /// Where each slice's start code is in [`Picture::bitstream`].
     pub slice_offsets: Vec<u32>,
     pub slot: u8,
-    /// The slots the stream uses: `max_num_ref_frames + 1`.
+    /// The slots the stream may hold at once ([`Sps::slots`]).
     pub slots: u8,
     /// The highest slot used so far, this picture's included.
     pub high_water: u8,
-    /// The slot of the picture decoded before this one, which NVIDIA's
-    /// driver names in the `dpb[]` entries no reference holds.
+    /// The slot of the last reference picture decoded before this one (0
+    /// for the first): what the engine conceals a damaged picture from
+    /// (`ERROR_FRM_IDX`), and what NVIDIA's driver names in the `dpb[]`
+    /// entries no reference holds. Non-reference pictures do not count:
+    /// h264-high-bf's B-frames name the reference before them.
     pub previous_slot: u8,
     pub frame_num: u32,
     pub poc: [i32; 2],
     /// The references, at their `dpb[]` places, before this picture.
     pub dpb: [Option<Reference>; 16],
+    /// Which decode of the stream this is (0 for the first).
+    pub decoded: u32,
+    /// The pictures shown as this one starts, in output order, maybe
+    /// itself.
+    pub outputs: Vec<Output>,
+}
+
+/// A picture FFmpeg's picture array holds: its place there and its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Held {
+    place: u8,
+    slot: u8,
+}
+
+/// A picture waiting to be shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waiting {
+    slot: u8,
+    poc: i32,
+    decoded: u32,
+    /// An IDR, or a picture with `memory_management_control_operation` 5:
+    /// no picture is shown across it.
+    barrier: bool,
 }
 
 /// A stream's parameter sets and reference state, one access unit at a time.
@@ -539,10 +819,16 @@ pub struct Parser {
     prev_ref_frame_num: u32,
     max_long_term_frame_idx: Option<u32>,
     previous_slot: u8,
-    high_water: Option<u8>,
     seen_idr: bool,
     /// The sequence the stream started with: a new one needs a new session.
     active_sps: Option<Sps>,
+    pool: Pool,
+    held: Vec<Held>,
+    waiting: Vec<Waiting>,
+    has_b_frames: u32,
+    next_outputed_poc: i32,
+    last_pocs: [i32; MAX_DELAYED],
+    decoded: u32,
 }
 
 impl Default for Parser {
@@ -564,15 +850,44 @@ impl Parser {
             prev_ref_frame_num: 0,
             max_long_term_frame_idx: None,
             previous_slot: 0,
-            high_water: None,
             seen_idr: false,
             active_sps: None,
+            pool: Pool::new(MAX_SLOTS),
+            held: Vec::new(),
+            waiting: Vec::new(),
+            has_b_frames: 0,
+            next_outputed_poc: i32::MIN,
+            last_pocs: [i32::MIN; MAX_DELAYED],
+            decoded: 0,
         }
     }
 
     /// The sequence of the stream's first picture.
     pub fn active_sps(&self) -> Option<&Sps> {
         self.active_sps.as_ref()
+    }
+
+    /// Takes a parameter set NAL outside an access unit (from an `avcC`).
+    pub fn parameter_set(&mut self, nal: &Nal<'_>) -> Result<()> {
+        match nal.h264_type() {
+            NAL_SPS => {
+                let sps = sps(&nal.bytes[1..])?;
+                let id = usize::from(sps.id);
+                self.sps[id] = Some(sps);
+            }
+            NAL_PPS => {
+                let pps = pps(&nal.bytes[1..], &self.sps)?;
+                let id = usize::from(pps.id);
+                self.pps[id] = Some(pps);
+            }
+            _ => return Err(Error::Invalid("not a parameter set")),
+        }
+        Ok(())
+    }
+
+    /// Whether `slot` holds a reference.
+    fn is_reference(&self, slot: u8) -> bool {
+        self.refs.iter().flatten().any(|r| r.slot == slot)
     }
 
     /// Takes one access unit's NAL units: the parameter sets it carries,
@@ -582,16 +897,7 @@ impl Parser {
         let mut slices: Vec<(Nal<'_>, Slice)> = Vec::new();
         for nal in nals {
             match nal.h264_type() {
-                NAL_SPS => {
-                    let sps = sps(&nal.bytes[1..])?;
-                    let id = usize::from(sps.id);
-                    self.sps[id] = Some(sps);
-                }
-                NAL_PPS => {
-                    let pps = pps(&nal.bytes[1..], &self.sps)?;
-                    let id = usize::from(pps.id);
-                    self.pps[id] = Some(pps);
-                }
+                NAL_SPS | NAL_PPS => self.parameter_set(nal)?,
                 NAL_SLICE | NAL_IDR => {
                     let header = slice(nal, &self.sps, &self.pps)?;
                     slices.push((*nal, header));
@@ -644,22 +950,21 @@ impl Parser {
         if sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
             return Err(Error::Unsupported("H.264 other than 8-bit 4:2:0"));
         }
-        if sps.scaling_matrix_present || pps.scaling_matrix_present {
-            return Err(Error::Unsupported("H.264 scaling matrices"));
-        }
         let max_frame_num = sps.max_frame_num();
         if idr {
-            self.seen_idr = true;
-            self.refs = [None; 16];
-            self.max_long_term_frame_idx = None;
-            self.prev_poc_msb = 0;
-            self.prev_poc_lsb = 0;
-            self.prev_frame_num_offset = 0;
-            self.prev_frame_num = 0;
-            self.prev_ref_frame_num = 0;
             if first.frame_num != 0 {
                 return Err(Error::Invalid("an IDR with a frame_num"));
             }
+            // FFmpeg's idr(): no reference left, and its POC origin.
+            self.seen_idr = true;
+            self.refs = [None; 16];
+            self.max_long_term_frame_idx = None;
+            self.prev_poc_msb = 1 << 16;
+            self.prev_poc_lsb = -1;
+            self.prev_frame_num_offset = 0;
+            self.prev_frame_num = 0;
+            self.prev_ref_frame_num = 0;
+            self.last_pocs = [i32::MIN; MAX_DELAYED];
         } else if first.frame_num != self.prev_ref_frame_num
             && first.frame_num != (self.prev_ref_frame_num + 1) % max_frame_num
         {
@@ -725,13 +1030,31 @@ impl Parser {
                 ([temp, temp], 0)
             }
         };
-        // The surface: the lowest slot no reference holds.
-        let slots = sps.max_num_ref_frames.max(1) + 1;
-        let slot = (0..slots)
-            .find(|s| !self.refs.iter().flatten().any(|r| r.slot == *s))
-            .ok_or(Error::Invalid("every surface holds a reference"))?;
-        let high_water = self.high_water.map_or(slot, |h| h.max(slot));
-        self.high_water = Some(high_water);
+        // FFmpeg's frame start: the pictures neither a reference nor
+        // waiting to be shown give their slots back, in picture-array
+        // order; the new picture takes the array's first free place and
+        // the pool's next slot.
+        self.pool.widen(sps.slots());
+        self.held.sort_by_key(|h| h.place);
+        let mut kept = Vec::with_capacity(self.held.len());
+        for held in core::mem::take(&mut self.held) {
+            let waiting = self.waiting.iter().any(|w| w.slot == held.slot);
+            if waiting || self.is_reference(held.slot) {
+                kept.push(held);
+            } else {
+                self.pool.give(held.slot);
+            }
+        }
+        self.held = kept;
+        let place = (0..PICTURE_PLACES)
+            .find(|p| !self.held.iter().any(|h| h.place == *p))
+            .ok_or(Error::Invalid("every picture place is held"))?;
+        let slot = self
+            .pool
+            .take()
+            .ok_or(Error::Invalid("every surface holds a picture"))?;
+        self.held.push(Held { place, slot });
+        let high_water = self.pool.high_water().unwrap_or(slot);
         let mut bitstream = Vec::new();
         let mut slice_offsets = Vec::with_capacity(slices.len());
         let mut kind = 'I';
@@ -745,7 +1068,7 @@ impl Parser {
                 _ => 'I',
             };
         }
-        let picture = Picture {
+        let mut picture = Picture {
             sps: sps.clone(),
             pps,
             slice: first.clone(),
@@ -755,12 +1078,14 @@ impl Parser {
             bitstream,
             slice_offsets,
             slot,
-            slots,
+            slots: self.pool.most(),
             high_water,
             previous_slot: self.previous_slot,
             frame_num: first.frame_num,
             poc,
             dpb: self.refs,
+            decoded: self.decoded,
+            outputs: Vec::new(),
         };
         // As if decoded: the marking (8.2.5) and the order count's state.
         let mut forget_all = false;
@@ -785,8 +1110,148 @@ impl Parser {
         }
         self.prev_frame_num_offset = if forget_all { 0 } else { frame_num_offset };
         self.prev_frame_num = if forget_all { 0 } else { first.frame_num };
-        self.previous_slot = slot;
+        if forget_all {
+            self.last_pocs = [i32::MIN; MAX_DELAYED];
+        }
+        if reference {
+            self.previous_slot = slot;
+        }
+        // FFmpeg shows a frame by the lower of its field order counts.
+        let shown_poc = poc[0].min(poc[1]);
+        if let Some(output) = self.select_output(&sps, kind, slot, shown_poc, idr || forget_all) {
+            picture.outputs.push(output);
+        }
+        self.decoded += 1;
         Ok(Some(picture))
+    }
+
+    /// FFmpeg's `h264_select_output_frame()` for the picture just started:
+    /// it joins the pictures waiting to be shown, and one of them may be
+    /// shown.
+    fn select_output(
+        &mut self,
+        sps: &Sps,
+        kind: char,
+        slot: u8,
+        poc: i32,
+        barrier: bool,
+    ) -> Option<Output> {
+        if let Some(restriction) = sps.restriction {
+            self.has_b_frames = self
+                .has_b_frames
+                .max(restriction.max_num_reorder_frames.min(MAX_DELAYED as u32));
+        }
+        // The guess at the reorder depth from the order counts, which only
+        // counts without a bitstream restriction.
+        let mut i = 0;
+        loop {
+            if i == MAX_DELAYED || poc < self.last_pocs[i] {
+                if i > 0 {
+                    self.last_pocs[i - 1] = poc;
+                }
+                break;
+            } else if i > 0 {
+                self.last_pocs[i - 1] = self.last_pocs[i];
+            }
+            i += 1;
+        }
+        let mut out_of_order = (MAX_DELAYED - i) as u32;
+        let last = self.last_pocs[MAX_DELAYED - 1];
+        let before = self.last_pocs[MAX_DELAYED - 2];
+        if kind == 'B' || (before > i32::MIN && i64::from(last) - i64::from(before) > 2) {
+            out_of_order = out_of_order.max(1);
+        }
+        let mut barrier = barrier;
+        if out_of_order == MAX_DELAYED as u32 {
+            self.last_pocs = [i32::MIN; MAX_DELAYED];
+            self.last_pocs[0] = poc;
+            barrier = true;
+        } else if self.has_b_frames < out_of_order && sps.restriction.is_none() {
+            self.has_b_frames = out_of_order;
+        }
+        self.waiting.push(Waiting {
+            slot,
+            poc,
+            decoded: self.decoded,
+            barrier,
+        });
+        let pictures = self.waiting.len() as u32;
+        let mut out = 0;
+        for k in 1..self.waiting.len() {
+            if self.waiting[k].barrier {
+                break;
+            }
+            if self.waiting[k].poc < self.waiting[out].poc {
+                out = k;
+            }
+        }
+        if self.has_b_frames == 0 && self.waiting[0].barrier {
+            self.next_outputed_poc = i32::MIN;
+        }
+        let shown = self.waiting[out];
+        let out_of_order = shown.poc < self.next_outputed_poc;
+        if out_of_order || pictures > self.has_b_frames {
+            self.waiting.remove(out);
+        }
+        if !out_of_order && pictures > self.has_b_frames {
+            self.next_outputed_poc = if out == 0 && self.waiting.first().is_some_and(|w| w.barrier)
+            {
+                i32::MIN
+            } else {
+                shown.poc
+            };
+            return Some(Output {
+                slot: shown.slot,
+                surface: shown.slot,
+                poc: shown.poc,
+                decoded: shown.decoded,
+            });
+        }
+        None
+    }
+
+    /// The pictures still waiting to be shown, in output order, as at the
+    /// end of the stream. Their slots stay held until the next picture.
+    pub fn flush(&mut self) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        while !self.waiting.is_empty() {
+            let mut out = 0;
+            for k in 1..self.waiting.len() {
+                if self.waiting[k].barrier {
+                    break;
+                }
+                if self.waiting[k].poc < self.waiting[out].poc {
+                    out = k;
+                }
+            }
+            let shown = self.waiting.remove(out);
+            outputs.push(Output {
+                slot: shown.slot,
+                surface: shown.slot,
+                poc: shown.poc,
+                decoded: shown.decoded,
+            });
+        }
+        self.next_outputed_poc = i32::MIN;
+        outputs
+    }
+
+    /// Forgets every picture (a seek): no reference, nothing to show, every
+    /// slot free; the parameter sets stay, and the next picture must be an
+    /// IDR.
+    pub fn reset(&mut self) {
+        let sps = core::mem::take(&mut self.sps);
+        let pps = core::mem::take(&mut self.pps);
+        *self = Self {
+            sps,
+            pps,
+            ..Self::new()
+        };
+    }
+
+    /// The slots held now: references and pictures waiting to be shown.
+    pub fn held_slots(&self) -> Vec<u8> {
+        self.held.iter().map(|h| h.slot).collect()
     }
 
     /// Marks the reference pictures after `current` (8.2.5); whether it
@@ -960,4 +1425,33 @@ pub fn pictures(stream: &[u8]) -> Result<Vec<Picture>> {
         }
     }
     Ok(pictures)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_matrices_come_out_in_raster_order() {
+        let intra = raster(&DEFAULT_4X4[0], &ZIGZAG4);
+        assert_eq!(
+            intra,
+            [
+                6, 13, 20, 28, 13, 20, 28, 32, 20, 28, 32, 37, 28, 32, 37, 42
+            ]
+        );
+        let intra8 = raster(&DEFAULT_8X8[0], &ZIGZAG8);
+        assert_eq!(intra8[..8], [6, 10, 13, 16, 18, 23, 25, 27]);
+        assert_eq!(intra8[63], 42);
+    }
+
+    #[test]
+    fn a_list_whose_first_delta_reaches_zero_is_the_default() {
+        // delta_scale -8 (se code 16: 0000 1 0001) takes nextScale to 0.
+        let mut bits = Bits::new(&[0b0000_1000, 0b1000_0000]);
+        assert_eq!(scaling_list::<16>(&mut bits), Ok(None));
+        // All deltas 0 (se code 0, "1"): a flat list of 8s.
+        let mut bits = Bits::new(&[0xff, 0xff, 0x80]);
+        assert_eq!(scaling_list::<16>(&mut bits), Ok(Some([8; 16])));
+    }
 }

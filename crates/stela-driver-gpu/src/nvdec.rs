@@ -13,14 +13,16 @@
 //!   release of [`PAYLOAD`] to a small buffer of video memory, read until the
 //!   payload lands or the caller's bound passes.
 //! - **The decoder** ([`session`], [`selftest`], `--nvdec-selftest`): H.264
-//!   and HEVC parsed on the host ([`parse`]), each picture's setup filled as
-//!   NVIDIA's driver fills it ([`setup`]), its method stream NVIDIA's
-//!   ([`push`]) on NVIDIA's buffer layout ([`layout`]), all read off a
-//!   capture of NVIDIA's own driver decoding on the same RTX 3050
-//!   (nvdec-cap-1118, `nvdec-conventions.md`), and the decoded pictures read
-//!   back by the copy engine, blitted block-linear to pitch-linear NV12 in
-//!   system memory ([`copy`]), or, when it fails, over BAR1 and de-tiled on
-//!   the CPU ([`surface`]).
+//!   and HEVC parsed on the host ([`parse`]), fed whole clips or one sample
+//!   at a time ([`stream`]), each picture placed in a surface slot and
+//!   shown in display order ([`dpb`]), its setup filled as NVIDIA's driver
+//!   fills it ([`setup`]), its method stream NVIDIA's ([`push`]) on
+//!   NVIDIA's buffer layout ([`layout`]), all read off a capture of
+//!   NVIDIA's own driver decoding on the same RTX 3050 (nvdec-cap-1118,
+//!   `nvdec-conventions.md`), and the decoded pictures read back by the copy
+//!   engine, blitted block-linear to pitch-linear NV12 in system memory
+//!   ([`copy`]), or, when it fails, over BAR1 and de-tiled on the CPU
+//!   ([`surface`]).
 //!
 //! Neither ever stops the boot: every refusal is a line and a value, waits
 //! are bounded by the caller's clock, and a channel whose push never
@@ -33,6 +35,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 mod captured;
 pub mod copy;
+pub mod dpb;
 mod fields;
 pub mod layout;
 pub mod md5;
@@ -43,8 +46,10 @@ pub mod push;
 pub mod selftest;
 pub mod session;
 pub mod setup;
+pub mod stream;
 pub mod surface;
 
+use dpb::Output;
 use parse::{h264, hevc};
 
 /// `NVC7B0_VIDEO_DECODER`, GA10x's NVDEC (`clc7b0.h`). GA100's NVC6B0,
@@ -181,14 +186,21 @@ pub enum Parsed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picture {
     pub codec: Codec,
-    /// The surface slot it is decoded to.
+    /// The slot it is decoded to: the picture index its setup names.
     pub slot: u8,
+    /// The surface that slot is bound to, which the method stream names
+    /// ([`dpb::Surfaces`]).
+    pub surface: u8,
+    /// Each slot's surface, as this picture is decoded.
+    pub bindings: [u8; 16],
     /// The stream's surface slots.
     pub slots: u8,
     /// The highest slot used so far, this picture's included.
     pub high_water: u8,
-    /// The slot of the picture decoded before it (0 for the first): what
-    /// the engine conceals a damaged picture from.
+    /// What the engine conceals a damaged picture from
+    /// (`SET_CONTROL_PARAMS.ERROR_FRM_IDX`): H.264's last reference
+    /// picture's slot, HEVC's first reference of list 0 (0 for the first
+    /// picture or an intra one).
     pub previous_slot: u8,
     /// `I`, `P` or `B`.
     pub kind: char,
@@ -198,16 +210,26 @@ pub struct Picture {
     /// The coded size and the displayed rectangle in it.
     pub coded: (u32, u32),
     pub crop: surface::Crop,
+    /// Bits per sample: 8, or 10 for HEVC Main 10.
+    pub bit_depth: u8,
+    /// Which decode of the stream it is (0 for the first).
+    pub decoded: u32,
+    /// The pictures shown as it starts, in display order, maybe itself,
+    /// with their surfaces: copy them out after its decode, before the
+    /// next picture's ([`stream`]).
+    pub outputs: Vec<Output>,
     pub parsed: Parsed,
 }
 
 impl Picture {
-    fn from_h264(picture: h264::Picture) -> Self {
+    pub(crate) fn from_h264(picture: h264::Picture) -> Self {
         let sps = &picture.sps;
         let (width, height) = sps.display_size();
         Self {
             codec: Codec::H264,
             slot: picture.slot,
+            surface: picture.slot,
+            bindings: core::array::from_fn(|k| k as u8),
             slots: picture.slots,
             high_water: picture.high_water,
             previous_slot: picture.previous_slot,
@@ -221,16 +243,21 @@ impl Picture {
                 width,
                 height,
             },
+            bit_depth: sps.bit_depth_luma,
+            decoded: picture.decoded,
+            outputs: picture.outputs.clone(),
             parsed: Parsed::H264(picture),
         }
     }
 
-    fn from_hevc(picture: hevc::Picture) -> Self {
+    pub(crate) fn from_hevc(picture: hevc::Picture) -> Self {
         let sps = &picture.sps;
         let (width, height) = sps.display_size();
         Self {
             codec: Codec::Hevc,
             slot: picture.slot,
+            surface: picture.slot,
+            bindings: core::array::from_fn(|k| k as u8),
             slots: picture.slots,
             high_water: picture.high_water,
             previous_slot: picture.previous_slot,
@@ -244,22 +271,34 @@ impl Picture {
                 width,
                 height,
             },
+            bit_depth: sps.bit_depth_luma,
+            decoded: picture.decoded,
+            outputs: picture.outputs.clone(),
             parsed: Parsed::Hevc(picture),
         }
     }
 
-    /// Every picture of the Annex B `stream`, in decoding order.
+    /// Every picture of the Annex B `stream`, in decoding order, one
+    /// access unit at a time through a [`stream::Stream`]. The last
+    /// picture's [`Picture::outputs`] also lists what the end of the stream
+    /// shows.
     pub fn all(codec: Codec, stream: &[u8]) -> Result<Vec<Self>, parse::Error> {
-        Ok(match codec {
-            Codec::H264 => h264::pictures(stream)?
-                .into_iter()
-                .map(Self::from_h264)
-                .collect(),
-            Codec::Hevc => hevc::pictures(stream)?
-                .into_iter()
-                .map(Self::from_hevc)
-                .collect(),
-        })
+        let nals = parse::nal_units(stream);
+        let units = match codec {
+            Codec::H264 => h264::access_units(&nals)?,
+            Codec::Hevc => hevc::access_units(&nals),
+        };
+        let mut decoder = stream::Stream::annex_b(codec);
+        let mut pictures = Vec::new();
+        for unit in &units {
+            if let Some(picture) = decoder.nal_units(unit)? {
+                pictures.push(picture);
+            }
+        }
+        if let Some(last) = pictures.last_mut() {
+            last.outputs.extend(decoder.flush());
+        }
+        Ok(pictures)
     }
 
     /// The slices as NVDEC reads them.
@@ -299,6 +338,16 @@ impl Picture {
         match &self.parsed {
             Parsed::H264(p) => setup::h264(p, geometry),
             Parsed::Hevc(p) => setup::hevc(p, geometry),
+        }
+    }
+
+    /// The picture's whole setup page (4 KiB, the status area zero): the
+    /// setup, and H.264's slice offsets or HEVC's scaling lists and tile
+    /// sizes.
+    pub fn page(&self, geometry: &Geometry) -> Result<Vec<u8>, setup::Refused> {
+        match &self.parsed {
+            Parsed::H264(p) => setup::h264_page(p, geometry),
+            Parsed::Hevc(p) => setup::hevc_page(p, geometry),
         }
     }
 }

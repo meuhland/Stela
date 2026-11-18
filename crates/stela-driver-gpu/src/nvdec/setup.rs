@@ -10,9 +10,12 @@
 //!
 //! - H.264: the setup, the slice offsets at +0x300 (a `u32` byte offset of
 //!   each slice's start code in the bitstream), the status at +0x700;
-//! - HEVC: the setup, the scaling list at +0x200 (zero: no scaling lists),
-//!   the tile sizes at +0x600 (a `u16` pair of CTB columns and rows per
-//!   tile), the status at +0xd00.
+//! - HEVC: the setup, the scaling lists at +0x200 (1 KiB, zero when the
+//!   sequence has none: [`hevc::ScalingList::buffer`]), the tile sizes at
+//!   +0x600 (a `u16` pair of CTB columns and rows per tile), the status at
+//!   +0xd00.
+//!
+//! [`h264_page`] and [`hevc_page`] build the whole page but the status.
 use super::fields::{h264 as f4, hevc as f5};
 use super::parse::{h264, hevc};
 use crate::nvenc::layout::Geometry;
@@ -245,9 +248,16 @@ pub fn h264(picture: &h264::Picture, geometry: &Geometry) -> Result<Vec<u8>, Ref
             }
         }
     }
-    // Flat scaling (no matrices: the parser refuses them).
-    for field in f4::WEIGHT_SCALE.iter().chain(f4::WEIGHT_SCALE8X8.iter()) {
-        put(&mut s, *field, 16);
+    // The scaling matrices in force, in raster order: the six 4x4 lists,
+    // then the intra and inter Y 8x8 lists (flat 16 without matrices).
+    let scaling = &pps.scaling;
+    let fours = scaling.list4x4.iter().flatten();
+    let eights = scaling.list8x8.iter().flatten();
+    for (field, value) in f4::WEIGHT_SCALE.iter().zip(fours) {
+        put(&mut s, *field, u64::from(*value));
+    }
+    for (field, value) in f4::WEIGHT_SCALE8X8.iter().zip(eights) {
+        put(&mut s, *field, u64::from(*value));
     }
     put(
         &mut s,
@@ -268,9 +278,7 @@ pub fn h264(picture: &h264::Picture, geometry: &Geometry) -> Result<Vec<u8>, Ref
 }
 
 /// Where the HEVC engine's filter buffer keeps each of its areas, in units
-/// of 256 bytes, and the sizes of the filter and co-located buffers: what
-/// NVIDIA's driver gave each captured size (`nvdec-conventions.md`). No
-/// formula covers them yet, so only the captured sizes are taken.
+/// of 256 bytes from its start, and the buffer's size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HevcFilter {
     pub sao: u32,
@@ -281,36 +289,44 @@ pub struct HevcFilter {
     /// `SET_INTRA_TOP_BUF_OFFSET`, in bytes into the filter buffer.
     pub intra_top: u64,
     pub filter_bytes: u64,
-    pub coloc_bytes: u64,
 }
 
-/// The filter layout of a `width` x `height` picture of `bit_depth`, when
-/// NVIDIA's driver was captured decoding that size.
-pub fn hevc_filter(width: u32, height: u32, bit_depth: u8) -> Option<HevcFilter> {
-    match (width, height, bit_depth) {
-        // hevc-qp25 (1088 rows), hevc-main-bf-1080p and -slices (1080).
-        (1920, 1080 | 1088, 8) => Some(HevcFilter {
-            sao: 2584,
-            bsd_ctrl: 23256,
-            flt_above: 23902,
-            sao_above: 32130,
-            slice_edge: 32130,
-            intra_top: 0x8d_7200,
-            filter_bytes: 0xa0_0000,
-            coloc_bytes: 0x40_0000,
-        }),
-        // hevc-main10-4k: captured, not run by the self-test.
-        (3840, 2160, 10) => Some(HevcFilter {
-            sao: 5168,
-            bsd_ctrl: 46512,
-            flt_above: 47804,
-            sao_above: 113220,
-            slice_edge: 113220,
-            intra_top: 0x239_c400,
-            filter_bytes: 0x240_0000,
-            coloc_bytes: 0xa0_0000,
-        }),
-        _ => None,
+/// The room left for the intra-prediction top row at the filter buffer's
+/// end: NVIDIA's buffers left 1,216,000 bytes (1080p) and 408,576 bytes
+/// (2160p Main 10) there.
+const HEVC_INTRA_TOP_BYTES: u64 = 0x4_0000;
+
+/// The filter layout of a `width` x `height` picture of `bit_depth`, as
+/// NVIDIA's driver lays it out. Fitted on the two captured sizes, 1920x1080
+/// (and 1088) at 8 bits and 3840x2160 at 10, which it gives exactly: with
+/// `rows` the height rounded up to 64 and `row` the width rounded up to 64
+/// in bytes (2 per sample above 8 bits),
+///
+/// - deblocking at 0, 608 bytes per row;
+/// - SAO (`HevcSaoBufferOffset`), 4864 bytes per row;
+/// - BSD control (`HevcBsdCtrlOffset`), 152 bytes per row;
+/// - filter above (`HevcFltAboveOffset`), `row + 16` bytes per row;
+/// - SAO above and slice edge (`HevcSaoAboveOffset`,
+///   `HevcSliceEdgeOffset`, the same place), `row / 2` bytes per row;
+/// - the intra top row ([`HEVC_INTRA_TOP_BYTES`]), the buffer then
+///   rounded up to 2 MiB.
+pub fn hevc_filter(width: u32, height: u32, bit_depth: u8) -> HevcFilter {
+    let rows = u64::from(height.next_multiple_of(64));
+    let row = u64::from(width.next_multiple_of(64)) * if bit_depth > 8 { 2 } else { 1 };
+    let units = |bytes: u64| (bytes / 256) as u32;
+    let sao = units(608 * rows);
+    let bsd_ctrl = sao + units(4864 * rows);
+    let flt_above = bsd_ctrl + units(152 * rows);
+    let sao_above = flt_above + units((row + 16) * rows);
+    let intra_top = u64::from(sao_above + units(row / 2 * rows)) * 256;
+    HevcFilter {
+        sao,
+        bsd_ctrl,
+        flt_above,
+        sao_above,
+        slice_edge: sao_above,
+        intra_top,
+        filter_bytes: (intra_top + HEVC_INTRA_TOP_BYTES).next_multiple_of(0x20_0000),
     }
 }
 
@@ -327,9 +343,7 @@ pub fn hevc_col_mv_units(sps: &hevc::Sps) -> u32 {
 pub fn hevc(picture: &hevc::Picture, geometry: &Geometry) -> Result<Vec<u8>, Refused> {
     let sps = &picture.sps;
     let pps = &picture.pps;
-    let filter = hevc_filter(sps.width, sps.height, sps.bit_depth_luma).ok_or(Refused(
-        "no captured HEVC filter layout for this size and depth",
-    ))?;
+    let filter = hevc_filter(sps.width, sps.height, sps.bit_depth_luma);
     if geometry.coded_width < sps.width || geometry.coded_height < sps.height {
         return Err(Refused("the surfaces are smaller than the sequence"));
     }
@@ -689,4 +703,70 @@ pub fn hevc_tile_sizes(sps: &hevc::Sps) -> [u8; 4] {
     word[..2].copy_from_slice(&columns.to_le_bytes());
     word[2..].copy_from_slice(&rows.to_le_bytes());
     word
+}
+
+/// The setup page of an H.264 `picture`: its setup, and the byte offset of
+/// each slice's start code at +0x300. The status area is the engine's.
+pub fn h264_page(picture: &h264::Picture, geometry: &Geometry) -> Result<Vec<u8>, Refused> {
+    let mut page = vec![0u8; PAGE_BYTES];
+    let setup = h264(picture, geometry)?;
+    page[..setup.len()].copy_from_slice(&setup);
+    if picture.slice_offsets.len() * 4 > H264_STATUS - H264_SLICE_OFFSETS {
+        return Err(Refused("more slices than the slice offsets hold"));
+    }
+    for (k, offset) in picture.slice_offsets.iter().enumerate() {
+        let at = H264_SLICE_OFFSETS + 4 * k;
+        page[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+    Ok(page)
+}
+
+/// The setup page of an HEVC `picture`: its setup, the scaling lists in
+/// force at +0x200 (zero when disabled) and the tile sizes at +0x600.
+pub fn hevc_page(picture: &hevc::Picture, geometry: &Geometry) -> Result<Vec<u8>, Refused> {
+    let mut page = vec![0u8; PAGE_BYTES];
+    let setup = hevc(picture, geometry)?;
+    page[..setup.len()].copy_from_slice(&setup);
+    if let Some(lists) = &picture.scaling {
+        page[HEVC_SCALING_LIST..HEVC_SCALING_LIST + 1024].copy_from_slice(&lists.buffer());
+    }
+    page[HEVC_TILE_SIZES..HEVC_TILE_SIZES + 4].copy_from_slice(&hevc_tile_sizes(&picture.sps));
+    Ok(page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_filter_formula_gives_both_captured_layouts() {
+        // hevc-qp25 (1088 rows), hevc-main-bf and -slices (1080): 8 bits.
+        for height in [1080, 1088] {
+            assert_eq!(
+                hevc_filter(1920, height, 8),
+                HevcFilter {
+                    sao: 2584,
+                    bsd_ctrl: 23256,
+                    flt_above: 23902,
+                    sao_above: 32130,
+                    slice_edge: 32130,
+                    intra_top: 0x8d_7200,
+                    filter_bytes: 0xa0_0000,
+                }
+            );
+        }
+        // hevc-main10-4k.
+        assert_eq!(
+            hevc_filter(3840, 2160, 10),
+            HevcFilter {
+                sao: 5168,
+                bsd_ctrl: 46512,
+                flt_above: 47804,
+                sao_above: 113220,
+                slice_edge: 113220,
+                intra_top: 0x239_c400,
+                filter_bytes: 0x240_0000,
+            }
+        );
+    }
 }
