@@ -18,7 +18,9 @@
 //!   ([`push`]) on NVIDIA's buffer layout ([`layout`]), all read off a
 //!   capture of NVIDIA's own driver decoding on the same RTX 3050
 //!   (nvdec-cap-1118, `nvdec-conventions.md`), and the decoded pictures read
-//!   back and de-tiled on the CPU ([`surface`]).
+//!   back by the copy engine, blitted block-linear to pitch-linear NV12 in
+//!   system memory ([`copy`]), or, when it fails, over BAR1 and de-tiled on
+//!   the CPU ([`surface`]).
 //!
 //! Neither ever stops the boot: every refusal is a line and a value, waits
 //! are bounded by the caller's clock, and a channel whose push never
@@ -30,6 +32,7 @@ use alloc::vec::Vec;
 
 #[cfg(test)]
 mod captured;
+pub mod copy;
 mod fields;
 pub mod layout;
 pub mod md5;
