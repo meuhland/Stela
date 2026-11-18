@@ -13,7 +13,10 @@
 //! completes marks the session dead; one whose job is still pending keeps
 //! the channel and its file open ([`Closed::keeps_file`]), since freeing
 //! either makes nouveau idle the channel, a busy wait of up to 15 s.
-//! [`Session::planes`] then copies the picture's surface out of BAR1.
+//! [`Session::planes`] then copies the picture's surface out of BAR1, the
+//! fallback of the copy engine's readback ([`super::copy`]), which opens its
+//! channel on this file ([`Session::node`]) and, when its own job never
+//! completes, makes the session keep everything ([`Session::hold`]).
 use super::fields::status as st;
 use super::layout::{CHROMA_OFFSET, KERNEL_VA_START, Layout, PUSH_BYTES, VA_TOP};
 use super::push::{self, MOST_WORDS};
@@ -152,6 +155,9 @@ pub struct Session<N: Node> {
     timeout_ns: u64,
     state: State,
     in_flight: Option<InFlight>,
+    /// Another channel on the file (the copy engine's) has a job that never
+    /// finished reading the surfaces: [`Session::close`] keeps everything.
+    held: bool,
 }
 
 impl<N: Node> Session<N> {
@@ -188,6 +194,7 @@ impl<N: Node> Session<N> {
             timeout_ns,
             state: State::Open,
             in_flight: None,
+            held: false,
         };
         let made = session.start_channel().and_then(|()| {
             for index in 0..session.layout.plans.len() {
@@ -323,12 +330,7 @@ impl<N: Node> Session<N> {
                 self.node.unmap(cpu, bytes);
             }
         }
-        if matches!(
-            self.state,
-            State::Dead {
-                keeps_channel: true
-            }
-        ) {
+        if self.keeps_file() {
             return;
         }
         for index in 0..self.buffers.len() {
@@ -377,16 +379,37 @@ impl<N: Node> Session<N> {
             }
         }
         self.give_back();
-        let keeps_file = matches!(
-            self.state,
-            State::Dead {
-                keeps_channel: true
-            }
-        );
+        let keeps_file = self.keeps_file();
         Closed {
             node: self.node,
             keeps_file,
         }
+    }
+
+    /// Whether [`Session::close`] keeps the channel, the buffers and the
+    /// file: a picture's job, or another channel's on the file, is pending.
+    fn keeps_file(&self) -> bool {
+        self.held
+            || matches!(
+                self.state,
+                State::Dead {
+                    keeps_channel: true
+                }
+            )
+    }
+
+    /// The session's render node file, for another channel on the same VM:
+    /// the copy engine's ([`super::copy::Copier`]), which reads the surfaces
+    /// at their addresses here.
+    pub fn node(&mut self) -> &mut N {
+        &mut self.node
+    }
+
+    /// Keeps the channel, the buffers and the file at [`Session::close`]:
+    /// another channel on the file has a job that never finished reading
+    /// the surfaces.
+    pub fn hold(&mut self) {
+        self.held = true;
     }
 
     pub fn layout(&self) -> &Layout {
