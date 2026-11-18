@@ -28,7 +28,9 @@
 //! between [`DISCARD_LEAST`] and [`DISCARD_MOST`] bytes and the disk's own
 //! limits. A disk whose discard commands take longer than [`DISCARD_SLOW`]
 //! [`DISCARD_STRIKES`] times in a row hears no more discards: they are
-//! hints (NVMe 1.4 section 6.7.1.1), and the ANS line says `shed=`. Blocks
+//! hints (NVMe 1.4 section 6.7.1.1), and the ANS line says `shed=`; but not
+//! one the guest was told keeps deallocated blocks zeros past a restart
+//! ([`HostDisk::deallocates_zeroed`]), whose discards are that promise. Blocks
 //! the disk heard of and no write took back since are not sent again, as an
 //! APFS format and its first mounts deallocate the whole container more
 //! than once. A flush that waits for discards sends them at once and
@@ -36,7 +38,9 @@
 //! which no measure takes from, on the disk, starting the next as
 //! soon as one completes rather than once a whole group has: one slow
 //! deallocation does not hold back the rest. A transfer waits for discards
-//! at most [`DISCARD_HOLD`]; then those not yet sent are given up.
+//! at most [`DISCARD_HOLD`]; then it goes, and those not yet sent go on in
+//! the background where they keep deallocated blocks zeros, and are given
+//! up elsewhere.
 //! Discards never reorder past
 //! writes. A write takes its blocks back from those waiting and waits out a
 //! batch it overlaps, and a flush waits for all of them where the guest was
@@ -77,9 +81,10 @@ const DISCARD_URGENT: u64 = 1 << 30;
 /// however small, makes the disk hear no more discards: 200 ms.
 const DISCARD_SLOW: u64 = 4_800_000;
 const DISCARD_STRIKES: u32 = 3;
-/// The longest a guest transfer waits for discards before those not yet
-/// sent are given up: 5 s, well inside the 30 s macOS gives an NVMe
-/// command.
+/// The longest a guest transfer waits for discards: 5 s, well inside the
+/// 30 s macOS gives an NVMe command. Then it goes; the discards not yet
+/// sent go on in the background on a disk whose deallocated blocks stay
+/// zeros, and are given up on any other.
 const DISCARD_HOLD: u64 = 120_000_000;
 /// The most runs [`Discards::heard`] keeps; past it, it forgets them all and
 /// at worst a run reaches the disk twice.
@@ -165,6 +170,10 @@ struct Discards {
     slow: u32,
     /// The command that made the disk hear no more discards, as `last`.
     shed: Option<(u64, u64)>,
+    /// A transfer waited [`DISCARD_HOLD`] for these discards: a flush no
+    /// longer waits for them, which go on in the background, until none
+    /// is left.
+    lapsed: bool,
 }
 
 impl Default for Discards {
@@ -182,6 +191,7 @@ impl Default for Discards {
             last: None,
             slow: 0,
             shed: None,
+            lapsed: false,
         }
     }
 }
@@ -249,10 +259,10 @@ impl Discards {
     }
 
     /// A command measured alone covered `bytes` in `took` counter ticks:
-    /// fit the next to [`DISCARD_TARGET`], at most twice this one, and give
-    /// up discards on the [`DISCARD_STRIKES`]th slow one in a row. Whether
-    /// that happened.
-    fn measured(&mut self, bytes: u64, took: u64) -> bool {
+    /// fit the next to [`DISCARD_TARGET`], at most twice this one, and,
+    /// where `may_shed`, give up discards on the [`DISCARD_STRIKES`]th slow
+    /// one in a row. Whether that happened.
+    fn measured(&mut self, bytes: u64, took: u64, may_shed: bool) -> bool {
         self.last = Some((bytes, took));
         let fitted = u128::from(bytes) * u128::from(DISCARD_TARGET) / u128::from(took.max(1));
         let fitted = u64::try_from(fitted).unwrap_or(u64::MAX);
@@ -263,8 +273,8 @@ impl Discards {
             self.slow = 0;
             return false;
         }
-        self.slow += 1;
-        if self.slow < DISCARD_STRIKES {
+        self.slow = self.slow.saturating_add(1);
+        if self.slow < DISCARD_STRIKES || !may_shed {
             return false;
         }
         self.shed = Some((bytes, took));
@@ -392,7 +402,9 @@ impl HostDisk {
                     .written(*lba, *lba + data.len() as u64 / block)
             }
             Request::WriteZeroes { lba, blocks, .. } => self.discards.written(*lba, *lba + *blocks),
-            Request::Flush => self.discards.outstanding() && self.deallocates_zeroed(),
+            Request::Flush => {
+                self.discards.outstanding() && self.deallocates_zeroed() && !self.discards.lapsed
+            }
             _ => false,
         }
     }
@@ -451,6 +463,9 @@ impl HostDisk {
     /// rest wait for the next poll.
     fn advance_discards(&mut self, done: &mut Vec<(u32, Finished)>, now: u64) {
         let block = u64::from(self.identity().block_size);
+        // The guest was told deallocated blocks stay zeros: its discards
+        // reach the disk, however slowly.
+        let zeroed = self.deallocates_zeroed();
         let mut started = 0;
         loop {
             started += self.start_discards(now, DISCARD_COMMANDS - started);
@@ -470,7 +485,7 @@ impl HostDisk {
                 } else if batch.alone {
                     let blocks: u64 = batch.extents.iter().map(|extent| extent.blocks).sum();
                     let took = now.saturating_sub(batch.started);
-                    if self.discards.measured(blocks * block, took) {
+                    if self.discards.measured(blocks * block, took, !zeroed) {
                         self.abandon_discards();
                     }
                 }
@@ -488,14 +503,24 @@ impl HostDisk {
             }
         }
         // A transfer never waits for discards near the guest's timeout:
-        // those not yet sent are given up; the running ones complete.
+        // the running ones complete, and those not yet sent go on in the
+        // background where they keep deallocated blocks zeros, and are given
+        // up elsewhere.
         if self
             .discards
             .held
             .iter()
             .any(|&(_, submitted, _)| now.saturating_sub(submitted) >= DISCARD_HOLD)
         {
-            self.abandon_discards();
+            match zeroed {
+                true => self.discards.lapsed = true,
+                false => {
+                    self.abandon_discards();
+                }
+            }
+        }
+        if !self.discards.outstanding() {
+            self.discards.lapsed = false;
         }
         for (key, started, request) in core::mem::take(&mut self.discards.held) {
             if let Some(finished) = self.submit(key, request, started) {

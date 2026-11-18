@@ -675,10 +675,12 @@ fn a_disk_slow_at_discards_hears_no_more() {
 }
 
 /// A flush that waits for discards on a disk slow at them waits
-/// [`DISCARD_HOLD`] at most: then those not yet sent are given up and it
-/// goes once the running ones complete.
+/// [`DISCARD_HOLD`] at most: then it goes, and the discards not yet sent go
+/// on in the background, as the guest was told its deallocated blocks stay
+/// zeros past a restart, where they were given up and the blocks kept
+/// their old bytes on the disk.
 #[test]
-fn a_flush_waits_for_discards_a_bounded_time() {
+fn a_flush_waits_for_discards_a_bounded_time_and_gives_none_up() {
     let (mut disk, log) = queued(1, true);
     for run in 0..(DISCARD_COMMANDS as u64 * 2) {
         disk.discard(run * 2, 1);
@@ -686,19 +688,62 @@ fn a_flush_waits_for_discards_a_bounded_time() {
     assert!(disk.submit(1, Request::Flush, 0).is_none());
     assert!(disk.poll(0).is_empty());
     assert_eq!(discard_tags(&log).len(), DISCARD_COMMANDS);
-    assert!(disk.poll(DISCARD_HOLD).is_empty());
+    assert!(disk.poll(DISCARD_HOLD - 1).is_empty());
     assert!(!log.started().contains(&Command::Flush));
+    assert!(disk.poll(DISCARD_HOLD).is_empty());
+    assert_eq!(
+        log.started().last(),
+        Some(&Command::Flush),
+        "the flush went"
+    );
+    let flush = log.started().len() as u32 - 1;
     for tag in discard_tags(&log) {
         release(&log, tag);
     }
-    assert!(disk.poll(DISCARD_HOLD + 1).is_empty());
-    assert_eq!(
-        discard_tags(&log).len(),
-        DISCARD_COMMANDS,
-        "the rest given up"
+    release(&log, flush);
+    assert_eq!(disk.poll(DISCARD_HOLD + 1).len(), 1);
+    let mut now = DISCARD_HOLD + 1;
+    while disk.discarding() {
+        now += DISCARD_QUIET;
+        assert!(disk.poll(now).is_empty());
+        for tag in discard_tags(&log) {
+            release(&log, tag);
+        }
+        assert!(log.started().len() < 4 * DISCARD_COMMANDS, "bounded");
+    }
+    assert_eq!(discard_tags(&log).len(), 2 * DISCARD_COMMANDS);
+    assert!(disk.diagnostic(now).contains("abandoned=0"));
+    // With none left, a flush waits for the next discards again.
+    disk.discard(100, 1);
+    assert!(disk.submit(2, Request::Flush, now).is_none());
+    assert_eq!(disk.discards.held.len(), 1);
+}
+
+/// A disk whose deallocated blocks the guest was told stay zeros hears
+/// every discard however slow it is at them, where the third slow command
+/// gave up the rest and dropped every later one.
+#[test]
+fn a_disk_that_keeps_deallocated_blocks_zeros_hears_every_discard() {
+    let (mut disk, log) = queued(1, true);
+    for run in 0..8 {
+        disk.discard(run * 2, 1);
+    }
+    let mut now = 0;
+    assert!(disk.poll(now).is_empty());
+    for _ in 0..=DISCARD_STRIKES {
+        let tag = *discard_tags(&log).last().unwrap();
+        now += 2 * DISCARD_SLOW;
+        release(&log, tag);
+        assert!(disk.poll(now).is_empty());
+    }
+    assert_eq!(discard_tags(&log).len(), DISCARD_STRIKES as usize + 2);
+    disk.discard(40, 1);
+    assert!(disk.discarding());
+    let line = disk.diagnostic(now);
+    assert!(
+        line.contains("abandoned=0") && line.contains("shed=none"),
+        "{line}"
     );
-    assert_eq!(log.started().last(), Some(&Command::Flush));
-    assert!(!disk.discarding());
 }
 
 /// Discards a flush waits for go in commands of at least 1 GiB, several
