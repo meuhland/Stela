@@ -16,11 +16,19 @@
  * host says its encoder codes HEVC (`stela_video_encoder_offer_hevc`): x264
  * has no HEVC, and a hardware HEVC encoder that refuses every session would
  * send VideoToolbox to Apple's software one.
+ *
+ * StelaVT's decoder, StelaVD (stelavt/StelaVD.c), is registered here too, as
+ * the process's hardware H.264 and HEVC decoder: Stela has no Apple video
+ * decoder, so a hardware-only client gets none and the rest decode in
+ * software. This first StelaVD runs Apple's software decoder inside each
+ * session, which proves the path before the host's NVDEC is put behind it.
+ * A file at STELAVD_OFF keeps it unregistered, without a rebuild.
  */
 #include "Apple.h"
 #include "Bundle.h"
 
 #define STELAVT "/Library/Video/Plug-Ins/StelaVT.bundle/Contents/MacOS/StelaVT"
+#define STELAVD_OFF "/Library/Video/Plug-Ins/StelaVD-off"
 #define RTLD_DEFAULT ((void *)-2)
 /* libsandbox's sandbox_check() filter and flag. */
 #define SANDBOX_FILTER_PATH 1
@@ -46,6 +54,31 @@ static struct {
 static int32_t register_codec(uint32_t codec)
 {
 	return stelavt.registerEncoder(codec, stelavt.info, stelavt.factory);
+}
+
+/* Registers StelaVD, when this StelaVT has it and STELAVD_OFF is absent, as
+ * the process's hardware H.264 and HEVC decoder. */
+static void register_stela_video_decoder(void *library, void *(*createDictionary)(const void *, long, const void *,
+    const void *), void (*setValue)(void *, const void *, const void *), const void *booleanTrue,
+    const void *keyCallBacks, const void *valueCallBacks)
+{
+	Register registerDecoder = (Register)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
+	const void *const *hardwareKey = dlsym(RTLD_DEFAULT, "kVTVideoDecoder_IsHardwareAccelerated");
+	int (*accessPath)(const char *, int) = dlsym(RTLD_DEFAULT, "access");
+	Factory factory = (Factory)dlsym(library, "StelaVD_CreateInstance");
+	if (!registerDecoder || !hardwareKey || !factory || !accessPath) {
+		return;
+	}
+	if (accessPath(STELAVD_OFF, 0) == 0) {
+		NSLog(@"StelaGPU: StelaVD not registered: " STELAVD_OFF " exists");
+		return;
+	}
+	void *info = createDictionary(NULL, 0, keyCallBacks, valueCallBacks);
+	setValue(info, *hardwareKey, booleanTrue);
+	int32_t h264 = registerDecoder(CODEC_H264, info, factory);
+	int32_t hevc = registerDecoder(CODEC_HEVC, info, factory);
+	NSLog(@"StelaGPU: StelaVD registered as this process's hardware decoder: H.264 %d, HEVC %d (0 is registered)",
+	    (int)h264, (int)hevc);
 }
 
 __attribute__((constructor)) static void register_stela_video_encoder(void)
@@ -98,6 +131,7 @@ __attribute__((constructor)) static void register_stela_video_encoder(void)
 	} else {
 		NSLog(@"StelaGPU: VideoToolbox refused to register StelaVT");
 	}
+	register_stela_video_decoder(library, createDictionary, setValue, *booleanTrue, keyCallBacks, valueCallBacks);
 }
 
 void stela_video_encoder_offer_hevc(void)
