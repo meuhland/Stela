@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Louis-Philippe Gauthier <6123610+meuhland@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:14:56 +0000
+Subject: [PATCH] feat(nouveau): a host may ask GSP-RM to boost the GPU's
+ performance level
+
+Under GSP-RM, RM's own policy picks the P-state from the load it sees, and
+nouveau asks for none. Stela's host encodes on NVENC, whose engine time
+follows the P-state's clocks: its boot self-test measured H.264 at 2.2 ms a
+1080p frame for its first 46 frames and 5.4-8.0 ms after, from the same
+frame on which the host CPU's stores into the GPU's memory went from 1.3 to
+4.1 ms, and macOS's sessions run at the slow figure.
+
+The report the host reads (struct nvkm_perf_report) gains boost, which the
+host sets, and boost_status, RM's answer. While boost is set, the perf work
+sends NV2080_CTRL_CMD_PERF_BOOST with BOOST_TO_MAX for 60 s, again every
+30 rounds; once it is cleared, CLEAR. A refusal keeps its errno and the
+boost is asked no more; busy is asked again at the next round. The control's
+layout is ctrl2080perf.h's as published, written without a copy at hand, so
+RM's answer is the test of whether GSP-RM serves it to nouveau's client.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drm/nouveau/include/nvkm/core/counts.h    |  8 ++++
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  4 ++
+ .../nvkm/subdev/gsp/rm/r535/nvrm/perf.h       | 18 ++++++++
+ .../nouveau/nvkm/subdev/gsp/rm/r535/perf.c    | 46 +++++++++++++++++++
+ 4 files changed, 76 insertions(+)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
+index 2bfd1f058e25244f6b0287d41a2055239c935a4e..42dd101d67924b22cc9ec190727bc4a1b533562b 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
+@@ -39,6 +39,12 @@ extern u64 nvkm_counts[NVKM_COUNTS][3];
+  * Capabilities' low word, all zero for a function with no PCIe capability or
+  * a read that failed. A host takes the counts and the speeds seen with atomic
+  * swaps and reads the rest.
++ *
++ * A host sets boost to have the rounds ask RM to hold the GPU at its highest
++ * performance level (NV2080_CTRL_CMD_PERF_BOOST), and clears it to have them
++ * let go. boost_status is 0 before anything was asked, 1 while RM holds the
++ * boost, 2 once it let go, or the errno of a refusal, after which it is asked
++ * no more.
+  */
+ struct nvkm_perf_report {
+ 	u32 started;
+@@ -50,6 +56,8 @@ struct nvkm_perf_report {
+ 	u32 link_control;
+ 	u32 link_speeds;
+ 	u32 link_cap;
++	u32 boost;
++	s32 boost_status;
+ };
+ 
+ extern struct nvkm_perf_report nvkm_perf;
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index a0eb3a391307064df7114d9d5583fd5da4bd4c34..c2be06769fa432073a02a68a98a023091e49ba67 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -229,6 +229,10 @@ struct nvkm_gsp {
+ 		bool armed;
+ 		/* RM refused the control: it is asked no more. */
+ 		bool pstate_off;
++		/* The boost a host asks for: refused, held, rounds since sent. */
++		bool boost_off;
++		bool boosted;
++		u32 boost_rounds;
+ 	} perf;
+ 
+ 	/* Internal GSP-RM control handles. */
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
+index 978a1f494d9f42a2fe696701dd9dfb60e57c7ded..c31e0492c36240d2b6d07d4a89702978cd5878c0 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
+@@ -17,4 +17,22 @@ typedef struct NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS {
+     NvU32 currPstate;
+ } NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS;
+ 
++/*
++ * ctrl2080perf.h's boost, as CUDA asks for it, written from the published
++ * header's layout without a copy at hand: RM's answer tells whether GSP-RM
++ * serves it to a client such as nouveau's.
++ */
++#define NV2080_CTRL_CMD_PERF_BOOST (0x2080200a) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_PERF_INTERFACE_ID << 8) | NV2080_CTRL_PERF_BOOST_PARAMS_MESSAGE_ID" */
++
++#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD                   1:0
++#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR             (0x00000000)
++#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_1LEVEL      (0x00000001)
++#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX      (0x00000002)
++#define NV2080_CTRL_PERF_BOOST_DURATION_MAX                3600
++
++typedef struct NV2080_CTRL_PERF_BOOST_PARAMS {
++    NvU32 flags;
++    NvU32 duration;
++} NV2080_CTRL_PERF_BOOST_PARAMS;
++
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+index 8722a6587a516678e1952628e85956d2f94f4fe3..0a2dd98841f8461a30e153edd9edf3194f39d3bc 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+@@ -15,6 +15,9 @@
+  * Each round also reads the GPU's own PCIe Link Status and Link Control, as
+  * RM moves the link speed with the P-state: a link that stays slow while RM
+  * runs at P0 limits every transfer from system memory.
++ *
++ * A host may also ask the rounds to have RM boost the GPU to its highest
++ * performance level (r535_gsp_perf_boost), and the report says RM's answer.
+  */
+ #include <rm/rpc.h>
+ 
+@@ -120,6 +123,48 @@ r535_gsp_perf_link(struct nvkm_gsp *gsp)
+ 			  __ATOMIC_RELAXED);
+ }
+ 
++/*
++ * While a host asks for it (nvkm_perf.boost), RM is asked to hold the GPU at
++ * its highest performance level for R535_GSP_PERF_BOOST_S seconds, again
++ * every R535_GSP_PERF_BOOST_RENEW rounds; once the host stops asking, RM is
++ * told to let go. An experiment for the host's video encoder, whose engine
++ * time follows the P-state's clocks while RM's own policy, which sees little
++ * load, keeps the GPU low. A refusal is kept in boost_status, and the boost
++ * is asked no more; an answer of busy is asked again at the next round.
++ */
++#define R535_GSP_PERF_BOOST_S 60
++#define R535_GSP_PERF_BOOST_RENEW 30
++
++static void
++r535_gsp_perf_boost(struct nvkm_gsp *gsp)
++{
++	struct nvkm_gsp_object *subdevice = &gsp->internal.device.subdevice;
++	NV2080_CTRL_PERF_BOOST_PARAMS *ctrl;
++	bool want = __atomic_load_n(&nvkm_perf.boost, __ATOMIC_RELAXED) != 0;
++
++	if (gsp->perf.boost_off || (!want && !gsp->perf.boosted))
++		return;
++	if (want && gsp->perf.boosted && ++gsp->perf.boost_rounds < R535_GSP_PERF_BOOST_RENEW)
++		return;
++
++	ctrl = nvkm_gsp_rm_ctrl_get(subdevice, NV2080_CTRL_CMD_PERF_BOOST, sizeof(*ctrl));
++	if (IS_ERR(ctrl)) {
++		r535_gsp_perf_refused(&gsp->perf.boost_off, &nvkm_perf.boost_status,
++				      PTR_ERR(ctrl));
++		return;
++	}
++	ctrl->flags = want ? NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX :
++			     NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR;
++	ctrl->duration = want ? R535_GSP_PERF_BOOST_S : 0;
++	if (r535_gsp_perf_push(subdevice, (void **)&ctrl, sizeof(*ctrl),
++			       &gsp->perf.boost_off, &nvkm_perf.boost_status))
++		return;
++	nvkm_gsp_rm_ctrl_done(subdevice, ctrl);
++	gsp->perf.boosted = want;
++	gsp->perf.boost_rounds = 0;
++	__atomic_store_n(&nvkm_perf.boost_status, want ? 1 : 2, __ATOMIC_RELAXED);
++}
++
+ static void
+ r535_gsp_perf_work(struct work_struct *work)
+ {
+@@ -130,6 +175,7 @@ r535_gsp_perf_work(struct work_struct *work)
+ 		return;
+ 
+ 	r535_gsp_perf_link(gsp);
++	r535_gsp_perf_boost(gsp);
+ 	if (!gsp->perf.pstate_off)
+ 		r535_gsp_perf_pstate(gsp);
+ 	__atomic_fetch_add(&nvkm_perf.rounds, 1, __ATOMIC_RELAXED);

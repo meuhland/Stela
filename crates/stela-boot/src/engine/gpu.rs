@@ -3445,20 +3445,48 @@ fn nvkm_report() -> String {
 /// then when they changed. Empty otherwise.
 #[cfg(feature = "nvk")]
 fn perf_report() -> String {
-    use stela_drivers::gpu::gsp_perf::{Report, Reported};
-    unsafe extern "C" {
-        /// `nvkm/subdev/gsp/rm/r535/perf.c`, which nouveau updates only
-        /// atomically.
-        static nvkm_perf: Report;
-    }
+    use stela_drivers::gpu::gsp_perf::Reported;
     static REPORTED: Reported = Reported::new();
-    // SAFETY: nouveau's static report, which it only updates atomically.
-    let report = unsafe { &nvkm_perf };
-    report
+    gsp_perf()
         .take()
         .and_then(|taken| REPORTED.line(&taken))
         .map(|line| format!("\n{line}"))
         .unwrap_or_default()
+}
+
+/// nouveau's report of GSP-RM's performance state
+/// (`nvkm/subdev/gsp/rm/r535/perf.c`).
+#[cfg(feature = "nvk")]
+fn gsp_perf() -> &'static stela_drivers::gpu::gsp_perf::Report {
+    unsafe extern "C" {
+        /// nouveau's static report, which it updates only atomically.
+        static nvkm_perf: stela_drivers::gpu::gsp_perf::Report;
+    }
+    // SAFETY: nouveau's static report, which it and the host update only
+    // atomically.
+    unsafe { &nvkm_perf }
+}
+
+/// `pstate=P8 pcie=gen1x16`: the GPU's P-state and PCIe link as nouveau last
+/// sampled them (once a second), and RM's answer to `--gpu-boost`, for the
+/// lines that time the GPU's own work (NVENC's); `pstate=unknown` before GSP
+/// starts.
+#[cfg(feature = "nvk")]
+fn perf_now() -> String {
+    gsp_perf()
+        .current()
+        .map_or_else(|| String::from("pstate=unknown"), |now| format!("{now}"))
+}
+
+/// `--gpu-boost`: nouveau's rounds ask GSP-RM to hold the GPU at its highest
+/// performance level from now on (`GPU PERF … boost=…` says RM's answer).
+#[cfg(feature = "nvk")]
+pub(in crate::engine) fn boost() {
+    gsp_perf().request_boost(true);
+    output::arguments(format_args!(
+        "GPU PERF boost asked: GSP-RM is to hold the GPU at its highest performance level \
+         (--gpu-boost)\n"
+    ));
 }
 
 /// The function of the timer-list timer due first when Linux last looked,

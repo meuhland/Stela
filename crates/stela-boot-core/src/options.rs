@@ -74,6 +74,9 @@ pub const INPUT_EVERY_TURN: &str = "--input-every-turn";
 /// Bring the home machine to the guest's USB controller as soon as host
 /// input reaches it ([`System::input_kick`]).
 pub const INPUT_KICK: &str = "--input-kick";
+/// Has GSP-RM hold each NVIDIA GPU at its highest performance level for the
+/// boot ([`System::gpu_boost`]).
+pub const GPU_BOOST: &str = "--gpu-boost";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -473,6 +476,13 @@ pub struct System {
     /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
     /// HEVC.
     pub nvenc: bool,
+    /// From the start of its GSP-RM, before the NVENC probe and self-test,
+    /// nouveau asks RM every 30 s to hold each NVIDIA GPU at its highest
+    /// performance level (`NV2080_CTRL_CMD_PERF_BOOST`), where by default
+    /// RM's own policy picks the P-state from the load it sees and leaves an
+    /// encoding GPU low (`--gpu-boost`). An experiment for NVENC's engine
+    /// time: `GPU PERF … boost=…` says RM's answer.
+    pub gpu_boost: bool,
     /// Log every device access in these physical ranges (`--watch BASE,BYTES`).
     pub watches: Vec<(u64, u64)>,
     /// Guest virtual ranges the stop's report shows (`--dump BASE,BYTES`).
@@ -558,6 +568,7 @@ impl Default for System {
             probe_nvenc: false,
             nvenc_selftest: false,
             nvenc: true,
+            gpu_boost: false,
             watches: Vec::new(),
             dumps: Vec::new(),
         }
@@ -1025,6 +1036,7 @@ impl fmt::Display for System {
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
         line.flag(NO_NVENC, !self.nvenc)?;
+        line.flag(GPU_BOOST, self.gpu_boost)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;

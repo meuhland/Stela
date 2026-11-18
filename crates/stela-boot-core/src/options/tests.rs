@@ -597,3 +597,27 @@ fn nvenc_sessions_are_on_unless_no_nvenc() {
     assert!(!usual.nvenc && usual.nvenc_selftest && usual.input && usual.parallel);
     assert!(usual.to_string().contains(" --nvenc-selftest --no-nvenc"));
 }
+
+/// `--gpu-boost`, the GPU held at its highest performance level, is off
+/// unless asked for, round-trips alone and beside the self-test and the
+/// boot's usual flags, and changes nothing else.
+#[test]
+fn gpu_boost_is_off_by_default_and_round_trips() {
+    assert!(!System::default().gpu_boost);
+    assert!(!round_trip("--system").to_string().contains("boost"));
+    let alone = round_trip(&format!("--system {GPU_BOOST}"));
+    assert!(alone.gpu_boost && alone.nvenc);
+    assert_eq!(alone.to_string(), "--system --gpu-boost");
+    assert_eq!(
+        System {
+            gpu_boost: false,
+            ..alone
+        },
+        System::default()
+    );
+    let usual = round_trip(&format!(
+        "--system --input --parallel {GPU_BOOST} {NVENC_SELFTEST}"
+    ));
+    assert!(usual.gpu_boost && usual.nvenc_selftest && usual.input && usual.parallel);
+    assert!(usual.to_string().contains(" --nvenc-selftest --gpu-boost"));
+}
