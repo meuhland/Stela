@@ -13,6 +13,8 @@
 #include <StelaGPU/Wire.h>
 #include <stela/gate.h>
 
+#include "../stelavt/StelaEncoder.h"
+
 /* The gate page of one device in this task. */
 typedef struct {
 	io_connect_t connect;
@@ -60,6 +62,17 @@ static inline StelaSpan stela_span(const void *address, size_t length)
 {
 	return (StelaSpan){.address = (uint64_t)address, .length = length};
 }
+
+/* Encoder.m: `device`, whose gate opened, may serve StelaVT's video encoder
+ * sessions; VideoEncoder.m: registers StelaVT for HEVC once a gate's host
+ * encodes it. */
+@class StelaGPUDevice;
+void stela_encoder_note_device(StelaGPUDevice *device);
+void stela_video_encoder_offer_hevc(void);
+/* Encoder.m: the calls StelaVT encodes on the host with. */
+const StelaEncoderAPI *stela_encoder_api(void);
+/* Device.m: why this process's last device failed to open, empty if none. */
+extern char stela_device_open_failure[160];
 
 /* An NSError of `domain` from a failed call. */
 NSError *stela_error(NSString *domain, NSInteger code, const StelaFailure *failure);

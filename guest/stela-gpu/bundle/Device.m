@@ -87,9 +87,12 @@ static void tile_span(NSUInteger start, NSUInteger length, NSUInteger tile, NSUI
 /* Names to the kernel console why a device failed before its gate could carry
  * the report: the kext logs the accelerator's kStelaGPUPluginReportKey once. A
  * task the sandbox keeps from setting it is not heard. */
+char stela_device_open_failure[160];
+
 static void report_open(io_service_t accelerator, NSString *step)
 {
 	NSLog(@"StelaGPU: %@", step);
+	strlcpy(stela_device_open_failure, step.UTF8String, sizeof(stela_device_open_failure));
 	IORegistryEntrySetCFProperty(accelerator, (__bridge CFStringRef)@kStelaGPUPluginReportKey,
 				     (__bridge CFTypeRef)step);
 }
@@ -205,6 +208,8 @@ static void report_open(io_service_t accelerator, NSString *step)
 	_completions = dispatch_queue_create("com.stela.StelaGPU.completions", NULL);
 	_notifications = IONotificationPortCreate(kIOMainPortDefault);
 	IONotificationPortSetDispatchQueue(_notifications, _completions);
+	/* Its gate may serve StelaVT's video encoder sessions. */
+	stela_encoder_note_device(self);
 	/* Armed once something waits: nothing does yet. */
 	return self;
 }
