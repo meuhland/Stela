@@ -13,8 +13,8 @@ use alloc::vec::Vec;
 
 /// The protocol version a connection negotiates. A major version changes
 /// records; a minor version only adds operations.
-pub const MAJOR: u32 = 4;
-pub const MINOR: u32 = 1;
+pub const MAJOR: u32 = 5;
+pub const MINOR: u32 = 0;
 
 /// A fixed-width wire record.
 ///
@@ -1037,6 +1037,10 @@ records! {
     /// it is an IDR, which begins with the parameter sets, the engine's
     /// picture index, `error_status` (2 is accepted) and average QP, and
     /// microseconds of the host's input pass and of the engine's work.
+    /// An encode answered `Pending` answers this record too, with only
+    /// `retry_us` and `calls`: how long to wait before calling again (0:
+    /// the frontend's own wait), and the frame's calls so far, which a
+    /// finished frame answers as well.
     pub struct EncoderEncodeResponse {
         pub bytes: u64,
         pub frame: u64,
@@ -1046,6 +1050,8 @@ records! {
         pub average_qp: u32,
         pub convert_us: u32,
         pub gpu_us: u32,
+        pub retry_us: u32,
+        pub calls: u32,
     }
 }
 

@@ -11,9 +11,10 @@ use crate::metal::service::{
     wire::{EncoderOpenResponse, Record, Value},
 };
 use crate::nvenc::{
+    SYNCOBJ_WAIT,
     bits::nal_types,
     layout::Geometry,
-    mock::{Engine, Gpu},
+    mock::{Engine, Gpu, Timing},
     surface,
 };
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
@@ -38,6 +39,10 @@ struct Platform {
     opened: AtomicU32,
     closed: Mutex<Vec<(Gpu, bool)>>,
     lines: Mutex<Vec<String>>,
+    /// The timing model every file shares, its clock then the platform's,
+    /// and whether `kick` runs Linux here.
+    timing: Option<Timing>,
+    kicks: bool,
 }
 
 impl Platform {
@@ -51,7 +56,29 @@ impl Platform {
             opened: AtomicU32::new(0),
             closed: Mutex::new(Vec::new()),
             lines: Mutex::new(Vec::new()),
+            timing: None,
+            kicks: false,
         }
+    }
+
+    /// A platform on the timing model: an engine taking `engine_ns` a
+    /// frame once Linux pushed it, and Linux run in place by `kick` or not.
+    fn timed(engine_ns: u64, kicks: bool) -> Self {
+        let mut platform = Self::new(Engine::Encode);
+        platform.timing = Some(Timing {
+            clock: Arc::new(AtomicU64::new(1_000_000_000)),
+            engine_ns,
+            pushes: Arc::new(AtomicU64::new(0)),
+        });
+        platform.kicks = kicks;
+        platform
+    }
+
+    /// The shared clock, which the frontend's sleeps move too.
+    fn clock(&self) -> &AtomicU64 {
+        self.timing
+            .as_ref()
+            .map_or(&self.clock, |timing| &timing.clock)
     }
 
     fn logged(&self, part: &str) -> bool {
@@ -78,6 +105,7 @@ impl EncoderPlatform for Platform {
         self.opened.fetch_add(1, Ordering::Relaxed);
         let mut gpu = Gpu::new(self.engine);
         gpu.refuse = self.refuse.clone();
+        gpu.timing = self.timing.clone();
         Ok(gpu)
     }
 
@@ -87,11 +115,26 @@ impl EncoderPlatform for Platform {
 
     fn now_ns(&self) -> u64 {
         let step = self.step.load(Ordering::Relaxed);
-        self.clock.fetch_add(step, Ordering::Relaxed) + step
+        self.clock().fetch_add(step, Ordering::Relaxed) + step
     }
 
     fn pause(&self) {
-        self.clock.fetch_add(50_000, Ordering::Relaxed);
+        let pause = if self.timing.is_some() {
+            10_000
+        } else {
+            50_000
+        };
+        self.clock().fetch_add(pause, Ordering::Relaxed);
+    }
+
+    fn kick(&self) -> bool {
+        match &self.timing {
+            Some(timing) if self.kicks => {
+                timing.pushes.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn relax(&self) {
@@ -247,7 +290,7 @@ fn call<R: Record, A: Record + Default>(
         &mut bytes,
         memory,
     );
-    if outcome.is_ok() {
+    if outcome.is_ok() || operation == Operation::EncoderEncode {
         response = wire::read(&bytes).unwrap();
     }
     (outcome, response)
@@ -845,4 +888,200 @@ fn the_shared_service_hands_encoder_calls_to_its_encoders() {
     assert_eq!(encoders.open_sessions(), 1);
     served.disconnect(connection);
     assert_eq!(encoders.open_sessions(), 0);
+}
+
+/// One frame on the timing model, as the frontend makes its calls: each
+/// `Pending` sleeps the response's `retry_us` (the bundle's 200 us for 0).
+/// The calls, the `Pending` hints and the longest call, in the model's ns.
+fn timed_frame(
+    encoders: &Encoders<Platform>,
+    request: &EncoderEncodeRequest,
+    memory: &mut Memory,
+) -> (EncoderEncodeResponse, usize, Vec<u32>, u64) {
+    let clock = encoders.platform().clock();
+    let mut hints = Vec::new();
+    let mut longest = 0;
+    for calls in 1..=10_000 {
+        let before = clock.load(Ordering::Relaxed);
+        let (outcome, response) = call::<_, EncoderEncodeResponse>(
+            encoders,
+            ONE,
+            Operation::EncoderEncode,
+            request,
+            memory,
+        );
+        longest = longest.max(clock.load(Ordering::Relaxed) - before);
+        match outcome {
+            Ok(()) => return (response, calls, hints, longest),
+            Err(fault) if fault.status == Status::Pending => {
+                hints.push(response.retry_us);
+                let sleep = if response.retry_us == 0 {
+                    200
+                } else {
+                    response.retry_us
+                };
+                clock.fetch_add(u64::from(sleep) * 1000, Ordering::Relaxed);
+            }
+            Err(fault) => panic!("{fault}"),
+        }
+    }
+    panic!("the frame never ended");
+}
+
+/// The SYNCOBJ_WAITs a session's file was asked, once it closed.
+fn asks_of(encoders: &Encoders<Platform>) -> usize {
+    let closed = encoders.platform().closed.lock().unwrap();
+    closed[0]
+        .0
+        .requests
+        .iter()
+        .filter(|&&r| r == SYNCOBJ_WAIT)
+        .count()
+}
+
+/// The timing model, H.264 at the self-test's 2.3 ms: the job is pushed by
+/// Linux run in place right after the submission, which comes in the call
+/// that stores the last band, and the call waits for the frame within its
+/// budget: one call a frame, no fence asked, no call past the budget. The
+/// engine's measured time reaches the heartbeat line.
+#[test]
+fn timed_h264_frames_take_one_call_each() {
+    let encoders = Encoders::new(Platform::timed(2_300_000, true));
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    for frame in 1..=8 {
+        let request = encode_request(opened.encoder, frame, 0);
+        let (response, calls, hints, longest) = timed_frame(&encoders, &request, &mut memory);
+        assert_eq!(response.frame, frame);
+        assert_eq!((calls, response.calls), (1, 1), "frame {frame}: {hints:?}");
+        assert!(
+            longest < CALL_BUDGET_NS,
+            "frame {frame}: a call of {longest} ns"
+        );
+        assert!(
+            response.gpu_us >= 2300 && response.gpu_us < 2500,
+            "{}",
+            response.gpu_us
+        );
+    }
+    encoders.report();
+    assert!(encoders.platform().logged("engine_us=23"));
+    assert!(encoders.platform().logged("asks=0 kicks="));
+    close(&encoders, ONE, opened.encoder, &mut memory);
+    assert_eq!(asks_of(&encoders), 0);
+}
+
+/// HEVC at 5.8 ms, past one call's budget: the call that submits answers
+/// `Pending` at once with a hint near the engine's time, rather than spin
+/// out its budget, and the call after the frontend's one sleep gets the
+/// frame. Two calls and one sleep a frame.
+#[test]
+fn timed_hevc_frames_sleep_once() {
+    let encoders = Encoders::new(Platform::timed(5_800_000, true));
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::Hevc, &mut memory).unwrap();
+    for frame in 1..=6 {
+        let request = encode_request(opened.encoder, frame, 0);
+        let (response, calls, hints, longest) = timed_frame(&encoders, &request, &mut memory);
+        assert_eq!(calls, 2, "frame {frame}: {hints:?}");
+        assert_eq!(response.calls, 2);
+        assert!(
+            hints[0] >= 5_000 && hints[0] <= 6_000,
+            "frame {frame}: hint {hints:?}"
+        );
+        // The submitting call did not wait out its budget.
+        assert!(longest < 1_000_000, "frame {frame}: a call of {longest} ns");
+    }
+    close(&encoders, ONE, opened.encoder, &mut memory);
+    assert_eq!(asks_of(&encoders), 0);
+}
+
+/// Where Linux cannot run in place (the boot CPU), the call asks nouveau's
+/// fence once right after the submission, which pushes the job; the frame
+/// still takes one call.
+#[test]
+fn timed_frames_without_a_kick_ask_once() {
+    let encoders = Encoders::new(Platform::timed(2_300_000, false));
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    for frame in 1..=4 {
+        let request = encode_request(opened.encoder, frame, 0);
+        let (_, calls, hints, _) = timed_frame(&encoders, &request, &mut memory);
+        assert_eq!(calls, 1, "frame {frame}: {hints:?}");
+    }
+    close(&encoders, ONE, opened.encoder, &mut memory);
+    assert_eq!(asks_of(&encoders), 4);
+}
+
+/// An engine slower than the session expects: the calls wait out their
+/// budgets, a late frame asks the fence once a call, the hints say "late",
+/// and the measured time catches up so later frames are expected right.
+#[test]
+fn timed_slow_engine_is_learned() {
+    let encoders = Encoders::new(Platform::timed(9_000_000, true));
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    let request = encode_request(opened.encoder, 1, 0);
+    let (_, first_calls, first_hints, longest) = timed_frame(&encoders, &request, &mut memory);
+    assert!(first_calls >= 2, "{first_hints:?}");
+    assert!(first_hints.contains(&RETRY_LATE_US), "{first_hints:?}");
+    assert!(
+        longest <= CALL_BUDGET_NS + 100_000,
+        "a call of {longest} ns"
+    );
+    let mut calls = 0;
+    for frame in 2..=12 {
+        let request = encode_request(opened.encoder, frame, 0);
+        calls = timed_frame(&encoders, &request, &mut memory).1;
+    }
+    assert_eq!(calls, 2, "once learned, a submit and one look");
+}
+
+/// A BGRA picture through the gate stores what `store_bgra` stores whole.
+#[test]
+fn a_bgra_picture_reaches_the_engine_converted() {
+    let encoders = Encoders::new(Platform::new(Engine::Encode));
+    let geometry = geometry();
+    let pitch = 4 * 1920 + 64;
+    let pixels: Vec<u8> = (0..pitch * 1080)
+        .map(|i| (i * 31 + i / pitch * 5) as u8)
+        .collect();
+    let mut memory = Memory::new((PICTURE - BASE) as usize + pixels.len());
+    let at = (PICTURE - BASE) as usize;
+    memory.bytes[at..at + pixels.len()].copy_from_slice(&pixels);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    let mut request = encode_request(opened.encoder, 1, 0);
+    request.input = EncoderInput::Bgra.raw();
+    request.luma = Span {
+        address: PICTURE,
+        length: pixels.len() as u64,
+    };
+    request.luma_pitch = pitch as u32;
+    request.chroma = Span::default();
+    request.chroma_pitch = 0;
+    let (outcome, response, _) = encode(&encoders, &request, &mut memory);
+    outcome.unwrap();
+    assert_eq!(response.idr, 1);
+    close(&encoders, ONE, opened.encoder, &mut memory);
+    let mut closed = encoders.platform().closed.lock().unwrap();
+    let (gpu, _) = &mut closed[0];
+    let mut expected = vec![0u8; geometry.surface_bytes() as usize];
+    // SAFETY: the buffer is the surface's size; the picture fits it.
+    unsafe {
+        surface::store_bgra(
+            expected.as_mut_ptr(),
+            &geometry,
+            &surface::Rgb {
+                pixels: &pixels,
+                pitch,
+                order: surface::Order::Bgra,
+            },
+        );
+    }
+    let input = gpu.submissions[0]
+        .chunks(2)
+        .find(|pair| (pair[0] & 0xfff) << 2 == crate::nvenc::method::SET_IN_CUR_PIC)
+        .map(|pair| u64::from(pair[1]) << 8)
+        .unwrap();
+    assert_eq!(gpu.read(input, expected.len()), expected);
 }

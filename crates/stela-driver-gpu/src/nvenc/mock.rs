@@ -4,8 +4,10 @@
 //! NVC7B7 would and writes a status, a slice and a reconstruction.
 use super::method as m;
 use super::*;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// What the engine does with a submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +23,27 @@ pub enum Engine {
     WrongType,
     /// Encodes, but reports `error_status` 1.
     Error,
+}
+
+/// A timing model of the engine and of the host's Linux: a submission's job
+/// reaches the channel only once Linux runs after its `EXEC` (a push the
+/// platform counts in `pushes`, or a `SYNCOBJ_WAIT`), and its semaphore is
+/// released `engine_ns` later, by the shared `clock`.
+#[derive(Clone)]
+pub struct Timing {
+    pub clock: Arc<AtomicU64>,
+    pub engine_ns: u64,
+    pub pushes: Arc<AtomicU64>,
+}
+
+/// A release the timing model holds back: where, what, the pushes counted
+/// at the `EXEC`, and when the job reached the channel.
+#[derive(Clone, Copy)]
+struct Held {
+    address: u64,
+    payload: u32,
+    pushes: u64,
+    started: Option<u64>,
 }
 
 pub struct Buffer {
@@ -56,6 +79,8 @@ pub struct Gpu {
     /// Each submission's words.
     pub submissions: Vec<Vec<u32>>,
     pub frames: u32,
+    pub timing: Option<Timing>,
+    held: Option<Held>,
 }
 
 impl Gpu {
@@ -76,6 +101,31 @@ impl Gpu {
             signaled: false,
             submissions: Vec::new(),
             frames: 0,
+            timing: None,
+            held: None,
+        }
+    }
+
+    /// The timing model's step: a held job reaches the channel once Linux
+    /// ran (`linux`, or a push counted since its `EXEC`), and its release
+    /// lands once the engine's time passed.
+    fn advance(&mut self, linux: bool) {
+        let (Some(timing), Some(mut held)) = (self.timing.clone(), self.held) else {
+            return;
+        };
+        let now = timing.clock.load(Ordering::Relaxed);
+        if held.started.is_none() && (linux || timing.pushes.load(Ordering::Relaxed) > held.pushes)
+        {
+            held.started = Some(now);
+        }
+        self.held = Some(held);
+        if let Some(started) = held.started
+            && now >= started + timing.engine_ns
+        {
+            self.held = None;
+            self.signaled = true;
+            let (fence, offset) = self.at(held.address);
+            fence.bytes_mut()[offset..offset + 4].copy_from_slice(&held.payload.to_le_bytes());
         }
     }
 
@@ -210,6 +260,17 @@ impl Gpu {
         let address = u64::from(get(m::SEMAPHORE_A)) << 32 | u64::from(get(m::SEMAPHORE_B));
         let payload = get(m::SEMAPHORE_C);
         assert_eq!(get(m::SEMAPHORE_D), 0);
+        if let Some(timing) = &self.timing {
+            // Released later, once Linux pushed the job and the engine ran.
+            self.signaled = false;
+            self.held = Some(Held {
+                address,
+                payload,
+                pushes: timing.pushes.load(Ordering::Relaxed),
+                started: None,
+            });
+            return;
+        }
         let (fence, offset) = self.at(address);
         fence.bytes_mut()[offset..offset + 4].copy_from_slice(&payload.to_le_bytes());
     }
@@ -257,6 +318,8 @@ unsafe impl Node for Gpu {
                 assert_eq!((wait.count_handles, wait.timeout_nsec), (1, 0));
                 // SAFETY: the session's handle.
                 assert_eq!(unsafe { *(wait.handles as *const u32) }, 77);
+                // The call lets the host's Linux run.
+                self.advance(true);
                 if !self.signaled {
                     return -62;
                 }
@@ -331,6 +394,11 @@ unsafe impl Node for Gpu {
     }
 
     fn now_ns(&mut self) -> u64 {
+        if let Some(timing) = &self.timing {
+            let now = timing.clock.fetch_add(1000, Ordering::Relaxed) + 1000;
+            self.advance(false);
+            return now;
+        }
         self.clock += 1000;
         self.clock
     }
