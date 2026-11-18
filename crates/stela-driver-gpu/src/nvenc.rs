@@ -14,7 +14,9 @@
 //!   [`Node::now_ns`] passes the bound. The legacy abi16 uAPI keeps it small:
 //!   a fresh file has no VM_BIND state, so `CHANNEL_ALLOC` turns it off,
 //!   buffers get their addresses from `GEM_NEW`, and `GEM_PUSHBUF` submits
-//!   with a fence of nouveau's own.
+//!   with a fence of nouveau's own. [`probe_engine`] runs the same probe on
+//!   another video engine described by a [`Target`]: NVDEC's
+//!   ([`crate::nvdec`], `--probe-nvdec`).
 //! - **The H.264/HEVC encoder** ([`session`]): nvenc-lab's `nvenc-test`
 //!   path, which encoded correct IDR and P frames on the RTX 3050 under
 //!   nouveau and GSP-RM 570.144 (2026-11-15/16): `VM_INIT` on a file of its
@@ -112,11 +114,23 @@ pub const PUSH_WORDS: usize = 10;
 /// The probe's push: bind the encoder, name H.264, and release `payload` to
 /// the GPU address `semaphore`.
 pub const fn push(semaphore: u64, payload: u32) -> [u32; PUSH_WORDS] {
+    probe_push(ENCODER_CLASS, APPLICATION_H264, semaphore, payload)
+}
+
+/// A probe's push to a video class whose `SET_APPLICATION_ID`, `SEMAPHORE_A..C`
+/// and `SEMAPHORE_D` sit where NVC7B7's do (NVC7B0's do): bind `class`, name
+/// `application`, and release `payload` to the GPU address `semaphore`.
+pub const fn probe_push(
+    class: u32,
+    application: u32,
+    semaphore: u64,
+    payload: u32,
+) -> [u32; PUSH_WORDS] {
     [
         header(SUBCHANNEL, method::SET_OBJECT, 1),
-        ENCODER_CLASS,
+        class,
         header(SUBCHANNEL, method::SET_APPLICATION_ID, 1),
-        APPLICATION_H264,
+        application,
         header(SUBCHANNEL, method::SEMAPHORE_A, 3),
         // SEMAPHORE_A_UPPER is bits 7:0, a 40-bit address.
         (semaphore >> 32) as u32 & 0xff,
@@ -595,43 +609,100 @@ struct Buffer {
 /// The lines go to `log` without a newline.
 pub type Log<'a> = &'a mut dyn FnMut(fmt::Arguments<'_>);
 
+/// One video engine the "alive" probe asks for a semaphore release: NVENC
+/// ([`PROBE`]) or NVDEC (`nvdec::PROBE`). Both share this module's uAPI,
+/// the push's methods (`SET_OBJECT`, `SET_APPLICATION_ID` and
+/// `SEMAPHORE_A..D` sit at the same offsets on NVC7B7 and NVC7B0) and the
+/// bounded wait; only the engine, class and words in the lines differ.
+#[derive(Clone, Copy, Debug)]
+pub struct Target {
+    /// The lines' first word: `NVENC` or `NVDEC`.
+    pub name: &'static str,
+    /// What the engine is, for the lines: `encoder` or `decoder`.
+    pub engine: &'static str,
+    /// The class of a chipset's engine, when the probe knows it.
+    pub class: fn(u16) -> Option<u32>,
+    /// The parts [`Target::class`] knows, for the lines.
+    pub parts: &'static str,
+    /// Its abi16 engine, a `NOUVEAU_FIFO_ENGINE_*` of Stela's Linux patch.
+    pub fifo_engine: u32,
+    /// That Linux patch, for a channel refused as unknown.
+    pub patch: &'static str,
+    /// `SET_APPLICATION_ID`, and its name for the lines.
+    pub application: u32,
+    pub application_name: &'static str,
+    /// The class's object handle on the probe's channel.
+    pub object_handle: u32,
+    /// What the release writes.
+    pub payload: u32,
+}
+
+/// The encoder's probe (`--probe-nvenc`).
+pub const PROBE: Target = Target {
+    name: "NVENC",
+    engine: "encoder",
+    class: encoder_class,
+    parts: "GA102-GA107 only",
+    fifo_engine: FIFO_ENGINE_NVENC,
+    patch: "0206",
+    application: APPLICATION_H264,
+    application_name: "H264",
+    object_handle: OBJECT_HANDLE,
+    payload: PAYLOAD,
+};
+
 /// Probes the encoder of `chipset` through `node`, waiting at most
 /// `timeout_ns` for its semaphore, and says what it found to `log`.
 pub fn probe<N: Node>(node: &mut N, chipset: u16, timeout_ns: u64, log: Log<'_>) -> Outcome {
-    let Some(class) = encoder_class(chipset) else {
+    probe_engine(node, &PROBE, chipset, timeout_ns, log)
+}
+
+/// Probes `target`'s engine of `chipset` through `node`, waiting at most
+/// `timeout_ns` for its semaphore, and says what it found to `log`, each
+/// line starting with `target`'s name and `PROBE`.
+pub fn probe_engine<N: Node>(
+    node: &mut N,
+    target: &Target,
+    chipset: u16,
+    timeout_ns: u64,
+    log: Log<'_>,
+) -> Outcome {
+    let name = target.name;
+    let Some(class) = (target.class)(chipset) else {
         log(format_args!(
-            "NVENC PROBE skipped: chipset {chipset:#x} has no encoder class the probe knows"
+            "{name} PROBE skipped: chipset {chipset:#x} has no {} class the probe knows",
+            target.engine
         ));
         return Outcome::Skipped;
     };
     log(format_args!(
-        "NVENC PROBE start: chipset {chipset:#x}, class {class:#06x}, bound {} ms",
+        "{name} PROBE start: chipset {chipset:#x}, class {class:#06x}, bound {} ms",
         timeout_ns / 1_000_000
     ));
     let mut alloc = ChannelAlloc {
         fb_ctxdma_handle: !0,
-        tt_ctxdma_handle: FIFO_ENGINE_NVENC,
+        tt_ctxdma_handle: target.fifo_engine,
         ..ChannelAlloc::default()
     };
     let result = node.control(CHANNEL_ALLOC, (&raw mut alloc).cast());
     if result != 0 {
         log(format_args!(
-            "NVENC PROBE channel refused: {} ({result}): {}",
+            "{name} PROBE channel refused: {} ({result}): {}",
             errno_name(result),
-            channel_refusal(result)
+            target.channel_refusal(result)
         ));
         let outcome = Outcome::Failed {
             step: Step::Channel,
             errno: result,
         };
-        done(log, &outcome);
+        done(target, log, &outcome);
         return outcome;
     }
     log(format_args!(
-        "NVENC PROBE channel ok: engine NVENC, channel {}, push domains {:#x}",
+        "{name} PROBE channel ok: engine {name}, channel {}, push domains {:#x}",
         alloc.channel, alloc.pushbuf_domains
     ));
-    let outcome = on_channel(node, alloc.channel, class, timeout_ns, log);
+    let outcome = on_channel(node, target, alloc.channel, class, timeout_ns, log);
     if !outcome.keeps_channel() {
         let mut free = ChannelFree {
             channel: alloc.channel,
@@ -639,12 +710,12 @@ pub fn probe<N: Node>(node: &mut N, chipset: u16, timeout_ns: u64, log: Log<'_>)
         let result = node.control(CHANNEL_FREE, (&raw mut free).cast());
         if result != 0 {
             log(format_args!(
-                "NVENC PROBE channel free refused: {} ({result})",
+                "{name} PROBE channel free refused: {} ({result})",
                 errno_name(result)
             ));
         }
     }
-    done(log, &outcome);
+    done(target, log, &outcome);
     outcome
 }
 
@@ -657,37 +728,160 @@ pub fn channel_refusal(errno: i64) -> &'static str {
     }
 }
 
+impl Target {
+    /// Why nouveau refused this engine's channel, by its errno.
+    pub fn channel_refusal(&self, errno: i64) -> Refusal<'_> {
+        Refusal {
+            target: self,
+            errno,
+        }
+    }
+}
+
+/// Why nouveau refused a [`Target`]'s channel, for the lines.
+pub struct Refusal<'a> {
+    target: &'a Target,
+    errno: i64,
+}
+
+impl fmt::Display for Refusal<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.target.name;
+        match self.errno {
+            -38 => write!(
+                f,
+                "this nouveau has no {name} case in abi16 (Stela's Linux patch {})",
+                self.target.patch
+            ),
+            -22 => write!(f, "nouveau found no {name} runlist on this GPU"),
+            _ => f.write_str("nouveau or GSP-RM refused the channel"),
+        }
+    }
+}
+
+impl Outcome {
+    /// What a probe of `target`'s engine on `chipset` with the bound
+    /// `timeout_ns` found, in one line's words: the boot gives each GPU one
+    /// after its name.
+    pub fn verdict<'a>(&self, target: &'a Target, chipset: u16, timeout_ns: u64) -> Verdict<'a> {
+        Verdict {
+            target,
+            chipset,
+            outcome: *self,
+            timeout_ns,
+        }
+    }
+}
+
+/// [`Outcome::verdict`].
+pub struct Verdict<'a> {
+    target: &'a Target,
+    chipset: u16,
+    outcome: Outcome,
+    timeout_ns: u64,
+}
+
+impl fmt::Display for Verdict<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let target = self.target;
+        let chipset = self.chipset;
+        let Some(class) = (target.class)(chipset) else {
+            return write!(
+                f,
+                "skipped: chipset {chipset:#x} has no {} class the probe knows ({})",
+                target.engine, target.parts
+            );
+        };
+        let bound = self.timeout_ns / 1_000_000;
+        match self.outcome {
+            Outcome::Skipped => write!(f, "class {class:#06x} skipped"),
+            Outcome::Alive { micros } => write!(
+                f,
+                "class {class:#06x} channel opened, semaphore released in {micros} us"
+            ),
+            Outcome::Timeout {
+                value,
+                fence_done: false,
+            } => write!(
+                f,
+                "class {class:#06x} channel opened, TIMEOUT: semaphore not released within {bound} \
+                 ms (it holds {value:#010x}) and the channel's fence is pending: the channel and \
+                 its file stay open"
+            ),
+            Outcome::Timeout {
+                value,
+                fence_done: true,
+            } => write!(
+                f,
+                "class {class:#06x} channel opened, TIMEOUT: semaphore not released within {bound} \
+                 ms (it holds {value:#010x}) though the channel's fence signalled: the engine \
+                 took the methods but wrote nothing"
+            ),
+            Outcome::Failed { step, errno } => {
+                let errno_name = errno_name(errno);
+                match step {
+                    Step::Channel => write!(
+                        f,
+                        "class {class:#06x} channel allocation refused: {errno_name} ({errno}): {}",
+                        target.channel_refusal(errno)
+                    ),
+                    Step::Class => write!(
+                        f,
+                        "class {class:#06x} channel opened, class allocation refused: {errno_name} \
+                         ({errno}): GSP-RM or nouveau has no {} object on this channel",
+                        target.engine
+                    ),
+                    Step::Buffer => write!(
+                        f,
+                        "class {class:#06x} channel opened, buffer allocation refused: \
+                         {errno_name} ({errno})"
+                    ),
+                    Step::Map => write!(f, "class {class:#06x} channel opened, buffer map refused"),
+                    Step::Submit => write!(
+                        f,
+                        "class {class:#06x} channel opened, submit refused: {errno_name} ({errno})"
+                    ),
+                }
+            }
+        }
+    }
+}
+
 /// The probe's last line.
-fn done(log: Log<'_>, outcome: &Outcome) {
+fn done(target: &Target, log: Log<'_>, outcome: &Outcome) {
+    let name = target.name;
     match outcome {
         Outcome::Failed { step, errno } => log(format_args!(
-            "NVENC PROBE done: failed at {}: {} ({errno})",
+            "{name} PROBE done: failed at {}: {} ({errno})",
             step.name(),
             errno_name(*errno)
         )),
-        outcome => log(format_args!("NVENC PROBE done: {}", outcome.name())),
+        outcome => log(format_args!("{name} PROBE done: {}", outcome.name())),
     }
 }
 
 /// The class, buffers, push and wait on `channel`.
 fn on_channel<N: Node>(
     node: &mut N,
+    target: &Target,
     channel: i32,
     class: u32,
     timeout_ns: u64,
     log: Log<'_>,
 ) -> Outcome {
+    let name = target.name;
     let mut object = GrobjAlloc {
         channel,
-        handle: OBJECT_HANDLE,
+        handle: target.object_handle,
         class: class as i32,
     };
     let result = node.control(GROBJ_ALLOC, (&raw mut object).cast());
     if result != 0 {
         log(format_args!(
-            "NVENC PROBE class refused: {class:#06x}: {} ({result}): GSP-RM or nouveau has no \
-             encoder object on this channel",
-            errno_name(result)
+            "{name} PROBE class refused: {class:#06x}: {} ({result}): GSP-RM or nouveau has no \
+             {} object on this channel",
+            errno_name(result),
+            target.engine
         ));
         return Outcome::Failed {
             step: Step::Class,
@@ -695,13 +889,14 @@ fn on_channel<N: Node>(
         };
     }
     log(format_args!(
-        "NVENC PROBE class ok: {class:#06x} instantiated as {OBJECT_HANDLE:#x}"
+        "{name} PROBE class ok: {class:#06x} instantiated as {:#x}",
+        target.object_handle
     ));
-    let push_buffer = match buffer(node, channel, log, "push") {
+    let push_buffer = match buffer(node, channel, log, name, "push") {
         Ok(buffer) => buffer,
         Err(outcome) => return outcome,
     };
-    let semaphore = match buffer(node, channel, log, "semaphore") {
+    let semaphore = match buffer(node, channel, log, name, "semaphore") {
         Ok(buffer) => buffer,
         Err(outcome) => {
             release(node, push_buffer, true);
@@ -709,10 +904,10 @@ fn on_channel<N: Node>(
         }
     };
     log(format_args!(
-        "NVENC PROBE buffers ok: push at {:#x}, semaphore at {:#x}",
+        "{name} PROBE buffers ok: push at {:#x}, semaphore at {:#x}",
         push_buffer.address, semaphore.address
     ));
-    let words = push(semaphore.address, PAYLOAD);
+    let words = probe_push(class, target.application, semaphore.address, target.payload);
     // SAFETY: both mappings are BUFFER_BYTES, past the push's words, and
     // writable until released; video memory is read and written whole words.
     unsafe {
@@ -758,7 +953,7 @@ fn on_channel<N: Node>(
     let result = node.control(GEM_PUSHBUF, (&raw mut submit).cast());
     if result != 0 {
         log(format_args!(
-            "NVENC PROBE submit refused: {} ({result})",
+            "{name} PROBE submit refused: {} ({result})",
             errno_name(result)
         ));
         release(node, push_buffer, true);
@@ -769,10 +964,11 @@ fn on_channel<N: Node>(
         };
     }
     log(format_args!(
-        "NVENC PROBE submitted: {PUSH_WORDS} words: SET_OBJECT {ENCODER_CLASS:#06x}, \
-         SET_APPLICATION_ID H264, SEMAPHORE_A..D release {PAYLOAD:#010x}"
+        "{name} PROBE submitted: {PUSH_WORDS} words: SET_OBJECT {class:#06x}, \
+         SET_APPLICATION_ID {}, SEMAPHORE_A..D release {:#010x}",
+        target.application_name, target.payload
     ));
-    let outcome = wait(node, &semaphore, timeout_ns, log);
+    let outcome = wait(node, target, &semaphore, timeout_ns, log);
     // A push that never finished keeps its buffers: nouveau's fence still
     // holds them, and freeing them is the channel's wait over again.
     let free = !outcome.keeps_channel();
@@ -781,10 +977,18 @@ fn on_channel<N: Node>(
     outcome
 }
 
-/// Reads the semaphore until it holds [`PAYLOAD`] or `timeout_ns` passes,
-/// asking nouveau between reads whether its fence after the push signalled.
-/// Each ask lets the host's Linux run, which takes the GPU's interrupts.
-fn wait<N: Node>(node: &mut N, semaphore: &Buffer, timeout_ns: u64, log: Log<'_>) -> Outcome {
+/// Reads the semaphore until it holds `target`'s payload or `timeout_ns`
+/// passes, asking nouveau between reads whether its fence after the push
+/// signalled. Each ask lets the host's Linux run, which takes the GPU's
+/// interrupts.
+fn wait<N: Node>(
+    node: &mut N,
+    target: &Target,
+    semaphore: &Buffer,
+    timeout_ns: u64,
+    log: Log<'_>,
+) -> Outcome {
+    let name = target.name;
     let started = node.now_ns();
     let deadline = started.saturating_add(timeout_ns);
     let mut fence_done = false;
@@ -792,10 +996,10 @@ fn wait<N: Node>(node: &mut N, semaphore: &Buffer, timeout_ns: u64, log: Log<'_>
         // SAFETY: the mapping holds a word and stays until released.
         let value = unsafe { semaphore.pointer.cast::<u32>().read_volatile() };
         let now = node.now_ns();
-        if value == PAYLOAD {
+        if value == target.payload {
             let micros = now.saturating_sub(started) / 1000;
             log(format_args!(
-                "NVENC PROBE ALIVE: semaphore {value:#010x} after {micros} us; NVENC runs under \
+                "{name} PROBE ALIVE: semaphore {value:#010x} after {micros} us; {name} runs under \
                  GSP-RM on this GPU"
             ));
             return Outcome::Alive { micros };
@@ -803,7 +1007,7 @@ fn wait<N: Node>(node: &mut N, semaphore: &Buffer, timeout_ns: u64, log: Log<'_>
         if now >= deadline {
             let micros = now.saturating_sub(started) / 1000;
             log(format_args!(
-                "NVENC PROBE TIMEOUT: semaphore {value:#010x} after {micros} us, channel fence {}",
+                "{name} PROBE TIMEOUT: semaphore {value:#010x} after {micros} us, channel fence {}",
                 if fence_done {
                     "done: the engine took the methods but wrote nothing"
                 } else {
@@ -821,7 +1025,7 @@ fn wait<N: Node>(node: &mut N, semaphore: &Buffer, timeout_ns: u64, log: Log<'_>
                 0 => {
                     fence_done = true;
                     log(format_args!(
-                        "NVENC PROBE fence done after {} us",
+                        "{name} PROBE fence done after {} us",
                         node.now_ns().saturating_sub(started) / 1000
                     ));
                 }
@@ -830,7 +1034,7 @@ fn wait<N: Node>(node: &mut N, semaphore: &Buffer, timeout_ns: u64, log: Log<'_>
                     // Not a reason to stop reading: the semaphore decides.
                     fence_done = true;
                     log(format_args!(
-                        "NVENC PROBE fence query refused: {} ({result})",
+                        "{name} PROBE fence query refused: {} ({result})",
                         errno_name(result)
                     ));
                 }
@@ -845,6 +1049,7 @@ fn buffer<N: Node>(
     node: &mut N,
     channel: i32,
     log: Log<'_>,
+    prefix: &str,
     name: &str,
 ) -> Result<Buffer, Outcome> {
     let mut new = GemNew {
@@ -859,7 +1064,7 @@ fn buffer<N: Node>(
     let result = node.control(GEM_NEW, (&raw mut new).cast());
     if result != 0 {
         log(format_args!(
-            "NVENC PROBE {name} buffer refused: {} ({result})",
+            "{prefix} PROBE {name} buffer refused: {} ({result})",
             errno_name(result)
         ));
         return Err(Outcome::Failed {
@@ -869,7 +1074,7 @@ fn buffer<N: Node>(
     }
     let Some(pointer) = node.map(new.info.map_handle, BUFFER_BYTES) else {
         log(format_args!(
-            "NVENC PROBE {name} buffer map refused at {:#x}",
+            "{prefix} PROBE {name} buffer map refused at {:#x}",
             new.info.map_handle
         ));
         close(node, new.info.handle);
@@ -901,4 +1106,4 @@ fn close<N: Node>(node: &mut N, handle: u32) {
 #[cfg(test)]
 pub(crate) mod mock;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

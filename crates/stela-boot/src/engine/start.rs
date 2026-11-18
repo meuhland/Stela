@@ -3148,6 +3148,11 @@ fn start_devices(
                     if options.nvenc_selftest {
                         gpu::nvenc::selftest();
                     }
+                    // After NVENC's, so a decoder that wedges leaves NVENC's
+                    // lines whole. It changes nothing NVENC serves.
+                    if options.probe_nvdec {
+                        gpu::nvdec::probe();
+                    }
                 }
                 // Whether the Metal services serve the guest's NVENC
                 // sessions, which open with them.
@@ -3161,15 +3166,20 @@ fn start_devices(
                     handoff.screen.map(|screen| screen.resolution()),
                     firmware.as_deref(),
                 );
-            } else if options.probe_nvenc || options.nvenc_selftest {
-                output::arguments(format_args!(
-                    "NVENC {} skipped: no GPU started\n",
-                    if options.nvenc_selftest {
-                        "SELFTEST"
-                    } else {
-                        "PROBE"
-                    }
-                ));
+            } else {
+                if options.probe_nvenc || options.nvenc_selftest {
+                    output::arguments(format_args!(
+                        "NVENC {} skipped: no GPU started\n",
+                        if options.nvenc_selftest {
+                            "SELFTEST"
+                        } else {
+                            "PROBE"
+                        }
+                    ));
+                }
+                if options.probe_nvdec {
+                    output::arguments(format_args!("NVDEC PROBE skipped: no GPU started\n"));
+                }
             }
             super::service::set_input_every_turn(options.input_every_turn);
             super::service::set_input_kick(options.input_kick);

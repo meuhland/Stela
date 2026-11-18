@@ -61,6 +61,8 @@ pub const PROBE_NVENC: &str = "--probe-nvenc";
 /// Encodes a test pattern with each started GPU's NVENC before macOS
 /// (`NVENC SELFTEST` lines).
 pub const NVENC_SELFTEST: &str = "--nvenc-selftest";
+/// Checks each started GPU's video decoder before macOS (`NVDEC PROBE` lines).
+pub const PROBE_NVDEC: &str = "--probe-nvdec";
 /// Serves no video encoder sessions to the guest: StelaVT encodes H.264
 /// with x264, as before NVENC ([`System::nvenc`]).
 pub const NO_NVENC: &str = "--no-nvenc";
@@ -469,6 +471,12 @@ pub struct System {
     /// check every frame, logged as `NVENC SELFTEST` lines
     /// (`--nvenc-selftest`). Nothing it finds stops the boot.
     pub nvenc_selftest: bool,
+    /// Once the GPUs start, before macOS and after NVENC's probe and
+    /// self-test, check that each one's video decoder runs under GSP: a
+    /// channel on its runlist, its class (NVC7B0), and one semaphore release,
+    /// logged as `NVDEC PROBE` lines (`--probe-nvdec`). Nothing it finds
+    /// stops the boot or changes NVENC.
+    pub probe_nvdec: bool,
     /// Each NVIDIA GPU whose encoder Stela drives (GA102-GA107) serves
     /// StelaVT's H.264 and HEVC sessions through its Metal gate; off with
     /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
@@ -565,6 +573,7 @@ impl Default for System {
             display_trace: false,
             probe_nvenc: false,
             nvenc_selftest: false,
+            probe_nvdec: false,
             nvenc: true,
             gpu_boost: false,
             watches: Vec::new(),
@@ -1029,6 +1038,7 @@ impl fmt::Display for System {
         line.flag("--display-trace", self.display_trace)?;
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
+        line.flag(PROBE_NVDEC, self.probe_nvdec)?;
         line.flag(NO_NVENC, !self.nvenc)?;
         line.flag(GPU_BOOST, self.gpu_boost)?;
         line.value("--network-check", self.network_check.as_deref())?;
