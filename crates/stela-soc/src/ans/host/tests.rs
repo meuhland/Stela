@@ -700,3 +700,23 @@ fn a_flush_waits_for_discards_a_bounded_time() {
     assert_eq!(log.started().last(), Some(&Command::Flush));
     assert!(!disk.discarding());
 }
+
+/// Discards a flush waits for go in commands of at least 1 GiB, several
+/// together, and none of them sizes the background's next command.
+#[test]
+fn urgent_discards_go_in_large_commands_that_measure_nothing() {
+    let (mut disk, log) = sata();
+    disk.hurry_discards(true);
+    disk.discard(0, 1_953_525_168);
+    assert!(disk.poll(0).is_empty());
+    let started = log.started();
+    assert_eq!(started.len(), DISCARD_COMMANDS);
+    assert!(
+        started
+            .iter()
+            .all(|command| discard_bytes(command) == DISCARD_URGENT)
+    );
+    release(&log, 0);
+    assert!(disk.poll(100 * DISCARD_TARGET).is_empty());
+    assert!(disk.diagnostic(0).contains("piece=65536KiB last=none"));
+}

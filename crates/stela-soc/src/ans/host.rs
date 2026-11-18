@@ -32,7 +32,8 @@
 //! the disk heard of and no write took back since are not sent again, as an
 //! APFS format and its first mounts deallocate the whole container more
 //! than once. A flush that waits for discards sends them at once and
-//! keeps [`DISCARD_COMMANDS`] commands on the disk, starting the next as
+//! keeps [`DISCARD_COMMANDS`] commands of at least [`DISCARD_URGENT`] bytes,
+//! which no measure takes from, on the disk, starting the next as
 //! soon as one completes rather than once a whole group has: one slow
 //! deallocation does not hold back the rest. A transfer waits for discards
 //! at most [`DISCARD_HOLD`]; then those not yet sent are given up.
@@ -68,6 +69,10 @@ const DISCARD_FIRST: u64 = 64 << 20;
 /// The fewest and most bytes one discard command covers.
 const DISCARD_LEAST: u64 = 1 << 20;
 const DISCARD_MOST: u64 = 8 << 30;
+/// The fewest bytes a command covers while a transfer waits for discards
+/// or a shutdown hurries them: the guest already waits for all of them,
+/// [`DISCARD_COMMANDS`] run together, and [`DISCARD_HOLD`] bounds the wait.
+const DISCARD_URGENT: u64 = 1 << 30;
 /// A discard command slower than this, [`DISCARD_STRIKES`] times in a row
 /// however small, makes the disk hear no more discards: 200 ms.
 const DISCARD_SLOW: u64 = 4_800_000;
@@ -509,7 +514,12 @@ impl HostDisk {
         if !self.discards.urgent() && (!self.running.is_empty() || now < self.discards.due(now)) {
             return 0;
         }
-        let budget = (self.discards.piece / u64::from(self.identity().block_size)).max(1);
+        let urgent = self.discards.urgent();
+        let piece = match urgent {
+            true => self.discards.piece.max(DISCARD_URGENT),
+            false => self.discards.piece,
+        };
+        let budget = (piece / u64::from(self.identity().block_size)).max(1);
         let mut started = 0;
         while started < most
             && self.discards.running.len() < self.discards.batches()
@@ -522,8 +532,10 @@ impl HostDisk {
                 break;
             }
             // A disk that runs commands where asked completes them before
-            // the counter moves, so its time measures nothing.
+            // the counter moves, so its time measures nothing; urgent
+            // commands run beside each other, so theirs measures them all.
             let alone = self.device.depth() != 0
+                && !urgent
                 && self.running.is_empty()
                 && self.discards.running.is_empty();
             let request = Request::Discard {
