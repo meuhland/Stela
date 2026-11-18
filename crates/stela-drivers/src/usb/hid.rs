@@ -252,6 +252,19 @@ impl Retry {
     }
 }
 
+/// The bytes one interrupt transfer asks for to receive a report of
+/// `report` bytes: whole packets of the endpoint's `max_packet`. A device
+/// whose report is longer than its descriptor says then ends the transfer
+/// with a short or a last whole packet, where a transfer of the described
+/// length ends in a babble error that halts the endpoint; the bytes past the
+/// described length are not read (Linux `hid_report_raw_event`).
+fn whole_packets(report: usize, max_packet: u16) -> usize {
+    match usize::from(max_packet & MAX_PACKET_SIZE) {
+        0 => report,
+        packet => report.div_ceil(packet) * packet,
+    }
+}
+
 /// One HID interface the host polls.
 pub struct UsbInput {
     controller: Shared,
@@ -430,7 +443,10 @@ impl UsbInput {
             ));
         }
         let length = match chosen {
-            REPORT_PROTOCOL => descriptor.as_ref().unwrap().input_bytes(),
+            REPORT_PROTOCOL => whole_packets(
+                descriptor.as_ref().unwrap().input_bytes(),
+                endpoint.max_packet,
+            ),
             _ => usize::from(endpoint.max_packet & MAX_PACKET_SIZE).min(BOOT_REPORT_BYTES),
         };
         if length == 0 {

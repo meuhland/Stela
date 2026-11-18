@@ -42,6 +42,76 @@ fn the_report_descriptor_is_asked_for_four_times() {
 }
 
 #[test]
+fn interrupt_transfers_ask_for_whole_packets() {
+    assert_eq!(whole_packets(9, 16), 16);
+    assert_eq!(whole_packets(8, 8), 8);
+    assert_eq!(whole_packets(20, 16), 32);
+    assert_eq!(
+        whole_packets(5, 0x1808),
+        8,
+        "only the packet-size bits count"
+    );
+    assert_eq!(whole_packets(5, 0), 5);
+}
+
+/// A keyboard on the model's interrupt endpoint (DCI 3).
+fn numbered_keyboard() -> (
+    UsbInput,
+    Rc<RefCell<model::CancelModel>>,
+    Shared,
+    TestRegion,
+) {
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (controller, hardware) = model::cancellation_controller(&mut dma);
+    hardware
+        .borrow_mut()
+        .descriptors
+        .push((REPORT_DESCRIPTOR, 0, NUMBERED_KEYBOARD.to_vec()));
+    let shared: Shared = Rc::new(RefCell::new(controller));
+    let interface = interface(&NUMBERED_KEYBOARD, BOOT, KEYBOARD);
+    let input = UsbInput::new(
+        shared.clone(),
+        &device(&shared),
+        &interface,
+        interface.endpoints[0],
+        &mut dma,
+    )
+    .unwrap()
+    .unwrap();
+    (input, hardware, shared, dma)
+}
+
+/// A device that pads its reports past the descriptor's length is read up
+/// to that length, as Linux `hid_report_raw_event` reads it: the transfer
+/// asks for whole packets, so the longer report is no babble error.
+#[test]
+fn a_report_longer_than_its_descriptor_says_is_read_to_the_described_length() {
+    let (mut input, hardware, _shared, _dma) = numbered_keyboard();
+    assert_eq!(input.length, 16, "nine report bytes in 16-byte packets");
+    hardware
+        .borrow_mut()
+        .push_event(vec![1, 2, 0, 4, 0, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc]);
+    let polled = input.poll_hid();
+    assert_eq!(
+        polled.inputs,
+        [
+            Input::Key {
+                usage: 0xe1,
+                pressed: true
+            },
+            Input::Key {
+                usage: 4,
+                pressed: true
+            }
+        ]
+    );
+    let ReceivedReport::Data(frame) = &polled.reports[0] else {
+        panic!("a decoded report");
+    };
+    assert_eq!(frame.bytes, [1, 2, 0, 4, 0, 0, 0, 0, 0]);
+}
+
+#[test]
 fn transfer_errors_retry_with_linux_backoff_for_one_second() {
     let first = Retry::first(1_000);
     assert_eq!(

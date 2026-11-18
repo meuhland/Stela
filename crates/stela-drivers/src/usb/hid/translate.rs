@@ -150,7 +150,8 @@ impl Translator {
         if dropped {
             self.dropped += 1;
         }
-        self.report(bytes, inputs);
+        // The legacy layouts read the report as its descriptor frames it.
+        self.report(&frame.bytes, inputs);
         Translated::Data(frame)
     }
 

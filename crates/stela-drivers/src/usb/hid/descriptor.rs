@@ -101,7 +101,8 @@ pub struct Sample {
 pub struct Frame {
     pub id: u8,
     pub samples: Vec<Sample>,
-    /// Exact received bytes, including the ID prefix when numbered.
+    /// The report's bytes as its layout describes them, including the ID
+    /// prefix when numbered; bytes received past the layout are left out.
     pub bytes: Vec<u8>,
 }
 
@@ -463,24 +464,28 @@ impl Descriptor {
             .unwrap_or(0)
     }
 
-    /// Decode one complete interrupt input. A short/overlong/unknown report is
-    /// diagnostic evidence, never an invented release or contact update.
+    /// Decode one complete interrupt input. A short or unknown report is
+    /// diagnostic evidence, never an invented release or contact update. A
+    /// report longer than its layout is read up to the layout's length, as
+    /// Linux `hid_report_raw_event` reads the described size and no byte
+    /// past it: devices pad their reports to the endpoint's packet or to
+    /// their longest report.
     pub fn decode(&self, bytes: &[u8]) -> Result<Frame, DecodeError> {
-        let (id, body) = if self.numbered {
-            let (&id, body) = bytes.split_first().ok_or(DecodeError::MissingId)?;
-            (id, body)
+        let id = if self.numbered {
+            *bytes.first().ok_or(DecodeError::MissingId)?
         } else {
-            (0, bytes)
+            0
         };
         let layout = self
             .layout(ReportType::Input, id)
             .ok_or(DecodeError::UnknownId(id))?;
-        if bytes.len() != layout.wire_bytes() {
+        let Some(bytes) = bytes.get(..layout.wire_bytes()) else {
             return Err(DecodeError::Length {
                 expected: layout.wire_bytes(),
                 actual: bytes.len(),
             });
-        }
+        };
+        let body = &bytes[usize::from(self.numbered)..];
         let mut samples = Vec::new();
         for (index, field) in layout.fields.iter().enumerate() {
             for element in 0..field.count {
