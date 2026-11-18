@@ -10,20 +10,30 @@
 //! moment later, so no processor waits for another's encoder work. Each
 //! call runs on the platform's stack ([`EncoderPlatform::run`]).
 //!
-//! **No processor stalls.** A call does at most [`STORE_BUDGET_NS`] of work
-//! and [`POLL_BUDGET_NS`] of looking, then answers `Pending`, and the
-//! frontend calls again; what the call did stays done.
+//! **No processor stalls.** A call works at most about [`CALL_BUDGET_NS`]
+//! (an open, [`STORE_BUDGET_NS`]), then answers `Pending`, and the frontend
+//! calls again; what the call did stays done.
 //!
 //! - `EncoderOpen` makes one piece of the session at a time
 //!   ([`Session::bring_up_step`]): the channel, then each buffer, every one
 //!   a host kernel call or a few.
-//! - `EncoderEncode` reads the picture's rows from the caller's memory, a
-//!   band at a time, and stores each into the session's block-linear input
-//!   surface ([`surface::store_rows`]): pitch-linear NV12 cannot reach the
-//!   engine any other way. Once every row is stored it submits the frame,
-//!   then looks at its semaphore until it completes. A call made again for
-//!   the same frame goes on where the last stopped; one for a later frame
-//!   starts it.
+//! - `EncoderEncode` reads the picture's rows from the caller's memory,
+//!   [`surface::BAND_ROWS`] at a time with both planes, and stores each band
+//!   into the session's block-linear input surface as whole block rows in
+//!   address order ([`surface::store_nv12_band`], or
+//!   [`surface::store_bgra_band`], which converts BGRA on the way):
+//!   pitch-linear pictures cannot reach the engine any other way. Right
+//!   after the last band it submits the frame in the same call, has the
+//!   host's Linux push the job at once ([`EncoderPlatform::kick`]), and
+//!   looks at the frame's semaphore for what is left of the call's budget,
+//!   when the engine's time (the session's measure of it) says the frame
+//!   completes within it. A call made again for the same frame goes on
+//!   where the last stopped; one for a later frame starts it.
+//! - **Waiting.** A call answered `Pending` writes its response's
+//!   `retry_us`: when the frame should be done, from the engine's measured
+//!   time, so the frontend sleeps once a frame instead of polling. Only a
+//!   late frame asks nouveau's fence (`SYNCOBJ_WAIT`, a call the boot CPU's
+//!   Linux serves); the semaphore the stream releases is read directly.
 //! - A frame the engine has not finished within [`FRAME_BOUND_NS`] makes
 //!   the session `Lost`: it takes no more frames. A channel whose job is
 //!   still pending then keeps its file open, and no session opens on the
@@ -47,7 +57,7 @@ use crate::nvenc::{
     Codec, Config, Node, Rate,
     layout::MAX_SIDE,
     session::{self, Encoded, Frame, Options, Session},
-    surface::{self, Order, Plane, Rgb},
+    surface::{self, Order, Rgb, Staging},
 };
 use alloc::vec::Vec;
 use core::{
@@ -69,19 +79,36 @@ pub const NONE: Fault = Fault::new(Status::Unsupported, "the host serves no vide
 /// Sessions one GPU encodes at once: GA106 has one NVENC, which GSP-RM
 /// time-slices between channels.
 pub const MAX_SESSIONS: usize = 2;
-/// About how long one call stores a picture or makes a session, at least
-/// one piece, before it answers `Pending`: the service's own budgets are
-/// 1 to 2 ms (`WAIT_BOUND_MILLIS`, `LIBRARY_MICROS`).
+/// About how long one call makes a session, at least one piece, before it
+/// answers `Pending`: the service's own budgets are 1 to 2 ms
+/// (`WAIT_BOUND_MILLIS`, `LIBRARY_MICROS`).
 pub const STORE_BUDGET_NS: u64 = 1_500_000;
-/// About how long one call looks for a submitted frame's completion before
-/// it answers `Pending`.
-pub const POLL_BUDGET_NS: u64 = 1_000_000;
+/// About how long one encode call stores, submits and waits for its frame
+/// before it answers `Pending`, at least one band: a frame then takes one
+/// call or two, where the frontend's sleep between calls costs it more
+/// than this host time does. It stays under the gate's 5 ms exit target
+/// (`GPU EXIT target_us`), which XNU's view of a held processor sets.
+pub const CALL_BUDGET_NS: u64 = 4_500_000;
 /// How long a frame may take from its submission: past this the session is
 /// `Lost`.
 pub const FRAME_BOUND_NS: u64 = 1_000_000_000;
-/// The rows of a plane one read from the caller's memory brings: an even
-/// number, as BGRA's chroma takes rows in pairs.
-const BAND_ROWS: usize = 64;
+/// Past the engine's expected time by this much a frame is late, and each
+/// call asks nouveau's fence once, which also lets the host's Linux run.
+pub const LATE_NS: u64 = 2_000_000;
+/// A completion seen within this of the look before it measures the
+/// engine's time.
+const ACCURATE_NS: u64 = 100_000;
+/// The engine's time for a 1080p frame before any is measured: the boot
+/// self-test's (2026-11-17), H.264 and HEVC.
+const H264_1080P_NS: u64 = 2_300_000;
+const HEVC_1080P_NS: u64 = 5_800_000;
+/// The `retry_us` of a `Pending` answer: at once, for a call that ran out
+/// of budget while storing; the bounds of a wait for the engine; and the
+/// wait for a late frame.
+const RETRY_AT_ONCE_US: u32 = 1;
+const RETRY_LEAST_US: u64 = 50;
+const RETRY_MOST_US: u64 = 8_000;
+const RETRY_LATE_US: u32 = 300;
 
 /// What the platform gives the encoders of one GPU.
 pub trait EncoderPlatform: Send + Sync + 'static {
@@ -99,6 +126,14 @@ pub trait EncoderPlatform: Send + Sync + 'static {
     fn now_ns(&self) -> u64;
     /// Waits a little between two looks at a semaphore.
     fn pause(&self);
+    /// Has the host's Linux run its ready work now, on this processor, for
+    /// a moment at most: nouveau's `EXEC` only queues the job, and its
+    /// scheduler's work item pushes it to the channel. Whether Linux ran
+    /// here; when it cannot (another processor runs it, or this is the boot
+    /// CPU), the encoders ask nouveau's fence instead, a posted call.
+    fn kick(&self) -> bool {
+        false
+    }
     /// Waits a moment for another holder of the encoders, in a wait with
     /// no bound: it may do the platform's work the holder waits for.
     fn relax(&self);
@@ -190,8 +225,18 @@ fn serve_records(
     caller.read(call.request.address, request).map_err(fault)?;
     let mut response = [0; RECORD_BYTES];
     let response = &mut response[..response_bytes];
-    encoders.serve(connection, operation, request, response, caller)?;
-    caller.write(call.response.address, response).map_err(fault)
+    let served = encoders.serve(connection, operation, request, response, caller);
+    // An encode answered `Pending` still answers its response: its
+    // `retry_us` says when to call again (zero from a call that found the
+    // encoders busy).
+    let hints = matches!(served, Err(fault) if fault.status == Status::Pending)
+        && operation == Operation::EncoderEncode;
+    if served.is_ok() || hints {
+        caller
+            .write(call.response.address, response)
+            .map_err(fault)?;
+    }
+    served
 }
 
 /// Where a session's current frame is.
@@ -200,14 +245,16 @@ enum Stage {
     Opening,
     /// No frame, or the last one answered.
     Idle,
-    /// Frame `frame`'s rows are being stored: `plane`'s from `row` on.
-    Storing {
+    /// Frame `frame`'s rows are being stored, both planes' a band at a
+    /// time, from picture row `row` on.
+    Storing { frame: u64, row: usize },
+    /// Frame `frame` was submitted at `submitted`, and last seen not yet
+    /// complete at `looked`, by the platform's clock.
+    InFlight {
         frame: u64,
-        plane: Plane,
-        row: usize,
+        submitted: u64,
+        looked: u64,
     },
-    /// Frame `frame` was submitted.
-    InFlight { frame: u64 },
     /// Frame `frame` is coded and kept until a later frame's call, so a
     /// call made again gets it.
     Done { frame: u64, encoded: Encoded },
@@ -224,9 +271,11 @@ struct Picture {
     luma_pitch: usize,
     chroma_pitch: usize,
     force_idr: bool,
-    /// When its first call came, and the time its calls spent storing it.
+    /// When its first call came, the time its calls spent storing it, and
+    /// its calls so far.
     began: u64,
     convert_ns: u64,
+    calls: u32,
 }
 
 /// What a session did since a report, or since it opened.
@@ -244,9 +293,23 @@ struct Counts {
     total_max: u64,
     calls: u64,
     pending: u64,
+    /// The engine's time where a look saw it closely ([`ACCURATE_NS`]).
+    engine_ns: u64,
+    engine_max: u64,
+    engine_samples: u64,
+    /// nouveau's fence asked (posted to Linux), and Linux run in place to
+    /// push a job ([`EncoderPlatform::kick`]).
+    asks: u64,
+    kicks: u64,
 }
 
 impl Counts {
+    fn engine(&mut self, ns: u64) {
+        self.engine_ns += ns;
+        self.engine_max = self.engine_max.max(ns);
+        self.engine_samples += 1;
+    }
+
     fn frame(&mut self, encoded: &Encoded, convert_ns: u64, total_ns: u64) {
         self.frames += 1;
         self.bytes += encoded.bytes.len() as u64;
@@ -272,18 +335,24 @@ impl Counts {
         self.total_max = self.total_max.max(other.total_max);
         self.calls += other.calls;
         self.pending += other.pending;
+        self.engine_ns += other.engine_ns;
+        self.engine_max = self.engine_max.max(other.engine_max);
+        self.engine_samples += other.engine_samples;
+        self.asks += other.asks;
+        self.kicks += other.kicks;
     }
 }
 
 /// `frames=… bytes=… idr=… errors=… gpu_us=avg/max convert_us=avg/max
-/// total_us=avg/max calls=… pending=…`.
+/// total_us=avg/max calls=… pending=… engine_us=avg/max/samples asks=…
+/// kicks=…`.
 impl fmt::Display for Counts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let average = |total: u64| total.checked_div(self.frames).unwrap_or(0) / 1000;
         write!(
             formatter,
             "frames={} bytes={} idr={} errors={} gpu_us={}/{} convert_us={}/{} total_us={}/{} \
-             calls={} pending={}",
+             calls={} pending={} engine_us={}/{}/{} asks={} kicks={}",
             self.frames,
             self.bytes,
             self.idrs,
@@ -296,6 +365,11 @@ impl fmt::Display for Counts {
             self.total_max / 1000,
             self.calls,
             self.pending,
+            self.engine_ns.checked_div(self.engine_samples).unwrap_or(0) / 1000,
+            self.engine_max / 1000,
+            self.engine_samples,
+            self.asks,
+            self.kicks,
         )
     }
 }
@@ -307,8 +381,14 @@ struct Slot<N: Node> {
     session: Session<N>,
     stage: Stage,
     picture: Option<Picture>,
-    /// The rows a band brings, kept between bands.
-    band: Vec<u8>,
+    /// The rows a band brings from the caller, each plane's, and the
+    /// stores' padded rows, kept between bands.
+    luma_band: Vec<u8>,
+    chroma_band: Vec<u8>,
+    staging: Staging,
+    /// The engine's expected time for a frame: the self-test's at first,
+    /// then a running mean of what the session measures.
+    engine_ns: u64,
     lost: bool,
     opened_at: u64,
     period: Counts,
@@ -626,7 +706,10 @@ impl<P: EncoderPlatform> Encoders<P> {
             session,
             stage: Stage::Opening,
             picture: None,
-            band: Vec::new(),
+            luma_band: Vec::new(),
+            chroma_band: Vec::new(),
+            staging: Staging::default(),
+            engine_ns: expected_engine_ns(codec, request.width, request.height),
             lost: false,
             opened_at: self.platform.now_ns(),
             period: Counts::default(),
@@ -666,7 +749,7 @@ impl<P: EncoderPlatform> Encoders<P> {
         }
         // A frame still in flight completes before another starts; its
         // output is dropped when a later frame asks.
-        if matches!(slot.stage, Stage::InFlight { frame } if frame != request.frame) {
+        if matches!(slot.stage, Stage::InFlight { frame, .. } if frame != request.frame) {
             if let Err(fault) = self.poll(slot, started) {
                 if fault.status == Status::Lost {
                     return Err(self.lost_slot(state, index));
@@ -675,19 +758,21 @@ impl<P: EncoderPlatform> Encoders<P> {
             }
             if !matches!(slot.stage, Stage::Done { .. } | Stage::Refused { .. }) {
                 slot.period.pending += 1;
-                return Err(GOES_ON);
+                return Err(self.goes_on(slot, response));
             }
         }
         if !matches!(
             slot.stage,
-            Stage::Storing { frame, .. } | Stage::InFlight { frame } if frame == request.frame
+            Stage::Storing { frame, .. } | Stage::InFlight { frame, .. } if frame == request.frame
         ) {
             slot.picture = Some(self.start_frame(slot, request, started)?);
             slot.stage = Stage::Storing {
                 frame: request.frame,
-                plane: Plane::Luma,
                 row: 0,
             };
+        }
+        if let Some(picture) = slot.picture.as_mut() {
+            picture.calls += 1;
         }
         if let Stage::Storing { .. } = slot.stage {
             let stored = self.store(slot, request.frame, started, caller);
@@ -696,19 +781,43 @@ impl<P: EncoderPlatform> Encoders<P> {
                 .as_mut()
                 .expect("a frame being stored has its picture");
             picture.convert_ns += self.platform.now_ns().saturating_sub(started);
-            stored?;
             let options = Options {
                 force_idr: picture.force_idr,
             };
+            match stored {
+                Ok(()) => {}
+                // Out of budget: the frontend calls again at once.
+                Err(fault) if fault == GOES_ON => {
+                    write_retry(response, RETRY_AT_ONCE_US, picture.calls);
+                    return Err(fault);
+                }
+                Err(fault) => return Err(fault),
+            }
+            // Submitted right after the last band, in the same call.
             if let Err(error) = slot.session.submit(Frame::Stored, options) {
                 return Err(self.failed(state, index, request.frame, error));
             }
+            let submitted = self.platform.now_ns();
             slot.stage = Stage::InFlight {
                 frame: request.frame,
+                submitted,
+                looked: submitted,
             };
+            // nouveau's EXEC queued the job; its scheduler's work item
+            // pushes it to the channel when Linux next runs. Run it now.
+            if self.platform.kick() {
+                slot.period.kicks += 1;
+            } else {
+                slot.session.ask_fence();
+                slot.period.asks += 1;
+            }
+        } else if self.platform.kick() {
+            // A call after a sleep: whatever Linux has ready, the job's
+            // push among it, runs before the look.
+            slot.period.kicks += 1;
         }
         let slot = &mut state.sessions[index];
-        if let Err(fault) = self.poll(slot, self.platform.now_ns()) {
+        if let Err(fault) = self.poll(slot, started) {
             if fault.status == Status::Lost {
                 return Err(self.lost_slot(state, index));
             }
@@ -721,9 +830,29 @@ impl<P: EncoderPlatform> Encoders<P> {
             Stage::Refused { fault, .. } => Err(*fault),
             _ => {
                 slot.period.pending += 1;
-                Err(GOES_ON)
+                Err(self.goes_on(slot, response))
             }
         }
+    }
+
+    /// `Pending` for a frame in flight, its response's `retry_us` saying
+    /// when the engine should have completed it.
+    fn goes_on(&self, slot: &Slot<P::Node>, response: &mut [u8]) -> Fault {
+        let calls = slot.picture.map_or(0, |picture| picture.calls);
+        let retry_us = match slot.stage {
+            Stage::InFlight { submitted, .. } => {
+                let expected = submitted.saturating_add(slot.engine_ns);
+                let now = self.platform.now_ns();
+                if expected > now {
+                    ((expected - now) / 1000).clamp(RETRY_LEAST_US, RETRY_MOST_US) as u32
+                } else {
+                    RETRY_LATE_US
+                }
+            }
+            _ => RETRY_AT_ONCE_US,
+        };
+        write_retry(response, retry_us, calls);
+        GOES_ON
     }
 
     /// The picture of a new frame, checked, with the session's rate set to
@@ -787,12 +916,14 @@ impl<P: EncoderPlatform> Encoders<P> {
             force_idr: request.flags & ENCODE_FORCE_IDR != 0,
             began,
             convert_ns: 0,
+            calls: 0,
         })
     }
 
-    /// Stores bands of the frame's rows until every row is stored, or the
-    /// call's budget is spent (`Pending`), or a band is out of the caller's
-    /// reach (`Unmapped`); what was stored stays.
+    /// Stores bands of the frame's rows, both planes' [`surface::BAND_ROWS`]
+    /// at a time, until every row is stored, or the call's budget is spent
+    /// (`Pending`), or a band is out of the caller's reach (`Unmapped`);
+    /// what was stored stays.
     fn store(
         &self,
         slot: &mut Slot<P::Node>,
@@ -803,103 +934,152 @@ impl<P: EncoderPlatform> Encoders<P> {
         let picture = slot.picture.expect("a frame being stored has its picture");
         let geometry = *slot.session.geometry();
         let surface = slot.session.input_surface().map_err(refusal)?;
-        let width = geometry.width as usize;
+        let (width, height) = (geometry.width as usize, geometry.height as usize);
         let mut first_band = true;
         loop {
-            let Stage::Storing { plane, row, .. } = slot.stage else {
+            let Stage::Storing { row, .. } = slot.stage else {
                 return Ok(());
             };
-            let (rows, span, pitch, row_bytes) = match (picture.input, plane) {
-                (EncoderInput::Nv12, Plane::Luma) => (
-                    geometry.height as usize,
-                    picture.luma,
-                    picture.luma_pitch,
-                    width,
-                ),
-                (EncoderInput::Nv12, Plane::Chroma) => (
-                    geometry.height as usize / 2,
-                    picture.chroma,
-                    picture.chroma_pitch,
-                    width,
-                ),
-                (EncoderInput::Bgra, _) => (
-                    geometry.height as usize,
-                    picture.luma,
-                    picture.luma_pitch,
-                    4 * width,
-                ),
-            };
-            if !first_band && self.platform.now_ns().saturating_sub(started) >= STORE_BUDGET_NS {
+            if row >= height {
+                return Ok(());
+            }
+            if !first_band && self.platform.now_ns().saturating_sub(started) >= CALL_BUDGET_NS {
                 return Err(GOES_ON);
             }
             first_band = false;
-            let count = BAND_ROWS.min(rows - row);
-            let bytes = (count - 1) * pitch + row_bytes;
-            slot.band.resize(bytes, 0);
-            caller
-                .read(span.address + (row * pitch) as u64, &mut slot.band)
-                .map_err(fault)?;
-            // SAFETY: the input surface is the session's until it submits
-            // this frame; the band holds `count` rows `pitch` apart, the
-            // last as wide as the picture, as `start_frame` checked.
-            unsafe {
-                match picture.input {
-                    EncoderInput::Nv12 => surface::store_rows(
-                        surface.as_ptr(),
-                        &geometry,
-                        plane,
+            let count = surface::BAND_ROWS.min(height - row);
+            // Each plane's rows of the band: the last only as wide as the
+            // picture, as `start_frame` checked the spans hold.
+            let read = |band: &mut Vec<u8>,
+                        span: Span,
+                        pitch: usize,
+                        first: usize,
+                        rows: usize,
+                        row_bytes: usize,
+                        caller: &mut dyn CallerMemory| {
+                band.resize((rows - 1) * pitch + row_bytes, 0);
+                caller
+                    .read(span.address + (first * pitch) as u64, band)
+                    .map_err(fault)
+            };
+            match picture.input {
+                EncoderInput::Nv12 => {
+                    read(
+                        &mut slot.luma_band,
+                        picture.luma,
+                        picture.luma_pitch,
                         row,
                         count,
-                        &slot.band,
-                        pitch,
-                    ),
-                    EncoderInput::Bgra => surface::store_bgra_rows(
-                        surface.as_ptr(),
-                        &geometry,
+                        width,
+                        caller,
+                    )?;
+                    read(
+                        &mut slot.chroma_band,
+                        picture.chroma,
+                        picture.chroma_pitch,
+                        row / 2,
+                        count / 2,
+                        width,
+                        caller,
+                    )?;
+                    // SAFETY: the input surface is the session's until it
+                    // submits this frame; `row` is a band's first row, and
+                    // the bands hold its rows of each plane.
+                    unsafe {
+                        surface::store_nv12_band(
+                            surface.as_ptr(),
+                            &geometry,
+                            row,
+                            &slot.luma_band,
+                            picture.luma_pitch,
+                            &slot.chroma_band,
+                            picture.chroma_pitch,
+                            &mut slot.staging,
+                        );
+                    }
+                }
+                EncoderInput::Bgra => {
+                    read(
+                        &mut slot.luma_band,
+                        picture.luma,
+                        picture.luma_pitch,
                         row,
                         count,
-                        &Rgb {
-                            pixels: &slot.band,
-                            pitch,
-                            order: Order::Bgra,
-                        },
-                    ),
+                        4 * width,
+                        caller,
+                    )?;
+                    // SAFETY: as above; the band holds its rows.
+                    unsafe {
+                        surface::store_bgra_band(
+                            surface.as_ptr(),
+                            &geometry,
+                            row,
+                            &Rgb {
+                                pixels: &slot.luma_band,
+                                pitch: picture.luma_pitch,
+                                order: Order::Bgra,
+                            },
+                            &mut slot.staging,
+                        );
+                    }
                 }
             }
-            let row = row + count;
-            slot.stage = match (picture.input, plane) {
-                _ if row < rows => Stage::Storing { frame, plane, row },
-                (EncoderInput::Nv12, Plane::Luma) => Stage::Storing {
-                    frame,
-                    plane: Plane::Chroma,
-                    row: 0,
-                },
-                _ => return Ok(()),
+            slot.stage = Stage::Storing {
+                frame,
+                row: row + count,
             };
         }
     }
 
-    /// Looks at the frame in flight until it completes or the poll budget
-    /// is spent; a completed frame is `Done` or `Refused`, and a timeout is
-    /// `Lost`.
+    /// Looks at the frame in flight until it completes, or until the
+    /// call's budget from `started` is spent, or at once when the engine's
+    /// expected time ends past that; a completed frame is `Done` or
+    /// `Refused`, and a timeout is `Lost`.
     fn poll(&self, slot: &mut Slot<P::Node>, started: u64) -> Result<(), Fault> {
-        let Stage::InFlight { frame } = slot.stage else {
+        let Stage::InFlight {
+            frame,
+            submitted,
+            mut looked,
+        } = slot.stage
+        else {
             return Ok(());
         };
-        // One ask a call lets the host's Linux run and tells a busy
-        // channel from an idle one.
-        slot.session.ask_fence();
+        let budget_end = started.saturating_add(CALL_BUDGET_NS);
+        let mut asked = false;
         loop {
             match slot.session.poll(false) {
                 Ok(Some(encoded)) => {
+                    let seen = self.platform.now_ns();
+                    // Seen right after a look that missed it: the engine's
+                    // own time, which the next frames' waits go by.
+                    if seen.saturating_sub(looked) <= ACCURATE_NS {
+                        let engine = seen.saturating_sub(submitted);
+                        slot.period.engine(engine);
+                        slot.engine_ns = (3 * slot.engine_ns + engine) / 4;
+                    }
                     let picture = slot.picture.expect("a frame in flight has its picture");
-                    let total = self.platform.now_ns().saturating_sub(picture.began);
+                    let total = seen.saturating_sub(picture.began);
                     slot.period.frame(&encoded, picture.convert_ns, total);
                     slot.stage = Stage::Done { frame, encoded };
                     return Ok(());
                 }
                 Ok(None) => {
-                    if self.platform.now_ns().saturating_sub(started) >= POLL_BUDGET_NS {
+                    let now = self.platform.now_ns();
+                    looked = now;
+                    slot.stage = Stage::InFlight {
+                        frame,
+                        submitted,
+                        looked,
+                    };
+                    let expected = submitted.saturating_add(slot.engine_ns);
+                    // A late frame: ask nouveau's fence once a call, which
+                    // also lets the host's Linux run.
+                    if !asked && now > expected.saturating_add(LATE_NS) {
+                        slot.session.ask_fence();
+                        slot.period.asks += 1;
+                        asked = true;
+                    }
+                    if now >= budget_end || (expected > budget_end && now < expected) {
                         return Ok(());
                     }
                     self.platform.pause();
@@ -1078,9 +1258,33 @@ fn answer(
             average_qp: encoded.status.average_qp,
             convert_us: micros(picture.map_or(0, |picture| picture.convert_ns)),
             gpu_us: micros(encoded.timing.wait_ns),
+            retry_us: 0,
+            calls: picture.map_or(0, |picture| picture.calls),
         },
         response,
     )
+}
+
+/// The response of an encode answered `Pending`: when to call again, and
+/// the frame's calls so far.
+fn write_retry(response: &mut [u8], retry_us: u32, calls: u32) {
+    let reply = EncoderEncodeResponse {
+        retry_us,
+        calls,
+        ..EncoderEncodeResponse::default()
+    };
+    // The response record is the operation's own size.
+    let _ = wire::write(&reply, response);
+}
+
+/// The engine's time for a frame of `codec` before any is measured: the
+/// self-test's 1080p time, scaled by the picture's area, at least 0.5 ms.
+fn expected_engine_ns(codec: Codec, width: u32, height: u32) -> u64 {
+    let at_1080p = match codec {
+        Codec::H264 => H264_1080P_NS,
+        Codec::Hevc => HEVC_1080P_NS,
+    };
+    (at_1080p * u64::from(width) * u64::from(height) / (1920 * 1080)).max(500_000)
 }
 
 impl<P: EncoderPlatform> GateEncoders for Encoders<P> {

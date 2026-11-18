@@ -316,6 +316,11 @@ impl EncoderPlatform for GateGpu {
         }
     }
 
+    // No `kick`: this build runs the host's Linux on the boot CPU only, so
+    // a processor's encoder call cannot run it in place after `EXEC`. The
+    // encoders ask nouveau's fence instead, a posted call the boot CPU
+    // serves, which pushes the job.
+
     fn relax(&self) {
         super::gate::relax();
     }

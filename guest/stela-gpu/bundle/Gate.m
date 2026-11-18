@@ -42,13 +42,30 @@ static void report_unreachable(uint32_t operation, StelaSpans spans, StelaFailur
 	stela_report(what.UTF8String, failure);
 }
 
+/* The longest wait an encode's response may ask for: a frame the engine is
+ * late with is looked at again at least this often. */
+#define ENCODE_RETRY_MOST_US 8000u
+
 /* How long a call answered Pending waits before it calls again: 0.5 ms,
  * doubling to 4 ms. The host compiles meanwhile on a processor whose guest
  * waits, which this thread's sleep may be. A video encoder's call waits
- * 0.2 ms each time: the host stores a picture and the engine codes it in a
- * few milliseconds, the frame's latency. */
-static void wait_pending(uint32_t operation, unsigned waits)
+ * 0.2 ms, except an encode whose response says how long: until the engine
+ * should have the frame done, so a frame costs one sleep, or no sleep at
+ * all for a call that only ran out of its budget (1 us). Every wake-up
+ * costs this emulated machine real time. */
+static void wait_pending(uint32_t operation, unsigned waits, void *response, size_t response_bytes)
 {
+	if (operation == StelaOperationEncoderEncode && response_bytes == sizeof(StelaEncoderEncodeResponse)) {
+		StelaEncoderEncodeResponse *answer = response;
+		uint32_t retry = answer->retry_us;
+		answer->retry_us = 0;
+		if (retry > 0) {
+			if (retry > 20) {
+				usleep(retry < ENCODE_RETRY_MOST_US ? retry : ENCODE_RETRY_MOST_US);
+			}
+			return;
+		}
+	}
 	if ((operation & 0xff00u) == (StelaOperationEncoderCapabilities & 0xff00u)) {
 		usleep(200);
 		return;
@@ -96,7 +113,7 @@ uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *reques
 		 * at mapping its memory. */
 		if (call.status == StelaStatusPending) {
 			tries--;
-			wait_pending(operation, waits++);
+			wait_pending(operation, waits++, response, response_bytes);
 		}
 		/* The pager can take back the stack's page after the record is written. */
 		again = call.status == StelaStatusUnmapped || call.status == StelaStatusPending ||
