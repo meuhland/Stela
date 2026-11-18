@@ -60,7 +60,7 @@
 mod slot;
 
 use super::super::typec::Usb2Speed;
-use crate::Result;
+use crate::{Result, input_latency};
 use alloc::{boxed::Box, collections::VecDeque, format, string::String};
 use slot::Slot;
 use stela_contracts::refuse;
@@ -231,6 +231,9 @@ struct Event {
     trb: [u32; 4],
     /// Whether posting sets IMAN.IP (clear for a TRB with BEI set).
     interrupt: bool,
+    /// The kind of host input followed to the screen whose report this
+    /// transfer event completes, if it is one ([`input_latency`]).
+    followed: Option<input_latency::Kind>,
 }
 
 #[derive(Clone)]
@@ -663,19 +666,24 @@ impl Xhci {
             return Ok(());
         }
         let rt = offset - INTERRUPTER_BASE;
-        let i = &mut self.interrupters[(rt / INTERRUPTER_STRIDE) as usize];
+        let n = (rt / INTERRUPTER_STRIDE) as usize;
+        let i = &mut self.interrupters[n];
         if rt % INTERRUPTER_STRIDE == 0x10 {
             i.erstba = value & !0x3f;
             i.reload = true;
         } else {
-            Self::write_erdp(i, value);
+            Self::write_erdp(n, i, value);
         }
         Ok(())
     }
 
-    fn write_erdp(i: &mut Interrupter, value: u64) {
+    /// Interrupter `n`'s ERDP: software moved its dequeue pointer past
+    /// the events it handled, which ends the wait of a host input's report
+    /// followed to the screen ([`input_latency::erdp`]).
+    fn write_erdp(n: usize, i: &mut Interrupter, value: u64) {
         let ehb = if value & EHB != 0 { 0 } else { i.erdp & EHB };
         i.erdp = value & !0xf | value & 7 | ehb;
+        input_latency::erdp(n, i.erdp & !0xf);
     }
 
     /// CRCR: the pointer and RCS while the ring is stopped; CS and CA stop
@@ -796,7 +804,7 @@ impl Xhci {
                     }
                     0x18 => {
                         let erdp = i.erdp & !0xffff_ffff | u64::from(value);
-                        Self::write_erdp(i, erdp);
+                        Self::write_erdp(n, i, erdp);
                     }
                     _ => i.erdp = i.erdp & 0xffff_ffff | u64::from(value) << 32,
                 }
@@ -951,6 +959,7 @@ impl Xhci {
             interrupter,
             trb,
             interrupt: true,
+            followed: None,
         });
     }
 
@@ -1051,6 +1060,7 @@ impl Xhci {
                     interrupter: n,
                     trb: [0, 0, EVENT_RING_FULL << 24, HOST_CONTROLLER << 10],
                     interrupt: true,
+                    followed: None,
                 };
                 if self.deliver(port, error)? {
                     self.interrupters[n].lost = 0;
@@ -1154,6 +1164,9 @@ impl Xhci {
             ring.index += 1;
         }
         self.interrupters[n].delivered += 1;
+        if let Some(kind) = event.followed {
+            input_latency::on_ring(kind, n, at, self.interrupters[n].erdp & !0xf);
+        }
         if event.interrupt {
             let i = &mut self.interrupters[n];
             i.erdp |= EHB;

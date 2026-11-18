@@ -36,7 +36,7 @@
 //! does not keep, as repeating an unchanged report tells the host nothing
 //! and wakes its driver every time.
 use super::{BusPeer, Function, Reply, Token, control::Stall};
-use crate::Result;
+use crate::{Result, input_latency};
 use alloc::{collections::VecDeque, vec::Vec};
 use stela_contracts::refuse;
 use stela_drivers::input::{Input, POINTER_MAX};
@@ -216,6 +216,9 @@ struct Interface {
     protocol: u8,
     halted: bool,
     queue: VecDeque<Vec<u8>>,
+    /// Reports queued or changed in the queue since the interface was
+    /// configured: whether an input made one ([`Peripheral::input`]).
+    touched: u64,
 }
 
 impl Interface {
@@ -224,6 +227,7 @@ impl Interface {
             protocol: REPORT_PROTOCOL,
             halted: false,
             queue: VecDeque::new(),
+            touched: 0,
         }
     }
 
@@ -232,6 +236,28 @@ impl Interface {
             self.queue.pop_back();
         }
         self.queue.push_back(report);
+        self.touched += 1;
+    }
+}
+
+/// The kind of input followed to the screen whose reports interface `n`
+/// sends ([`input_latency`]).
+fn followed_kind(n: usize) -> input_latency::Kind {
+    match n {
+        KEYBOARD => input_latency::Kind::Keyboard,
+        _ => input_latency::Kind::Pointer,
+    }
+}
+
+/// The interface whose report `input` changes.
+fn interface_for(input: &Input) -> usize {
+    match input {
+        Input::Key { .. } => KEYBOARD,
+        Input::Move { .. } | Input::Buttons(_) | Input::Wheel(_) | Input::HWheel(_) => POINTER,
+        Input::Motion { .. }
+        | Input::MouseButtons(_)
+        | Input::MouseWheel(_)
+        | Input::MouseHWheel(_) => MOUSE,
     }
 }
 
@@ -272,6 +298,10 @@ pub struct Peripheral {
     x: u16,
     y: u16,
     mouse_buttons: u8,
+    /// For each interface, how many reports wait ahead of the report of
+    /// the input followed to the screen, while one waits in its queue
+    /// ([`input_latency`]).
+    marks: [Option<usize>; INTERFACES],
 }
 
 /// The interfaces after configuration.
@@ -299,6 +329,7 @@ impl Peripheral {
             x: 0,
             y: 0,
             mouse_buttons: 0,
+            marks: [None; INTERFACES],
         }
     }
 
@@ -310,8 +341,38 @@ impl Peripheral {
 
     /// Applies one input change, queuing the report it produces. Reports
     /// queue only while configured; a host that has not configured the
-    /// device reads the current state with GET_REPORT.
+    /// device reads the current state with GET_REPORT. The report of the
+    /// input followed to the screen is marked in its queue, so the guest's
+    /// read of it is timed ([`input_latency`]).
     pub fn input(&mut self, input: Input) -> Result<()> {
+        let Some(kind) =
+            input_latency::Kind::of(&input).filter(|&kind| input_latency::delivering(kind))
+        else {
+            return self.apply(input);
+        };
+        let n = interface_for(&input);
+        let touched = self.interfaces[n].touched;
+        let applied = self.apply(input);
+        let queue = &self.interfaces[n].queue;
+        if self.interfaces[n].touched != touched && !queue.is_empty() {
+            self.marks[n] = Some(queue.len() - 1);
+            input_latency::queued(kind);
+        } else {
+            input_latency::dropped(kind);
+        }
+        applied
+    }
+
+    /// The interfaces' queues were emptied: no report in them is followed.
+    fn unmark(&mut self) {
+        for (n, mark) in self.marks.iter_mut().enumerate() {
+            if mark.take().is_some() {
+                input_latency::abandon(followed_kind(n));
+            }
+        }
+    }
+
+    fn apply(&mut self, input: Input) -> Result<()> {
         match input {
             Input::Key { usage, pressed } => {
                 if let 0xe0..=0xe7 = usage {
@@ -346,10 +407,11 @@ impl Peripheral {
                 (self.x, self.y) = (x, y);
                 // Motion coalesces into a queued report of the same buttons.
                 let report = self.pointer_report(0, 0);
-                let queue = &mut self.interfaces[POINTER].queue;
-                match queue.back_mut() {
+                let interface = &mut self.interfaces[POINTER];
+                match interface.queue.back_mut() {
                     Some(last) if last[0] == report[0] && last[5] == 0 && last[6] == 0 => {
-                        last.copy_from_slice(&report)
+                        last.copy_from_slice(&report);
+                        interface.touched += 1;
                     }
                     _ => self.queue(POINTER, report.to_vec()),
                 }
@@ -411,8 +473,8 @@ impl Peripheral {
             return;
         }
         let buttons = self.mouse_buttons;
-        let queue = &mut self.interfaces[MOUSE].queue;
-        if let Some(last) = queue.back_mut()
+        let interface = &mut self.interfaces[MOUSE];
+        if let Some(last) = interface.queue.back_mut()
             && last[0] == buttons
             && last[3] == 0
             && last[4] == 0
@@ -423,6 +485,7 @@ impl Peripheral {
                 *delta -= merged - held;
                 last[byte] = merged as i8 as u8;
             }
+            interface.touched += 1;
         }
         while dx != 0 || dy != 0 {
             let step_x = dx.clamp(-MOTION_MAX, MOTION_MAX);
@@ -548,6 +611,7 @@ impl Peripheral {
             (0x00, SET_CONFIGURATION) if value <= 1 && self.address != 0 => {
                 self.configuration = value as u8;
                 self.interfaces = interfaces();
+                self.unmark();
                 Ok(Outcome::Done(None))
             }
             (0x81, GET_INTERFACE) if configured && interface < INTERFACES => reply(&[0]),
@@ -672,6 +736,12 @@ impl Peripheral {
         let Some(report) = self.interfaces[n].queue.pop_front() else {
             return Reply::Nak;
         };
+        if let Some(ahead) = self.marks[n] {
+            self.marks[n] = ahead.checked_sub(1);
+            if ahead == 0 {
+                input_latency::taken(followed_kind(n));
+            }
+        }
         let report = self.report(n, report);
         let length = report.len().min(buffer.len());
         buffer[..length].copy_from_slice(&report[..length]);
@@ -702,6 +772,7 @@ impl BusPeer for Peripheral {
         self.configuration = 0;
         self.control = Control::Idle;
         self.interfaces = interfaces();
+        self.unmark();
         Ok(())
     }
 

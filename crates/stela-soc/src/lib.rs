@@ -53,6 +53,7 @@ pub mod handoff;
 pub mod hpm;
 pub mod i2c;
 pub mod inline_key;
+pub mod input_latency;
 pub mod ipi;
 pub mod lockdown;
 pub mod mcc;

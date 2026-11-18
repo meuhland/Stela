@@ -93,6 +93,7 @@ fn held_events_wait_per_interrupter_and_overflow_reports_event_ring_full() {
         interrupter: 1,
         trb: Xhci::port_status_change(0),
         interrupt: true,
+        followed: None,
     });
     service(&mut x, &mut ram);
     let mut first = [0u8; 16];
