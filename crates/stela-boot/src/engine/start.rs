@@ -3145,6 +3145,10 @@ fn start_devices(
                         gpu::nvenc::selftest();
                     }
                 }
+                // Whether the Metal services serve the guest's NVENC
+                // sessions, which open with them.
+                #[cfg(feature = "nvk")]
+                gpu::nvenc::set_serving(options.nvenc);
                 let firmware = handoff
                     .screen
                     .and_then(|screen| screen.pci_source)

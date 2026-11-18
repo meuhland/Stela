@@ -61,6 +61,9 @@ pub const PROBE_NVENC: &str = "--probe-nvenc";
 /// Encodes a test pattern with each started GPU's NVENC before macOS
 /// (`NVENC SELFTEST` lines).
 pub const NVENC_SELFTEST: &str = "--nvenc-selftest";
+/// Serves no video encoder sessions to the guest: StelaVT encodes H.264
+/// with x264, as before NVENC ([`System::nvenc`]).
+pub const NO_NVENC: &str = "--no-nvenc";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -446,6 +449,11 @@ pub struct System {
     /// check every frame, logged as `NVENC SELFTEST` lines
     /// (`--nvenc-selftest`). Nothing it finds stops the boot.
     pub nvenc_selftest: bool,
+    /// Each NVIDIA GPU whose encoder Stela drives (GA102-GA107) serves
+    /// StelaVT's H.264 and HEVC sessions through its Metal gate; off with
+    /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
+    /// HEVC.
+    pub nvenc: bool,
     /// Log every device access in these physical ranges (`--watch BASE,BYTES`).
     pub watches: Vec<(u64, u64)>,
     /// Guest virtual ranges the stop's report shows (`--dump BASE,BYTES`).
@@ -528,6 +536,7 @@ impl Default for System {
             display_trace: false,
             probe_nvenc: false,
             nvenc_selftest: false,
+            nvenc: true,
             watches: Vec::new(),
             dumps: Vec::new(),
         }
@@ -988,6 +997,7 @@ impl fmt::Display for System {
         line.flag("--display-trace", self.display_trace)?;
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
+        line.flag(NO_NVENC, !self.nvenc)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;

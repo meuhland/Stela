@@ -791,6 +791,11 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
     // Peaks a compile or allocation raised with no GPU line after it.
     report_peaks();
     shared().iter().for_each(|service| report_memory(service));
+    // `NVENC SESSION` lines of the sessions that encoded since.
+    shared()
+        .iter()
+        .filter_map(|service| service.encoders())
+        .for_each(|encoders| encoders.report());
     let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
     // How long submitted work took to be seen complete: the GPU's time plus
     // the wait for its interrupt and a look at the device.
@@ -1254,6 +1259,10 @@ fn open_gpu(
     });
     match opened? {
         Ok(service) => {
+            // The guest's video encoder sessions, beside Metal on its gate.
+            if let Some(encoders) = super::nvenc::attach(gpu.window, index, &bound.name, chipset) {
+                service.set_encoders(encoders);
+            }
             // Without a second stack, every compilation stays in its turn.
             service.set_wait_bound(gpu.tsc_hz / 1000 * WAIT_BOUND_MILLIS);
             service.set_look_budget(gpu.tsc_hz / 1_000_000 * LOOK_MICROS);
@@ -1371,6 +1380,13 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
     let quiesce_ms = ms(began);
     let closing = host::rdtsc();
     let reachable = close_gates();
+    // Every encoder session closes before the drivers unload, whether or
+    // not its gate closed it: a session's channel would otherwise still be
+    // open as nouveau unloads.
+    services
+        .iter()
+        .filter_map(|service| service.encoders())
+        .for_each(|encoders| encoders.close_all());
     let close_ms = ms(closing);
     let quarantine = dma_quarantine_status();
     output::arguments(format_args!(

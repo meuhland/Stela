@@ -41,19 +41,19 @@ pub const fn block_linear_offset(x: usize, y: usize, pitch: usize) -> usize {
     block * BLOCK_BYTES + ((y % BLOCK_ROWS) / 8) * 512 + gob_line((x % 64) / 16, y % 8)
 }
 
-/// Stores `rows` pitch-wide rows into a block-linear plane at `plane`,
-/// each row given by `row(y, buffer)` into a pitch-wide buffer.
+/// Stores rows `rows` of a block-linear plane at `plane`, pitch-wide, each
+/// given by `row(y, buffer)` into a pitch-wide buffer.
 ///
 /// # Safety
-/// `plane` is writable for `pitch * rows` bytes.
+/// `plane` is writable for `pitch * rows.end` bytes.
 unsafe fn store_plane(
     plane: *mut u8,
     pitch: usize,
-    rows: usize,
+    rows: core::ops::Range<usize>,
     mut row: impl FnMut(usize, &mut [u8]),
 ) {
     let mut line = vec![0u8; pitch];
-    for y in 0..rows {
+    for y in rows {
         row(y, &mut line);
         for x in (0..pitch).step_by(16) {
             // SAFETY: the offset of a line inside the plane, which the
@@ -103,6 +103,94 @@ impl Nv12<'_> {
     }
 }
 
+/// A plane of an NV12 surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plane {
+    /// Y, one byte a pixel.
+    Luma,
+    /// Interleaved Cb and Cr, half as tall: two bytes for each two pixels.
+    Chroma,
+}
+
+impl Plane {
+    /// The picture's rows of the plane.
+    pub fn rows(self, geometry: &Geometry) -> usize {
+        match self {
+            Self::Luma => geometry.height as usize,
+            Self::Chroma => geometry.height as usize / 2,
+        }
+    }
+
+    /// The surface's rows of the plane, the coded height's.
+    fn coded_rows(self, geometry: &Geometry) -> usize {
+        match self {
+            Self::Luma => geometry.coded_height as usize,
+            Self::Chroma => geometry.coded_height as usize / 2,
+        }
+    }
+
+    /// Where the plane starts in the surface: the chroma follows the luma.
+    fn offset(self, geometry: &Geometry) -> usize {
+        match self {
+            Self::Luma => 0,
+            Self::Chroma => geometry.pitch as usize * geometry.coded_height as usize,
+        }
+    }
+
+    /// The bytes a padding column repeats.
+    fn unit(self) -> usize {
+        match self {
+            Self::Luma => 1,
+            Self::Chroma => 2,
+        }
+    }
+}
+
+/// Stores the picture's rows `first..first + count` of `plane`, which
+/// `rows` holds `row_pitch` bytes apart, into the block-linear NV12 surface
+/// at `surface`, repeating each row's last pixel out to the pitch. The band
+/// that ends with the plane's last row also repeats that row out to the
+/// coded height, as NVENC pads nothing. A picture stored band by band, in
+/// any order, is the surface [`store_nv12`] makes of it whole.
+///
+/// # Safety
+/// `surface` is writable for `geometry.surface_bytes()` bytes. `count` is
+/// at least one, `first + count` at most `plane.rows(geometry)`, and `rows`
+/// holds `(count - 1) * row_pitch` bytes and then the picture's width.
+pub unsafe fn store_rows(
+    surface: *mut u8,
+    geometry: &Geometry,
+    plane: Plane,
+    first: usize,
+    count: usize,
+    rows: &[u8],
+    row_pitch: usize,
+) {
+    let pitch = geometry.pitch as usize;
+    let width = geometry.width as usize;
+    let last = plane.rows(geometry) - 1;
+    debug_assert!(count >= 1 && first + count - 1 <= last);
+    debug_assert!(rows.len() >= (count - 1) * row_pitch + width);
+    let end = if first + count - 1 == last {
+        plane.coded_rows(geometry)
+    } else {
+        first + count
+    };
+    // SAFETY: the plane's rows lie within the surface, which the caller
+    // makes writable.
+    unsafe {
+        store_plane(
+            surface.add(plane.offset(geometry)),
+            pitch,
+            first..end,
+            |y, line| {
+                let start = (y.min(last) - first) * row_pitch;
+                padded(line, &rows[start..], width, plane.unit());
+            },
+        );
+    }
+}
+
 /// Stores `picture` into the block-linear NV12 surface at `surface`,
 /// repeating its last row and column out to the coded size.
 ///
@@ -110,24 +198,22 @@ impl Nv12<'_> {
 /// `surface` is writable for `geometry.surface_bytes()` bytes, and
 /// `picture` [`Nv12::fits`] it.
 pub unsafe fn store_nv12(surface: *mut u8, geometry: &Geometry, picture: &Nv12<'_>) {
-    let pitch = geometry.pitch as usize;
-    let rows = geometry.coded_height as usize;
-    let (width, height) = (geometry.width as usize, geometry.height as usize);
-    // SAFETY: the luma plane is the surface's first pitch * rows bytes.
-    unsafe {
-        store_plane(surface, pitch, rows, |y, line| {
-            let y = y.min(height - 1);
-            let start = y * picture.luma_pitch;
-            padded(line, &picture.luma[start..], width, 1);
-        });
-    }
-    // SAFETY: the chroma plane follows, half as tall.
-    unsafe {
-        store_plane(surface.add(pitch * rows), pitch, rows / 2, |y, line| {
-            let y = y.min(height / 2 - 1);
-            let start = y * picture.chroma_pitch;
-            padded(line, &picture.chroma[start..], width, 2);
-        });
+    for (plane, rows, row_pitch) in [
+        (Plane::Luma, picture.luma, picture.luma_pitch),
+        (Plane::Chroma, picture.chroma, picture.chroma_pitch),
+    ] {
+        // SAFETY: the caller's bounds, and `fits` covers every row.
+        unsafe {
+            store_rows(
+                surface,
+                geometry,
+                plane,
+                0,
+                plane.rows(geometry),
+                rows,
+                row_pitch,
+            );
+        }
     }
 }
 
@@ -210,38 +296,72 @@ fn chroma(r: i32, g: i32, b: i32) -> (u8, u8) {
 /// `surface` is writable for `geometry.surface_bytes()` bytes, and
 /// `picture` [`Rgb::fits`] it.
 pub unsafe fn store_bgra(surface: *mut u8, geometry: &Geometry, picture: &Rgb<'_>) {
+    // SAFETY: the caller's bounds; `fits` covers every row.
+    unsafe {
+        store_bgra_rows(surface, geometry, 0, geometry.height as usize, picture);
+    }
+}
+
+/// Converts the picture's rows `first..first + count`, which `band` holds
+/// from its first row on, as [`store_bgra`] does, and stores their luma and
+/// the chroma rows they make whole into the block-linear NV12 surface at
+/// `surface`. The band that ends the picture also repeats its last rows out
+/// to the coded height. A picture stored band by band, in any order, is the
+/// surface [`store_bgra`] makes of it whole.
+///
+/// # Safety
+/// `surface` is writable for `geometry.surface_bytes()` bytes. `first` and
+/// `count` are even, `count` at least two and `first + count` at most the
+/// picture's height, and `band` holds `count` rows of the picture's width.
+pub unsafe fn store_bgra_rows(
+    surface: *mut u8,
+    geometry: &Geometry,
+    first: usize,
+    count: usize,
+    band: &Rgb<'_>,
+) {
     let pitch = geometry.pitch as usize;
     let rows = geometry.coded_height as usize;
     let (width, height) = (geometry.width as usize, geometry.height as usize);
+    debug_assert!(first.is_multiple_of(2) && count.is_multiple_of(2) && count >= 2);
+    debug_assert!(first + count <= height);
+    let ends = first + count == height;
     let mut source = vec![0u8; width];
+    let luma_end = if ends { rows } else { first + count };
     // SAFETY: the luma plane, as in `store_nv12`.
     unsafe {
-        store_plane(surface, pitch, rows, |y, line| {
-            let y = y.min(height - 1);
+        store_plane(surface, pitch, first..luma_end, |y, line| {
+            let y = y.min(height - 1) - first;
             for (x, out) in source.iter_mut().enumerate() {
-                let (r, g, b) = picture.rgb(x, y);
+                let (r, g, b) = band.rgb(x, y);
                 *out = luma(r, g, b);
             }
             padded(line, &source, width, 1);
         });
     }
     let mut source = vec![0u8; width];
+    let chroma_end = if ends { rows / 2 } else { (first + count) / 2 };
     // SAFETY: the chroma plane, as in `store_nv12`.
     unsafe {
-        store_plane(surface.add(pitch * rows), pitch, rows / 2, |y, line| {
-            let y = y.min(height / 2 - 1);
-            for x in (0..width).step_by(2) {
-                let (mut r, mut g, mut b) = (0, 0, 0);
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let (pr, pg, pb) = picture.rgb(x + dx, 2 * y + dy);
-                    (r, g, b) = (r + pr, g + pg, b + pb);
+        store_plane(
+            surface.add(pitch * rows),
+            pitch,
+            first / 2..chroma_end,
+            |y, line| {
+                let y = y.min(height / 2 - 1);
+                for x in (0..width).step_by(2) {
+                    let (mut r, mut g, mut b) = (0, 0, 0);
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let (pr, pg, pb) = band.rgb(x + dx, 2 * y + dy - first);
+                        (r, g, b) = (r + pr, g + pg, b + pb);
+                    }
+                    let (cb, cr) = chroma((r + 2) / 4, (g + 2) / 4, (b + 2) / 4);
+                    source[x] = cb;
+                    source[x + 1] = cr;
                 }
-                let (cb, cr) = chroma((r + 2) / 4, (g + 2) / 4, (b + 2) / 4);
-                source[x] = cb;
-                source[x + 1] = cr;
-            }
-            padded(line, &source, width, 2);
-        });
+                padded(line, &source, width, 2);
+            },
+        );
     }
 }
 
@@ -339,6 +459,82 @@ fn log2(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture stored in bands of any size, in any order, is the surface
+    /// the whole store makes, NV12 and BGRA alike.
+    #[test]
+    fn bands_store_what_the_whole_store_does() {
+        for (width, height) in [(1920, 1080), (640, 362), (48, 34)] {
+            let geometry = Geometry::new(width, height).unwrap();
+            let bytes = geometry.surface_bytes() as usize;
+            let nv12 = pattern(&geometry, 3);
+            let picture = pattern_picture(&geometry, &nv12);
+            let mut whole = vec![0u8; bytes];
+            // SAFETY: the buffer is the surface's size; the pattern fits.
+            unsafe { store_nv12(whole.as_mut_ptr(), &geometry, &picture) };
+            let mut banded = vec![0u8; bytes];
+            for (plane, rows, pitch) in [
+                (Plane::Chroma, picture.chroma, picture.chroma_pitch),
+                (Plane::Luma, picture.luma, picture.luma_pitch),
+            ] {
+                let total = plane.rows(&geometry);
+                let mut bands = Vec::new();
+                let mut row = 0;
+                for size in [7, 64, 1, 30].iter().cycle() {
+                    if row == total {
+                        break;
+                    }
+                    let count = (*size).min(total - row);
+                    bands.push((row, count));
+                    row += count;
+                }
+                for &(first, count) in bands.iter().rev() {
+                    let rows =
+                        &rows[first * pitch..first * pitch + (count - 1) * pitch + width as usize];
+                    // SAFETY: as above.
+                    unsafe {
+                        store_rows(
+                            banded.as_mut_ptr(),
+                            &geometry,
+                            plane,
+                            first,
+                            count,
+                            rows,
+                            pitch,
+                        );
+                    }
+                }
+            }
+            assert!(whole == banded, "{width}x{height} NV12");
+
+            let pitch = 4 * width as usize + 32;
+            let pixels: Vec<u8> = (0..pitch * height as usize)
+                .map(|i| (i * 7 + i / pitch * 13) as u8)
+                .collect();
+            let rgb = Rgb {
+                pixels: &pixels,
+                pitch,
+                order: Order::Bgra,
+            };
+            let mut whole = vec![0u8; bytes];
+            // SAFETY: as above.
+            unsafe { store_bgra(whole.as_mut_ptr(), &geometry, &rgb) };
+            let mut banded = vec![0u8; bytes];
+            let mut row = 0;
+            while row < height as usize {
+                let count = 64.min(height as usize - row);
+                let band = Rgb {
+                    pixels: &pixels[row * pitch..],
+                    pitch,
+                    order: Order::Bgra,
+                };
+                // SAFETY: as above.
+                unsafe { store_bgra_rows(banded.as_mut_ptr(), &geometry, row, count, &band) };
+                row += count;
+            }
+            assert!(whole == banded, "{width}x{height} BGRA");
+        }
+    }
 
     #[test]
     fn log2_is_close() {
