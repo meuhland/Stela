@@ -28,8 +28,10 @@
 //! between [`DISCARD_LEAST`] and [`DISCARD_MOST`] bytes and the disk's own
 //! limits. A disk whose discard commands take longer than [`DISCARD_SLOW`]
 //! [`DISCARD_STRIKES`] times in a row hears no more discards: they are
-//! hints (NVMe 1.4 section 6.7.1.1), and the ANS line says `shed=`. A
-//! flush that waits for discards sends them at once and
+//! hints (NVMe 1.4 section 6.7.1.1), and the ANS line says `shed=`. Blocks
+//! the disk heard of and no write took back since are not sent again, as an
+//! APFS format and its first mounts deallocate the whole container more
+//! than once. A flush that waits for discards sends them at once and
 //! keeps [`DISCARD_COMMANDS`] commands on the disk, starting the next as
 //! soon as one completes rather than once a whole group has: one slow
 //! deallocation does not hold back the rest. A transfer waits for discards
@@ -74,6 +76,9 @@ const DISCARD_STRIKES: u32 = 3;
 /// sent are given up: 5 s, well inside the 30 s macOS gives an NVMe
 /// command.
 const DISCARD_HOLD: u64 = 120_000_000;
+/// The most runs [`Discards::heard`] keeps; past it, it forgets them all and
+/// at worst a run reaches the disk twice.
+const HEARD_RUNS: usize = 65_536;
 
 /// Merge `start..end` into `runs`, disjoint runs of blocks keyed by their
 /// first block, each with its end.
@@ -128,6 +133,9 @@ struct Batch {
 struct Discards {
     /// Merged runs of host blocks: each one's first block and its end.
     waiting: BTreeMap<u64, u64>,
+    /// Runs the disk heard of, or is hearing of, that no write took back
+    /// since: a deallocation of them again sends nothing.
+    heard: BTreeMap<u64, u64>,
     /// The batches on the disk: at most one in the background,
     /// [`DISCARD_COMMANDS`] while urgent.
     running: Vec<Batch>,
@@ -158,6 +166,7 @@ impl Default for Discards {
     fn default() -> Self {
         Self {
             waiting: BTreeMap::new(),
+            heard: BTreeMap::new(),
             running: Vec::new(),
             held: Vec::new(),
             failed: None,
@@ -173,15 +182,31 @@ impl Default for Discards {
 }
 
 impl Discards {
-    /// Merge `start..end` into the waiting runs.
+    /// Merge the parts of `start..end` the disk has not heard of into the
+    /// waiting runs.
     fn add(&mut self, start: u64, end: u64) {
-        insert_run(&mut self.waiting, start, end);
+        let mut heard: Vec<(u64, u64)> = self
+            .heard
+            .range(..end)
+            .rev()
+            .take_while(|&(_, &last)| last > start)
+            .map(|(&first, &last)| (first.max(start), last.min(end)))
+            .collect();
+        heard.reverse();
+        let mut at = start;
+        for (first, last) in heard {
+            insert_run(&mut self.waiting, at, first);
+            at = at.max(last);
+        }
+        insert_run(&mut self.waiting, at, end);
     }
 
-    /// A write takes `start..end` back from the waiting runs. Whether it
-    /// overlaps a running batch, which it must wait out.
+    /// A write takes `start..end` back from the waiting runs and from those
+    /// the disk heard of. Whether it overlaps a running batch, which it
+    /// must wait out.
     fn written(&mut self, start: u64, end: u64) -> bool {
         remove_runs(&mut self.waiting, start, end);
+        remove_runs(&mut self.heard, start, end);
         self.running.iter().any(|batch| {
             batch
                 .extents
@@ -192,7 +217,8 @@ impl Discards {
 
     /// The waiting runs for one command, first blocks first: at most
     /// `ranges` of them, each at most `range` blocks (0: no limit), and
-    /// `budget` blocks in all. A run cut short keeps its rest waiting.
+    /// `budget` blocks in all. A run cut short keeps its rest waiting. The
+    /// disk hears of them from now on.
     fn batch(&mut self, ranges: usize, range: u64, budget: u64) -> Vec<Extent> {
         let mut extents = Vec::new();
         let mut left = budget.max(1);
@@ -208,6 +234,10 @@ impl Discards {
                 self.waiting.insert(lba + blocks, end);
             }
             left -= blocks;
+            if self.heard.len() >= HEARD_RUNS {
+                self.heard.clear();
+            }
+            insert_run(&mut self.heard, lba, lba + blocks);
             extents.push(Extent { lba, blocks });
         }
         extents

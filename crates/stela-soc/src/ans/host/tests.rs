@@ -518,6 +518,21 @@ fn a_batch_cuts_runs_at_the_range_limit_and_the_budget() {
     assert_eq!(runs(&discards), [(70, 100), (200, 210)]);
 }
 
+/// Blocks the disk heard of are not sent again until a write takes them
+/// back: an APFS format and its mounts deallocate the whole container more
+/// than once.
+#[test]
+fn blocks_the_disk_heard_of_are_not_sent_again_until_written() {
+    let mut discards = Discards::default();
+    discards.add(0, 100);
+    assert_eq!(discards.batch(1, 0, u64::MAX).len(), 1);
+    discards.add(0, 120);
+    assert_eq!(runs(&discards), [(100, 120)]);
+    assert!(!discards.written(40, 50));
+    discards.add(0, 120);
+    assert_eq!(runs(&discards), [(40, 50), (100, 120)]);
+}
+
 /// A disk with a slot per command, which has room while fewer than `depth`
 /// commands run: what an AHCI port with NCQ reports.
 struct Slots {
