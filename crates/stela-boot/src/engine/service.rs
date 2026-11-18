@@ -153,6 +153,9 @@ impl Service {
         // The service moves between cores: its stamps across turns are
         // the corrected count, not one core's raw TSC.
         let now = host::fresh_counter();
+        // A host input followed to the screen is stamped on the TSC every
+        // core reads alike, wherever each stage runs (`INPUT LATENCY`).
+        stela_soc::input_latency::set_clock(host::rdtsc, tsc_hz);
         Self {
             devices,
             restore,

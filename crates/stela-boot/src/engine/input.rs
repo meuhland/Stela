@@ -30,10 +30,17 @@
 //! guest has one keyboard and one pointer for all host devices, so each
 //! device's keys and buttons are kept apart and joined: a touchpad's report
 //! does not let go of a mouse's drag, nor one keyboard's Shift the other's.
+//!
+//! Each read notes, for the first key press and the first pointer motion it
+//! returns, the TSC when its poll saw the device's transfer complete and
+//! how long after the device's previous poll that came; the delivery then
+//! follows that input to the screen ([`stela_soc::input_latency`]), and the
+//! gaps the polls achieved are reported (`INPUT POLL`).
 use super::storage::{Inputs, RestoreRoot};
 use crate::output;
 use alloc::vec::Vec;
 use stela_drivers::input::{HeldInputs, Input, InputDevice};
+use stela_soc::input_latency::{self, Kind};
 use stela_soc::machine::AppleDevices;
 
 /// What was reported of one device, each kind once, and when it was read.
@@ -126,6 +133,57 @@ pub struct HostInput {
     /// Host keyboard and pointer changes given to the guest since boot
     /// (`INPUT reports`).
     delivered: Delivered,
+    /// Each device's polls since the last report, in the same order as
+    /// `reported` (`INPUT POLL`).
+    polls: Vec<Polls>,
+    /// The inputs of the last read to follow to the screen, by
+    /// [`Kind`]: where each is in what the read returned, when it was
+    /// read and how long after its device's previous poll
+    /// ([`stela_soc::input_latency`]).
+    followed: [Option<Followed>; 2],
+}
+
+/// An input of a read to follow to the screen ([`HostInput::followed`]).
+#[derive(Clone, Copy)]
+struct Followed {
+    index: usize,
+    read_at: u64,
+    poll_gap: u64,
+}
+
+/// One device's polls since the last report, on the TSC: when it was last
+/// polled, the gaps between its polls, and those before a poll that found
+/// input, which a report waited in the host controller at most.
+#[derive(Default)]
+struct Polls {
+    last: u64,
+    gaps: Vec<u64>,
+    found: Vec<u64>,
+}
+
+/// The poll gaps a report keeps of each device; later ones are left out.
+const POLL_GAPS: usize = 4096;
+
+impl Polls {
+    /// A poll that began at TSC `at`; `found` when it read input. The gap
+    /// before it, none for the device's first poll.
+    fn polled(&mut self, at: u64, found: bool) -> u64 {
+        let gap = if self.last == 0 {
+            0
+        } else {
+            at.wrapping_sub(self.last)
+        };
+        self.last = at;
+        if gap != 0 {
+            if self.gaps.len() < POLL_GAPS {
+                self.gaps.push(gap);
+            }
+            if found && self.found.len() < POLL_GAPS {
+                self.found.push(gap);
+            }
+        }
+        gap
+    }
 }
 
 /// Host input changes given to the guest's peripheral since boot, by kind:
@@ -163,6 +221,7 @@ impl HostInput {
             .collect();
         Self {
             next_id: inputs.devices.len() as u64,
+            polls: inputs.devices.iter().map(|_| Polls::default()).collect(),
             reported,
             inputs,
             refused: false,
@@ -171,6 +230,7 @@ impl HostInput {
             reported_times: 0,
             held: HeldInputs::new(),
             delivered: Delivered::default(),
+            followed: [None; 2],
         }
     }
 
@@ -183,6 +243,7 @@ impl HostInput {
                 id: self.next_id,
                 ..Reported::default()
             });
+            self.polls.push(Polls::default());
             self.next_id += 1;
         }
     }
@@ -197,9 +258,17 @@ impl HostInput {
     }
 
     /// Deliver what [`Self::read`] read from the host's devices, and note
-    /// the guest's lock-key LEDs for the next read to send.
+    /// the guest's lock-key LEDs for the next read to send. The inputs the
+    /// read chose to follow to the screen are followed from here, unless
+    /// one of their kind still is ([`stela_soc::input_latency::begin`]).
     pub fn deliver_all(&mut self, devices: &mut AppleDevices, inputs: Vec<Input>) {
-        for input in inputs {
+        let followed = core::mem::take(&mut self.followed);
+        for (index, input) in inputs.into_iter().enumerate() {
+            if let Some(kind) = Kind::of(&input)
+                && let Some(chosen) = followed[kind as usize].filter(|f| f.index == index)
+            {
+                input_latency::begin(kind, chosen.read_at, chosen.poll_gap);
+            }
             self.deliver(devices, input);
         }
         self.wanted_leds = devices.keyboard_leds();
@@ -258,7 +327,14 @@ impl HostInput {
         let starved = millis * STARVED_MILLIS;
         // Whether this turn may still wait for the lock.
         let mut may_wait = true;
-        for (device, reported) in self.inputs.devices.iter_mut().zip(&mut self.reported) {
+        self.followed = [None; 2];
+        let devices = self
+            .inputs
+            .devices
+            .iter_mut()
+            .zip(&mut self.reported)
+            .zip(&mut self.polls);
+        for ((device, reported), polls) in devices {
             // A stopped device a busy lock kept from being dropped.
             if device.stopped() {
                 stopped = true;
@@ -278,6 +354,7 @@ impl HostInput {
             let before = pending.len();
             let entering = super::host::fresh_counter();
             let entered;
+            let began;
             let polled = {
                 // SAFETY: the loader root `storage::open` captured, which
                 // maps this device.
@@ -293,9 +370,25 @@ impl HostInput {
                     continue;
                 };
                 entered = super::host::fresh_counter();
+                began = super::host::rdtsc();
                 device.poll(&mut pending)
             };
+            // The poll saw the device's transfers complete: what it read
+            // was the host's from here.
+            let read_at = super::host::rdtsc();
             self.held.polled(reported.id, &mut pending, before);
+            let poll_gap = polls.polled(began, pending.len() != before);
+            for (offset, input) in pending[before..].iter().enumerate() {
+                if let Some(kind) = Kind::of(input)
+                    && self.followed[kind as usize].is_none()
+                {
+                    self.followed[kind as usize] = Some(Followed {
+                        index: before + offset,
+                        read_at,
+                        poll_gap,
+                    });
+                }
+            }
             let times = &mut reported.times;
             let (waited, took) = (
                 entered.wrapping_sub(entering),
@@ -350,7 +443,10 @@ impl HostInput {
     /// spent retry windows, each recovered. Then `INPUT TIMES
     /// name:polls/waited_us/longest_wait_us/polled_us/longest_poll_us/
     /// skipped …`: each device's polls since the last report, the
-    /// host-drivers lock waits before them, and their own time.
+    /// host-drivers lock waits before them, and their own time; `INPUT
+    /// POLL` ([`Self::report_polls`]); and an `INPUT LATENCY` line for each
+    /// kind of input followed to the screen in the window
+    /// ([`stela_soc::input_latency`]).
     fn report_times(&mut self) {
         let (errors, windows) = self
             .inputs
@@ -384,6 +480,48 @@ impl HostInput {
             );
         }
         output::arguments(format_args!("{line}\n"));
+        self.report_polls();
+        for kind in Kind::ALL {
+            let report = input_latency::take(kind);
+            if !report.is_empty() {
+                output::arguments(format_args!("{report}\n"));
+            }
+        }
+    }
+
+    /// `INPUT POLL name:endpoint_us=N:gap_us=p50/p90/max:found_gap_us=
+    /// p50/p90/max …`: each device's interrupt endpoint's service interval
+    /// as its descriptor asks (0 for a device that has none), the gaps its
+    /// polls since the last report achieved, and the gaps before the polls
+    /// that found input: a report waits in the host controller for up to
+    /// that long, as the host is polled, not interrupted.
+    fn report_polls(&mut self) {
+        let hz = u128::from(input_latency::hz().max(1));
+        let mut line = alloc::string::String::from("INPUT POLL");
+        for (device, polls) in self.inputs.devices.iter().zip(&mut self.polls) {
+            let percentiles = |gaps: &mut Vec<u64>| {
+                let [p50, p90, max] = input_latency::percentiles(gaps);
+                gaps.clear();
+                [p50, p90, max].map(|ticks| u128::from(ticks) * 1_000_000 / hz)
+            };
+            let gaps = percentiles(&mut polls.gaps);
+            let found = percentiles(&mut polls.found);
+            let _ = core::fmt::Write::write_fmt(
+                &mut line,
+                format_args!(
+                    " {}:endpoint_us={}:gap_us={}/{}/{}:found_gap_us={}/{}/{}",
+                    device.name().replace(' ', "_"),
+                    device.interval_us().unwrap_or(0),
+                    gaps[0],
+                    gaps[1],
+                    gaps[2],
+                    found[0],
+                    found[1],
+                    found[2],
+                ),
+            );
+        }
+        output::arguments(format_args!("{line}\n"));
     }
 
     /// Report and drop every device that stopped, appending to `pending` a
@@ -407,6 +545,7 @@ impl HostInput {
             };
             let device = self.inputs.devices.remove(index);
             self.reported.remove(index);
+            self.polls.remove(index);
             let name = device.name();
             let why = device
                 .first_error()

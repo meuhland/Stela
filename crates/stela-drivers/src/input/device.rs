@@ -150,6 +150,16 @@ impl InputDevice {
         }
     }
 
+    /// The service interval of a USB HID interface's interrupt IN endpoint
+    /// in microseconds ([`UsbInput::interval_us`]); `None` for a device
+    /// read another way.
+    pub fn interval_us(&self) -> Option<u32> {
+        match self {
+            Self::Usb(device) => Some(device.interval_us()),
+            _ => None,
+        }
+    }
+
     /// Whether the device stopped and is no longer read.
     pub fn stopped(&self) -> bool {
         match self {
