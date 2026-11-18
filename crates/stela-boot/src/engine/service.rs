@@ -76,6 +76,22 @@ pub(super) fn set_input_every_turn(every: bool) {
     INPUT_EVERY_TURN.store(every, Ordering::Relaxed);
 }
 
+/// Whether host input delivered to the guest calls the home machine to
+/// the devices at once (`--input-kick`).
+static INPUT_KICK: AtomicBool = AtomicBool::new(false);
+
+/// Call the home machine to the devices once host input reached the
+/// guest's peripheral. Its report waits in the peripheral until the guest's
+/// controller polls the endpoint, which only the home machine does, at the
+/// device deadline it finds at its next step: the delivery's release of the
+/// devices' lock wakes it when it sleeps, but leaves one that runs guest
+/// code to its own next step, which native code reaches only at an exit.
+/// A call home (`SharedDevices::call_home`) also stops it at its next chain
+/// gate, so the report goes onto the guest's event ring at once.
+pub(super) fn set_input_kick(kick: bool) {
+    INPUT_KICK.store(kick, Ordering::Relaxed);
+}
+
 /// How long the host may go unserved before the boot PE serves it: a PE's
 /// wait returns to its run loop at least this often
 /// (`WAIT_POLLS_PER_SECOND`), so with any PE idle it is served first. A
@@ -361,6 +377,9 @@ impl Service {
                     }
                     input.deliver_all(devices, inputs);
                 });
+                if INPUT_KICK.load(Ordering::Relaxed) {
+                    devices.call_home();
+                }
             }
             lap.part(Part::Input);
             #[cfg(feature = "diagnostics")]

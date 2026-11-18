@@ -45,6 +45,9 @@ pub const DISPLAY_FASTEST: &str = "--display-fastest";
 /// Read the host's keyboards and pointers at every host service turn
 /// ([`System::input_every_turn`]).
 pub const INPUT_EVERY_TURN: &str = "--input-every-turn";
+/// Bring the home machine to the guest's USB controller as soon as host
+/// input reaches it ([`System::input_kick`]).
+pub const INPUT_KICK: &str = "--input-kick";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
@@ -321,6 +324,11 @@ pub struct System {
     /// at the part after the last one it ran, and the next turns read no
     /// input until the rotation comes back to it.
     pub input_every_turn: bool,
+    /// Once host input reaches the guest's peripheral, stop the home
+    /// machine's native code at its next chain gate so that it runs the
+    /// guest's USB controller at once (`--input-kick`), where by default it
+    /// finds the controller's new deadline at its next step of its own.
+    pub input_kick: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -464,6 +472,7 @@ impl Default for System {
             idle_skip: false,
             input: false,
             input_every_turn: false,
+            input_kick: false,
             native_cores: None,
             guest_pes: None,
             native_bootstrap_check: false,
@@ -933,6 +942,7 @@ impl fmt::Display for System {
         line.value(DNS, (!self.dns.is_empty()).then(|| Servers(&self.dns)))?;
         line.flag("--input", self.input)?;
         line.flag(INPUT_EVERY_TURN, self.input_every_turn)?;
+        line.flag(INPUT_KICK, self.input_kick)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;
