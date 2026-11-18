@@ -1,20 +1,40 @@
 /*
- * vttest: encodes moving 1080p NV12 frames through VideoToolbox, asking for
- * a hardware, low-latency encoder as Parsec does, once for each codec asked
- * for, and checks what ran.
+ * vttest: encodes moving 1080p frames through VideoToolbox, as Parsec does,
+ * once for each codec asked for, and checks what ran.
  *
  *   vttest [--codec h264|hevc|both] [--frames N] [--mode hw+ll|ll|hw|none|list]
- *          [--out PREFIX] [--register BUNDLE_EXECUTABLE] [--size WxH]
+ *          [--input pool|bgra|420v] [--out PREFIX] [--register BUNDLE_EXECUTABLE]
+ *          [--size WxH]
+ *
+ * Modes, the session's encoder specification:
+ *
+ * - hw+ll (the default), Parsec's: low-latency rate control, hardware not
+ *   required. VideoProcessing refuses a specification that requires
+ *   hardware together with low-latency rate control (-12902, "Cannot
+ *   require hardware accelerated encoder"), so Parsec asks for neither
+ *   and checks what ran; so does vttest.
+ * - hw: a hardware encoder required, no low-latency rate control.
+ * - ll: low-latency rate control; any encoder passes.
+ * - none: an empty specification; any encoder passes.
+ *
+ * Inputs: `pool` (the default) draws frames from the session's pixel buffer
+ * pool, in the format the encoder asked for first (BGRA where StelaVT
+ * encodes on NVENC); `bgra` and `420v` make buffers of that format
+ * (Parsec's capture is BGRA), which VideoToolbox converts if the encoder
+ * does not take it.
  *
  * For each codec it reports the encoder VideoToolbox chose, whether it is
- * hardware, the frames in and out, the key frames (the first and one asked
+ * hardware (the session's UsingHardwareAcceleratedVideoEncoder, or the
+ * encoder list's entry for the session's encoder ID) and whether it is
+ * StelaVT's, the frames in and out, the key frames (the first and one asked
  * for halfway), the bitrate, the frames a second and the process's CPU a
- * frame, and writes the stream as Annex B to PREFIX.h264 or PREFIX.hevc.
- * It then decodes the stream with VideoToolbox's decoder and compares each
- * picture's luma with the frame it was made from. A codec passes when its
- * session opens on a hardware encoder, every frame comes out with both key
- * frames, and every one decodes at 30 dB or more; vttest exits 1 when one
- * does not.
+ * frame, each frame's encode latency (submission to its output: average,
+ * 95th percentile and longest), and writes the stream as Annex B to
+ * PREFIX.h264 or PREFIX.hevc. It then decodes the stream with
+ * VideoToolbox's decoder and compares each picture's luma with the frame it
+ * was made from. A codec passes when its session opens on a hardware
+ * encoder (hw, hw+ll), every frame comes out with both key frames, and
+ * every one decodes at 30 dB or more; vttest exits 1 when one does not.
  *
  * With --register it first registers the StelaVT executable given for both
  * codecs in this process, after loading Metal's devices so StelaGPU.bundle
@@ -42,6 +62,12 @@ enum { kMostFrames = 4096 };
 
 static struct {
 	CMVideoCodecType codec;
+	/* The input frames' pixel format, which sets the luma they decode to. */
+	OSType format;
+	/* When each frame was submitted, and its encode latency, in seconds. */
+	double submitted[kMostFrames];
+	double latency[kMostFrames];
+	int latencies;
 	FILE *out;
 	int emitted, keyframes, errors, dropped;
 	size_t bytes;
@@ -83,8 +109,15 @@ static void writeParameterSets(CMFormatDescriptionRef format)
 	}
 }
 
+static double now(void);
+
 static void encoded(void *context, void *source, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample)
 {
+	/* The source refcon is the frame's number plus one. */
+	intptr_t number = (intptr_t)source - 1;
+	if (number >= 0 && number < kMostFrames && run.submitted[number] > 0 && run.latencies < kMostFrames) {
+		run.latency[run.latencies++] = now() - run.submitted[number];
+	}
 	if (flags & kVTEncodeInfo_FrameDropped) {
 		run.dropped++;
 		return;
@@ -142,7 +175,7 @@ static double now(void)
 }
 
 /* A desktop-like scene: flat bands, text-like stripes, one moving box. */
-static uint8_t lumaAt(int frame, size_t w, size_t r, size_t c)
+static uint8_t sceneAt(int frame, size_t w, size_t r, size_t c)
 {
 	uint8_t v = (uint8_t)(40 + (r / 120) * 20);
 	if ((r % 24) < 2 && (c % 300) < 220) {
@@ -154,17 +187,41 @@ static uint8_t lumaAt(int frame, size_t w, size_t r, size_t c)
 	return v;
 }
 
+/* The luma a frame decodes to: the scene's value as NV12, or what grey
+ * BGRA of that value becomes in BT.709 limited range (the host's and
+ * StelaVT's conversion, and VideoToolbox's). */
+static uint8_t lumaAt(int frame, size_t w, size_t r, size_t c)
+{
+	uint8_t v = sceneAt(frame, w, r, c);
+	return run.format == kCVPixelFormatType_32BGRA ? (uint8_t)(16 + ((220 * v + 128) >> 8)) : v;
+}
+
 static void fill(CVPixelBufferRef buffer, int frame)
 {
 	CVPixelBufferLockBaseAddress(buffer, 0);
 	size_t w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer);
+	if (CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA) {
+		/* Grey: the decoded luma follows, the chroma stays neutral. */
+		uint8_t *pixels = CVPixelBufferGetBaseAddress(buffer);
+		size_t pitch = CVPixelBufferGetBytesPerRow(buffer);
+		for (size_t r = 0; r < h; r++) {
+			for (size_t c = 0; c < w; c++) {
+				uint8_t v = sceneAt(frame, w, r, c);
+				uint8_t *p = pixels + r * pitch + 4 * c;
+				p[0] = p[1] = p[2] = v;
+				p[3] = 255;
+			}
+		}
+		CVPixelBufferUnlockBaseAddress(buffer, 0);
+		return;
+	}
 	uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(buffer, 0);
 	size_t ys = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0);
 	uint8_t *uv = CVPixelBufferGetBaseAddressOfPlane(buffer, 1);
 	size_t uvs = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1);
 	for (size_t r = 0; r < h; r++) {
 		for (size_t c = 0; c < w; c++) {
-			y[r * ys + c] = lumaAt(frame, w, r, c);
+			y[r * ys + c] = sceneAt(frame, w, r, c);
 		}
 	}
 	for (size_t r = 0; r < h / 2; r++) {
@@ -255,6 +312,40 @@ static void decodeAll(void)
 	CFRelease(number);
 }
 
+/* The encoder list's entry for `encoderID`: whether it is hardware and
+ * whether it is StelaVT's (its ID, or its name, says Stela). False when the
+ * list has no such entry. */
+static bool listed(CFStringRef encoderID, bool *hardware, bool *stela)
+{
+	CFArrayRef encoders = NULL;
+	bool found = false;
+	VTCopyVideoEncoderList(NULL, &encoders);
+	for (CFIndex i = 0; encoderID && encoders && i < CFArrayGetCount(encoders) && !found; i++) {
+		CFDictionaryRef item = CFArrayGetValueAtIndex(encoders, i);
+		CFStringRef id = CFDictionaryGetValue(item, kVTVideoEncoderList_EncoderID);
+		if (!id || !CFEqual(id, encoderID)) {
+			continue;
+		}
+		found = true;
+		*hardware = CFDictionaryGetValue(item, kVTVideoEncoderList_IsHardwareAccelerated) == kCFBooleanTrue;
+		CFStringRef name = CFDictionaryGetValue(item, kVTVideoEncoderList_EncoderName);
+		CFStringRef display = CFDictionaryGetValue(item, kVTVideoEncoderList_DisplayName);
+		*stela = CFStringHasPrefix(id, CFSTR("org.stela."))
+		    || (name && CFStringFind(name, CFSTR("Stela"), 0).location != kCFNotFound)
+		    || (display && CFStringFind(display, CFSTR("Stela"), 0).location != kCFNotFound);
+	}
+	if (encoders) {
+		CFRelease(encoders);
+	}
+	return found;
+}
+
+static int compareDoubles(const void *a, const void *b)
+{
+	double x = *(const double *)a, y = *(const double *)b;
+	return x < y ? -1 : x > y;
+}
+
 static void list(void)
 {
 	CFArrayRef encoders = NULL;
@@ -321,7 +412,8 @@ static void setNumber(VTCompressionSessionRef session, CFStringRef key, int valu
 }
 
 /* Encodes `frames` frames of `codec`; whether it passed. */
-static bool encode(CMVideoCodecType codec, const char *mode, int frames, int width, int height, const char *prefix)
+static bool encode(CMVideoCodecType codec, const char *mode, const char *input, int frames, int width, int height,
+    const char *prefix)
 {
 	bool hevc = codec == kCMVideoCodecType_HEVC;
 	const char *label = hevc ? "hevc" : "h264";
@@ -336,13 +428,19 @@ static bool encode(CMVideoCodecType codec, const char *mode, int frames, int wid
 	}
 	CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 	    &kCFTypeDictionaryValueCallBacks);
-	if (strstr(mode, "hw")) {
+	/* Requiring hardware and low-latency rate control together is refused:
+	 * hw+ll asks for low latency alone, as Parsec does, and checks what ran. */
+	bool lowLatency = strstr(mode, "ll") != NULL;
+	bool wantsHardware = strstr(mode, "hw") != NULL;
+	if (wantsHardware && !lowLatency) {
 		CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
 	}
-	if (strstr(mode, "ll")) {
+	if (lowLatency) {
 		CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kCFBooleanTrue);
 	}
-	printf("== %s %dx%d, mode %s\n", label, width, height, mode);
+	printf("== %s %dx%d, mode %s (%s%s), input %s\n", label, width, height, mode,
+	    wantsHardware && !lowLatency ? "hardware required" : "hardware not required",
+	    lowLatency ? ", low-latency rate control" : "", input);
 	VTCompressionSessionRef session = NULL;
 	OSStatus status = VTCompressionSessionCreate(NULL, width, height, codec, spec, NULL, NULL, encoded, NULL, &session);
 	CFRelease(spec);
@@ -359,8 +457,20 @@ static bool encode(CMVideoCodecType codec, const char *mode, int frames, int wid
 	}
 	CFBooleanRef hardware = NULL;
 	VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &hardware);
-	bool isHardware = hardware == kCFBooleanTrue;
-	printf("  encoder: %s, hardware: %s\n", name, isHardware ? "yes" : "no");
+	bool listHardware = false, stela = false;
+	bool inList = listed(encoderID, &listHardware, &stela);
+	/* A runtime-registered encoder (anon-N) may answer no through the
+	 * session though its registration says hardware: either counts. */
+	bool isHardware = hardware == kCFBooleanTrue || (inList && listHardware);
+	printf("  encoder: %s, hardware: %s (session property %s, encoder list %s), StelaVT: %s\n", name,
+	    isHardware ? "yes" : "no", hardware == kCFBooleanTrue ? "yes" : hardware ? "no" : "unanswered",
+	    inList ? (listHardware ? "yes" : "no") : "not listed", stela ? "yes" : "no");
+	if (encoderID) {
+		CFRelease(encoderID);
+	}
+	if (hardware) {
+		CFRelease(hardware);
+	}
 	int fps = 60;
 	setNumber(session, kVTCompressionPropertyKey_AverageBitRate, 10000000, "AverageBitRate");
 	setNumber(session, kVTCompressionPropertyKey_ExpectedFrameRate, fps, "ExpectedFrameRate");
@@ -373,17 +483,40 @@ static bool encode(CMVideoCodecType codec, const char *mode, int frames, int wid
 	    &kCFTypeDictionaryValueCallBacks);
 	double cpu0 = cpuSeconds(), t0 = now(), encodeSeconds = 0;
 	int submitted = 0;
+	OSType made = strcmp(input, "bgra") == 0 ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+	bool fromPool = pool && strcmp(input, "pool") == 0;
 	for (int i = 0; i < frames; i++) {
 		CVPixelBufferRef buffer = NULL;
-		if (pool) {
+		if (fromPool) {
 			CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &buffer);
 		} else {
-			CVPixelBufferCreate(NULL, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &buffer);
+			/* IOSurface-backed, as a capture's buffers are. */
+			CFDictionaryRef surface = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+			    &kCFTypeDictionaryValueCallBacks);
+			const void *keys[] = {kCVPixelBufferIOSurfacePropertiesKey};
+			const void *values[] = {surface};
+			CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+			    &kCFTypeDictionaryValueCallBacks);
+			CVPixelBufferCreate(NULL, width, height, made, attributes, &buffer);
+			CFRelease(attributes);
+			CFRelease(surface);
+		}
+		if (!buffer) {
+			printf("  frame %d: no pixel buffer\n", i);
+			break;
+		}
+		if (i == 0) {
+			run.format = CVPixelBufferGetPixelFormatType(buffer);
+			char code[5] = {(char)(run.format >> 24), (char)(run.format >> 16), (char)(run.format >> 8), (char)run.format, 0};
+			printf("  input frames: '%s'%s\n", code, fromPool ? ", from the session's pool" : "");
 		}
 		fill(buffer, i);
 		double before = now();
+		if (i < kMostFrames) {
+			run.submitted[i] = before;
+		}
 		status = VTCompressionSessionEncodeFrame(session, buffer, CMTimeMake(i, fps), CMTimeMake(1, fps),
-		    i == frames / 2 ? forceKey : NULL, NULL, NULL);
+		    i == frames / 2 ? forceKey : NULL, (void *)(intptr_t)(i + 1), NULL);
 		encodeSeconds += now() - before;
 		CVPixelBufferRelease(buffer);
 		if (status != noErr) {
@@ -402,6 +535,17 @@ static bool encode(CMVideoCodecType codec, const char *mode, int frames, int wid
 	       "frame, drawing the test frames included\n",
 	    submitted / encodeSeconds, encodeSeconds * 1000 / (submitted ? submitted : 1), wall, submitted / wall,
 	    cpu * 1000 / (submitted ? submitted : 1));
+	if (run.latencies > 0) {
+		double sum = 0;
+		for (int i = 0; i < run.latencies; i++) {
+			sum += run.latency[i];
+		}
+		qsort(run.latency, (size_t)run.latencies, sizeof(double), compareDoubles);
+		int p95 = (run.latencies * 95 + 99) / 100 - 1;
+		printf("  encode latency (submission to output) over %d frames: average %.2f ms, p95 %.2f ms, longest %.2f ms\n",
+		    run.latencies, sum * 1000 / run.latencies, run.latency[p95 < 0 ? 0 : p95] * 1000,
+		    run.latency[run.latencies - 1] * 1000);
+	}
 	VTCompressionSessionInvalidate(session);
 	CFRelease(session);
 	if (run.out) {
@@ -410,15 +554,15 @@ static bool encode(CMVideoCodecType codec, const char *mode, int frames, int wid
 	decodeAll();
 	printf("  decoded %d of %d, %d undecodable, luma PSNR lowest %.1f dB, average %.1f dB\n", run.decoded,
 	    run.emitted, run.undecodable, run.lowest, run.decoded ? run.sum / run.decoded : 0);
-	bool passed = isHardware && submitted == frames && run.emitted + run.dropped == frames && run.errors == 0
-	    && run.keyframes >= (frames > 1 ? 2 : 1) && run.decoded == run.emitted && run.lowest >= 30;
+	bool passed = (isHardware || !wantsHardware) && submitted == frames && run.emitted + run.dropped == frames
+	    && run.errors == 0 && run.keyframes >= (frames > 1 ? 2 : 1) && run.decoded == run.emitted && run.lowest >= 30;
 	printf("%s %s: %s\n", label, passed ? "PASS" : "FAIL", name);
 	return passed;
 }
 
 int main(int argc, char **argv)
 {
-	const char *codecs = "both", *mode = "hw+ll", *prefix = NULL, *plugin = NULL;
+	const char *codecs = "both", *mode = "hw+ll", *input = "pool", *prefix = NULL, *plugin = NULL;
 	int frames = 300, width = 1920, height = 1080;
 	for (int i = 1; i < argc; i++) {
 		const char *value = i + 1 < argc ? argv[i + 1] : NULL;
@@ -428,6 +572,9 @@ int main(int argc, char **argv)
 			frames = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--mode") == 0 && value) {
 			mode = argv[++i];
+		} else if (strcmp(argv[i], "--input") == 0 && value
+		    && (strcmp(value, "pool") == 0 || strcmp(value, "bgra") == 0 || strcmp(value, "420v") == 0)) {
+			input = argv[++i];
 		} else if (strcmp(argv[i], "--out") == 0 && value) {
 			prefix = argv[++i];
 		} else if (strcmp(argv[i], "--register") == 0 && value) {
@@ -436,7 +583,7 @@ int main(int argc, char **argv)
 			i++;
 		} else {
 			fprintf(stderr, "usage: vttest [--codec h264|hevc|both] [--frames N] [--mode hw+ll|ll|hw|none|list] "
-			    "[--out PREFIX] [--register BUNDLE_EXECUTABLE] [--size WxH]\n");
+			    "[--input pool|bgra|420v] [--out PREFIX] [--register BUNDLE_EXECUTABLE] [--size WxH]\n");
 			return 2;
 		}
 	}
@@ -449,10 +596,10 @@ int main(int argc, char **argv)
 	}
 	bool passed = true;
 	if (strcmp(codecs, "h264") == 0 || strcmp(codecs, "both") == 0) {
-		passed &= encode(kCMVideoCodecType_H264, mode, frames, width, height, prefix);
+		passed &= encode(kCMVideoCodecType_H264, mode, input, frames, width, height, prefix);
 	}
 	if (strcmp(codecs, "hevc") == 0 || strcmp(codecs, "both") == 0) {
-		passed &= encode(kCMVideoCodecType_HEVC, mode, frames, width, height, prefix);
+		passed &= encode(kCMVideoCodecType_HEVC, mode, input, frames, width, height, prefix);
 	}
 	printf("vttest %s\n", passed ? "PASS" : "FAIL");
 	return passed ? 0 : 1;
