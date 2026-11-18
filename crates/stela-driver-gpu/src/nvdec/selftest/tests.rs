@@ -34,6 +34,10 @@ fn clip(codec: Codec, golden: Vec<[u8; 16]>) -> Clip {
             Codec::Hevc => HEVC_CLIP,
         },
         golden,
+        pool: match codec {
+            Codec::H264 => 16,
+            Codec::Hevc => 19,
+        },
     }
 }
 

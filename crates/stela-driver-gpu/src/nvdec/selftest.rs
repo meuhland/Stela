@@ -10,6 +10,7 @@
 //! A frame whose MD5 differs is read again under the other block-linear
 //! block heights and pitch-linear ([`surface::Tiling::ALL`]), once per clip,
 //! so a wrong guess of the surface layout shows apart from a wrong decode.
+use super::layout::Layout;
 use super::session::{Decoded, Error, Session};
 use super::surface::{self, Tiling};
 use super::{Codec, H264_CLIP, HEVC_CLIP, Picture, golden, md5};
@@ -31,6 +32,10 @@ pub struct Clip {
     /// One MD5 per frame, in decoding order (the clips have no B-frames, so
     /// it is display order too).
     pub golden: Vec<[u8; 16]>,
+    /// The surfaces NVIDIA's driver's address map had room for
+    /// (`ulNumDecodeSurfaces`, FFmpeg's): the session's buffers sit at
+    /// NVIDIA's addresses for as many.
+    pub pool: usize,
 }
 
 /// The two clips, H.264 first.
@@ -40,11 +45,13 @@ pub fn clips() -> [Clip; 2] {
             codec: Codec::H264,
             stream: H264_CLIP,
             golden: golden(Codec::H264),
+            pool: 16,
         },
         Clip {
             codec: Codec::Hevc,
             stream: HEVC_CLIP,
             golden: golden(Codec::Hevc),
+            pool: 19,
         },
     ]
 }
@@ -163,15 +170,22 @@ pub fn run<N: Node>(node: N, chipset: u16, clip: &Clip, log: Log<'_>) -> (Report
             return (report, refuse(node));
         }
     };
-    let slots = pictures.iter().map(|p| p.slots).max().unwrap_or(1);
-    let mut session = match Session::open(
-        node,
-        chipset,
+    // The surfaces the clip reaches, on NVIDIA's address map for its pool.
+    let slots = pictures.iter().map(|p| p.surface).max().unwrap_or(0) + 1;
+    let layout = match Layout::with(
         clip.codec,
-        geometry,
+        &geometry,
+        first.bit_depth,
         usize::from(slots),
-        FRAME_BOUND_NS,
+        clip.pool.max(usize::from(slots)),
     ) {
+        Ok(layout) => layout,
+        Err(why) => {
+            log(format_args!("NVDEC SELFTEST {name} FAIL at open: {why}"));
+            return (report, refuse(node));
+        }
+    };
+    let mut session = match Session::open_layout(node, chipset, geometry, layout, FRAME_BOUND_NS) {
         Ok(session) => session,
         Err((error, node)) => {
             log(format_args!(

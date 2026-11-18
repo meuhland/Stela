@@ -1,6 +1,7 @@
-//! HEVC (Rec. ITU-T H.265): sequence and picture parameter sets, the slice
-//! segment header up to the reference picture set, the picture order count
-//! (8.3.1) and the reference picture sets (8.3.2), for Main and Main 10.
+//! HEVC (Rec. ITU-T H.265): sequence and picture parameter sets (with
+//! their scaling lists), the slice segment header up to the reference
+//! picture set, the picture order count (8.3.1), the reference picture sets
+//! (8.3.2) and the output order (C.5.2), for Main and Main 10.
 //!
 //! What NVDEC's setup takes besides the parameter sets: the POC difference
 //! of every picture the current one keeps (`RefDiffPicOrderCnts[slot]`), the
@@ -8,8 +9,20 @@
 //! counts of the slice header, the bits from `slice_pic_order_cnt_lsb` to
 //! the end of the long-term references (`sw_hdr_skip_length`: the engine
 //! skips what the driver parsed) and those of the slice's own
-//! `st_ref_pic_set()`. Each picture is written to the lowest slot no kept
-//! picture holds, out of `sps_max_dec_pic_buffering_minus1 + 1`.
+//! `st_ref_pic_set()`.
+//!
+//! Surface slots and output order are FFmpeg's ([`super::super::dpb`]):
+//! an IDR drops every reference first; the picture joins FFmpeg's picture
+//! array at its first free place; the pictures its reference picture set
+//! drops and that wait for nothing give their slots back, in array order;
+//! pictures are shown (lowest order count first) while more than
+//! `sps_max_num_reorder_pics` wait or the array holds more than
+//! `sps_max_dec_pic_buffering`, a shown picture that is no reference
+//! giving its slot back at once; and only then does the picture take the
+//! slot pool's next slot, which may be one just shown (hevc-main-bf's
+//! POC 8 takes POC 3's slot as POC 3 is shown, and NVIDIA's driver moves
+//! that slot to another surface: [`super::super::dpb::Surfaces`]).
+use super::super::dpb::{Output, Pool};
 use super::{Bits, Error, Nal, Result, ceil_log2};
 use alloc::vec::Vec;
 
@@ -24,8 +37,12 @@ pub const NAL_EOS: u8 = 36;
 pub const NAL_PREFIX_SEI: u8 = 39;
 
 /// The largest pictures NVDEC takes for HEVC here: 4096x4096 (8192 on
-/// GA10x, which the self-test's layouts never reach).
+/// GA10x, which Stela's layouts do not reach).
 pub const MAX_SIDE: u32 = 4096;
+/// The most surface slots a stream gets: `SET_PICTURE_LUMA_OFFSET0..15`.
+pub const MAX_SLOTS: u8 = 16;
+/// The places of FFmpeg's HEVC picture array.
+const PICTURE_PLACES: u8 = 32;
 
 /// A short-term reference picture set (7.3.7, 7.4.8): the POC deltas
 /// before and after the current picture, nearest first, and whether the
@@ -51,6 +68,145 @@ pub struct Window {
     pub bottom: u32,
 }
 
+/// Scaling lists (7.3.4, 7.4.5), each in raster order: per `sizeId` (4x4,
+/// 8x8, 16x16, 32x32) and `matrixId` (0..5; 32x32 uses 0 and 3) the 4x4 or
+/// 8x8 grid of coefficients, and the 16x16 and 32x32 DC coefficients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalingList {
+    pub lists: [[[u8; 64]; 6]; 4],
+    pub dc: [[u8; 6]; 2],
+}
+
+/// Table 7-6, in up-right diagonal order: the intra and inter default 8x8
+/// lists (sizeId 1 to 3).
+const DEFAULT_INTRA: [u8; 64] = [
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19, 20,
+    21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31,
+    29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115,
+];
+const DEFAULT_INTER: [u8; 64] = [
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 20, 20, 20,
+    20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28,
+    28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91,
+];
+
+/// The up-right diagonal scan of an `n` x `n` block (6.5.3): the raster
+/// position of each coded coefficient.
+fn diagonal(n: usize) -> Vec<usize> {
+    let mut scan = Vec::with_capacity(n * n);
+    let (mut x, mut y) = (0i32, 0i32);
+    while scan.len() < n * n {
+        while y >= 0 {
+            if (x as usize) < n && (y as usize) < n {
+                scan.push(y as usize * n + x as usize);
+            }
+            y -= 1;
+            x += 1;
+        }
+        y = x;
+        x = 0;
+    }
+    scan
+}
+
+impl ScalingList {
+    /// Table 7-5 and 7-6: flat 4x4 lists, the default 8x8 ones, DC 16.
+    pub fn default_lists() -> Self {
+        let scan8 = diagonal(8);
+        let mut out = Self {
+            lists: [[[16; 64]; 6]; 4],
+            dc: [[16; 6]; 2],
+        };
+        for size in 1..4 {
+            for matrix in 0..6 {
+                let coded = if matrix < 3 {
+                    &DEFAULT_INTRA
+                } else {
+                    &DEFAULT_INTER
+                };
+                for (k, &value) in coded.iter().enumerate() {
+                    out.lists[size][matrix][scan8[k]] = value;
+                }
+            }
+        }
+        out
+    }
+
+    /// The 1 KiB buffer NVIDIA's driver puts at the setup page's +0x200
+    /// (`HEVC_SET_SCALING_LIST_OFFSET`), read off hevc-main-slices-1080p:
+    /// the six 16x16 DC coefficients, the two 32x32 ones (matrixId 0, 3),
+    /// 8 zero bytes, then the 4x4 lists (16 bytes each), the 8x8, 16x16 and
+    /// 32x32 ones (64 bytes each, 32x32 for matrixId 0 and 3), all in
+    /// raster order, and 16 zero bytes.
+    pub fn buffer(&self) -> [u8; 1024] {
+        let mut out = [0u8; 1024];
+        out[..6].copy_from_slice(&self.dc[0]);
+        out[6] = self.dc[1][0];
+        out[7] = self.dc[1][3];
+        let mut at = 16;
+        for matrix in 0..6 {
+            out[at..at + 16].copy_from_slice(&self.lists[0][matrix][..16]);
+            at += 16;
+        }
+        for size in 1..3 {
+            for matrix in 0..6 {
+                out[at..at + 64].copy_from_slice(&self.lists[size][matrix]);
+                at += 64;
+            }
+        }
+        for matrix in [0, 3] {
+            out[at..at + 64].copy_from_slice(&self.lists[3][matrix]);
+            at += 64;
+        }
+        out
+    }
+}
+
+/// `scaling_list_data()` (7.3.4).
+fn scaling_list_data(b: &mut Bits) -> Result<ScalingList> {
+    let defaults = ScalingList::default_lists();
+    let mut out = defaults;
+    let scan4 = diagonal(4);
+    let scan8 = diagonal(8);
+    for size in 0..4 {
+        let step = if size == 3 { 3 } else { 1 };
+        let mut matrix = 0;
+        while matrix < 6 {
+            if !b.flag()? {
+                let delta =
+                    b.ue_max((matrix / step) as u32, "scaling_list_pred_matrix_id_delta")? as usize;
+                if delta == 0 {
+                    out.lists[size][matrix] = defaults.lists[size][matrix];
+                    if size > 1 {
+                        out.dc[size - 2][matrix] = 16;
+                    }
+                } else {
+                    let reference = matrix - delta * step;
+                    out.lists[size][matrix] = out.lists[size][reference];
+                    if size > 1 {
+                        out.dc[size - 2][matrix] = out.dc[size - 2][reference];
+                    }
+                }
+            } else {
+                let count = if size == 0 { 16 } else { 64 };
+                let mut next = 8i32;
+                if size > 1 {
+                    next = b.se_in(-7..=247, "scaling_list_dc_coef_minus8")? + 8;
+                    out.dc[size - 2][matrix] = next as u8;
+                }
+                for k in 0..count {
+                    let delta = b.se_in(-128..=127, "scaling_list_delta_coef")?;
+                    next = (next + delta + 256) % 256;
+                    let at = if size == 0 { scan4[k] } else { scan8[k] };
+                    out.lists[size][matrix][at] = next as u8;
+                }
+            }
+            matrix += step;
+        }
+    }
+    Ok(out)
+}
+
 /// A sequence parameter set (7.3.2.2), VUI and extensions left out.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sps {
@@ -68,6 +224,8 @@ pub struct Sps {
     pub log2_max_poc_lsb: u8,
     /// `sps_max_dec_pic_buffering_minus1` of the highest sub-layer.
     pub max_dec_pic_buffering_minus1: u8,
+    /// `sps_max_num_reorder_pics` of the highest sub-layer.
+    pub max_num_reorder: u8,
     pub log2_min_cb: u8,
     pub log2_max_cb: u8,
     pub log2_min_tb: u8,
@@ -75,6 +233,8 @@ pub struct Sps {
     pub max_transform_hierarchy_depth_inter: u8,
     pub max_transform_hierarchy_depth_intra: u8,
     pub scaling_list_enabled: bool,
+    /// The sequence's lists when enabled: its own, else the defaults.
+    pub scaling: Option<ScalingList>,
     pub amp: bool,
     pub sample_adaptive_offset: bool,
     pub pcm: bool,
@@ -110,6 +270,18 @@ impl Sps {
             self.width - self.window.left - self.window.right,
             self.height - self.window.top - self.window.bottom,
         )
+    }
+
+    /// `sps_max_dec_pic_buffering`.
+    pub fn max_dec_pic_buffering(&self) -> u32 {
+        u32::from(self.max_dec_pic_buffering_minus1) + 1
+    }
+
+    /// The surface slots a stream of this sequence may hold at once: the
+    /// picture buffer and the one being decoded (bumping keeps the buffer
+    /// within `sps_max_dec_pic_buffering` while any picture waits).
+    pub fn slots(&self) -> u8 {
+        (self.max_dec_pic_buffering() + 1).min(u32::from(MAX_SLOTS)) as u8
     }
 }
 
@@ -147,6 +319,8 @@ pub struct Pps {
     pub pps_deblocking_filter_disabled: bool,
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
+    /// `pps_scaling_list_data()`, when the set has its own.
+    pub scaling: Option<ScalingList>,
     pub lists_modification_present: bool,
     pub log2_parallel_merge_level: u8,
     pub slice_segment_header_extension_present: bool,
@@ -156,10 +330,12 @@ pub struct Pps {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Slice {
     pub first_slice_segment_in_pic: bool,
+    pub no_output_of_prior_pics: bool,
     pub pps_id: u8,
     pub dependent: bool,
     /// 0 B, 1 P, 2 I.
     pub slice_type: u8,
+    pub pic_output: bool,
     pub pic_order_cnt_lsb: u32,
     /// The slice's own short-term set, or the SPS's it names.
     pub st_rps: StRps,
@@ -343,7 +519,10 @@ pub fn sps(escaped: &[u8]) -> Result<Sps> {
     for _ in first..=max_sub_layers_minus1 {
         sps.max_dec_pic_buffering_minus1 =
             b.ue_max(15, "sps_max_dec_pic_buffering_minus1 above 15")? as u8;
-        b.ue()?; // sps_max_num_reorder_pics
+        sps.max_num_reorder = b.ue_max(
+            u32::from(sps.max_dec_pic_buffering_minus1),
+            "sps_max_num_reorder_pics out of range",
+        )? as u8;
         b.ue()?; // sps_max_latency_increase_plus1
     }
     sps.log2_min_cb = 3 + b.ue_max(3, "log2_min_luma_coding_block_size_minus3 above 3")? as u8;
@@ -361,7 +540,11 @@ pub fn sps(escaped: &[u8]) -> Result<Sps> {
         b.ue_max(4, "max_transform_hierarchy_depth_intra")? as u8;
     sps.scaling_list_enabled = b.flag()?;
     if sps.scaling_list_enabled {
-        return Err(Error::Unsupported("HEVC scaling lists"));
+        sps.scaling = Some(if b.flag()? {
+            scaling_list_data(&mut b)?
+        } else {
+            ScalingList::default_lists()
+        });
     }
     sps.amp = b.flag()?;
     sps.sample_adaptive_offset = b.flag()?;
@@ -448,7 +631,7 @@ pub fn pps(escaped: &[u8], sps: &[Option<Sps>]) -> Result<Pps> {
         }
     }
     if b.flag()? {
-        return Err(Error::Unsupported("HEVC scaling lists"));
+        pps.scaling = Some(scaling_list_data(&mut b)?);
     }
     pps.lists_modification_present = b.flag()?;
     pps.log2_parallel_merge_level = 2 + b.ue_max(
@@ -480,10 +663,11 @@ pub fn slice(nal: &Nal<'_>, sps: &[Option<Sps>], pps: &[Option<Pps>]) -> Result<
     let mut b = Bits::new(&nal.bytes[2..]);
     let mut slice = Slice {
         first_slice_segment_in_pic: b.flag()?,
+        pic_output: true,
         ..Slice::default()
     };
     if (16..=23).contains(&kind) {
-        b.skip(1)?; // no_output_of_prior_pics_flag
+        slice.no_output_of_prior_pics = b.flag()?;
     }
     slice.pps_id = b.ue_max(63, "slice_pic_parameter_set_id above 63")? as u8;
     let pic = pps
@@ -511,7 +695,7 @@ pub fn slice(nal: &Nal<'_>, sps: &[Option<Sps>], pps: &[Option<Pps>]) -> Result<
     b.skip(usize::from(pic.num_extra_slice_header_bits))?;
     slice.slice_type = b.ue_max(2, "slice_type above 2")? as u8;
     if pic.output_flag_present {
-        b.skip(1)?;
+        slice.pic_output = b.flag()?;
     }
     if seq.separate_colour_plane {
         b.skip(2)?;
@@ -591,7 +775,7 @@ pub fn slice(nal: &Nal<'_>, sps: &[Option<Sps>], pps: &[Option<Pps>]) -> Result<
     Ok(slice)
 }
 
-/// A picture the decoded-picture buffer keeps.
+/// A picture the decoded-picture buffer keeps as a reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Kept {
     pub slot: u8,
@@ -616,20 +800,31 @@ pub struct Picture {
     pub bitstream: Vec<u8>,
     pub slices: usize,
     pub slot: u8,
-    /// The slots the stream uses: `sps_max_dec_pic_buffering_minus1 + 1`.
+    /// The slots the stream may hold at once ([`Sps::slots`]).
     pub slots: u8,
     /// The highest slot used so far, this picture's included.
     pub high_water: u8,
-    /// The slot of the picture decoded before this one (0 for the first).
+    /// What the engine conceals a damaged picture from (`ERROR_FRM_IDX`):
+    /// the first slot of the initial reference list 0 (0 without
+    /// references), as NVIDIA's driver gives it. For P-only streams that
+    /// is the picture decoded before; hevc-main-bf's B-frames show the
+    /// difference.
     pub previous_slot: u8,
     pub poc: i32,
-    /// The pictures kept for this one, before it is added.
+    /// The references kept for this one, before it is added.
     pub dpb: Vec<Kept>,
     /// `RefPicSetStCurrBefore`, `RefPicSetStCurrAfter`, `RefPicSetLtCurr`
     /// as slots.
     pub st_curr_before: Vec<u8>,
     pub st_curr_after: Vec<u8>,
     pub lt_curr: Vec<u8>,
+    /// The scaling lists in force, when enabled: the PPS's, else the SPS's.
+    pub scaling: Option<ScalingList>,
+    /// Which decode of the stream this is (0 for the first).
+    pub decoded: u32,
+    /// The pictures shown at this picture's start, in output order (this
+    /// one may be among them).
+    pub outputs: Vec<Output>,
 }
 
 impl Picture {
@@ -639,19 +834,43 @@ impl Picture {
     }
 }
 
+/// A picture of FFmpeg's picture array: a reference, or waiting to be
+/// shown, or both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame {
+    place: u8,
+    /// `None` only for the picture being started, before its slot is taken.
+    slot: Option<u8>,
+    poc: i32,
+    short: bool,
+    long: bool,
+    output: bool,
+    decoded: u32,
+}
+
+impl Frame {
+    fn reference(&self) -> bool {
+        self.short || self.long
+    }
+
+    fn held(&self) -> bool {
+        self.reference() || self.output
+    }
+}
+
 /// A stream's parameter sets and reference state, one access unit at a time.
 #[derive(Clone, Debug)]
 pub struct Parser {
     sps: Vec<Option<Sps>>,
     pps: Vec<Option<Pps>>,
-    dpb: Vec<Kept>,
+    frames: Vec<Frame>,
+    pool: Pool,
     prev_tid0_poc: i32,
-    high_water: Option<u8>,
-    previous_slot: u8,
     /// The next IRAP has `NoRaslOutputFlag` (the first, or after an end of
     /// sequence).
     starting: bool,
     active_sps: Option<Sps>,
+    decoded: u32,
 }
 
 impl Default for Parser {
@@ -665,17 +884,91 @@ impl Parser {
         Self {
             sps: alloc::vec![None; 16],
             pps: alloc::vec![None; 64],
-            dpb: Vec::new(),
+            frames: Vec::new(),
+            pool: Pool::new(MAX_SLOTS),
             prev_tid0_poc: 0,
-            high_water: None,
-            previous_slot: 0,
             starting: true,
             active_sps: None,
+            decoded: 0,
         }
     }
 
     pub fn active_sps(&self) -> Option<&Sps> {
         self.active_sps.as_ref()
+    }
+
+    /// Takes a parameter set NAL outside an access unit (from an `hvcC`):
+    /// VPS are skipped.
+    pub fn parameter_set(&mut self, nal: &Nal<'_>) -> Result<()> {
+        if nal.bytes.len() < 2 {
+            return Err(Error::Truncated);
+        }
+        match nal.hevc_type() {
+            NAL_VPS => {}
+            NAL_SPS => {
+                let sps = sps(&nal.bytes[2..])?;
+                let id = usize::from(sps.id);
+                self.sps[id] = Some(sps);
+            }
+            NAL_PPS => {
+                let pps = pps(&nal.bytes[2..], &self.sps)?;
+                let id = usize::from(pps.id);
+                self.pps[id] = Some(pps);
+            }
+            _ => return Err(Error::Invalid("not a parameter set")),
+        }
+        Ok(())
+    }
+
+    /// Drops the array's pictures that are neither references nor waiting
+    /// to be shown, giving their slots back in array order.
+    fn release_unheld(&mut self) {
+        self.frames.sort_by_key(|f| f.place);
+        let mut kept = Vec::with_capacity(self.frames.len());
+        for frame in core::mem::take(&mut self.frames) {
+            if frame.held() {
+                kept.push(frame);
+            } else if let Some(slot) = frame.slot {
+                self.pool.give(slot);
+            }
+        }
+        self.frames = kept;
+    }
+
+    /// FFmpeg's `ff_hevc_output_frames()`: shows the lowest order count
+    /// while more than `reorder` wait, or (with any waiting) the array
+    /// holds more than `buffering`.
+    fn bump(&mut self, reorder: u32, buffering: u32, outputs: &mut Vec<Output>, discard: bool) {
+        loop {
+            let waiting = self.frames.iter().filter(|f| f.output).count() as u32;
+            let held = self.frames.iter().filter(|f| f.held()).count() as u32;
+            if !(waiting > reorder || (waiting > 0 && held > buffering)) {
+                return;
+            }
+            let mut best: Option<usize> = None;
+            for (k, frame) in self.frames.iter().enumerate() {
+                if frame.output && best.is_none_or(|b| frame.poc < self.frames[b].poc) {
+                    best = Some(k);
+                }
+            }
+            let Some(k) = best else { return };
+            self.frames[k].output = false;
+            let frame = self.frames[k];
+            if !discard {
+                outputs.push(Output {
+                    slot: frame.slot.unwrap_or(u8::MAX),
+                    surface: frame.slot.unwrap_or(u8::MAX),
+                    poc: frame.poc,
+                    decoded: frame.decoded,
+                });
+            }
+            if !frame.held() {
+                self.frames.remove(k);
+                if let Some(slot) = frame.slot {
+                    self.pool.give(slot);
+                }
+            }
+        }
     }
 
     /// Takes one access unit's NAL units: the parameter sets it carries,
@@ -692,16 +985,7 @@ impl Parser {
                 return Err(Error::Unsupported("HEVC layers above the base"));
             }
             match kind {
-                NAL_SPS => {
-                    let sps = sps(&nal.bytes[2..])?;
-                    let id = usize::from(sps.id);
-                    self.sps[id] = Some(sps);
-                }
-                NAL_PPS => {
-                    let pps = pps(&nal.bytes[2..], &self.sps)?;
-                    let id = usize::from(pps.id);
-                    self.pps[id] = Some(pps);
-                }
+                NAL_VPS | NAL_SPS | NAL_PPS => self.parameter_set(nal)?,
                 NAL_EOS => self.starting = true,
                 0..=9 | 16..=21 => {
                     let header = slice(nal, &self.sps, &self.pps)?;
@@ -779,6 +1063,36 @@ impl Parser {
             }
         };
         let poc = msb + lsb;
+        self.pool.widen(sps.slots());
+        let mut outputs = Vec::new();
+        // An IDR drops every reference as its header is read; an IRAP
+        // that starts afresh then shows (or with no_output_of_prior_pics
+        // drops) everything still waiting.
+        if idr {
+            for frame in &mut self.frames {
+                frame.short = false;
+                frame.long = false;
+            }
+            self.release_unheld();
+        }
+        if irap && no_rasl_output && self.decoded > 0 {
+            let discard = first.no_output_of_prior_pics || (nal_type == NAL_CRA && self.starting);
+            self.bump(0, 0, &mut outputs, discard);
+        }
+        // The new picture's place in the array.
+        let place = (0..PICTURE_PLACES)
+            .find(|p| !self.frames.iter().any(|f| f.place == *p))
+            .ok_or(Error::Invalid("every picture place is held"))?;
+        let rasl_skipped = matches!(nal_type, 8 | 9) && no_rasl_output;
+        self.frames.push(Frame {
+            place,
+            slot: None,
+            poc,
+            short: true,
+            long: false,
+            output: first.pic_output && !rasl_skipped,
+            decoded: self.decoded,
+        });
         // 8.3.2: the reference picture set, and what the buffer keeps.
         let mut before = Vec::new();
         let mut after = Vec::new();
@@ -814,57 +1128,67 @@ impl Parser {
                 long_follow.push((target, msb_present));
             }
         }
-        let matches_long = |kept: &Kept, &(target, full): &(i32, bool)| {
+        let matches_long = |frame_poc: i32, &(target, full): &(i32, bool)| {
             if full {
-                kept.poc == target
+                frame_poc == target
             } else {
-                kept.poc & (max_lsb - 1) == target
+                frame_poc & (max_lsb - 1) == target
             }
         };
-        let old = core::mem::take(&mut self.dpb);
-        if !(irap && no_rasl_output) {
-            for kept in old {
+        if !idr {
+            let restart = irap && no_rasl_output;
+            for frame in self.frames.iter_mut().filter(|f| f.slot.is_some()) {
+                let was_reference = frame.reference();
+                let was_long = frame.long;
+                frame.short = false;
+                frame.long = false;
+                if restart || !was_reference {
+                    continue;
+                }
                 let long = long_curr
                     .iter()
                     .chain(&long_follow)
-                    .any(|lt| matches_long(&kept, lt));
-                let short = !kept.long_term
+                    .any(|lt| matches_long(frame.poc, lt));
+                let short = !was_long
                     && !long
-                    && (before.contains(&kept.poc)
-                        || after.contains(&kept.poc)
-                        || follow.contains(&kept.poc));
-                if long || short {
-                    self.dpb.push(Kept {
-                        long_term: long,
-                        ..kept
-                    });
-                }
+                    && (before.contains(&frame.poc)
+                        || after.contains(&frame.poc)
+                        || follow.contains(&frame.poc));
+                frame.long = long;
+                frame.short = short;
             }
+            self.release_unheld();
         }
-        let slot_of = |dpb: &[Kept], poc: i32, long: bool| {
-            dpb.iter()
-                .find(|k| k.poc == poc && k.long_term == long)
-                .map(|k| k.slot)
+        let references: Vec<Frame> = self
+            .frames
+            .iter()
+            .filter(|f| f.slot.is_some() && f.reference())
+            .copied()
+            .collect();
+        let slot_of = |poc: i32, long: bool| {
+            references
+                .iter()
+                .find(|f| f.poc == poc && f.long == long)
+                .and_then(|f| f.slot)
         };
         let mut st_curr_before = Vec::new();
         for &p in &before {
-            st_curr_before.push(slot_of(&self.dpb, p, false).ok_or(Error::Missing(
+            st_curr_before.push(slot_of(p, false).ok_or(Error::Missing(
                 "a short-term reference is not in the buffer",
             ))?);
         }
         let mut st_curr_after = Vec::new();
         for &p in &after {
-            st_curr_after.push(slot_of(&self.dpb, p, false).ok_or(Error::Missing(
+            st_curr_after.push(slot_of(p, false).ok_or(Error::Missing(
                 "a short-term reference is not in the buffer",
             ))?);
         }
         let mut lt_curr = Vec::new();
         for lt in &long_curr {
-            let slot = self
-                .dpb
+            let slot = references
                 .iter()
-                .find(|k| k.long_term && matches_long(k, lt))
-                .map(|k| k.slot)
+                .find(|f| f.long && matches_long(f.poc, lt))
+                .and_then(|f| f.slot)
                 .ok_or(Error::Missing("a long-term reference is not in the buffer"))?;
             lt_curr.push(slot);
         }
@@ -884,12 +1208,41 @@ impl Parser {
         if kind != 'I' && st_curr_before.len() + st_curr_after.len() + lt_curr.len() == 0 {
             return Err(Error::Invalid("an inter picture with no reference"));
         }
-        let slots = sps.max_dec_pic_buffering_minus1 + 1;
-        let slot = (0..slots)
-            .find(|s| !self.dpb.iter().any(|k| k.slot == *s))
-            .ok_or(Error::Invalid("every surface holds a kept picture"))?;
-        let high_water = self.high_water.map_or(slot, |h| h.max(slot));
-        self.high_water = Some(high_water);
+        // Bumping (C.5.2.2), then the picture's slot.
+        self.bump(
+            u32::from(sps.max_num_reorder),
+            sps.max_dec_pic_buffering(),
+            &mut outputs,
+            false,
+        );
+        let slot = self
+            .pool
+            .take()
+            .ok_or(Error::Invalid("every surface holds a picture"))?;
+        let current = self.decoded;
+        if let Some(frame) = self.frames.iter_mut().find(|f| f.decoded == current) {
+            frame.slot = Some(slot);
+        }
+        for output in &mut outputs {
+            if output.decoded == current {
+                output.slot = slot;
+                output.surface = slot;
+            }
+        }
+        let high_water = self.pool.high_water().unwrap_or(slot);
+        let dpb = references
+            .iter()
+            .map(|f| Kept {
+                slot: f.slot.unwrap_or(0),
+                poc: f.poc,
+                long_term: f.long,
+            })
+            .collect();
+        let scaling = if sps.scaling_list_enabled {
+            pps.scaling.or(sps.scaling)
+        } else {
+            None
+        };
         let picture = Picture {
             sps: sps.clone(),
             pps,
@@ -901,18 +1254,27 @@ impl Parser {
             bitstream,
             slices: slices.len(),
             slot,
-            slots,
+            slots: self.pool.most(),
             high_water,
-            previous_slot: self.previous_slot,
+            previous_slot: st_curr_before
+                .iter()
+                .chain(&st_curr_after)
+                .chain(&lt_curr)
+                .next()
+                .copied()
+                .unwrap_or(0),
             poc,
-            dpb: self.dpb.clone(),
+            dpb,
             st_curr_before,
             st_curr_after,
             lt_curr,
+            scaling,
+            decoded: current,
+            outputs,
         };
         // As if decoded.
         self.starting = false;
-        self.previous_slot = slot;
+        self.decoded += 1;
         let sub_layer_non_reference = nal_type <= 14 && nal_type % 2 == 0;
         if first_nal.hevc_temporal_id() == 0
             && !matches!(nal_type, 6..=9)
@@ -920,12 +1282,33 @@ impl Parser {
         {
             self.prev_tid0_poc = poc;
         }
-        self.dpb.push(Kept {
-            slot,
-            poc,
-            long_term: false,
-        });
         Ok(Some(picture))
+    }
+
+    /// The pictures still waiting to be shown, in output order, as at the
+    /// end of the stream.
+    pub fn flush(&mut self) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        self.bump(0, 0, &mut outputs, false);
+        outputs
+    }
+
+    /// Forgets every picture (a seek): no reference, nothing to show, every
+    /// slot free; the parameter sets stay, and the next picture must be an
+    /// IRAP.
+    pub fn reset(&mut self) {
+        let sps = core::mem::take(&mut self.sps);
+        let pps = core::mem::take(&mut self.pps);
+        *self = Self {
+            sps,
+            pps,
+            ..Self::new()
+        };
+    }
+
+    /// The slots held now: references and pictures waiting to be shown.
+    pub fn held_slots(&self) -> Vec<u8> {
+        self.frames.iter().filter_map(|f| f.slot).collect()
     }
 }
 
@@ -967,4 +1350,32 @@ pub fn pictures(stream: &[u8]) -> Result<Vec<Picture>> {
         }
     }
     Ok(pictures)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_diagonal_scan_goes_up_right() {
+        assert_eq!(
+            diagonal(4),
+            [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15]
+        );
+        assert_eq!(diagonal(8).len(), 64);
+    }
+
+    #[test]
+    fn the_default_lists_fill_nvidias_buffer_as_captured() {
+        // hevc-main-slices-1080p's buffer (x265 scaling-list=default).
+        let buffer = ScalingList::default_lists().buffer();
+        assert_eq!(buffer[..8], [16; 8]);
+        assert_eq!(buffer[8..16], [0; 8]);
+        assert!(buffer[16..0x70].iter().all(|&b| b == 16));
+        assert_eq!(buffer[0x70..0x78], [16, 16, 16, 16, 17, 18, 21, 24]);
+        assert_eq!(buffer[0xa8..0xb0], [24, 25, 29, 36, 47, 65, 88, 115]);
+        assert_eq!(buffer[0x130..0x138], [16, 16, 16, 16, 17, 18, 20, 24]);
+        assert_eq!(buffer[0x3e8..0x3f0], [24, 25, 28, 33, 41, 54, 71, 91]);
+        assert_eq!(buffer[0x3f0..], [0; 16]);
+    }
 }
