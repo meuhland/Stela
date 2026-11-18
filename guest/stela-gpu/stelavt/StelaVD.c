@@ -35,6 +35,25 @@
 
 /* ---- The private interface ---------------------------------------------- */
 
+/*
+ * On arm64e CoreMedia authenticates every pointer of these tables
+ * (CMDerivedObjectCreate: `autda` of the vtable's base class with the
+ * field's address and 0xb911), so each field is signed as Apple's plugins
+ * sign it: the class pointers with the DA key and the functions with the IA
+ * key, both address-diversified, with the discriminators of AppleH264SW's
+ * fixups (macOS 27.2). Unsigned tables kill an arm64e client with
+ * EXC_ARM_PAC_FAIL (WallpaperAerialsExtension did). Fields whose
+ * discriminator is unknown stay NULL. The arm64 slice signs nothing.
+ */
+#if __has_feature(ptrauth_qualifier)
+#include <ptrauth.h>
+#define SIGNED_CLASS(d) __ptrauth(ptrauth_key_asda, 1, d)
+#define SIGNED_CODE(d) __ptrauth(ptrauth_key_asia, 1, d)
+#else
+#define SIGNED_CLASS(d)
+#define SIGNED_CODE(d)
+#endif
+
 typedef CFTypeRef VDBaseObjectRef;
 typedef VDBaseObjectRef VTVideoDecoderRef;
 typedef struct OpaqueVTVideoDecoderSession *VTVideoDecoderSession;
@@ -44,35 +63,37 @@ typedef const void *VDBaseClassID;
 typedef struct {
 	uintptr_t version;
 	size_t derivedStorageSize;
-	Boolean (*equal)(VDBaseObjectRef, VDBaseObjectRef);
-	OSStatus (*invalidate)(VDBaseObjectRef);
-	void (*finalize)(VDBaseObjectRef);
-	CFStringRef (*copyDebugDescription)(VDBaseObjectRef);
-	OSStatus (*copyProperty)(VDBaseObjectRef, CFStringRef, CFAllocatorRef, void *);
-	OSStatus (*setProperty)(VDBaseObjectRef, CFStringRef, CFTypeRef);
-	OSStatus (*notificationBarrier)(VDBaseObjectRef);
+	const void *equal; /* discriminator unknown: NULL */
+	OSStatus (*SIGNED_CODE(0x3af8) invalidate)(VDBaseObjectRef);
+	void (*SIGNED_CODE(0x5680) finalize)(VDBaseObjectRef);
+	CFStringRef (*SIGNED_CODE(0xf18e) copyDebugDescription)(VDBaseObjectRef);
+	OSStatus (*SIGNED_CODE(0x9725) copyProperty)(VDBaseObjectRef, CFStringRef, CFAllocatorRef, void *);
+	OSStatus (*SIGNED_CODE(0x2724) setProperty)(VDBaseObjectRef, CFStringRef, CFTypeRef);
+	/* Read from version 2 (0xd563); this class is version 1. */
+	const void *notificationBarrier;
 	const void *reserved[3];
 } VDBaseClass;
 
 typedef struct {
 	uintptr_t version;
-	OSStatus (*startSession)(VTVideoDecoderRef, VTVideoDecoderSession, CMVideoFormatDescriptionRef);
-	OSStatus (*decodeFrame)(VTVideoDecoderRef, VTVideoDecoderFrame, CMSampleBufferRef, VTDecodeFrameFlags,
-	    VTDecodeInfoFlags *);
-	OSStatus (*copySupportedPropertyDictionary)(VTVideoDecoderRef, CFDictionaryRef *);
-	OSStatus (*setProperties)(VTVideoDecoderRef, CFDictionaryRef);
-	OSStatus (*copySerializableProperties)(VTVideoDecoderRef, CFAllocatorRef, CFDictionaryRef *);
-	Boolean (*canAcceptFormatDescription)(VTVideoDecoderRef, CMFormatDescriptionRef);
-	OSStatus (*finishDelayedFrames)(VTVideoDecoderRef);
-	const void *startTileSession;
-	const void *decodeTile;
+	OSStatus (*SIGNED_CODE(0x7be9) startSession)(VTVideoDecoderRef, VTVideoDecoderSession,
+	    CMVideoFormatDescriptionRef);
+	OSStatus (*SIGNED_CODE(0xaf83) decodeFrame)(VTVideoDecoderRef, VTVideoDecoderFrame, CMSampleBufferRef,
+	    VTDecodeFrameFlags, VTDecodeInfoFlags *);
+	OSStatus (*SIGNED_CODE(0x50eb) copySupportedPropertyDictionary)(VTVideoDecoderRef, CFDictionaryRef *);
+	const void *setProperties;              /* unknown: NULL */
+	const void *copySerializableProperties; /* unknown: NULL */
+	Boolean (*SIGNED_CODE(0x3f3c) canAcceptFormatDescription)(VTVideoDecoderRef, CMFormatDescriptionRef);
+	const void *finishDelayedFrames; /* unknown: NULL; StelaVD emits each frame before decodeFrame returns */
+	const void *startTileSession;    /* 0x9605, not offered */
+	const void *decodeTile;          /* 0xba86, not offered */
 	const void *reserved[8];
 } VTVideoDecoderClass;
 
 typedef struct {
 	const void *reserved;
-	const VDBaseClass *baseClass;
-	const VTVideoDecoderClass *derivedClass;
+	const VDBaseClass *SIGNED_CLASS(0xb911) baseClass;
+	const VTVideoDecoderClass *SIGNED_CLASS(0x2356) derivedClass;
 } VTVideoDecoderVTable;
 
 static struct {
@@ -335,16 +356,6 @@ static Boolean canAcceptFormatDescription(VTVideoDecoderRef decoder, CMFormatDes
 	return CMFormatDescriptionGetMediaSubType(format) == storage(decoder)->codec;
 }
 
-static OSStatus finishDelayedFrames(VTVideoDecoderRef decoder)
-{
-	Decoder *d = storage(decoder);
-	if (d->inner) {
-		VTDecompressionSessionFinishDelayedFrames(d->inner);
-		VTDecompressionSessionWaitForAsynchronousFrames(d->inner);
-	}
-	return noErr;
-}
-
 static const VDBaseClass kBaseClass = {
 	.version = 1,
 	.derivedStorageSize = sizeof(Decoder),
@@ -361,7 +372,6 @@ static const VTVideoDecoderClass kDecoderClass = {
 	.decodeFrame = decodeFrame,
 	.copySupportedPropertyDictionary = copySupportedPropertyDictionary,
 	.canAcceptFormatDescription = canAcceptFormatDescription,
-	.finishDelayedFrames = finishDelayedFrames,
 };
 
 static const VTVideoDecoderVTable kVTable = {NULL, &kBaseClass, &kDecoderClass};
