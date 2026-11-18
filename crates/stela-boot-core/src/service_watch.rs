@@ -170,6 +170,18 @@ impl Turn {
         true
     }
 
+    /// Whether a part outside the rotation runs ahead of it at counter value
+    /// `now`, as the inputs do at every turn (`--input-every-turn`): unless
+    /// the turn ended or a step's time is up. It is not the part every turn
+    /// runs, so the rotation's first due part still runs whatever came for
+    /// the PE meanwhile, and the rotation goes on where it would have.
+    pub fn ahead(&self, now: u64) -> bool {
+        self.ended.is_none()
+            && !self
+                .limit
+                .is_some_and(|limit| now.wrapping_sub(self.started) >= limit)
+    }
+
     /// Whether the turn may go on inside a part between two of its pieces:
     /// no step's time ran out, and no interrupt or guest work came.
     pub fn goes_on(&self, now: u64, interrupted: bool, guest: bool) -> bool {
@@ -330,6 +342,37 @@ mod tests {
             from = ended.map_or(0, |(next, _)| next);
         }
         assert_eq!(served, [0, 1, 2]);
+    }
+
+    /// With guest work always waiting, part 0 (the inputs) runs one turn in
+    /// six of the rotation; run ahead of it, at every turn, while the
+    /// rotation still gets its one part a turn.
+    #[test]
+    fn a_part_run_ahead_runs_at_every_turn_and_the_rotation_goes_on() {
+        let mut from = 0;
+        let (mut ahead, mut rotation) = (0, alloc::vec::Vec::new());
+        for _ in 0..6 {
+            let mut turn = Turn::new(from, 0, Some(100));
+            if from != 0 && turn.ahead(0) {
+                ahead += 1;
+            }
+            for part in 0..6 {
+                if turn.due(part, 0, false, true) {
+                    rotation.push(part);
+                }
+            }
+            from = turn.ended().map_or(0, |(next, _)| next);
+        }
+        assert_eq!(rotation, [0, 1, 2, 3, 4, 5]);
+        // Part 0 ran in the rotation once and ahead of it five times.
+        assert_eq!(ahead, 5);
+        // Not once a step's time is up, nor after the turn ended.
+        let mut turn = Turn::new(1, 100, Some(50));
+        assert!(turn.ahead(149));
+        assert!(!turn.ahead(150));
+        assert!(turn.due(1, 120, true, false));
+        assert!(!turn.due(2, 130, true, false));
+        assert!(!turn.ahead(130));
     }
 
     #[test]
