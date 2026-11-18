@@ -2355,9 +2355,15 @@ fn terminal_exits(
     if !is_direct_exit(&code[offset..], fallthrough, word) {
         return vec![];
     }
-    let Some(before) = offset.checked_sub(link_slot(linked, fallthrough, word.kind)) else {
+    let Some(mut before) = offset.checked_sub(link_slot(linked, fallthrough, word.kind)) else {
         return vec![];
     };
+    // A page-relative continuation starts with its page's restore.
+    if let Some(restore) = before.checked_sub(super::chain::PAGE_RESTORE_BYTES)
+        && super::chain::is_page_restore(&code[restore..before])
+    {
+        before = restore;
+    }
     let mut exits = terminal_exits_before(&code[..before], terminal, fallthrough, linked);
     exits.push(DirectExit {
         offset,
@@ -2563,7 +2569,12 @@ fn emit_terminal(
 /// after a paired frame and a host call of it (`chain::paired_call`), then
 /// the frame's continuation, an exit to `return_address` that leaves all
 /// `ran` unrun, as the call's exit counted them. Elsewhere `exit` alone.
-fn paired_exit(
+///
+/// Page-relative, the continuation first sets the page it runs at again
+/// from the return's target in RAX ([`Asm::restore_page_base`]): the
+/// callee, and every block it chained to, may have run at other pages, and
+/// the continuation's exit and the block its link enters add the page.
+pub(super) fn paired_exit(
     code: &mut Code,
     return_address: GuestAddress,
     ran: usize,
@@ -2577,12 +2588,13 @@ fn paired_exit(
     let continuation = super::chain::paired_call(&mut asm, return_address);
     exit(&mut asm);
     asm.bind(continuation);
+    asm.restore_page_base(return_address);
     direct_exit_with(&mut asm, return_address, continuation_word(ran));
 }
 
 /// The word of a paired call's continuation from a block of `ran`
 /// instructions: every one of them left unrun ([`paired_exit`]).
-fn continuation_word(ran: usize) -> ExitWord {
+pub(super) fn continuation_word(ran: usize) -> ExitWord {
     ExitWord {
         kind: ExitKind::Fallthrough,
         skipped: u16::try_from(ran).expect("bounded block instructions"),

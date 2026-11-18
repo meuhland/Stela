@@ -402,6 +402,25 @@ impl<'a> Asm<'a> {
             &super::chain::BASE_NOP
         });
     }
+    /// Page-relative, set [`crate::GuestState::page_base`] again to the page
+    /// this block runs at from RAX, which holds `address` as the block ran
+    /// it: `movabs r8, address`, whose field the compile leaves the
+    /// address's offset from the block's page, `sub rax, r8` and `mov
+    /// [page_base], rax` ([`super::chain::PAGE_RESTORE_BYTES`]). A paired
+    /// call's continuation starts so (`chain::paired_call`): the host `ret`
+    /// that reaches it comes from the callee's return, with whatever page
+    /// the callee ran at, and the return's target, the call's return
+    /// address, in RAX. Not page-relative, nothing. Clobbers RAX, R8 and
+    /// the flags.
+    pub(crate) fn restore_page_base(&mut self, address: crate::GuestAddress) {
+        if !(self.page_relative && self.relocations.is_some()) {
+            return;
+        }
+        const PAGE_BASE: u32 = core::mem::offset_of!(crate::GuestState, page_base) as u32;
+        self.guest_field(Gpr::R8, address);
+        self.alu(Alu::Sub, Size::Qword, Gpr::Rax, Gpr::R8);
+        self.mov_store(Size::Qword, super::frame(PAGE_BASE), Gpr::Rax);
+    }
     fn guest_field(&mut self, destination: Gpr, address: crate::GuestAddress) {
         self.opcode_reg(Size::Qword, 0xb8, destination);
         let at = self.code.len();

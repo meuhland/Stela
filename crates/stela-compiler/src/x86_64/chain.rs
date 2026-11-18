@@ -2561,6 +2561,12 @@ fn link_body(
 /// past the room counts its refusal and takes the exit as a plain one;
 /// code run without a control pushes none.
 ///
+/// Page-relative, `return_address` is the frame's as the caller ran it, at
+/// its page base, and the continuation sets that page again
+/// (`Asm::restore_page_base`) from the return's target, which equals it:
+/// the callee may have run at other pages, so the base a matched return
+/// leaves is the callee's.
+///
 /// Between blocks the host stack holds paired frames and nothing else, from
 /// the state's saved entry stack pointer down ([`EXIT_RETURN`]): every
 /// block, thunk and tail leaves RSP as it found it but for these. A run
@@ -2600,6 +2606,24 @@ pub(crate) fn paired_call(
     asm.bind(call);
     asm.bind(uncontrolled);
     continuation
+}
+
+/// Bytes of a page-relative paired call's continuation's page restore
+/// (`Asm::restore_page_base`): `movabs r8, address`, `sub rax, r8`, `mov
+/// [rdi+page_base], rax`.
+pub const PAGE_RESTORE_BYTES: usize = 20;
+
+/// Whether `bytes` are a page restore (`Asm::restore_page_base`) of any
+/// address: what starts a page-relative paired call's continuation, before
+/// its exit's link slot.
+pub(crate) fn is_page_restore(bytes: &[u8]) -> bool {
+    let mut code = Code::new();
+    code.set_page_relative(true);
+    code.asm().restore_page_base(GuestAddress(0));
+    let template = code.into_bytes();
+    debug_assert_eq!(template.len(), PAGE_RESTORE_BYTES);
+    // The address's field is the template's bytes 2..10.
+    bytes.len() == template.len() && bytes[..2] == template[..2] && bytes[10..] == template[10..]
 }
 
 /// The start of a return to the target in RAX, from a block that ran `ran`

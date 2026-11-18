@@ -2412,6 +2412,82 @@ fn page_relative_blocks_are_the_same_at_every_page() {
     }
 }
 
+/// A page-relative call's paired continuation (`block::paired_exit`) starts
+/// with its page's restore (`chain::is_page_restore`), whose field holds the
+/// return address's offset from the block's page, and the block still
+/// reports the call's exit and the continuation's: for BL and BLR, with the
+/// return address in the block's page or at the next page's first word.
+#[test]
+fn page_relative_calls_continue_after_their_pages_restore() {
+    use crate::block::{BlockProfile, Features};
+    use crate::x86_64::chain::{DIRECT_EXIT_BYTES, PAGE_RESTORE_BYTES, is_direct_exit};
+    use crate::{GuestAddress, Options, TargetCpu, compile, x86_64::NativeSystem};
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    let options = |page_relative| {
+        Options::new(
+            BlockProfile::new(Features::SYSTEM_MODE),
+            TargetCpu::Baseline,
+        )
+        .with_native_system(NativeSystem {
+            page_relative,
+            ..NativeSystem::NONE
+        })
+    };
+    // BL +8 and BLR X0, at a page's start and at its last word.
+    for (call, kind) in [
+        (0x9400_0002_u32, ExitKind::Call),
+        (0xd63f_0000, ExitKind::Call),
+    ] {
+        for base in [0x7f12_3456_7400_u64, 0x7f12_3456_7ff8] {
+            let page = base & !0xfff;
+            let back = base + 8;
+            let source: Vec<u8> = [ADD, call].into_iter().flat_map(u32::to_le_bytes).collect();
+            let compiled = compile(&source, GuestAddress(base), &options(true)).unwrap();
+            let code = &compiled.native.x86_64_code;
+            let continuation = compiled
+                .direct_exits
+                .iter()
+                .find(|exit| exit.kind == ExitKind::Fallthrough)
+                .unwrap_or_else(|| panic!("{call:#x} at {base:#x}: no continuation"));
+            assert_eq!(continuation.target, GuestAddress(back));
+            assert_eq!(continuation.skipped, 2);
+            assert_eq!(continuation.offset + DIRECT_EXIT_BYTES, code.len());
+            // Page-relative, its field is the offset; the base slot adds the page.
+            assert!(is_direct_exit(
+                &code[continuation.offset..],
+                GuestAddress(back - page),
+                continuation.word()
+            ));
+            let slot = crate::x86_64::chain::link_slot(
+                Some(base),
+                GuestAddress(back),
+                ExitKind::Fallthrough,
+            );
+            let restore = continuation.offset - slot - PAGE_RESTORE_BYTES;
+            assert!(
+                crate::x86_64::chain::is_page_restore(&code[restore..restore + PAGE_RESTORE_BYTES]),
+                "{call:#x} at {base:#x}: the continuation starts with the restore"
+            );
+            assert_eq!(
+                code[restore + 2..restore + 10],
+                (back - page).to_le_bytes(),
+                "the restore's field is the return address's offset"
+            );
+            // The call's own exit is reported before it, as without pages.
+            if call == 0x9400_0002 {
+                assert!(
+                    compiled
+                        .direct_exits
+                        .iter()
+                        .any(|exit| exit.kind == kind && exit.target == GuestAddress(base + 12))
+                );
+            }
+            let plain = compile(&source, GuestAddress(base), &options(false)).unwrap();
+            assert_eq!(compiled.direct_exits.len(), plain.direct_exits.len());
+        }
+    }
+}
+
 /// In page-relative code a guest address is its offset from the block's
 /// page followed by `add reg,[page_base]`: in the body, and in a direct
 /// exit's base slot (`chain::BASE_ADD`).

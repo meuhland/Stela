@@ -1977,9 +1977,10 @@ fn conditional_exits_branch_over_the_fallthrough_exit() {
     assert_eq!(code[..6], [0x0f, 0x85, DIRECT_EXIT_BYTES as u8, 0, 0, 0]);
     assert_eq!(code[6..6 + DIRECT_EXIT_BYTES], fallthrough);
     assert_eq!(code[6 + DIRECT_EXIT_BYTES..], taken);
-    // The branch, then MOVABS, the base slot, MOV, the patch point, the
-    // return (one emission) and four INT3s each.
-    assert_eq!(code.instructions(), 19);
+    // The branch, then MOVABS, MOV, the patch point, the return (one
+    // emission) and four INT3s each; the base slot after MOVABS is data,
+    // whatever it holds.
+    assert_eq!(code.instructions(), 17);
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]

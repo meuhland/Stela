@@ -271,7 +271,7 @@ mod native_component {
 
     #[test]
     fn emitted_exclusive_payloads_results_and_faults_match_private_abi() {
-        assert_eq!(size_of::<GuestState>(), 912);
+        assert_eq!(size_of::<GuestState>(), 920);
         assert_eq!(size_of::<ExclusiveData>(), EXCLUSIVE_DATA_BYTES);
         assert_eq!(align_of::<ExclusiveData>(), EXCLUSIVE_DATA_ALIGNMENT);
         let dump =

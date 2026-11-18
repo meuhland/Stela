@@ -448,3 +448,66 @@ fn a_shared_exit_into_a_block_of_one_pc_goes_through_a_cell_once() {
         );
     }
 }
+
+/// A shared caller's paired call (`chain::paired_call`) at another page
+/// than the one it was installed for: the continuation's exit, which a
+/// matched return reaches with the caller's page set again
+/// (`Asm::restore_page_base`), settles at the return address of the page
+/// the caller ran at, retires none of its instructions and links in that
+/// page into the shared block there. Runs keep their paired frames with
+/// page-relative code and sharing on, and a shared block's retirement
+/// moves the retire epoch every frame holds, so no return enters a retired
+/// shared block's continuation.
+#[test]
+fn a_shared_callers_continuation_continues_at_the_page_it_ran_at() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const BL_8: u32 = 0x9400_0002; // bl .+8
+    let (mut machine, moved) = aliased(&[ADD, BL_8, RET, RET], true);
+    let caller = fetched(&mut machine, BASE);
+    assert!(machine.code.blocks[caller].shared, "a call is no thunk's");
+    assert_eq!(fetched(&mut machine, moved), caller);
+    let returned = fetched(&mut machine, BASE + 8);
+    assert_eq!(fetched(&mut machine, moved + 8), returned);
+    // The continuation: an exit to the return address, both instructions
+    // unrun, as the installed page's successors hold it.
+    let continuation = ExitWord {
+        kind: ExitKind::Fallthrough,
+        skipped: 2,
+    };
+    let position = machine.code.blocks[caller]
+        .successors
+        .iter()
+        .position(|exit| exit.target.0 == BASE + 8 && exit.word() == continuation)
+        .expect("the continuation's exit");
+    let retired = machine.retired_instructions();
+    machine.cpu.pc = moved;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: moved + 8,
+        kind: u64::from(continuation.encoded()),
+    }];
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, moved + 8);
+    assert_eq!(machine.cpu.state.page_base.0, moved);
+    assert_eq!(machine.retired_instructions(), retired, "all unrun");
+    assert!(
+        machine.code.blocks.record(caller).chained(position),
+        "linked in its page into the shared block at the return address"
+    );
+    // Frames stay on, checked against the board's epoch.
+    let control = machine.chain.snapshot();
+    assert_eq!(
+        (control.frame_room as usize, control.retire_epoch),
+        (
+            chain::DEFAULT_FRAME_BOUND as usize * chain::FRAME_BYTES,
+            machine.code.blocks.epoch_address(),
+        )
+    );
+    // The shared block of the return address goes, at both pages: every
+    // frame pushed before fails from here on.
+    let before = machine.code.blocks.epoch();
+    let code = machine.code.blocks[returned].code.0;
+    machine.evict_code(code..code + 1);
+    assert!(!machine.code.blocks.record(returned).live());
+    assert!(machine.code.blocks.epoch() > before);
+    assert!(!machine.code.blocks.record(caller).chained(position));
+}
