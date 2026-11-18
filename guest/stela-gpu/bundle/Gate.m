@@ -44,9 +44,15 @@ static void report_unreachable(uint32_t operation, StelaSpans spans, StelaFailur
 
 /* How long a call answered Pending waits before it calls again: 0.5 ms,
  * doubling to 4 ms. The host compiles meanwhile on a processor whose guest
- * waits, which this thread's sleep may be. */
-static void wait_pending(unsigned waits)
+ * waits, which this thread's sleep may be. A video encoder's call waits
+ * 0.2 ms each time: the host stores a picture and the engine codes it in a
+ * few milliseconds, the frame's latency. */
+static void wait_pending(uint32_t operation, unsigned waits)
 {
+	if ((operation & 0xff00u) == (StelaOperationEncoderCapabilities & 0xff00u)) {
+		usleep(200);
+		return;
+	}
 	usleep(waits < 3 ? 500u << waits : 4000u);
 }
 
@@ -90,7 +96,7 @@ uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *reques
 		 * at mapping its memory. */
 		if (call.status == StelaStatusPending) {
 			tries--;
-			wait_pending(waits++);
+			wait_pending(operation, waits++);
 		}
 		/* The pager can take back the stack's page after the record is written. */
 		again = call.status == StelaStatusUnmapped || call.status == StelaStatusPending ||

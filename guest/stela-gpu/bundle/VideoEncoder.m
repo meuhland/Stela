@@ -1,7 +1,7 @@
 /*
- * Registers the StelaVT H.264 encoder, when installed, in each process that
- * loads this plugin and has VideoToolbox: Stela has no Apple video encoder,
- * so real-time clients otherwise fall back to Apple's software HEVC.
+ * Registers the StelaVT encoder, when installed, in each process that loads
+ * this plugin and has VideoToolbox: Stela has no Apple video encoder, so
+ * real-time clients otherwise fall back to Apple's software HEVC.
  *
  * VideoToolbox lists only Apple-signed encoder plugins from
  * /Library/Video/Plug-Ins, and its low-latency rate control runs an inner
@@ -9,17 +9,44 @@
  * This plugin is loaded into that service with Metal, so registering
  * StelaVT here makes it the service's hardware H.264 encoder. Nothing
  * happens without VideoToolbox in the process or without StelaVT installed.
+ *
+ * StelaVT encodes on the host's NVENC through this plugin's gate
+ * (Encoder.m), whose calls it gets here before it is registered, and
+ * otherwise with x264. It is registered for HEVC as well once a device's
+ * host says its encoder codes HEVC (`stela_video_encoder_offer_hevc`): x264
+ * has no HEVC, and a hardware HEVC encoder that refuses every session would
+ * send VideoToolbox to Apple's software one.
  */
 #include "Apple.h"
+#include "Bundle.h"
 
 #define STELAVT "/Library/Video/Plug-Ins/StelaVT.bundle/Contents/MacOS/StelaVT"
 #define RTLD_DEFAULT ((void *)-2)
 /* libsandbox's sandbox_check() filter and flag. */
 #define SANDBOX_FILTER_PATH 1
 #define SANDBOX_CHECK_NO_REPORT 0x40000000
+/* 'avc1' and 'hvc1'. */
+#define CODEC_H264 0x61766331u
+#define CODEC_HEVC 0x68766331u
 
 typedef int32_t (*Factory)(uint32_t, const void *, const void **);
 typedef int32_t (*Register)(uint32_t, const void *, Factory);
+
+/* What the constructor found, which the HEVC registration takes later. */
+static struct {
+	Register registerEncoder;
+	Factory factory;
+	const void *info;
+	/* It encodes on the host, which HEVC needs. */
+	bool hostEncoder;
+} stelavt;
+
+/* Registers StelaVT for `codec` with the hardware info: VideoToolbox's
+ * status. */
+static int32_t register_codec(uint32_t codec)
+{
+	return stelavt.registerEncoder(codec, stelavt.info, stelavt.factory);
+}
 
 __attribute__((constructor)) static void register_stela_video_encoder(void)
 {
@@ -42,6 +69,14 @@ __attribute__((constructor)) static void register_stela_video_encoder(void)
 		NSLog(@"StelaGPU: StelaVT is not installed or does not load; no H.264 encoder registered");
 		return;
 	}
+	/* The host's encoder, before VideoToolbox can make a session. A StelaVT
+	 * built before NVENC has no such export, and encodes with x264. */
+	StelaVTUseEncoders useEncoders = (StelaVTUseEncoders)dlsym(library, STELAVT_USE_ENCODERS);
+	if (useEncoders) {
+		useEncoders(stela_encoder_api());
+	} else {
+		NSLog(@"StelaGPU: this StelaVT takes no host encoder; it encodes with x264");
+	}
 	void *(*createDictionary)(const void *, long, const void *, const void *) = dlsym(RTLD_DEFAULT,
 	    "CFDictionaryCreateMutable");
 	void (*setValue)(void *, const void *, const void *) = dlsym(RTLD_DEFAULT, "CFDictionarySetValue");
@@ -53,12 +88,27 @@ __attribute__((constructor)) static void register_stela_video_encoder(void)
 	}
 	void *info = createDictionary(NULL, 0, keyCallBacks, valueCallBacks);
 	setValue(info, *hardwareKey, *booleanTrue);
-	/* 'avc1' */
-	int32_t status = registerEncoder(0x61766331, info, factory);
-	CFRelease(info);
-	if (status == 0) {
+	/* Kept for the HEVC registration, as long as the process. */
+	stelavt.registerEncoder = registerEncoder;
+	stelavt.factory = factory;
+	stelavt.info = info;
+	stelavt.hostEncoder = useEncoders != NULL;
+	if (register_codec(CODEC_H264) == 0) {
 		NSLog(@"StelaGPU: StelaVT registered as this process's hardware H.264 encoder");
 	} else {
 		NSLog(@"StelaGPU: VideoToolbox refused to register StelaVT");
+	}
+}
+
+void stela_video_encoder_offer_hevc(void)
+{
+	/* No StelaVT, or one that takes no host encoder. */
+	if (!stelavt.factory || !stelavt.hostEncoder) {
+		return;
+	}
+	if (register_codec(CODEC_HEVC) == 0) {
+		NSLog(@"StelaGPU: StelaVT registered as this process's hardware HEVC encoder (the host's NVENC)");
+	} else {
+		NSLog(@"StelaGPU: VideoToolbox refused to register StelaVT for HEVC");
 	}
 }
