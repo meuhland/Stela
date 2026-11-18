@@ -81,7 +81,7 @@ pub(super) fn room_for(
     None
 }
 
-fn fault(error: CallerFault) -> Fault {
+pub(super) fn fault(error: CallerFault) -> Fault {
     match error {
         CallerFault::Denied { address } => {
             Fault::new(Status::Unmapped, "a span the caller cannot access").bits(address)

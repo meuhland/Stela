@@ -158,6 +158,22 @@ const OPERATIONS: &[(&str, Reach)] = &[
         Reach::Call("indirectRenderCommandAtIndex:"),
     ),
     ("ResetIndirect", Reach::Call("resetWithRange:")),
+    (
+        "EncoderCapabilities",
+        Reach::Without("the video encoder's, not Metal's: StelaVT's, tested in `encoders`"),
+    ),
+    (
+        "EncoderOpen",
+        Reach::Without("the video encoder's, not Metal's: StelaVT's, tested in `encoders`"),
+    ),
+    (
+        "EncoderEncode",
+        Reach::Without("the video encoder's, not Metal's: StelaVT's, tested in `encoders`"),
+    ),
+    (
+        "EncoderClose",
+        Reach::Without("the video encoder's, not Metal's: StelaVT's, tested in `encoders`"),
+    ),
     ("CommandBufferCode::EndEncoding", Reach::Call("endEncoding")),
     (
         "CommandBufferCode::SignalEvent",

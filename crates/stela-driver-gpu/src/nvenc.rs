@@ -899,6 +899,6 @@ fn close<N: Node>(node: &mut N, handle: u32) {
 }
 
 #[cfg(test)]
-mod mock;
+pub(crate) mod mock;
 #[cfg(test)]
 mod tests;

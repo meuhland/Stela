@@ -65,6 +65,7 @@
 //! and command pools stay the turn's.
 use super::{
     Service, StagedLibrary,
+    encoders::{self, GateEncoders},
     wire::{self, GateCall, NewLibraryRequest, Operation, Span, Status},
 };
 use crate::metal::{
@@ -171,6 +172,9 @@ pub struct SharedService<B: Backend, C: Compiler> {
     refusals: Arc<AtomicU32>,
     /// `GetBytes` calls whose GPU copies are finished outside the turn.
     read_backs: ReadBacks,
+    /// The GPU's video encoders ([`SharedService::set_encoders`]), as a
+    /// leaked box, or null: their calls never take a turn.
+    encoders: AtomicPtr<Arc<dyn GateEncoders>>,
     host: ServiceHost,
 }
 
@@ -704,6 +708,17 @@ impl<B: Backend, C: Compiler> SharedService<B, C> {
     }
 }
 
+impl<B: Backend, C: Compiler> Drop for SharedService<B, C> {
+    fn drop(&mut self) {
+        let encoders = *self.encoders.get_mut();
+        if !encoders.is_null() {
+            // SAFETY: the box `set_encoders` leaked, which nothing else
+            // frees, and which no call reaches once the service drops.
+            drop(unsafe { Box::from_raw(encoders) });
+        }
+    }
+}
+
 impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
     pub fn new(mut service: Service<B, C>, host: ServiceHost) -> Self {
         service.device().set_clock(host.ticks);
@@ -791,8 +806,35 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             look_budget: AtomicU64::new(0),
             refusals,
             read_backs,
+            encoders: AtomicPtr::new(core::ptr::null_mut()),
             host,
         }
+    }
+
+    /// Serves the GPU's video encoder calls with `encoders`, before any
+    /// turn, once for the boot: without them the device answers them
+    /// `Unsupported`.
+    pub fn set_encoders(&self, encoders: Arc<dyn GateEncoders>) {
+        let boxed = Box::into_raw(Box::new(encoders));
+        if self
+            .encoders
+            .compare_exchange(
+                core::ptr::null_mut(),
+                boxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: never published.
+            drop(unsafe { Box::from_raw(boxed) });
+        }
+    }
+
+    /// The GPU's video encoders, when it has them.
+    pub fn encoders(&self) -> Option<&Arc<dyn GateEncoders>> {
+        // SAFETY: published once and never freed while the service lives.
+        unsafe { self.encoders.load(Ordering::Acquire).as_ref() }
     }
 
     /// Defers the compilations no cache holds to jobs, which the platform
@@ -1723,6 +1765,10 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
     }
 
     fn disconnect(&self, connection: NonZeroU64) {
+        // Its encoder sessions close first: they hold no turn.
+        if let Some(encoders) = self.encoders() {
+            encoders.disconnect(connection);
+        }
         self.jobs.with(|jobs| {
             jobs.parked
                 .retain(|parked| parked.connection != connection.get());
@@ -1772,6 +1818,29 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
                 gave_up: false,
             });
         };
+        // A video encoder's call is the encoders', which hold no turn.
+        if let Some(encoders) = self.encoders()
+            && let Some(call) = read_call(record, caller)
+            && encoders::is_encoder_operation(call.operation)
+        {
+            let status = encoders::serve_gate(&**encoders, connection, record, call, caller)?;
+            if !matches!(
+                status,
+                Status::Ok
+                    | Status::Pending
+                    | Status::Unmapped
+                    | Status::Unsupported
+                    | Status::Lost
+                    | Status::Dropped
+            ) {
+                (self.host.report)(&alloc::format!(
+                    "video encoder operation {:#x} answered {status:?}",
+                    call.operation
+                ));
+            }
+            served_at_once(call.operation, status);
+            return Ok(());
+        }
         if self.still_pending(connection, record, caller) {
             let operation = read_call(record, caller).map_or(0, |call| call.operation);
             served_at_once(operation, Status::Pending);
