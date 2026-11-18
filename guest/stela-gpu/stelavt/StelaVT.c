@@ -15,8 +15,15 @@
  *
  * NVENC's output is Annex B, which becomes length-prefixed samples (AVCC,
  * HVCC) under a format description made of the session's parameter sets.
- * The host's parameter sets signal video range, so a session NVENC serves
- * asks for '420v' only.
+ *
+ * Pixel formats: a session NVENC serves asks for 'BGRA' first, then '420v':
+ * the host converts BGRA to NV12 on its own CPU while it stores the picture
+ * for the engine, so a client capturing BGRA (Parsec) hands its buffers
+ * through, and VideoToolbox does no conversion of its own in the guest
+ * (VTPixelTransferSession, through Metal). The host's parameter sets signal
+ * video range, so it asks for no '420f'. x264 takes NV12 only: a BGRA frame
+ * that reaches it (NVENC lost mid-stream) is converted here first, as the
+ * host converts it.
  *
  * VideoToolbox's plugin interface is private. Its layout here follows
  * Apple's own encoder plugins (JPEGVideoEncoder.bundle, macOS 27.2):
@@ -35,6 +42,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <x264.h>
 
 #include "StelaEncoder.h"
@@ -147,8 +155,9 @@ static const StelaEncoderAPI *host(void)
 	return api;
 }
 
-/* Whether the host's encoder codes `codec` now; why not in `reason`. */
-static bool hostCodes(uint32_t codec, char *reason, size_t bytes)
+/* Whether the host's encoder codes `codec` now, and whether it takes BGRA
+ * (`bgra`, optional); why not in `reason`. */
+static bool hostCodesInput(uint32_t codec, bool *bgra, char *reason, size_t bytes)
 {
 	const StelaEncoderAPI *api = host();
 	if (!api) {
@@ -164,7 +173,15 @@ static bool hostCodes(uint32_t codec, char *reason, size_t bytes)
 		snprintf(reason, bytes, "the host's encoder does not code this codec");
 		return false;
 	}
+	if (bgra) {
+		*bgra = (capabilities.inputs & (1u << StelaEncoderBGRA)) != 0;
+	}
 	return true;
+}
+
+static bool hostCodes(uint32_t codec, char *reason, size_t bytes)
+{
+	return hostCodesInput(codec, NULL, reason, bytes);
 }
 
 /* ---- The encoder ---------------------------------------------------------- */
@@ -214,6 +231,12 @@ typedef struct {
 	int64_t nextPts;
 	uint64_t frames, bytes, idrs;
 	uint64_t gpuMicros, convertMicros;
+	/* Frames that came as BGRA, and each encode's time in this process. */
+	uint64_t bgraFrames;
+	uint64_t encodeMicros, encodeMost;
+	/* x264's NV12 of a BGRA frame. */
+	uint8_t *scratch;
+	size_t scratchBytes;
 } Encoder;
 
 static const char *codecName(CMVideoCodecType codec)
@@ -252,10 +275,12 @@ static void finalize(CMBaseObjectRef object)
 	if (e->format) {
 		CFRelease(e->format);
 	}
+	free(e->scratch);
 	uint64_t frames = e->frames ? e->frames : 1;
-	os_log(logger(), "StelaVT: %{public}s session closed after %llu frames, %llu bytes, %llu IDRs, on %{public}s"
-	    " (NVENC gpu %llu us, host convert %llu us a frame)", codecName(e->codec), e->frames, e->bytes, e->idrs,
-	    backendName(e->backend), e->gpuMicros / frames, e->convertMicros / frames);
+	os_log(logger(), "StelaVT: %{public}s session closed after %llu frames (%llu BGRA), %llu bytes, %llu IDRs, on"
+	    " %{public}s (NVENC gpu %llu us, host convert %llu us, encode call %llu us, longest %llu us, a frame)",
+	    codecName(e->codec), e->frames, e->bgraFrames, e->bytes, e->idrs, backendName(e->backend),
+	    e->gpuMicros / frames, e->convertMicros / frames, e->encodeMicros / frames, e->encodeMost);
 	pthread_mutex_destroy(&e->lock);
 }
 
@@ -399,13 +424,16 @@ static OSStatus startSession(VTVideoEncoderRef encoder, VTEncoderSessionRef sess
 	e->width = size.width;
 	e->height = size.height;
 	pthread_mutex_unlock(&e->lock);
-	/* NV12, which both encoders read without conversion: video range only
-	 * when NVENC may serve, whose parameter sets signal video range. */
+	/* NVENC: BGRA first, which the host converts, then NV12 in video range,
+	 * which its parameter sets signal. x264: NV12 in either range. */
 	char reason[160];
 	uint32_t codec = e->codec == kCMVideoCodecType_HEVC ? StelaEncoderHEVC : StelaEncoderH264;
-	bool nvenc = hostCodes(codec, reason, sizeof reason);
-	int formats[] = {kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
-	CFIndex count = nvenc ? 1 : 2;
+	bool bgra = false;
+	bool nvenc = hostCodesInput(codec, &bgra, reason, sizeof reason);
+	int withBGRA[] = {kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange};
+	int withNV12[] = {kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
+	const int *formats = nvenc && bgra ? withBGRA : withNV12;
+	CFIndex count = nvenc && !bgra ? 1 : 2;
 	CFNumberRef numbers[2];
 	for (CFIndex i = 0; i < count; i++) {
 		numbers[i] = CFNumberCreate(NULL, kCFNumberIntType, &formats[i]);
@@ -425,7 +453,8 @@ static OSStatus startSession(VTVideoEncoderRef encoder, VTEncoderSessionRef sess
 		CFRelease(numbers[i]);
 	}
 	os_log(logger(), "StelaVT: %{public}s session %dx%d, %{public}s, pixel buffer attributes %d",
-	    codecName(e->codec), size.width, size.height, nvenc ? "420v for NVENC" : "420v and 420f", (int)status);
+	    codecName(e->codec), size.width, size.height,
+	    nvenc ? (bgra ? "BGRA for NVENC, then 420v" : "420v for NVENC") : "420v and 420f", (int)status);
 	return status;
 }
 
@@ -617,15 +646,16 @@ static OSStatus openNVENC(Encoder *e, int width, int height, char *reason, size_
 }
 
 /* Picks the session's encoder at its first frame and says which, once. */
-static OSStatus openBackend(Encoder *e, int width, int height, bool fullRange)
+static OSStatus openBackend(Encoder *e, int width, int height, bool fullRange, bool bgra)
 {
 	char reason[160] = "";
 	bool hevc = e->codec == kCMVideoCodecType_HEVC;
 	if (!fullRange || hevc) {
 		if (openNVENC(e, width, height, reason, sizeof reason) == noErr) {
 			e->backend = BackendNVENC;
-			os_log(logger(), "StelaVT: %{public}s session %dx%d %.0f fps %d kb/s encodes on NVENC (the host's)%{public}s",
+			os_log(logger(), "StelaVT: %{public}s session %dx%d %.0f fps %d kb/s encodes on NVENC (the host's) from %{public}s%{public}s",
 			    codecName(e->codec), width, height, e->frameRate > 0 ? e->frameRate : 60, e->bitrate / 1000,
+			    bgra ? "BGRA, which the host converts" : "420v",
 			    fullRange ? ", full-range input coded as video range" : "");
 			return noErr;
 		}
@@ -757,6 +787,61 @@ static OSStatus emitNVENC(Encoder *e, VTEncoderFrameToken token, const uint8_t *
 
 /* ---- Encoding ---------------------------------------------------------- */
 
+/* BT.709 limited range, 8-bit fixed point: the host's own conversion
+ * (crates/stela-driver-gpu/src/nvenc/surface.rs), so x264 and NVENC code the
+ * same picture. */
+static inline uint8_t lumaOf(int r, int g, int b)
+{
+	return (uint8_t)(16 + ((47 * r + 157 * g + 16 * b + 128) >> 8));
+}
+
+static inline uint8_t clampChroma(int v)
+{
+	return (uint8_t)(v < 16 ? 16 : v > 240 ? 240 : v);
+}
+
+/* BGRA `image` (locked) as NV12 in `e->scratch`: luma `width` bytes a row,
+ * then interleaved CbCr, each the mean of a 2x2 block. */
+static bool bgraToNV12(Encoder *e, CVImageBufferRef image, int width, int height)
+{
+	size_t need = (size_t)width * (size_t)height * 3 / 2;
+	if (e->scratchBytes < need) {
+		uint8_t *grown = realloc(e->scratch, need);
+		if (!grown) {
+			return false;
+		}
+		e->scratch = grown;
+		e->scratchBytes = need;
+	}
+	const uint8_t *pixels = CVPixelBufferGetBaseAddress(image);
+	size_t pitch = CVPixelBufferGetBytesPerRow(image);
+	uint8_t *luma = e->scratch, *chroma = e->scratch + (size_t)width * (size_t)height;
+	for (int y = 0; y + 1 < height; y += 2) {
+		const uint8_t *above = pixels + (size_t)y * pitch, *below = above + pitch;
+		uint8_t *top = luma + (size_t)y * (size_t)width, *bottom = top + width;
+		uint8_t *uv = chroma + (size_t)(y / 2) * (size_t)width;
+		for (int x = 0; x + 1 < width; x += 2) {
+			const uint8_t *p[4] = {above + 4 * x, above + 4 * x + 4, below + 4 * x, below + 4 * x + 4};
+			int r = 0, g = 0, b = 0;
+			for (int i = 0; i < 4; i++) {
+				b += p[i][0];
+				g += p[i][1];
+				r += p[i][2];
+			}
+			top[x] = lumaOf(p[0][2], p[0][1], p[0][0]);
+			top[x + 1] = lumaOf(p[1][2], p[1][1], p[1][0]);
+			bottom[x] = lumaOf(p[2][2], p[2][1], p[2][0]);
+			bottom[x + 1] = lumaOf(p[3][2], p[3][1], p[3][0]);
+			r = (r + 2) / 4;
+			g = (g + 2) / 4;
+			b = (b + 2) / 4;
+			uv[x] = clampChroma(128 + ((-26 * r - 87 * g + 113 * b + 128) >> 8));
+			uv[x + 1] = clampChroma(128 + ((112 * r - 102 * g - 10 * b + 128) >> 8));
+		}
+	}
+	return true;
+}
+
 static OSStatus encodeX264(Encoder *e, VTEncoderFrameToken token, CVImageBufferRef image, CMTime time,
     CMTime duration, bool forceKey)
 {
@@ -775,9 +860,21 @@ static OSStatus encodeX264(Encoder *e, VTEncoderFrameToken token, CVImageBufferR
 	x264_picture_init(&in);
 	in.img.i_csp = X264_CSP_NV12;
 	in.img.i_plane = 2;
-	for (int plane = 0; plane < 2; plane++) {
-		in.img.plane[plane] = CVPixelBufferGetBaseAddressOfPlane(image, (size_t)plane);
-		in.img.i_stride[plane] = (int)CVPixelBufferGetBytesPerRowOfPlane(image, (size_t)plane);
+	if (CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA) {
+		/* x264 takes no BGRA for 4:2:0: converted here, as the host would. */
+		int width = (int)CVPixelBufferGetWidth(image), height = (int)CVPixelBufferGetHeight(image);
+		if (!bgraToNV12(e, image, width, height)) {
+			CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+			return kVTVideoEncoderMalfunctionErr;
+		}
+		in.img.plane[0] = e->scratch;
+		in.img.plane[1] = e->scratch + (size_t)width * (size_t)height;
+		in.img.i_stride[0] = in.img.i_stride[1] = width;
+	} else {
+		for (int plane = 0; plane < 2; plane++) {
+			in.img.plane[plane] = CVPixelBufferGetBaseAddressOfPlane(image, (size_t)plane);
+			in.img.i_stride[plane] = (int)CVPixelBufferGetBytesPerRowOfPlane(image, (size_t)plane);
+		}
 	}
 	in.i_pts = e->nextPts++;
 	if (forceKey) {
@@ -831,23 +928,35 @@ static OSStatus encodeNVENC(Encoder *e, VTEncoderFrameToken token, CVImageBuffer
 	}
 	bool key = forceKey || (keyFrames > 0 && e->sinceKey >= keyFrames);
 	CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-	size_t lumaPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
-	size_t chromaPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+	bool bgra = CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA;
 	StelaEncoderFrame frame = {
 		.frame = ++e->frame,
-		.luma = CVPixelBufferGetBaseAddressOfPlane(image, 0),
-		.luma_bytes = lumaPitch * CVPixelBufferGetHeightOfPlane(image, 0),
-		.chroma = CVPixelBufferGetBaseAddressOfPlane(image, 1),
-		.chroma_bytes = chromaPitch * CVPixelBufferGetHeightOfPlane(image, 1),
-		.luma_pitch = (uint32_t)lumaPitch,
-		.chroma_pitch = (uint32_t)chromaPitch,
-		.input = StelaEncoderNV12,
 		.force_idr = key,
 		.bitrate = e->newBitrate > 0 ? (uint32_t)e->newBitrate : 0,
 		.out = e->out,
 		.out_bytes = e->outBytes,
 	};
+	if (bgra) {
+		/* One plane, which the host converts while it stores it. */
+		size_t pitch = CVPixelBufferGetBytesPerRow(image);
+		frame.luma = CVPixelBufferGetBaseAddress(image);
+		frame.luma_bytes = pitch * CVPixelBufferGetHeight(image);
+		frame.luma_pitch = (uint32_t)pitch;
+		frame.input = StelaEncoderBGRA;
+		e->bgraFrames++;
+	} else {
+		size_t lumaPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
+		size_t chromaPitch = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+		frame.luma = CVPixelBufferGetBaseAddressOfPlane(image, 0);
+		frame.luma_bytes = lumaPitch * CVPixelBufferGetHeightOfPlane(image, 0);
+		frame.chroma = CVPixelBufferGetBaseAddressOfPlane(image, 1);
+		frame.chroma_bytes = chromaPitch * CVPixelBufferGetHeightOfPlane(image, 1);
+		frame.luma_pitch = (uint32_t)lumaPitch;
+		frame.chroma_pitch = (uint32_t)chromaPitch;
+		frame.input = StelaEncoderNV12;
+	}
 	StelaEncoderResult result = {0};
+	uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	StelaEncoderStatus status = host()->encode(e->nvenc, &frame, &result, reason, bytes);
 	if (status == StelaEncoderOk && result.bytes > e->outBytes) {
 		/* Longer than the host said a frame takes: the same frame again. */
@@ -861,6 +970,9 @@ static OSStatus encodeNVENC(Encoder *e, VTEncoderFrameToken token, CVImageBuffer
 		}
 	}
 	CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
+	uint64_t micros = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - began) / 1000;
+	e->encodeMicros += micros;
+	e->encodeMost = micros > e->encodeMost ? micros : e->encodeMost;
 	if (status == StelaEncoderOk && result.bytes <= e->outBytes) {
 		e->newBitrate = 0;
 		e->drops = 0;
@@ -887,16 +999,17 @@ static OSStatus encodeFrame(VTVideoEncoderRef encoder, VTEncoderFrameToken token
 	Encoder *e = storage(encoder);
 	OSType format = CVPixelBufferGetPixelFormatType(image);
 	if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-	    && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+	    && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && format != kCVPixelFormatType_32BGRA) {
 		return kVTPixelTransferNotSupportedErr;
 	}
+	/* BGRA becomes video-range NV12, on the host or here for x264. */
 	bool fullRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
 	int width = (int)CVPixelBufferGetWidth(image), height = (int)CVPixelBufferGetHeight(image);
 	bool forceKey = options && truth(CFDictionaryGetValue(options, kVTEncodeFrameOptionKey_ForceKeyFrame));
 	pthread_mutex_lock(&e->lock);
 	OSStatus status = noErr;
 	if (e->backend == BackendNone) {
-		status = openBackend(e, width, height, fullRange);
+		status = openBackend(e, width, height, fullRange, format == kCVPixelFormatType_32BGRA);
 	}
 	if (status == noErr && e->backend == BackendNVENC) {
 		char reason[160] = "";
