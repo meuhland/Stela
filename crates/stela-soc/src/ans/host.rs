@@ -43,8 +43,9 @@
 //! up elsewhere.
 //! Discards never reorder past
 //! writes. A write takes its blocks back from those waiting and waits out a
-//! batch it overlaps, and a flush waits for all of them where the guest was
-//! told deallocated blocks stay zeros, as a controller's cache holds them.
+//! batch it overlaps; a waiting run a running write overlaps waits out the
+//! write; and a flush waits for all of them where the guest was told
+//! deallocated blocks stay zeros, as a controller's cache holds them.
 use alloc::{boxed::Box, collections::BTreeMap, format, string::String, vec::Vec};
 use stela_drivers::block::{
     BlockDevice, BlockError, Extent, Finished, Identity, Request, Submission,
@@ -232,15 +233,31 @@ impl Discards {
 
     /// The waiting runs for one command, first blocks first: at most
     /// `ranges` of them, each at most `range` blocks (0: no limit), and
-    /// `budget` blocks in all. A run cut short keeps its rest waiting. The
-    /// disk hears of them from now on.
-    fn batch(&mut self, ranges: usize, range: u64, budget: u64) -> Vec<Extent> {
+    /// `budget` blocks in all. A run cut short keeps its rest waiting, and
+    /// one that overlaps a block range of `writing`, the running writes',
+    /// waits whole, so that the write lands first. The disk hears of them
+    /// from now on.
+    fn batch(
+        &mut self,
+        ranges: usize,
+        range: u64,
+        budget: u64,
+        writing: &[(u64, u64)],
+    ) -> Vec<Extent> {
         let mut extents = Vec::new();
+        let mut later = Vec::new();
         let mut left = budget.max(1);
         while extents.len() < ranges.max(1)
             && left != 0
             && let Some((lba, end)) = self.waiting.pop_first()
         {
+            if writing
+                .iter()
+                .any(|&(first, last)| first < end && lba < last)
+            {
+                later.push((lba, end));
+                continue;
+            }
             let mut blocks = (end - lba).min(left);
             if range != 0 {
                 blocks = blocks.min(range);
@@ -255,6 +272,7 @@ impl Discards {
             insert_run(&mut self.heard, lba, lba + blocks);
             extents.push(Extent { lba, blocks });
         }
+        self.waiting.extend(later);
         extents
     }
 
@@ -315,6 +333,8 @@ pub(super) struct HostDisk {
     /// The running transfers: each one's key, when it was submitted in
     /// counter ticks, and its commands.
     running: Vec<(u32, u64, Submission)>,
+    /// The running writes' keys and block ranges, which no discard passes.
+    writing: Vec<(u32, u64, u64)>,
     /// What a transfer took, a moving average in counter ticks.
     latency: u64,
     discards: Discards,
@@ -325,6 +345,7 @@ impl HostDisk {
         Self {
             device,
             running: Vec::new(),
+            writing: Vec::new(),
             latency: FIRST_LATENCY,
             discards: Discards::default(),
         }
@@ -392,16 +413,26 @@ impl HostDisk {
         self.discards.outstanding()
     }
 
+    /// The blocks `request` writes, if it writes.
+    fn written_blocks(&self, request: &Request) -> Option<(u64, u64)> {
+        match request {
+            Request::Write { lba, data, .. } => {
+                let block = u64::from(self.identity().block_size);
+                Some((*lba, *lba + data.len() as u64 / block))
+            }
+            Request::WriteZeroes { lba, blocks, .. } => Some((*lba, *lba + *blocks)),
+            _ => None,
+        }
+    }
+
     /// Whether `request` must wait for discards. A write takes its blocks
     /// back whatever the answer.
     fn held(&mut self, request: &Request) -> bool {
         match request {
-            Request::Write { lba, data, .. } => {
-                let block = u64::from(self.identity().block_size);
-                self.discards
-                    .written(*lba, *lba + data.len() as u64 / block)
+            Request::Write { .. } | Request::WriteZeroes { .. } => {
+                let (start, end) = self.written_blocks(request).expect("a write");
+                self.discards.written(start, end)
             }
-            Request::WriteZeroes { lba, blocks, .. } => self.discards.written(*lba, *lba + *blocks),
             Request::Flush => {
                 self.discards.outstanding() && self.deallocates_zeroed() && !self.discards.lapsed
             }
@@ -419,6 +450,7 @@ impl HostDisk {
             return None;
         }
         self.discards.active = Some(now);
+        let written = self.written_blocks(&request);
         let mut submission = match Submission::new(request, self.device.identity()) {
             Ok(submission) => submission,
             Err(error) => return Some(Err(error)),
@@ -427,6 +459,9 @@ impl HostDisk {
             return Some(done);
         }
         self.running.push((key, now, submission));
+        if let Some((start, end)) = written {
+            self.writing.push((key, start, end));
+        }
         None
     }
 
@@ -441,6 +476,7 @@ impl HostDisk {
                 continue;
             };
             let (key, started, _) = self.running.swap_remove(index);
+            self.writing.retain(|&(writer, _, _)| writer != key);
             let took = now.saturating_sub(started);
             self.latency = (self.latency * 7 + took) / 8;
             self.discards.active = Some(now);
@@ -545,14 +581,19 @@ impl HostDisk {
             false => self.discards.piece,
         };
         let budget = (piece / u64::from(self.identity().block_size)).max(1);
+        let writing: Vec<(u64, u64)> = self
+            .writing
+            .iter()
+            .map(|&(_, start, end)| (start, end))
+            .collect();
         let mut started = 0;
         while started < most
             && self.discards.running.len() < self.discards.batches()
             && self.discards.failed.is_none()
         {
-            let extents = self
-                .discards
-                .batch(limits.ranges.max(1), limits.blocks, budget);
+            let extents =
+                self.discards
+                    .batch(limits.ranges.max(1), limits.blocks, budget, &writing);
             if extents.is_empty() {
                 break;
             }

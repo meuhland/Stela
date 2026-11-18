@@ -49,9 +49,21 @@ fn batches_take_the_first_runs_a_batch_at_a_time() {
         discards.add(start, start + 2);
     }
     let lbas = |extents: Vec<Extent>| extents.iter().map(|e| e.lba).collect::<Vec<_>>();
-    assert_eq!(lbas(discards.batch(2, 0, u64::MAX)), [0, 10]);
-    assert_eq!(lbas(discards.batch(2, 0, u64::MAX)), [20]);
-    assert!(discards.batch(2, 0, u64::MAX).is_empty());
+    assert_eq!(lbas(discards.batch(2, 0, u64::MAX, &[])), [0, 10]);
+    assert_eq!(lbas(discards.batch(2, 0, u64::MAX, &[])), [20]);
+    assert!(discards.batch(2, 0, u64::MAX, &[]).is_empty());
+}
+
+#[test]
+fn a_run_a_running_write_overlaps_waits_for_it() {
+    let mut discards = Discards::default();
+    for start in [0, 10, 20] {
+        discards.add(start, start + 2);
+    }
+    let lbas = |extents: Vec<Extent>| extents.iter().map(|e| e.lba).collect::<Vec<_>>();
+    assert_eq!(lbas(discards.batch(8, 0, u64::MAX, &[(11, 12)])), [0, 20]);
+    assert_eq!(runs(&discards), [(10, 12)]);
+    assert_eq!(lbas(discards.batch(8, 0, u64::MAX, &[])), [10]);
 }
 
 /// What the test sees of a queued disk: the commands started, whose tags
@@ -239,6 +251,30 @@ fn discards_wait_for_a_pause_in_guest_transfers() {
         log.started().last(),
         Some(Command::Discard { .. })
     ));
+}
+
+/// A write still on the disk, then a deallocation of its block and a flush:
+/// the discard goes only once the write completed, so the block ends
+/// deallocated, where the discard could pass the write and leave its bytes.
+#[test]
+fn an_urgent_discard_waits_for_a_running_write_to_its_blocks() {
+    let (mut disk, log) = queued(256, true);
+    assert!(disk.submit(1, write(2), 0).is_none());
+    disk.discard(0, 8);
+    assert!(disk.submit(2, Request::Flush, 10).is_none());
+    assert!(disk.poll(10).is_empty());
+    assert_eq!(log.started().len(), 1, "no discard beside the write");
+    release(&log, 0);
+    assert_eq!(disk.poll(20).len(), 1);
+    assert_eq!(
+        log.started().last(),
+        Some(&Command::Discard {
+            extents: vec![Extent { lba: 0, blocks: 8 }],
+        })
+    );
+    release(&log, 1);
+    assert!(disk.poll(30).is_empty());
+    assert_eq!(log.started().last(), Some(&Command::Flush));
 }
 
 #[test]
@@ -500,7 +536,7 @@ fn a_batch_cuts_runs_at_the_range_limit_and_the_budget() {
     let mut discards = Discards::default();
     discards.add(0, 100);
     discards.add(200, 210);
-    let batch = discards.batch(4, 30, 70);
+    let batch = discards.batch(4, 30, 70, &[]);
     assert_eq!(
         batch,
         [
@@ -525,7 +561,7 @@ fn a_batch_cuts_runs_at_the_range_limit_and_the_budget() {
 fn blocks_the_disk_heard_of_are_not_sent_again_until_written() {
     let mut discards = Discards::default();
     discards.add(0, 100);
-    assert_eq!(discards.batch(1, 0, u64::MAX).len(), 1);
+    assert_eq!(discards.batch(1, 0, u64::MAX, &[]).len(), 1);
     discards.add(0, 120);
     assert_eq!(runs(&discards), [(100, 120)]);
     assert!(!discards.written(40, 50));
