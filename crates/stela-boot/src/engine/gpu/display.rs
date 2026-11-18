@@ -101,6 +101,8 @@ struct KmsScanout {
     /// The counter at the display's last vertical blank as the last look
     /// read it, when it could ([`Display::last_vblank_ns`]).
     vblank_tsc: Option<u64>,
+    /// The display's flips as last seen ([`note_flips`]).
+    flips_seen: u64,
 }
 
 impl Scanout for KmsScanout {
@@ -131,6 +133,7 @@ impl Scanout for KmsScanout {
         console::release();
         let presented = display.present(rows);
         self.blank &= presented.is_err();
+        note_flips(&mut self.flips_seen, display);
         finish_present(display, presented)
     }
 
@@ -150,6 +153,7 @@ impl Scanout for KmsScanout {
         console::release();
         let presented = prepared.present();
         self.blank &= presented.is_err();
+        note_flips(&mut self.flips_seen, display);
         finish_present(display, presented)?;
         Ok(true)
     }
@@ -199,6 +203,7 @@ impl Scanout for KmsScanout {
     fn flush(&mut self) -> Result<()> {
         if let Some((_, display)) = &mut self.display {
             let flushed = display.flush();
+            note_flips(&mut self.flips_seen, display);
             finish_present(display, flushed)?;
         }
         self.look();
@@ -248,6 +253,7 @@ impl KmsScanout {
             tsc_hz,
             reported: false,
             vblank_tsc: None,
+            flips_seen: 0,
         }
     }
 
@@ -315,6 +321,7 @@ impl KmsScanout {
                         false => crate::status::take_screen(Some(screen)),
                     }
                     self.blank = self.presented;
+                    self.flips_seen = display.flips();
                     let (name, _) = self.waiting.swap_remove(index);
                     for (_, fd) in self.waiting.drain(..) {
                         client::close_descriptor(fd);
@@ -461,6 +468,17 @@ fn report_outputs(name: &str, display: &Display<Node>) {
         output::arguments(format_args!(
             "GPU {name}: scaling an output was refused: {error:?}; it stays dark\n"
         ));
+    }
+}
+
+/// A flip `display`'s driver took since `seen` puts a new frame on screen:
+/// what a host input followed to the screen waits for
+/// (`stela_soc::input_latency`).
+fn note_flips(seen: &mut u64, display: &Display<Node>) {
+    let flips = display.flips();
+    if flips != *seen {
+        *seen = flips;
+        stela_soc::input_latency::shown();
     }
 }
 

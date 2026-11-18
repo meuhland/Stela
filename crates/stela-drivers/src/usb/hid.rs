@@ -325,6 +325,9 @@ pub struct UsbInput {
     reports: u64,
     transfer_errors: u64,
     retry_windows: u64,
+    /// The device's xHCI speed ID (1 full, 2 low, 3 high, 4 and up
+    /// SuperSpeed), which says what unit its endpoint's bInterval counts.
+    speed: u8,
     pub name: String,
 }
 
@@ -516,6 +519,7 @@ impl UsbInput {
             reports: 0,
             transfer_errors: 0,
             retry_windows: 0,
+            speed: device.speed,
             name: format!(
                 "{} ({} interface {})",
                 device.name(),
@@ -523,6 +527,18 @@ impl UsbInput {
                 interface.number
             ),
         }))
+    }
+
+    /// The service interval the interrupt IN endpoint's descriptor asks
+    /// for, in microseconds (USB 2.0 9.6.6): bInterval frames of 1 ms at
+    /// full and low speed, 2^(bInterval-1) microframes of 125 us faster.
+    /// The host controller polls the device no more often than that.
+    pub fn interval_us(&self) -> u32 {
+        let interval = u32::from(self.endpoint.interval.max(1));
+        match self.speed {
+            1 | 2 => interval * 1000,
+            _ => 125 << (interval.min(16) - 1),
+        }
     }
 
     /// Legacy keyboard/pointer service. Use `poll_hid` for the complete report

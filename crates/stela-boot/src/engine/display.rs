@@ -171,6 +171,8 @@ pub fn flush(turn: Turn) -> u64 {
                     let spent = core::mem::take(&mut staged.spent);
                     present_took(spent);
                     staged.frame.spent(spent, finished);
+                    // A host input followed to the screen waits for this.
+                    stela_soc::input_latency::shown();
                     None
                 }
                 Err(reason) => {

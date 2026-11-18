@@ -1415,6 +1415,8 @@ impl Methods {
         }
         let due = self.latched.expect("a ready frame has an open latch");
         let count = self.ready_swaps(now);
+        // A host input the guest handled before this latch can show in it.
+        crate::input_latency::latched();
         let newest = &self.frames[count - 1];
         let planes = newest.planes;
         let layers = newest.layers();

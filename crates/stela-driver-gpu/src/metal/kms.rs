@@ -436,6 +436,8 @@ pub struct Display<D> {
     stale: [Range<usize>; 3],
     /// The hidden buffer holds a frame whose flip is not requested yet.
     queued: bool,
+    /// Flips of a new frame the first output's driver took ([`Self::flips`]).
+    flips: u64,
     /// The row a producer fills before it is copied to video memory.
     row: Vec<u8>,
     /// The outputs showing the picture; the first paces the flips and
@@ -1667,6 +1669,7 @@ impl<D: Drm> Display<D> {
             // Each buffer holds black, and the front the console's text.
             stale: [0..height as usize, 0..height as usize, 0..height as usize],
             queued: false,
+            flips: 0,
             row: Vec::new(),
             heads,
             crtcs,
@@ -2263,6 +2266,13 @@ impl<D: Drm> Display<D> {
         Ok(PreparedFrame(self))
     }
 
+    /// The flips of a new frame the first output's driver took since the
+    /// display was taken: each one puts the frame the hidden buffer held on
+    /// screen at the next vertical blank.
+    pub fn flips(&self) -> u64 {
+        self.flips
+    }
+
     /// Whether a frame waits in the hidden buffer for its flip to be
     /// requested, or an output that follows the first waits for its flip
     /// to the newest buffer ([`Self::flush`]).
@@ -2346,6 +2356,7 @@ impl<D: Drm> Display<D> {
             match self.flip(pacer, self.buffers[2].framebuffer) {
                 0 => {
                     self.queued = false;
+                    self.flips = self.flips.wrapping_add(1);
                     self.buffers.rotate_right(1);
                     self.stale.rotate_right(1);
                     for (index, head) in self.heads.iter_mut().enumerate() {

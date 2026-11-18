@@ -1019,6 +1019,9 @@ impl Xhci {
             interrupter,
             trb,
             interrupt,
+            // The transfer event right after the peripheral handed over a
+            // followed input's report is that report's.
+            followed: crate::input_latency::tag_event(),
         });
         Ok(())
     }
