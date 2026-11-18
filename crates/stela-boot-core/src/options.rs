@@ -47,6 +47,9 @@ pub const NVENC_SELFTEST: &str = "--nvenc-selftest";
 /// Serves no video encoder sessions to the guest: StelaVT encodes H.264
 /// with x264, as before NVENC ([`System::nvenc`]).
 pub const NO_NVENC: &str = "--no-nvenc";
+/// Has GSP-RM hold each NVIDIA GPU at its highest performance level for the
+/// boot ([`System::gpu_boost`]).
+pub const GPU_BOOST: &str = "--gpu-boost";
 /// Take a GPU's display in its monitor's fastest mode of the size
 /// ([`System::display_fastest`]).
 pub const DISPLAY_FASTEST: &str = "--display-fastest";
@@ -426,6 +429,13 @@ pub struct System {
     /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
     /// HEVC.
     pub nvenc: bool,
+    /// From the start of its GSP-RM, before the NVENC probe and self-test,
+    /// nouveau asks RM every 30 s to hold each NVIDIA GPU at its highest
+    /// performance level (`NV2080_CTRL_CMD_PERF_BOOST`), where by default
+    /// RM's own policy picks the P-state from the load it sees and leaves an
+    /// encoding GPU low (`--gpu-boost`). An experiment for NVENC's engine
+    /// time: `GPU PERF … boost=…` says RM's answer.
+    pub gpu_boost: bool,
     /// A GPU's display is taken in its monitor's fastest progressive mode of
     /// the size that macOS can be told of (`--display-fastest`), where by
     /// default it runs the monitor's preferred mode, which every input of
@@ -511,6 +521,7 @@ impl Default for System {
             probe_nvenc: false,
             nvenc_selftest: false,
             nvenc: true,
+            gpu_boost: false,
             display_fastest: false,
             watches: Vec::new(),
             dumps: Vec::new(),
@@ -967,6 +978,7 @@ impl fmt::Display for System {
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
         line.flag(NO_NVENC, !self.nvenc)?;
+        line.flag(GPU_BOOST, self.gpu_boost)?;
         line.flag(DISPLAY_FASTEST, self.display_fastest)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;

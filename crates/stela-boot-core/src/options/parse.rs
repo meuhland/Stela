@@ -49,6 +49,7 @@ impl ParseState<'_> {
             PROBE_NVENC => options.probe_nvenc = true,
             NVENC_SELFTEST => options.nvenc_selftest = true,
             NO_NVENC => options.nvenc = false,
+            GPU_BOOST => options.gpu_boost = true,
             DISPLAY_FASTEST => options.display_fastest = true,
             "--native-shared-check" => flag(
                 &mut options.native_shared_check,

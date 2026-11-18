@@ -3194,6 +3194,10 @@ fn start_devices(
                 // their lines come right after the start's.
                 #[cfg(feature = "nvk")]
                 {
+                    // Before the self-test, so it runs boosted too.
+                    if options.gpu_boost {
+                        gpu::boost();
+                    }
                     if options.probe_nvenc {
                         gpu::nvenc::probe();
                     }
