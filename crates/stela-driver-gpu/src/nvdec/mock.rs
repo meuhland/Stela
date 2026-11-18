@@ -1,0 +1,374 @@
+//! A GA106 render node of the patched nouveau with a decoder, for the
+//! session's and the self-test's tests: buffers in host memory, `VM_BIND`
+//! recorded, and an engine that reads each submission's methods the way
+//! NVC7B0 would, checks them against the setup page, and writes a known
+//! picture into the current surface, a status, and the release.
+use super::fields::{h264 as f4, hevc as f5};
+use super::method as m;
+use super::setup::{H264_STATUS, HEVC_STATUS, PAGE_BYTES};
+use super::surface::Tiling;
+use super::{APPLICATION_H264, APPLICATION_HEVC, DECODER_CLASS, FIFO_ENGINE_NVDEC};
+use crate::nvenc::{
+    CHANNEL_ALLOC, CHANNEL_FREE, ChannelAlloc, DOMAIN_VRAM, EXEC, Exec, ExecPush, GEM_CLOSE,
+    GEM_NEW, GROBJ_ALLOC, GemClose, GemNew, GrobjAlloc, Node, SUBCHANNEL, SYNCOBJ_CREATE,
+    SYNCOBJ_DESTROY, SYNCOBJ_WAIT, Sync, SyncobjCreate, SyncobjWait, VM_BIND, VM_BIND_OP_MAP,
+    VM_INIT, VmBind, VmBindOp, VmInit,
+};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::ptr::NonNull;
+
+/// What the engine does with a submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// Decodes: [`picture`] of the picture index into the current surface
+    /// in `Tiling`, a clean status, and the release.
+    Decode(Tiling),
+    /// Decodes the first `n` pictures, then never gets past the push.
+    HangsAfter(u32),
+    /// Takes the methods and signals the fence, but writes nothing.
+    Silent,
+}
+
+/// The picture the mock "decodes" for picture index `index`: pitch-linear
+/// planes of `pitch` x `rows`, luma then chroma.
+pub fn picture(index: u32, pitch: u32, rows: u32) -> (Vec<u8>, Vec<u8>) {
+    let (pitch, rows) = (pitch as usize, rows as usize);
+    let mut luma = vec![0u8; pitch * rows];
+    let mut chroma = vec![0u8; pitch * rows / 2];
+    for y in 0..rows {
+        for x in 0..pitch {
+            luma[y * pitch + x] = (x + 3 * y + 7 * index as usize) as u8;
+        }
+    }
+    for y in 0..rows / 2 {
+        for x in 0..pitch {
+            chroma[y * pitch + x] = (5 * x + y + index as usize) as u8;
+        }
+    }
+    (luma, chroma)
+}
+
+pub struct Buffer {
+    words: Vec<u64>,
+    pub bytes: u64,
+    pub kind: u8,
+    pub address: Option<u64>,
+}
+
+impl Buffer {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        let len = self.bytes as usize;
+        // SAFETY: the words hold at least `bytes` bytes.
+        unsafe { core::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), len) }
+    }
+}
+
+pub struct Gpu {
+    pub engine: Engine,
+    /// Errnos to answer each request with, instead of performing it.
+    pub refuse: Vec<(u32, i64)>,
+    pub requests: Vec<u32>,
+    pub buffers: Vec<Buffer>,
+    pub closed: Vec<u32>,
+    pub mapped: usize,
+    pub unmapped: usize,
+    pub clock: u64,
+    pub vm_init: bool,
+    pub channel_freed: bool,
+    signaled: bool,
+    /// Each submission's (method, data) pairs.
+    pub submissions: Vec<Vec<(u32, u32)>>,
+    pub frames: u32,
+    last_slot: Option<u32>,
+}
+
+impl Gpu {
+    pub fn new(engine: Engine) -> Self {
+        Self {
+            engine,
+            refuse: Vec::new(),
+            requests: Vec::new(),
+            buffers: Vec::new(),
+            closed: Vec::new(),
+            mapped: 0,
+            unmapped: 0,
+            clock: 1_000_000_000,
+            vm_init: false,
+            channel_freed: false,
+            signaled: false,
+            submissions: Vec::new(),
+            frames: 0,
+            last_slot: None,
+        }
+    }
+
+    /// The buffer holding GPU address `address`, and the offset in it.
+    pub fn at(&mut self, address: u64) -> (&mut Buffer, usize) {
+        let buffer = self
+            .buffers
+            .iter_mut()
+            .find(|buffer| {
+                buffer
+                    .address
+                    .is_some_and(|start| address >= start && address < start + buffer.bytes)
+            })
+            .unwrap_or_else(|| panic!("no buffer bound at {address:#x}"));
+        let offset = (address - buffer.address.unwrap()) as usize;
+        (buffer, offset)
+    }
+
+    fn exec(&mut self, exec: &Exec) {
+        assert_eq!(
+            (exec.push_count, exec.sig_count, exec.wait_count),
+            (1, 1, 0)
+        );
+        // SAFETY: the session's records, live through its ioctl.
+        let (push, signal) = unsafe {
+            (
+                *(exec.push_ptr as *const ExecPush),
+                *(exec.sig_ptr as *const Sync),
+            )
+        };
+        assert_eq!(signal.flags, 0);
+        let words: Vec<u32> = {
+            let (buffer, offset) = self.at(push.va);
+            buffer.bytes_mut()[offset..offset + push.va_len as usize]
+                .chunks(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect()
+        };
+        let mut methods = Vec::new();
+        for pair in words.chunks(2) {
+            assert_eq!(pair[0] >> 16, 0x2001, "one-word headers");
+            assert_eq!(pair[0] >> 13 & 7, SUBCHANNEL);
+            methods.push(((pair[0] & 0xfff) << 2, pair[1]));
+        }
+        self.submissions.push(methods.clone());
+        let frame = self.frames;
+        self.frames += 1;
+        self.signaled = false;
+        let tiling = match self.engine {
+            Engine::HangsAfter(n) if frame >= n => return,
+            Engine::HangsAfter(_) => Tiling::NVDEC,
+            Engine::Silent => {
+                self.signaled = true;
+                return;
+            }
+            Engine::Decode(tiling) => tiling,
+        };
+        self.signaled = true;
+        if frame == 0 {
+            assert_eq!(
+                methods[0],
+                (m::SET_OBJECT, DECODER_CLASS),
+                "the class first"
+            );
+        }
+        let get = |method: u32| {
+            methods
+                .iter()
+                .rev()
+                .find(|(m, _)| *m == method)
+                .map(|(_, data)| *data)
+                .unwrap_or_else(|| panic!("no method {method:#x}"))
+        };
+        let shifted = |method: u32| u64::from(get(method)) << 8;
+        let hevc = match get(m::SET_APPLICATION_ID) {
+            APPLICATION_H264 => false,
+            APPLICATION_HEVC => true,
+            other => panic!("application {other}"),
+        };
+        let index = get(m::SET_PICTURE_INDEX);
+        let page = shifted(m::SET_DRV_PIC_SETUP_OFFSET);
+        let setup = {
+            let (buffer, offset) = self.at(page);
+            buffer.bytes_mut()[offset..offset + PAGE_BYTES].to_vec()
+        };
+        // The setup and the methods agree on the picture and its stream.
+        let (slot, stream_len, status_at) = if hevc {
+            (
+                f5::CURR_PIC_IDX.get(&setup),
+                f5::STREAM_LEN.get(&setup),
+                HEVC_STATUS,
+            )
+        } else {
+            (
+                f4::CURR_PIC_IDX.get(&setup),
+                f4::STREAM_LEN.get(&setup),
+                H264_STATUS,
+            )
+        };
+        // ERROR_FRM_IDX: the previous picture's slot.
+        let conceal = get(m::SET_CONTROL_PARAMS) >> 7 & 0x3f;
+        if frame == 0 {
+            assert_eq!(conceal, 0);
+        } else {
+            assert_eq!(Some(conceal), self.last_slot, "ERROR_FRM_IDX");
+        }
+        self.last_slot = Some(slot as u32);
+        assert_eq!(shifted(m::SET_NVDEC_STATUS_OFFSET), page + status_at as u64);
+        let stream = shifted(m::SET_IN_BUF_BASE_OFFSET);
+        {
+            let (buffer, offset) = self.at(stream);
+            let bytes = buffer.bytes_mut();
+            assert_eq!(&bytes[offset..offset + 3], &[0, 0, 1], "a start code first");
+            assert!(stream_len > 3 && bytes[offset + stream_len as usize - 1] != 0);
+        }
+        let luma_method = if hevc {
+            m::SET_PICTURE_LUMA_OFFSET0 + 4 * 16
+        } else {
+            m::SET_PICTURE_LUMA_OFFSET0 + 4 * slot as u32
+        };
+        let chroma_method =
+            luma_method - m::SET_PICTURE_LUMA_OFFSET0 + m::SET_PICTURE_CHROMA_OFFSET0;
+        let (luma_at, chroma_at) = (shifted(luma_method), shifted(chroma_method));
+        let (pitch, rows) = (1920u32, 1088u32);
+        let (luma, chroma) = picture(index, pitch, rows);
+        for (address, plane, height) in [(luma_at, &luma, rows), (chroma_at, &chroma, rows / 2)] {
+            let (buffer, offset) = self.at(address);
+            let bytes = buffer.bytes_mut();
+            for y in 0..height as usize {
+                for x in (0..pitch as usize).step_by(16) {
+                    let at = offset + tiling.offset(x, y, pitch as usize);
+                    let from = y * pitch as usize + x;
+                    bytes[at..at + 16].copy_from_slice(&plane[from..from + 16]);
+                }
+            }
+        }
+        {
+            let (buffer, offset) = self.at(page + status_at as u64);
+            let status = &mut buffer.bytes_mut()[offset..offset + 16];
+            status[0..4].copy_from_slice(&8160u32.to_le_bytes());
+            status[8..12].copy_from_slice(&123_456u32.to_le_bytes());
+        }
+        let address = u64::from(get(m::SEMAPHORE_A)) << 32 | u64::from(get(m::SEMAPHORE_B));
+        let payload = get(m::SEMAPHORE_C);
+        assert_eq!(get(m::SEMAPHORE_D), 0);
+        let (fence, offset) = self.at(address);
+        fence.bytes_mut()[offset..offset + 4].copy_from_slice(&payload.to_le_bytes());
+    }
+}
+
+// SAFETY: the mock's mappings are its buffers, kept for the test.
+unsafe impl Node for Gpu {
+    fn control(&mut self, request: u32, argument: *mut c_void) -> i64 {
+        self.requests.push(request);
+        if let Some(&(_, errno)) = self.refuse.iter().find(|(r, _)| *r == request) {
+            return errno;
+        }
+        match request {
+            VM_INIT => {
+                // SAFETY: the request's own argument.
+                let init = unsafe { &*argument.cast::<VmInit>() };
+                assert_eq!(
+                    (init.kernel_managed_addr, init.kernel_managed_size),
+                    (1 << 39, 1 << 39)
+                );
+                assert!(!self.vm_init, "VM_INIT once per file");
+                self.vm_init = true;
+            }
+            CHANNEL_ALLOC => {
+                // SAFETY: as above.
+                let alloc = unsafe { &mut *argument.cast::<ChannelAlloc>() };
+                assert_eq!(alloc.fb_ctxdma_handle, !0);
+                assert_eq!(alloc.tt_ctxdma_handle, FIFO_ENGINE_NVDEC);
+                alloc.channel = 5;
+            }
+            GROBJ_ALLOC => {
+                // SAFETY: as above.
+                let object = unsafe { &*argument.cast::<GrobjAlloc>() };
+                assert_eq!((object.channel, object.class), (5, 0xc7b0));
+            }
+            SYNCOBJ_CREATE => {
+                // SAFETY: as above.
+                unsafe { (*argument.cast::<SyncobjCreate>()).handle = 78 };
+            }
+            SYNCOBJ_DESTROY => {}
+            SYNCOBJ_WAIT => {
+                // SAFETY: as above.
+                let wait = unsafe { &*argument.cast::<SyncobjWait>() };
+                assert_eq!((wait.count_handles, wait.timeout_nsec), (1, 0));
+                if !self.signaled {
+                    return -62;
+                }
+            }
+            GEM_NEW => {
+                // SAFETY: as above.
+                let new = unsafe { &mut *argument.cast::<GemNew>() };
+                let kind = (new.info.tile_flags >> 8) as u8;
+                let vram = new.info.domain & DOMAIN_VRAM != 0;
+                let page = match (vram, kind) {
+                    (true, 0) => 0x1_0000,
+                    (true, _) => 0x20_0000,
+                    (false, _) => 0x1000,
+                };
+                let bytes = new.info.size.next_multiple_of(page);
+                self.buffers.push(Buffer {
+                    words: vec![0; bytes as usize / 8],
+                    bytes,
+                    kind,
+                    address: None,
+                });
+                new.info.handle = self.buffers.len() as u32;
+                new.info.size = bytes;
+                new.info.map_handle = (self.buffers.len() as u64) << 32;
+            }
+            VM_BIND => {
+                // SAFETY: as above.
+                let bind = unsafe { &*argument.cast::<VmBind>() };
+                assert_eq!((bind.op_count, bind.flags), (1, 0));
+                // SAFETY: the session's op.
+                let op = unsafe { *(bind.op_ptr as *const VmBindOp) };
+                assert_eq!(op.op, VM_BIND_OP_MAP);
+                let index = op.handle as usize - 1;
+                let buffer = &self.buffers[index];
+                assert_eq!(u32::from(buffer.kind), op.flags, "the PTE kind");
+                assert_eq!(op.range, buffer.bytes);
+                assert!(op.addr % 0x1000 == 0 && op.addr + op.range <= 1 << 39);
+                let overlaps = self.buffers.iter().any(|other| {
+                    other.address.is_some_and(|start| {
+                        start < op.addr + op.range && op.addr < start + other.bytes
+                    })
+                });
+                assert!(!overlaps, "{:#x} overlaps another binding", op.addr);
+                self.buffers[index].address = Some(op.addr);
+            }
+            EXEC => {
+                // SAFETY: as above.
+                let exec = unsafe { *argument.cast::<Exec>() };
+                assert_eq!(exec.channel, 5);
+                self.exec(&exec);
+            }
+            GEM_CLOSE => {
+                // SAFETY: as above.
+                self.closed
+                    .push(unsafe { (*argument.cast::<GemClose>()).handle });
+            }
+            CHANNEL_FREE => self.channel_freed = true,
+            _ => panic!("unexpected request {request:#x}"),
+        }
+        0
+    }
+
+    fn map(&mut self, offset: u64, bytes: usize) -> Option<NonNull<u8>> {
+        let buffer = &mut self.buffers[(offset >> 32) as usize - 1];
+        assert_eq!(bytes as u64, buffer.bytes);
+        self.mapped += 1;
+        NonNull::new(buffer.words.as_mut_ptr().cast())
+    }
+
+    fn unmap(&mut self, _: NonNull<u8>, _: usize) {
+        self.unmapped += 1;
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        self.clock += 1000;
+        self.clock
+    }
+
+    fn pause(&mut self) {
+        self.clock += 1_000_000;
+    }
+}

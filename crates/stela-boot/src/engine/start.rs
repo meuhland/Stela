@@ -3153,6 +3153,11 @@ fn start_devices(
                     if options.probe_nvdec {
                         gpu::nvdec::probe();
                     }
+                    // Last, after the probe: a decoder that wedges leaves
+                    // every earlier line whole, and NVENC serves as before.
+                    if options.nvdec_selftest {
+                        gpu::nvdec::selftest();
+                    }
                 }
                 // Whether the Metal services serve the guest's NVENC
                 // sessions, which open with them.
@@ -3179,6 +3184,9 @@ fn start_devices(
                 }
                 if options.probe_nvdec {
                     output::arguments(format_args!("NVDEC PROBE skipped: no GPU started\n"));
+                }
+                if options.nvdec_selftest {
+                    output::arguments(format_args!("NVDEC SELFTEST skipped: no GPU started\n"));
                 }
             }
             super::service::set_input_every_turn(options.input_every_turn);

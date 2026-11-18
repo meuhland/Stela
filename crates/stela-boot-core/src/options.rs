@@ -63,6 +63,9 @@ pub const PROBE_NVENC: &str = "--probe-nvenc";
 pub const NVENC_SELFTEST: &str = "--nvenc-selftest";
 /// Checks each started GPU's video decoder before macOS (`NVDEC PROBE` lines).
 pub const PROBE_NVDEC: &str = "--probe-nvdec";
+/// Decodes two embedded clips with each started GPU's NVDEC before macOS
+/// and checks every frame (`NVDEC SELFTEST` lines).
+pub const NVDEC_SELFTEST: &str = "--nvdec-selftest";
 /// Serves no video encoder sessions to the guest: StelaVT encodes H.264
 /// with x264, as before NVENC ([`System::nvenc`]).
 pub const NO_NVENC: &str = "--no-nvenc";
@@ -477,6 +480,13 @@ pub struct System {
     /// logged as `NVDEC PROBE` lines (`--probe-nvdec`). Nothing it finds
     /// stops the boot or changes NVENC.
     pub probe_nvdec: bool,
+    /// Once the GPUs start, before macOS and after NVDEC's probe, decode two
+    /// embedded clips (H.264 and HEVC, 1920x1080, 30 frames each) with each
+    /// GA10x GPU's NVDEC and check every decoded frame's MD5 against the
+    /// software decode's, logged as `NVDEC SELFTEST` lines
+    /// (`--nvdec-selftest`). Nothing it finds stops the boot or changes
+    /// NVENC.
+    pub nvdec_selftest: bool,
     /// Each NVIDIA GPU whose encoder Stela drives (GA102-GA107) serves
     /// StelaVT's H.264 and HEVC sessions through its Metal gate; off with
     /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
@@ -574,6 +584,7 @@ impl Default for System {
             probe_nvenc: false,
             nvenc_selftest: false,
             probe_nvdec: false,
+            nvdec_selftest: false,
             nvenc: true,
             gpu_boost: false,
             watches: Vec::new(),
@@ -1039,6 +1050,7 @@ impl fmt::Display for System {
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
         line.flag(PROBE_NVDEC, self.probe_nvdec)?;
+        line.flag(NVDEC_SELFTEST, self.nvdec_selftest)?;
         line.flag(NO_NVENC, !self.nvenc)?;
         line.flag(GPU_BOOST, self.gpu_boost)?;
         line.value("--network-check", self.network_check.as_deref())?;

@@ -630,6 +630,38 @@ fn probe_nvdec_is_off_by_default_and_round_trips() {
     assert!(daily.to_string().contains(" --probe-nvdec"));
 }
 
+/// `--nvdec-selftest` decodes two embedded clips with NVDEC before macOS;
+/// it is off unless asked for, asks for nothing else (not the probe, not
+/// NVENC's probe or self-test, and NVENC's sessions stay on), and
+/// round-trips alone, beside the probe, and beside the daily boot's flags.
+#[test]
+fn nvdec_selftest_is_off_by_default_and_round_trips() {
+    assert!(!System::default().nvdec_selftest);
+    assert!(!round_trip("--system").nvdec_selftest);
+    let alone = round_trip(&format!("--system {NVDEC_SELFTEST}"));
+    assert!(alone.nvdec_selftest && !alone.probe_nvdec && !alone.nvenc_selftest && alone.nvenc);
+    assert_eq!(alone.to_string(), "--system --nvdec-selftest");
+    assert_eq!(
+        System {
+            nvdec_selftest: false,
+            ..alone
+        },
+        System::default()
+    );
+    let both = round_trip(&format!("--system {NVDEC_SELFTEST} {PROBE_NVDEC}"));
+    assert!(both.nvdec_selftest && both.probe_nvdec);
+    assert_eq!(both.to_string(), "--system --probe-nvdec --nvdec-selftest");
+    let daily = round_trip(&format!(
+        "--system --page-relative --shared-aliases --input-every-turn --input-kick {GPU_BOOST} \
+         {NVDEC_SELFTEST}"
+    ));
+    assert!(daily.nvdec_selftest && daily.gpu_boost && daily.nvenc);
+    assert!(daily.page_relative && daily.shared_aliases);
+    assert!(daily.input_every_turn && daily.input_kick);
+    assert!(!daily.probe_nvdec && !daily.probe_nvenc && !daily.nvenc_selftest);
+    assert!(daily.to_string().contains(" --nvdec-selftest"), "{daily}");
+}
+
 /// The guest's NVENC sessions are on unless `--no-nvenc`, which
 /// round-trips alone and beside the boot's usual flags and the self-test,
 /// and changes nothing else.
