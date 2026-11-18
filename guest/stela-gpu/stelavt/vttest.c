@@ -3,19 +3,40 @@
  * once for each codec asked for, and checks what ran.
  *
  *   vttest [--codec h264|hevc|both] [--frames N] [--mode hw+ll|ll|hw|none|list]
+ *          (hw+ll is the default)
  *          [--input pool|bgra|420v] [--out PREFIX] [--register BUNDLE_EXECUTABLE]
  *          [--size WxH]
  *
- * Modes, the session's encoder specification:
+ * Modes:
  *
- * - hw+ll (the default), Parsec's: low-latency rate control, hardware not
- *   required. VideoProcessing refuses a specification that requires
- *   hardware together with low-latency rate control (-12902, "Cannot
- *   require hardware accelerated encoder"), so Parsec asks for neither
- *   and checks what ran; so does vttest.
- * - hw: a hardware encoder required, no low-latency rate control.
- * - ll: low-latency rate control; any encoder passes.
- * - none: an empty specification; any encoder passes.
+ * - hw+ll (the default) is a real-time streaming client, as Parsec's
+ *   sessions show themselves to the host: low-latency rate control asked
+ *   for in the specification (hardware not required: VideoProcessing
+ *   refuses that pair, -12902 "Cannot require hardware accelerated
+ *   encoder"), then RealTime, no frame reordering, 60 fps expected, no key
+ *   frame interval (an infinite GOP: key frames only when asked), a bitrate
+ *   that starts at 10 Mb/s and rises 750 kb/s every 30 frames, and frames
+ *   submitted at 60 fps. When VideoToolbox refuses the low-latency session,
+ *   vttest prints the status and VideoToolbox's own log lines from this
+ *   process and VTEncoderXPCService, tries the low-latency session made
+ *   other ways (each opened and closed at once: the source pixel buffer
+ *   attributes a capture gives, EnableHardwareAcceleratedVideoEncoder, the
+ *   hardware encoder's ID pinned, 1280x720, no output callback) and keeps
+ *   the first that opens and that it can encode with. If none opens, it goes
+ *   on as a client does: the same session without low-latency rate control,
+ *   and the result line says so. PASS needs the encoder that ran to be
+ *   hardware.
+ * - ll: the low-latency key alone in the specification, and no property
+ *   set: Apple's minimal low-latency session. Any encoder passes; a
+ *   refused session fails, with the log lines.
+ * - hw: a hardware encoder required, no low-latency rate control, the
+ *   bitrate, frame rate, key frame interval and RealTime set. PASS needs
+ *   hardware.
+ * - none: an empty specification, the same properties as hw; any encoder
+ *   passes.
+ *
+ * A refusal at VTCompressionSessionCreate comes before any property is
+ * set: it is the specification, the size or the process, never a property.
  *
  * Inputs: `pool` (the default) draws frames from the session's pixel buffer
  * pool, in the format the encoder asked for first (BGRA where StelaVT
@@ -32,9 +53,9 @@
  * 95th percentile and longest), and writes the stream as Annex B to
  * PREFIX.h264 or PREFIX.hevc. It then decodes the stream with
  * VideoToolbox's decoder and compares each picture's luma with the frame it
- * was made from. A codec passes when its session opens on a hardware
- * encoder (hw, hw+ll), every frame comes out with both key frames, and
- * every one decodes at 30 dB or more; vttest exits 1 when one does not.
+ * was made from. A codec passes when its session opens (on a hardware
+ * encoder for hw and hw+ll), every frame comes out with both key frames,
+ * and every one decodes at 30 dB or more; vttest exits 1 when one does not.
  *
  * With --register it first registers the StelaVT executable given for both
  * codecs in this process, after loading Metal's devices so StelaGPU.bundle
@@ -54,6 +75,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef OSStatus (*Factory)(FourCharCode, CFAllocatorRef, void **);
 typedef OSStatus (*Register)(CMVideoCodecType, CFDictionaryRef, Factory);
@@ -411,8 +433,221 @@ static void setNumber(VTCompressionSessionRef session, CFStringRef key, int valu
 	CFRelease(number);
 }
 
+static void setBoolean(VTCompressionSessionRef session, CFStringRef key, bool value, const char *name)
+{
+	printf("  set %s %s: %d\n", name, value ? "true" : "false",
+	    (int)VTSessionSetProperty(session, key, value ? kCFBooleanTrue : kCFBooleanFalse));
+}
+
+typedef enum {
+	ModeHardwareLowLatency,
+	ModeLowLatency,
+	ModeHardware,
+	ModeNone,
+} Mode;
+
+static const char *modeName(Mode mode)
+{
+	switch (mode) {
+	case ModeHardwareLowLatency:
+		return "hw+ll";
+	case ModeLowLatency:
+		return "ll";
+	case ModeHardware:
+		return "hw";
+	case ModeNone:
+		break;
+	}
+	return "none";
+}
+
+static bool parseMode(const char *text, Mode *mode)
+{
+	for (Mode m = ModeHardwareLowLatency; m <= ModeNone; m++) {
+		if (strcmp(text, modeName(m)) == 0) {
+			*mode = m;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* An encoder specification: low-latency rate control and hardware asked
+ * for or required, as given. */
+static CFMutableDictionaryRef specification(bool lowLatency, bool requireHardware)
+{
+	CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	if (requireHardware) {
+		CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+	}
+	if (lowLatency) {
+		CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kCFBooleanTrue);
+	}
+	return spec;
+}
+
+/* Source pixel buffer attributes as a screen capture gives its buffers:
+ * BGRA of the session's size, IOSurface-backed. */
+static CFDictionaryRef captureAttributes(int width, int height)
+{
+	int format = kCVPixelFormatType_32BGRA;
+	CFNumberRef numbers[] = {CFNumberCreate(NULL, kCFNumberIntType, &format),
+	    CFNumberCreate(NULL, kCFNumberIntType, &width), CFNumberCreate(NULL, kCFNumberIntType, &height)};
+	CFDictionaryRef surface = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	const void *keys[] = {kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey,
+	    kCVPixelBufferIOSurfacePropertiesKey};
+	const void *values[] = {numbers[0], numbers[1], numbers[2], surface};
+	CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 4, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	for (int i = 0; i < 3; i++) {
+		CFRelease(numbers[i]);
+	}
+	CFRelease(surface);
+	return attributes;
+}
+
+/* The encoder list's hardware encoder for `codec`, StelaVT's first; NULL
+ * when there is none. */
+static CFStringRef copyHardwareEncoderID(CMVideoCodecType codec)
+{
+	CFArrayRef encoders = NULL;
+	CFStringRef found = NULL;
+	VTCopyVideoEncoderList(NULL, &encoders);
+	for (CFIndex i = 0; encoders && i < CFArrayGetCount(encoders); i++) {
+		CFDictionaryRef item = CFArrayGetValueAtIndex(encoders, i);
+		int type = 0;
+		CFNumberRef number = CFDictionaryGetValue(item, kVTVideoEncoderList_CodecType);
+		if (!number || !CFNumberGetValue(number, kCFNumberIntType, &type) || (CMVideoCodecType)type != codec
+		    || CFDictionaryGetValue(item, kVTVideoEncoderList_IsHardwareAccelerated) != kCFBooleanTrue) {
+			continue;
+		}
+		CFStringRef id = CFDictionaryGetValue(item, kVTVideoEncoderList_EncoderID);
+		bool stela = false, hardware = false;
+		if (!found || (listed(id, &hardware, &stela) && stela)) {
+			if (found) {
+				CFRelease(found);
+			}
+			found = CFRetain(id);
+		}
+	}
+	if (encoders) {
+		CFRelease(encoders);
+	}
+	return found;
+}
+
+/* VideoToolbox's lines in the log from this process and from
+ * VTEncoderXPCService over the last seconds that say why a session was
+ * refused. `log show` may need an admin user; its command is printed so it
+ * can be run again by hand. */
+static void showLog(void)
+{
+	char command[512];
+	snprintf(command, sizeof command,
+	    "/usr/bin/log show --last 20s --style compact --info --debug --predicate "
+	    "'processID == %d OR process == \"VTEncoderXPCService\"' 2>&1",
+	    (int)getpid());
+	printf("  the log's reasons (%s):\n", command);
+	FILE *log = popen(command, "r");
+	if (!log) {
+		printf("    log show did not start\n");
+		return;
+	}
+	static const char *const words[] = {"12902", "atency", "VCP", "RateControl", "ardware", "rror", "efus", "ailed",
+	    "nvalid", "nsupported", "Stela"};
+	char line[1024];
+	int shown = 0, read = 0;
+	while (fgets(line, sizeof line, log)) {
+		read++;
+		for (size_t w = 0; w < sizeof words / sizeof words[0] && shown < 40; w++) {
+			if (strstr(line, words[w])) {
+				printf("    %s", line);
+				shown++;
+				break;
+			}
+		}
+	}
+	pclose(log);
+	if (!shown) {
+		printf("    none of %d lines names a reason\n", read);
+	}
+}
+
+/* The low-latency session made other ways, each opened and closed at once:
+ * which part of vttest's VideoToolbox refuses. The first that opens and
+ * that the frames can go through (its size and output callback vttest's) is
+ * kept in *kept, and its way named in `used`. */
+static void tryLowLatency(CMVideoCodecType codec, int width, int height, VTCompressionSessionRef *kept, char *used,
+    size_t usedBytes)
+{
+	static const char *const ways[] = {
+	    "source attributes as a capture gives (BGRA, the size, IOSurface)",
+	    "EnableHardwareAcceleratedVideoEncoder",
+	    "the hardware encoder's ID pinned",
+	    "1280x720",
+	    "no output callback (a client of the output handler)",
+	};
+	for (size_t way = 0; way < sizeof ways / sizeof ways[0]; way++) {
+		CFMutableDictionaryRef spec = specification(true, false);
+		CFDictionaryRef attributes = NULL;
+		CFStringRef id = NULL;
+		int w = width, h = height;
+		VTCompressionOutputCallback callback = encoded;
+		switch (way) {
+		case 0:
+			attributes = captureAttributes(width, height);
+			break;
+		case 1:
+			CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
+			    kCFBooleanTrue);
+			break;
+		case 2:
+			id = copyHardwareEncoderID(codec);
+			if (id) {
+				CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EncoderID, id);
+			}
+			break;
+		case 3:
+			w = 1280;
+			h = 720;
+			break;
+		default:
+			callback = NULL;
+			break;
+		}
+		if (way == 2 && !id) {
+			printf("  low latency with %s: no hardware encoder listed\n", ways[way]);
+			CFRelease(spec);
+			continue;
+		}
+		VTCompressionSessionRef session = NULL;
+		OSStatus status = VTCompressionSessionCreate(NULL, w, h, codec, spec, attributes, NULL, callback, NULL, &session);
+		char name[256] = "";
+		if (id) {
+			CFStringGetCString(id, name, sizeof name, kCFStringEncodingUTF8);
+		}
+		printf("  low latency with %s%s%s: %d\n", ways[way], id ? " " : "", name, (int)status);
+		if (status == noErr && !*kept && w == width && h == height && callback) {
+			*kept = session;
+			snprintf(used, usedBytes, "%s", ways[way]);
+		} else if (status == noErr) {
+			VTCompressionSessionInvalidate(session);
+			CFRelease(session);
+		}
+		CFRelease(spec);
+		if (attributes) {
+			CFRelease(attributes);
+		}
+		if (id) {
+			CFRelease(id);
+		}
+	}
+}
+
 /* Encodes `frames` frames of `codec`; whether it passed. */
-static bool encode(CMVideoCodecType codec, const char *mode, const char *input, int frames, int width, int height,
+static bool encode(CMVideoCodecType codec, Mode mode, const char *input, int frames, int width, int height,
     const char *prefix)
 {
 	bool hevc = codec == kCMVideoCodecType_HEVC;
@@ -426,25 +661,45 @@ static bool encode(CMVideoCodecType codec, const char *mode, const char *input, 
 		snprintf(path, sizeof path, "%s.%s", prefix, label);
 		run.out = fopen(path, "wb");
 	}
-	CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
-	    &kCFTypeDictionaryValueCallBacks);
-	/* Requiring hardware and low-latency rate control together is refused:
-	 * hw+ll asks for low latency alone, as Parsec does, and checks what ran. */
-	bool lowLatency = strstr(mode, "ll") != NULL;
-	bool wantsHardware = strstr(mode, "hw") != NULL;
-	if (wantsHardware && !lowLatency) {
-		CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
-	}
-	if (lowLatency) {
-		CFDictionarySetValue(spec, kVTVideoEncoderSpecification_EnableLowLatencyRateControl, kCFBooleanTrue);
-	}
-	printf("== %s %dx%d, mode %s (%s%s), input %s\n", label, width, height, mode,
-	    wantsHardware && !lowLatency ? "hardware required" : "hardware not required",
-	    lowLatency ? ", low-latency rate control" : "", input);
+	bool lowLatency = mode == ModeHardwareLowLatency || mode == ModeLowLatency;
+	bool wantsHardware = mode == ModeHardwareLowLatency || mode == ModeHardware;
+	/* A real-time client: paced at its frame rate, its bitrate moving. */
+	bool client = mode == ModeHardwareLowLatency;
+	static const char *const descriptions[] = {
+	    "low-latency rate control, hardware not required, a real-time client's properties, paced",
+	    "low-latency rate control alone, no property set",
+	    "hardware required",
+	    "an empty specification",
+	};
+	printf("== %s %dx%d, mode %s (%s), input %s\n", label, width, height, modeName(mode), descriptions[mode], input);
+	CFMutableDictionaryRef spec = specification(lowLatency, mode == ModeHardware);
 	VTCompressionSessionRef session = NULL;
 	OSStatus status = VTCompressionSessionCreate(NULL, width, height, codec, spec, NULL, NULL, encoded, NULL, &session);
 	CFRelease(spec);
 	printf("  session: %d\n", (int)status);
+	/* What the result line adds: how the low-latency session opened, or
+	 * that it did not. */
+	char note[320] = "";
+	if (status != noErr && lowLatency) {
+		showLog();
+	}
+	if (status != noErr && client) {
+		OSStatus refused = status;
+		char used[160] = "";
+		tryLowLatency(codec, width, height, &session, used, sizeof used);
+		if (session) {
+			status = noErr;
+			printf("  low-latency session: opened with %s\n", used);
+			snprintf(note, sizeof note, " (low latency with %s)", used);
+		} else {
+			spec = specification(false, false);
+			status = VTCompressionSessionCreate(NULL, width, height, codec, spec, NULL, NULL, encoded, NULL, &session);
+			CFRelease(spec);
+			printf("  low latency refused (%d) every way: a real-time session without it, as a client goes on: %d\n",
+			    (int)refused, (int)status);
+			snprintf(note, sizeof note, " (low latency refused, %d: a real-time session without it)", (int)refused);
+		}
+	}
 	if (status != noErr) {
 		printf("%s FAIL: no session (%d)\n", label, (int)status);
 		return false;
@@ -472,17 +727,29 @@ static bool encode(CMVideoCodecType codec, const char *mode, const char *input, 
 		CFRelease(hardware);
 	}
 	int fps = 60;
-	setNumber(session, kVTCompressionPropertyKey_AverageBitRate, 10000000, "AverageBitRate");
-	setNumber(session, kVTCompressionPropertyKey_ExpectedFrameRate, fps, "ExpectedFrameRate");
-	setNumber(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, 100000, "MaxKeyFrameInterval");
-	printf("  set RealTime: %d\n", (int)VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue));
+	int bitrate = 10000000;
+	/* A real-time client's bitrate rises this much every so many frames, as
+	 * Parsec's did on the host (2 to 50 Mb/s in steps of 750 kb/s). */
+	const int step = 750000, every = 30;
+	if (client) {
+		setBoolean(session, kVTCompressionPropertyKey_RealTime, true, "RealTime");
+		setBoolean(session, kVTCompressionPropertyKey_AllowFrameReordering, false, "AllowFrameReordering");
+		setNumber(session, kVTCompressionPropertyKey_ExpectedFrameRate, fps, "ExpectedFrameRate");
+		setNumber(session, kVTCompressionPropertyKey_AverageBitRate, bitrate, "AverageBitRate");
+		printf("  no MaxKeyFrameInterval: an infinite GOP, key frames only when asked\n");
+	} else if (mode != ModeLowLatency) {
+		setNumber(session, kVTCompressionPropertyKey_AverageBitRate, bitrate, "AverageBitRate");
+		setNumber(session, kVTCompressionPropertyKey_ExpectedFrameRate, fps, "ExpectedFrameRate");
+		setNumber(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, 100000, "MaxKeyFrameInterval");
+		setBoolean(session, kVTCompressionPropertyKey_RealTime, true, "RealTime");
+	}
 	CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(session);
 	const void *forceKeys[] = {kVTEncodeFrameOptionKey_ForceKeyFrame};
 	const void *forceValues[] = {kCFBooleanTrue};
 	CFDictionaryRef forceKey = CFDictionaryCreate(NULL, forceKeys, forceValues, 1, &kCFTypeDictionaryKeyCallBacks,
 	    &kCFTypeDictionaryValueCallBacks);
 	double cpu0 = cpuSeconds(), t0 = now(), encodeSeconds = 0;
-	int submitted = 0;
+	int submitted = 0, bitrateChanges = 0, bitrateRefused = 0;
 	OSType made = strcmp(input, "bgra") == 0 ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 	bool fromPool = pool && strcmp(input, "pool") == 0;
 	for (int i = 0; i < frames; i++) {
@@ -511,6 +778,20 @@ static bool encode(CMVideoCodecType codec, const char *mode, const char *input, 
 			printf("  input frames: '%s'%s\n", code, fromPool ? ", from the session's pool" : "");
 		}
 		fill(buffer, i);
+		if (client && i > 0 && i % every == 0) {
+			bitrate += step;
+			CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &bitrate);
+			bitrateRefused += VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, number) != noErr;
+			bitrateChanges++;
+			CFRelease(number);
+		}
+		if (client) {
+			/* Each frame at its 60 fps slot, as a capture delivers them. */
+			double wait = t0 + (double)i / fps - now();
+			if (wait > 0) {
+				usleep((useconds_t)(wait * 1e6));
+			}
+		}
 		double before = now();
 		if (i < kMostFrames) {
 			run.submitted[i] = before;
@@ -528,13 +809,16 @@ static bool encode(CMVideoCodecType codec, const char *mode, const char *input, 
 	VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
 	double cpu = cpuSeconds() - cpu0, wall = now() - t0;
 	CFRelease(forceKey);
+	if (bitrateChanges) {
+		printf("  bitrate: %d changes, %d refused, up to %.2f Mbit/s\n", bitrateChanges, bitrateRefused, bitrate / 1e6);
+	}
 	printf("  frames in %d, out %d, key frames %d, dropped %d, errors %d, %zu bytes (%.1f Mbit/s at %d fps)\n",
 	    submitted, run.emitted, run.keyframes, run.dropped, run.errors, run.bytes,
 	    run.emitted ? run.bytes * 8.0 * fps / run.emitted / 1e6 : 0, fps);
-	printf("  %.1f fps encoding alone (%.2f ms a frame); wall %.2fs (%.1f fps with drawing); process cpu %.2f ms a "
+	printf("  %.1f fps encoding alone (%.2f ms a frame); wall %.2fs (%.1f fps with drawing%s); process cpu %.2f ms a "
 	       "frame, drawing the test frames included\n",
 	    submitted / encodeSeconds, encodeSeconds * 1000 / (submitted ? submitted : 1), wall, submitted / wall,
-	    cpu * 1000 / (submitted ? submitted : 1));
+	    client ? ", paced" : "", cpu * 1000 / (submitted ? submitted : 1));
 	if (run.latencies > 0) {
 		double sum = 0;
 		for (int i = 0; i < run.latencies; i++) {
@@ -556,13 +840,15 @@ static bool encode(CMVideoCodecType codec, const char *mode, const char *input, 
 	    run.emitted, run.undecodable, run.lowest, run.decoded ? run.sum / run.decoded : 0);
 	bool passed = (isHardware || !wantsHardware) && submitted == frames && run.emitted + run.dropped == frames
 	    && run.errors == 0 && run.keyframes >= (frames > 1 ? 2 : 1) && run.decoded == run.emitted && run.lowest >= 30;
-	printf("%s %s: %s\n", label, passed ? "PASS" : "FAIL", name);
+	printf("%s %s: %s%s\n", label, passed ? "PASS" : "FAIL", name, note);
 	return passed;
 }
 
 int main(int argc, char **argv)
 {
-	const char *codecs = "both", *mode = "hw+ll", *input = "pool", *prefix = NULL, *plugin = NULL;
+	const char *codecs = "both", *input = "pool", *prefix = NULL, *plugin = NULL;
+	Mode mode = ModeHardwareLowLatency;
+	bool listing = false;
 	int frames = 300, width = 1920, height = 1080;
 	for (int i = 1; i < argc; i++) {
 		const char *value = i + 1 < argc ? argv[i + 1] : NULL;
@@ -570,8 +856,11 @@ int main(int argc, char **argv)
 			codecs = argv[++i];
 		} else if (strcmp(argv[i], "--frames") == 0 && value) {
 			frames = atoi(argv[++i]);
-		} else if (strcmp(argv[i], "--mode") == 0 && value) {
-			mode = argv[++i];
+		} else if (strcmp(argv[i], "--mode") == 0 && value && strcmp(value, "list") == 0) {
+			listing = true;
+			i++;
+		} else if (strcmp(argv[i], "--mode") == 0 && value && parseMode(value, &mode)) {
+			i++;
 		} else if (strcmp(argv[i], "--input") == 0 && value
 		    && (strcmp(value, "pool") == 0 || strcmp(value, "bgra") == 0 || strcmp(value, "420v") == 0)) {
 			input = argv[++i];
@@ -590,7 +879,7 @@ int main(int argc, char **argv)
 	if (plugin && !registerPlugin(plugin)) {
 		return 1;
 	}
-	if (strcmp(mode, "list") == 0) {
+	if (listing) {
 		list();
 		return 0;
 	}
