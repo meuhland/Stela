@@ -365,6 +365,309 @@ pub unsafe fn store_bgra_rows(
     }
 }
 
+/// The picture rows one band of the fast stores takes: two luma block rows,
+/// which make one chroma block row. Their bands start at multiples of it.
+pub const BAND_ROWS: usize = 2 * BLOCK_ROWS;
+
+/// Copies 16 bytes with two 8-byte moves: the host is soft-float, and its
+/// code keeps out of the vector registers, which hold the guest's state.
+///
+/// # Safety
+/// `from` is readable and `to` writable for 16 bytes.
+#[inline(always)]
+unsafe fn copy16(from: *const u8, to: *mut u8) {
+    // SAFETY: the caller's bounds; unaligned moves.
+    unsafe {
+        let low = from.cast::<u64>().read_unaligned();
+        let high = from.add(8).cast::<u64>().read_unaligned();
+        to.cast::<u64>().write_unaligned(low);
+        to.add(8).cast::<u64>().write_unaligned(high);
+    }
+}
+
+/// Stores block rows `blocks` of the block-linear plane at `plane`, `pitch`
+/// bytes a row, writing each block row's bytes in address order: whole
+/// 64-byte lines one after another, which is what a write-combined BAR1
+/// mapping takes fastest. `row(y)` gives the plane's row `y`, `pitch`
+/// readable bytes already padded.
+///
+/// A block row is 16 rows by the pitch, contiguous: its 64-byte-wide
+/// blocks in order, each two GOBs of 8 rows, each GOB's 16-byte lines in
+/// Turing's order ([`gob_line`]): column pair, row quad, column, row.
+///
+/// # Safety
+/// `plane` is writable for `pitch * 16 * blocks.end` bytes, and each row
+/// `row` gives is readable for `pitch` bytes.
+unsafe fn tile_block_rows(
+    plane: *mut u8,
+    pitch: usize,
+    blocks: core::ops::Range<usize>,
+    row: impl Fn(usize) -> *const u8,
+) {
+    for block_row in blocks {
+        let y0 = block_row * BLOCK_ROWS;
+        let mut rows = [core::ptr::null::<u8>(); BLOCK_ROWS];
+        for (y, at) in rows.iter_mut().enumerate() {
+            *at = row(y0 + y);
+        }
+        // SAFETY: the block row lies inside the plane.
+        let mut out = unsafe { plane.add(y0 * pitch) };
+        for x0 in (0..pitch).step_by(64) {
+            for gob in 0..2 {
+                for pair in 0..2 {
+                    for quad in 0..2 {
+                        for column in 0..2 {
+                            let x = x0 + (pair * 2 + column) * 16;
+                            for y in 0..4 {
+                                let source = rows[gob * 8 + quad * 4 + y];
+                                // SAFETY: a 16-byte line of a padded row,
+                                // and the next 16 bytes of the block row.
+                                unsafe {
+                                    copy16(source.add(x), out);
+                                    out = out.add(16);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The block rows of `plane` a band from picture row `first` stores: its
+/// own two (luma) or one (chroma), and for the band holding the picture's
+/// last rows every block row after them, which repeat the last row.
+fn band_blocks(geometry: &Geometry, plane: Plane, first: usize) -> core::ops::Range<usize> {
+    let (start, own) = match plane {
+        Plane::Luma => (first / BLOCK_ROWS, 2),
+        Plane::Chroma => (first / 2 / BLOCK_ROWS, 1),
+    };
+    let blocks = plane.coded_rows(geometry).div_ceil(BLOCK_ROWS);
+    if first + BAND_ROWS >= geometry.height as usize {
+        start..blocks
+    } else {
+        start..(start + own).min(blocks)
+    }
+}
+
+/// Room for one band's rows of both planes, padded to the pitch, which the
+/// fast stores keep between bands so that none allocates.
+#[derive(Default)]
+pub struct Staging {
+    rows: Vec<u8>,
+}
+
+impl Staging {
+    /// The luma rows (`BAND_ROWS`) and chroma rows (half as many), each
+    /// `pitch` bytes.
+    fn planes(&mut self, pitch: usize) -> (&mut [u8], &mut [u8]) {
+        let luma = BAND_ROWS * pitch;
+        let bytes = luma + luma / 2;
+        if self.rows.len() < bytes {
+            self.rows.resize(bytes, 0);
+        }
+        let (luma_rows, chroma_rows) = self.rows[..bytes].split_at_mut(luma);
+        (luma_rows, chroma_rows)
+    }
+}
+
+/// Stores the NV12 picture's rows `first..` (at most [`BAND_ROWS`], to its
+/// height) into the block-linear surface at `surface`, as whole block rows
+/// in address order, and for the last band every block row to the coded
+/// height, the last row and column repeated. `luma` holds the band's luma
+/// rows from `first`, `luma_pitch` apart; `chroma` its chroma rows from
+/// `first / 2`. Bands may come in any order; together they make the surface
+/// [`store_nv12`] makes, and also fill a chroma plane's rows past the coded
+/// height to its last block row.
+///
+/// # Safety
+/// `surface` is writable for `geometry.surface_bytes()` bytes; `first` is a
+/// multiple of [`BAND_ROWS`] below the height; each plane's slice holds its
+/// rows, the last only as wide as the picture.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn store_nv12_band(
+    surface: *mut u8,
+    geometry: &Geometry,
+    first: usize,
+    luma: &[u8],
+    luma_pitch: usize,
+    chroma: &[u8],
+    chroma_pitch: usize,
+    staging: &mut Staging,
+) {
+    let pitch = geometry.pitch as usize;
+    let width = geometry.width as usize;
+    let height = geometry.height as usize;
+    debug_assert!(first.is_multiple_of(BAND_ROWS) && first < height);
+    let count = BAND_ROWS.min(height - first);
+    let (luma_rows, chroma_rows) = staging.planes(pitch);
+    for (plane, rows, row_pitch, staged, plane_first, plane_rows) in [
+        (Plane::Luma, luma, luma_pitch, luma_rows, first, count),
+        (
+            Plane::Chroma,
+            chroma,
+            chroma_pitch,
+            chroma_rows,
+            first / 2,
+            count / 2,
+        ),
+    ] {
+        // A row as wide as the pitch is read in place; a narrower one is
+        // padded into the staging rows first.
+        let direct = width == pitch;
+        if !direct {
+            for y in 0..plane_rows {
+                padded(
+                    &mut staged[y * pitch..(y + 1) * pitch],
+                    &rows[y * row_pitch..],
+                    width,
+                    plane.unit(),
+                );
+            }
+        }
+        let last = plane.rows(geometry) - 1;
+        let staged = staged.as_ptr();
+        let source = rows.as_ptr();
+        // SAFETY: the plane's block rows lie inside the surface (the
+        // chroma's whole blocks are in `surface_bytes`); each row given is
+        // `pitch` readable bytes: a picture row at least that wide when
+        // direct, a staging row otherwise.
+        unsafe {
+            tile_block_rows(
+                surface.add(plane.offset(geometry)),
+                pitch,
+                band_blocks(geometry, plane, first),
+                |y| {
+                    let y = y.min(last) - plane_first;
+                    if direct {
+                        source.add(y * row_pitch)
+                    } else {
+                        staged.add(y * pitch)
+                    }
+                },
+            );
+        }
+    }
+}
+
+/// BT.709 limited-range luma of two 32-bit pixels at once: `pixels` holds
+/// them in its two 32-bit lanes, blue at bit `blue` and red at bit `red` of
+/// each. Gives the two lumas in the lanes' low bytes, and each lane's red,
+/// green and blue for the chroma's sums. Every lane's sum stays below 2^16,
+/// so the lanes never carry into each other.
+#[inline(always)]
+fn luma_pair(pixels: u64, blue: u32, red: u32) -> (u64, u64, u64, u64) {
+    const LANES: u64 = 0x0000_00ff_0000_00ff;
+    let b = (pixels >> blue) & LANES;
+    let g = (pixels >> 8) & LANES;
+    let r = (pixels >> red) & LANES;
+    let sum = 47 * r + 157 * g + 16 * b + 0x0000_0080_0000_0080;
+    (((sum >> 8) & LANES) + 0x0000_0010_0000_0010, r, g, b)
+}
+
+/// Converts `count` rows of 32-bit RGB (even, at most [`BAND_ROWS`]) from
+/// `band` into pitch-wide NV12 rows: `count` luma rows and `count / 2`
+/// chroma rows, each row's last pixel repeated to the pitch. The same
+/// arithmetic as [`store_bgra`]'s, two pixels a step.
+fn convert_rows(
+    band: &Rgb<'_>,
+    count: usize,
+    width: usize,
+    pitch: usize,
+    luma_rows: &mut [u8],
+    chroma_rows: &mut [u8],
+) {
+    let (blue, red) = match band.order {
+        Order::Bgra => (0, 16),
+        Order::Rgba => (16, 0),
+    };
+    // The two lanes' sum of a 2x2 block's component, rounded to its mean.
+    let mean = |sum: u64| (((sum & 0xffff_ffff) + (sum >> 32) + 2) >> 2) as i32;
+    for pair in 0..count / 2 {
+        let above = &band.pixels[2 * pair * band.pitch..][..4 * width];
+        let below = &band.pixels[(2 * pair + 1) * band.pitch..][..4 * width];
+        let (top, rest) = luma_rows[2 * pair * pitch..].split_at_mut(pitch);
+        let bottom = &mut rest[..pitch];
+        let uv = &mut chroma_rows[pair * pitch..][..pitch];
+        let pixels = above
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(below.as_chunks::<8>().0);
+        let outputs = top[..width]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(bottom[..width].as_chunks_mut::<2>().0)
+            .zip(uv[..width].as_chunks_mut::<2>().0);
+        for ((a, b), ((top, bottom), uv)) in pixels.zip(outputs) {
+            let a = u64::from_le_bytes(*a);
+            let b = u64::from_le_bytes(*b);
+            let (ya, ra, ga, ba) = luma_pair(a, blue, red);
+            let (yb, rb, gb, bb) = luma_pair(b, blue, red);
+            top[0] = ya as u8;
+            top[1] = (ya >> 32) as u8;
+            bottom[0] = yb as u8;
+            bottom[1] = (yb >> 32) as u8;
+            let (cb, cr) = chroma(mean(ra + rb), mean(ga + gb), mean(ba + bb));
+            uv[0] = cb;
+            uv[1] = cr;
+        }
+        for (row, unit) in [(top, 1), (bottom, 1), (uv, 2)] {
+            let last = width - unit;
+            for x in (width..pitch).step_by(unit) {
+                let count = unit.min(pitch - x);
+                row.copy_within(last..last + count, x);
+            }
+        }
+    }
+}
+
+/// Converts the 32-bit RGB picture's rows `first..` (at most
+/// [`BAND_ROWS`], to its height), which `band` holds from row `first` on,
+/// to NV12 as [`store_bgra`] does, and stores them as whole block rows in
+/// address order, the last band also every block row to the coded height.
+/// Bands may come in any order; together they make the surface
+/// [`store_bgra`] makes, and also fill a chroma plane's rows past the
+/// coded height to its last block row.
+///
+/// # Safety
+/// `surface` is writable for `geometry.surface_bytes()` bytes; `first` is a
+/// multiple of [`BAND_ROWS`] below the height; `band` holds the band's
+/// rows, the last only as wide as the picture.
+pub unsafe fn store_bgra_band(
+    surface: *mut u8,
+    geometry: &Geometry,
+    first: usize,
+    band: &Rgb<'_>,
+    staging: &mut Staging,
+) {
+    let pitch = geometry.pitch as usize;
+    let width = geometry.width as usize;
+    let height = geometry.height as usize;
+    debug_assert!(first.is_multiple_of(BAND_ROWS) && first < height);
+    let count = BAND_ROWS.min(height - first);
+    let (luma_rows, chroma_rows) = staging.planes(pitch);
+    convert_rows(band, count, width, pitch, luma_rows, chroma_rows);
+    for (plane, staged, plane_first, plane_last) in [
+        (Plane::Luma, &*luma_rows, first, height - 1),
+        (Plane::Chroma, &*chroma_rows, first / 2, height / 2 - 1),
+    ] {
+        let staged = staged.as_ptr();
+        // SAFETY: as in `store_nv12_band`; each staging row is `pitch`
+        // bytes.
+        unsafe {
+            tile_block_rows(
+                surface.add(plane.offset(geometry)),
+                pitch,
+                band_blocks(geometry, plane, first),
+                |y| staged.add((y.min(plane_last) - plane_first) * pitch),
+            );
+        }
+    }
+}
+
 /// nvenc-test's test pattern (`tiling.c`), pitch-wide NV12 of the coded
 /// size: a diagonal luma ramp with 16-pixel stripes, a bright 256x256 square
 /// moving 8 px right and 4 px down per frame, and four chroma quadrants. A
@@ -534,6 +837,203 @@ mod tests {
             }
             assert!(whole == banded, "{width}x{height} BGRA");
         }
+    }
+
+    /// Each plane's coded rows of the block-linear `surface`, as linear
+    /// rows: a chroma plane's last block row may hold rows past them.
+    fn coded(surface: &[u8], geometry: &Geometry) -> Vec<u8> {
+        let pitch = geometry.pitch as usize;
+        let mut out = Vec::new();
+        for plane in [Plane::Luma, Plane::Chroma] {
+            let base = plane.offset(geometry);
+            for y in 0..plane.coded_rows(geometry) {
+                for x in (0..pitch).step_by(16) {
+                    let at = base + block_linear_offset(x, y, pitch);
+                    out.extend_from_slice(&surface[at..at + 16]);
+                }
+            }
+        }
+        out
+    }
+
+    /// A BGRA picture of `geometry` with every value and order of bytes,
+    /// `pitch` bytes a row.
+    fn bgra(geometry: &Geometry, pitch: usize) -> Vec<u8> {
+        (0..pitch * geometry.height as usize)
+            .map(|i| (i * 7 + i / pitch * 13 + (i * i) % 251) as u8)
+            .collect()
+    }
+
+    /// The fast bands, in any order, store the surface the whole stores
+    /// store, NV12 at the pitch and wider, and BGRA in both byte orders;
+    /// 1080p's surface is equal byte for byte.
+    #[test]
+    fn fast_bands_store_what_the_whole_store_does() {
+        for (width, height) in [
+            (1920, 1080),
+            (640, 362),
+            (48, 34),
+            (1280, 720),
+            (1366, 768),
+            (2560, 1440),
+        ] {
+            let geometry = Geometry::new(width, height).unwrap();
+            let bytes = geometry.surface_bytes() as usize;
+            let (w, h) = (width as usize, height as usize);
+            let firsts: Vec<usize> = (0..h).step_by(BAND_ROWS).rev().collect();
+            let mut staging = Staging::default();
+            for extra in [0, 64] {
+                let nv12 = pattern(&geometry, 9);
+                let pitch = geometry.pitch as usize;
+                // The same picture at the guest's pitch, `extra` wider.
+                let row_pitch = pitch + extra;
+                let rows = geometry.coded_height as usize;
+                let mut wide = vec![0xeeu8; row_pitch * rows * 3 / 2];
+                for y in 0..rows * 3 / 2 {
+                    wide[y * row_pitch..y * row_pitch + pitch]
+                        .copy_from_slice(&nv12[y * pitch..(y + 1) * pitch]);
+                }
+                let picture = Nv12 {
+                    luma: &wide[..row_pitch * rows],
+                    luma_pitch: row_pitch,
+                    chroma: &wide[row_pitch * rows..],
+                    chroma_pitch: row_pitch,
+                };
+                let mut whole = vec![0u8; bytes];
+                // SAFETY: the buffer is the surface's size; the picture fits.
+                unsafe { store_nv12(whole.as_mut_ptr(), &geometry, &picture) };
+                let mut banded = vec![0u8; bytes];
+                for &first in &firsts {
+                    // SAFETY: as above, a band of rows from `first`.
+                    unsafe {
+                        store_nv12_band(
+                            banded.as_mut_ptr(),
+                            &geometry,
+                            first,
+                            &picture.luma[first * row_pitch..],
+                            row_pitch,
+                            &picture.chroma[first / 2 * row_pitch..],
+                            row_pitch,
+                            &mut staging,
+                        );
+                    }
+                }
+                assert!(
+                    coded(&whole, &geometry) == coded(&banded, &geometry),
+                    "{width}x{height}+{extra} NV12"
+                );
+                if (width, height) == (1920, 1080) {
+                    assert!(whole == banded, "1080p NV12 whole surface");
+                }
+            }
+            for order in [Order::Bgra, Order::Rgba] {
+                let pitch = 4 * w + 32;
+                let pixels = bgra(&geometry, pitch);
+                let rgb = Rgb {
+                    pixels: &pixels,
+                    pitch,
+                    order,
+                };
+                let mut whole = vec![0u8; bytes];
+                // SAFETY: as above.
+                unsafe { store_bgra(whole.as_mut_ptr(), &geometry, &rgb) };
+                let mut banded = vec![0u8; bytes];
+                for &first in &firsts {
+                    let band = Rgb {
+                        pixels: &pixels[first * pitch..],
+                        pitch,
+                        order,
+                    };
+                    // SAFETY: as above.
+                    unsafe {
+                        store_bgra_band(banded.as_mut_ptr(), &geometry, first, &band, &mut staging)
+                    };
+                }
+                assert!(
+                    coded(&whole, &geometry) == coded(&banded, &geometry),
+                    "{width}x{height} {order:?}"
+                );
+                if (width, height) == (1920, 1080) {
+                    assert!(whole == banded, "1080p {order:?} whole surface");
+                }
+            }
+        }
+    }
+
+    /// Microseconds per 1080p picture of each store, into host memory, when
+    /// `NVENC_STORE_BENCH` is set: `NVENC_STORE_BENCH=1 cargo test --release
+    /// -p stela-driver-gpu --lib stores_per_picture -- --nocapture`. The
+    /// host build may vectorize what the soft-float UEFI build cannot; the
+    /// numbers are a ceiling on speed. Without the variable it does nothing.
+    #[test]
+    fn stores_per_picture() {
+        extern crate std;
+        use std::time::Instant;
+        if std::env::var_os("NVENC_STORE_BENCH").is_none() {
+            return;
+        }
+        let geometry = Geometry::new(1920, 1080).unwrap();
+        let bytes = geometry.surface_bytes() as usize;
+        let nv12 = pattern(&geometry, 4);
+        let picture = pattern_picture(&geometry, &nv12);
+        let pitch = 4 * 1920;
+        let pixels = bgra(&geometry, pitch);
+        let rgb = Rgb {
+            pixels: &pixels,
+            pitch,
+            order: Order::Bgra,
+        };
+        let mut surface = vec![0u8; bytes];
+        let mut staging = Staging::default();
+        let runs = 30;
+        let mut time = |name: &str, store: &mut dyn FnMut(&mut [u8])| {
+            store(&mut surface.clone());
+            let started = Instant::now();
+            for _ in 0..runs {
+                store(&mut surface);
+            }
+            std::println!(
+                "{name}: {} us per 1080p picture",
+                started.elapsed().as_micros() / runs
+            );
+        };
+        let luma_pitch = geometry.pitch as usize;
+        time("store_nv12 (16-byte lines, scattered)", &mut |out| {
+            // SAFETY: the surface's size; the pattern fits it.
+            unsafe { store_nv12(out.as_mut_ptr(), &geometry, &picture) }
+        });
+        time("store_nv12_band (block rows in order)", &mut |out| {
+            for first in (0..1080).step_by(BAND_ROWS) {
+                // SAFETY: the surface's size; bands of the picture.
+                unsafe {
+                    store_nv12_band(
+                        out.as_mut_ptr(),
+                        &geometry,
+                        first,
+                        &picture.luma[first * luma_pitch..],
+                        luma_pitch,
+                        &picture.chroma[first / 2 * luma_pitch..],
+                        luma_pitch,
+                        &mut staging,
+                    )
+                }
+            }
+        });
+        time("store_bgra (per pixel)", &mut |out| {
+            // SAFETY: as above.
+            unsafe { store_bgra(out.as_mut_ptr(), &geometry, &rgb) }
+        });
+        time("store_bgra_band (two pixels a step)", &mut |out| {
+            for first in (0..1080).step_by(BAND_ROWS) {
+                let band = Rgb {
+                    pixels: &pixels[first * pitch..],
+                    pitch,
+                    order: Order::Bgra,
+                };
+                // SAFETY: as above.
+                unsafe { store_bgra_band(out.as_mut_ptr(), &geometry, first, &band, &mut staging) }
+            }
+        });
     }
 
     #[test]
