@@ -18,6 +18,7 @@ pub(super) mod display;
 mod file;
 #[cfg(feature = "nvk")]
 pub(super) mod gate;
+pub(super) mod link;
 /// `xtask guest`'s objects of the StelaGPU kext.
 #[cfg(feature = "nvk")]
 mod kext {
@@ -987,6 +988,9 @@ pub(super) struct Claimed {
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
     link: Option<PcieLink>,
+    /// The PCI Express port above it, read for the link's lines.
+    #[cfg_attr(not(feature = "nvk"), allow(dead_code, reason = "read at a loss"))]
+    port: Option<link::Port>,
 }
 
 fn claim(
@@ -995,6 +999,7 @@ fn claim(
     line: u32,
     gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
+    port: Option<link::Port>,
 ) -> Result<Claimed, ServiceError> {
     use crate::pci_io::ScreenOwner;
     let address = adapter.address;
@@ -1106,6 +1111,12 @@ fn claim(
             if decode.memory_was_off { "off" } else { "on" }
         ));
     }
+    link::log_link(
+        address,
+        "as the firmware left it",
+        &*function.config(),
+        port.as_ref(),
+    );
     let config = function
         .config()
         .retain_epoch()
@@ -1196,6 +1207,14 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
+    if reset {
+        link::log_link(
+            address,
+            "after its reset",
+            &*function.config(),
+            port.as_ref(),
+        );
+    }
     if let Some(chip) =
         gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
     {
@@ -1255,6 +1274,7 @@ fn claim(
         drm,
         #[cfg(feature = "nvk")]
         link,
+        port,
     })
 }
 
@@ -1455,6 +1475,7 @@ pub(super) fn claim_all(
     adapters: &[gpu::Adapter],
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
+    port_above: &dyn Fn(stela_drivers::bus::pci::Address) -> Option<link::Port>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
@@ -1512,6 +1533,7 @@ pub(super) fn claim_all(
                     claimed.len() as u32,
                     source,
                     catalog.clone(),
+                    port_above(adapter.address),
                 )
             });
         match result {
@@ -1535,6 +1557,8 @@ struct Bound {
     name: String,
     drm: client::DrmDevice,
     link: Option<PcieLink>,
+    /// The PCI Express port above it, read when it stops answering.
+    port: Option<link::Port>,
 }
 
 /// The original managed child runs the driver's initcalls and probe.
@@ -1618,6 +1642,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         name: claimed.name,
                         drm: claimed.drm,
                         link: claimed.link,
+                        port: claimed.port,
                     });
                 } else {
                     output::arguments(format_args!(

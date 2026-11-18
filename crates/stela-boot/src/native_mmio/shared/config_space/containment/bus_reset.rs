@@ -117,6 +117,24 @@ fn members(fabric: &Fabric, address: Address) -> Result<(usize, Vec<usize>), &'s
 }
 
 impl Source {
+    /// The bridge directly above the function at `address` in the contained
+    /// fabric, as the census routed it; `None` for a function on a root bus,
+    /// outside the fabric, or before containment. Reads only.
+    pub(crate) fn parent_bridge(&self, address: Address) -> Option<Address> {
+        let cohort = self.pci_slots.0.try_borrow().ok()?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return None;
+        };
+        let at = fabric
+            .slots
+            .binary_search_by_key(&address, |slot| slot.address)
+            .ok()?;
+        match fabric.slots[at].route {
+            topology::Parent::Bridge(bridge) => Some(bridge),
+            _ => None,
+        }
+    }
+
     /// Whether [`Self::reset_parent_bus`] would find a bus it may reset for
     /// the cold requester at `address`. Reads only.
     pub(crate) fn parent_bus_reset_available(&self, address: Address) -> bool {

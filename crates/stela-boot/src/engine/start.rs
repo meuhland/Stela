@@ -1552,7 +1552,13 @@ fn open_gpus(
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, gop, firmware.as_ref())
+            gpu::claim_all(
+                &services,
+                &adapters,
+                gop,
+                firmware.as_ref(),
+                &|address| gpu::link::port_above(mmio, address),
+            )
         });
         (claimed, refused, random)
     });

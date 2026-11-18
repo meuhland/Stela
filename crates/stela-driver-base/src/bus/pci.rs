@@ -24,6 +24,7 @@ pub mod assignment;
 pub mod bus_reset;
 pub mod capability;
 pub mod hotplug;
+pub mod link_report;
 pub mod msi;
 pub mod msix;
 pub mod native;

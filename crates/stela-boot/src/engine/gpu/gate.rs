@@ -417,6 +417,17 @@ static SILENT: SilentLines<4, 320> = SilentLines::new();
 /// is kept for [`watch_losses`].
 pub(in crate::engine) fn driver_line(line: &str) {
     SILENT.observe(line);
+    // What the port above reads when its GPU went silent or came back.
+    if let Some(event) = gpu_loss::link_event(line)
+        && let Some(gpu) = installed()
+        && let Some(bound) = gpu
+            .start
+            .bound
+            .iter()
+            .find(|bound| line.contains(&bound.name))
+    {
+        super::link::log_port_at(&bound.name, event, bound.port.as_ref());
+    }
 }
 
 /// End the boot once no GPU can serve macOS again: every GPU that serves

@@ -26,6 +26,24 @@ pub const REOPEN_SPAN_MS: u64 = 30_000;
 /// left the bus (nouveau's `nvkm_device_gone`): after it no reopen can work.
 const SILENT: &str = ": stopped answering";
 
+/// What a kernel driver's line says, after its device's name, of a GPU
+/// whose MMIO read all ones for a moment and then answered again
+/// (nouveau's `nvkm_device_gone`).
+const ANSWERS_AGAIN: &str = ": answers again";
+
+/// What a kernel driver's `line` says of its GPU's link, as the boot log
+/// names it beside the port's view: that it stopped answering, or that it
+/// answered again after a silence; `None` for any other line.
+pub fn link_event(line: &str) -> Option<&'static str> {
+    if line.contains(SILENT) {
+        Some("stopped answering")
+    } else if line.contains(ANSWERS_AGAIN) {
+        Some("answered again after a silence")
+    } else {
+        None
+    }
+}
+
 /// A GPU that serves Metal, as [`verdict`] reads it.
 #[derive(Clone, Copy, Debug)]
 pub struct Gpu<'a> {
@@ -191,6 +209,25 @@ mod tests {
             error: (failed_reopens != 0).then_some("DeviceLost"),
             silent,
         }
+    }
+
+    /// Both of nouveau's link lines are named for the port's line, and no
+    /// other line is.
+    #[test]
+    fn the_lines_that_go_with_the_ports_view_are_the_silence_and_its_end() {
+        assert_eq!(link_event(GONE), Some("stopped answering"));
+        assert_eq!(
+            link_event(
+                "nouveau 0000:02:00.0: answers again: BOOT_0 read ffffffff for 12 to 20 ms \
+                 (config vendor 10de link status 1043 then; ...); taken for a transient, said \
+                 once"
+            ),
+            Some("answered again after a silence")
+        );
+        assert_eq!(
+            link_event("nouveau 0000:02:00.0: timer: stalled at ffffffffffffffff"),
+            None
+        );
     }
 
     #[test]
