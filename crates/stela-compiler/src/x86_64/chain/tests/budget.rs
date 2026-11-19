@@ -524,9 +524,13 @@ fn native_interruption_gate_costs() {
     for mode in [Mode::Direct, Mode::Slot, Mode::Lookup, Mode::Cell] {
         let mut table = LookupTable::new();
         let mut itlb = LookupTable::itlb();
+        // A lookup tail reads the jump cache in front of the stamps, which
+        // every PE's control holds before it runs.
+        let stamps = table.new_stamps();
         let mut control = Box::new(Aligned(ChainControl {
             table: table.address(),
             itlb: itlb.address(),
+            stamps,
             contexts: [5, 7],
             salts: [itlb_salt(5), itlb_salt(7)],
             masks: [TABLE_MASK, ITLB_MASK],
@@ -558,13 +562,25 @@ fn native_interruption_gate_costs() {
                 targets: 15,
             };
             // The exit, its tail after it and the probes after that.
+            // A lookup tail serves a dynamic exit, whose target the block
+            // left in RAX: the block sets it before its exit.
             let through_tail = |cell: Option<u64>| {
-                let mut code = direct_exit_at(at, TARGET, ExitKind::Direct).to_vec();
+                let mut code = Code::new();
+                if cell.is_none() {
+                    code.asm().mov_imm64(Rax, TARGET.0);
+                }
+                let mut code = code.into_bytes();
+                let exit = at + code.len() as u64;
+                code.extend(direct_exit_at(exit, TARGET, ExitKind::Direct));
                 let tail = at + code.len() as u64;
-                let point = direct_patch(at);
+                let point = direct_patch(exit);
                 let offset = (point - at) as usize;
                 code[offset..offset + PATCH_BYTES].copy_from_slice(&jump(point, tail).unwrap());
-                let probes = (tail + CELL_TAIL_BYTES as u64).next_multiple_of(16);
+                let tail_bytes = match cell {
+                    Some(_) => CELL_TAIL_BYTES,
+                    None => LOOKUP_TAIL_BYTES,
+                };
+                let probes = (tail + tail_bytes as u64).next_multiple_of(16);
                 match cell {
                     Some(cell) => code.extend(
                         cell_tail(
@@ -643,8 +659,12 @@ const RING: usize = 64;
 /// indirect jump for every target as the former shared dispatcher did.
 fn ring_costs(report: &mut fs::File) {
     const ITERATIONS: u64 = 1 << 20;
-    // Direct exits, whose patch points jump to their tails.
-    const EXIT_BYTES: usize = DIRECT_EXIT_BYTES;
+    // Each block: `movabs rax` with the next block's PC, as a return
+    // leaves its target there, and an exit whose patch point jumps to its
+    // tail, then its lookup tail.
+    const SET_TARGET: usize = 10;
+    const EXIT_BYTES: usize = SET_TARGET + DIRECT_EXIT_BYTES;
+    const TAIL_BYTES: usize = LOOKUP_TAIL_BYTES;
     const PAGE: usize = 4096;
     let bytes = RING * (EXIT_BYTES + TAIL_BYTES) + TAIL_BYTES + PAGE;
     let bytes = bytes.next_multiple_of(PAGE);
@@ -677,8 +697,17 @@ fn ring_costs(report: &mut fs::File) {
             } else {
                 at + EXIT_BYTES as u64
             };
-            let mut bytes = direct_exit_at(at, GuestAddress(pc(next)), ExitKind::Return).to_vec();
-            let point = direct_patch(at);
+            let mut set = Code::new();
+            set.asm().mov_imm64(Rax, pc(next));
+            let mut bytes = set.into_bytes();
+            assert_eq!(bytes.len(), SET_TARGET);
+            let exit = at + SET_TARGET as u64;
+            bytes.extend(direct_exit_at(
+                exit,
+                GuestAddress(pc(next)),
+                ExitKind::Return,
+            ));
+            let point = direct_patch(exit);
             let offset = (point - at) as usize;
             bytes[offset..offset + PATCH_BYTES].copy_from_slice(&jump(point, tail).unwrap());
             code.extend(bytes);
@@ -708,9 +737,11 @@ fn ring_costs(report: &mut fs::File) {
             .unwrap(),
         );
         code.extend(lookup_dispatcher(0).unwrap());
+        let stamps = table.new_stamps();
         let mut control = Box::new(Aligned(ChainControl {
             table: table.address(),
             itlb: itlb.address(),
+            stamps,
             contexts: [5, 5],
             salts: [itlb_salt(5); 2],
             masks: [TABLE_MASK, ITLB_MASK],
