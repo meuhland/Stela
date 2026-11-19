@@ -39,9 +39,16 @@
 //!
 //! **Limits and cleanup.** A GPU serves at most [`MAX_SESSIONS`] sessions at
 //! once, admitted while their video memory together stays within
-//! [`VRAM_BUDGET`] (each at most `decoder::VRAM_BUDGET`). A connection's
+//! [`VRAM_BUDGET`] (each at most `decoder::VRAM_BUDGET`) and their system
+//! memory within [`HOST_BUDGET`]: nouveau's GART buffers are pages of the
+//! host's heap, which the engine and Linux share, so an open is also
+//! refused while the heap would keep less than [`HEAP_FREE_LEAST`] free or
+//! has no extent of [`HEAP_LARGEST_LEAST`] (stela-main-nvdec7 ended with
+//! eight 4K sessions of 88 MiB each left open and no 4 MiB extent). A
+//! session idle [`TRIM_IDLE_NS`] lets its staging buffer go. A connection's
 //! close closes its sessions ([`GateDecoders::disconnect`]), as the PC's
-//! stop closes every one.
+//! stop closes every one; the open and closed lines give the host memory a
+//! session holds and the heap before and after.
 //!
 //! **Eviction.** VideoToolbox may leave a session open and never call it
 //! again (the Aerial wallpaper's AVPlayerLooper leaves one behind each loop,
@@ -50,7 +57,8 @@
 //! when that makes room (else nothing is closed and the open is refused,
 //! listing the sessions open and how long each has been idle); and a
 //! session idle [`RELEASE_IDLE_NS`] is closed at the next decoder call
-//! (of another session) to give its video memory back. An evicted
+//! (of another session) to give its video memory back, as one idle
+//! [`EVICT_IDLE_NS`] is while the host's heap is low. An evicted
 //! session's calls answer `Evicted`, which StelaVD takes as "open a new
 //! session at the next sync sample", and its close answers `Ok`.
 //!
@@ -59,7 +67,7 @@
 //! closes: frames, outputs, errors, and the average and most of `gpu_us`
 //! (the engine's decode), `ce_us` (the copy engine's readback), `copy_us`
 //! (the CPU's copy into the caller) and `total_us` (a sample's calls).
-use super::encoders::EncoderPlatform;
+use super::encoders::{EncoderPlatform, HostHeap};
 use super::gate::fault;
 use super::pace::{Pace, RETRY_AT_ONCE_US};
 use super::wire::{
@@ -115,6 +123,23 @@ pub const RELEASE_IDLE_NS: u64 = 60_000_000_000;
 /// The least time between two looks for sessions idle past
 /// [`RELEASE_IDLE_NS`].
 const SWEEP_NS: u64 = 1_000_000_000;
+/// The system memory the GPU's decoder sessions take together, at most:
+/// nouveau's GART buffers, which the host's heap backs (bitstream buffers,
+/// the push ring, setup pages, the copier's ring and staging). A 4K Main 10
+/// session takes about 32 MiB once it shows a picture ([`decoder::needs`]);
+/// stela-main-nvdec7's took 88 MiB, and eight left open took the heap's
+/// last large extents.
+pub const HOST_BUDGET: u64 = 320 << 20;
+/// The host's heap a session leaves free when it opens, at least: the
+/// engine's translations, Linux and the C library share it.
+pub const HEAP_FREE_LEAST: u64 = 512 << 20;
+/// The largest free extent of the host's heap a session opens with, at
+/// least: below it the heap is in pieces, and a large allocation elsewhere
+/// (the engine's code cache, a Vec that grows) may find no room.
+pub const HEAP_LARGEST_LEAST: u64 = 64 << 20;
+/// How long a session goes without a call before its staging buffer is
+/// let go ([`Decoder::trim`]): 3 s, past any frame period and preroll.
+pub const TRIM_IDLE_NS: u64 = 3_000_000_000;
 /// Evicted sessions remembered, so their calls answer `Evicted` rather than
 /// a stale handle; the oldest is forgotten past this.
 const MOST_EVICTED: usize = 64;
@@ -409,6 +434,13 @@ struct Slot<N: Node> {
     last_call: u64,
     period: Counts,
     total: Counts,
+    /// The system memory it takes once it shows a picture
+    /// ([`decoder::needs`]), which the host budget counts.
+    host_needed: u64,
+    /// The host's heap when its open began, for the open line.
+    heap_before: Option<HostHeap>,
+    /// Its staging was let go, idle, this many times.
+    trims: u32,
 }
 
 impl<N: Node> Slot<N> {
@@ -444,6 +476,61 @@ struct State<N: Node> {
     swept: u64,
 }
 
+/// What an open that does not fit is short of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Short {
+    Sessions,
+    Vram,
+    /// The decoders' [`HOST_BUDGET`].
+    Host,
+    /// The host's heap would keep less than [`HEAP_FREE_LEAST`] free.
+    HeapFree,
+    /// The host's heap has no extent of [`HEAP_LARGEST_LEAST`].
+    HeapLargest,
+}
+
+impl Short {
+    fn fault(self) -> &'static str {
+        match self {
+            Self::Sessions => "every video decoder session of the GPU is in use",
+            Self::Vram => "the video memory of the GPU's decoder sessions is taken",
+            Self::Host => "the host memory of the GPU's decoder sessions is taken",
+            Self::HeapFree | Self::HeapLargest => "the host's heap is low",
+        }
+    }
+}
+
+/// Whether the host's heap is low: less than [`HEAP_FREE_LEAST`] free, or
+/// no extent of [`HEAP_LARGEST_LEAST`].
+fn heap_low(heap: &HostHeap) -> bool {
+    heap.free() < HEAP_FREE_LEAST || heap.largest < HEAP_LARGEST_LEAST
+}
+
+/// ` | heap 2475->2483M used of 4646M, largest 1760M`: the host's heap
+/// before and after, or nothing when the platform does not say.
+fn heap_change(before: Option<HostHeap>, after: Option<HostHeap>) -> String {
+    let Some(after) = after else {
+        return String::new();
+    };
+    let from = before.map_or_else(String::new, |before| {
+        alloc::format!("{}->", before.used >> 20)
+    });
+    alloc::format!(
+        " | heap {from}{}M used of {}M, largest {}M",
+        after.used >> 20,
+        after.total >> 20,
+        after.largest >> 20
+    )
+}
+
+impl<N: Node> Slot<N> {
+    /// The system memory the host budget counts for it: what it takes
+    /// once it shows a picture, or more if a bitstream buffer grew.
+    fn host_counted(&self) -> u64 {
+        self.host_needed.max(self.decoder.host_bytes())
+    }
+}
+
 fn evicted() -> Fault {
     Fault::new(
         Status::Evicted,
@@ -456,6 +543,8 @@ pub struct Decoders<P: EncoderPlatform> {
     platform: P,
     /// The video memory its sessions may take together ([`VRAM_BUDGET`]).
     vram_budget: u64,
+    /// The system memory its sessions may take together ([`HOST_BUDGET`]).
+    host_budget: u64,
     held: AtomicBool,
     state: UnsafeCell<State<P::Node>>,
 }
@@ -555,9 +644,16 @@ impl<P: EncoderPlatform> Decoders<P> {
 
     /// Decoders whose sessions take at most `vram_budget` bytes together.
     pub fn with_vram_budget(platform: P, vram_budget: u64) -> Self {
+        Self::with_budgets(platform, vram_budget, HOST_BUDGET)
+    }
+
+    /// Decoders whose sessions take at most `vram_budget` bytes of video
+    /// memory and `host_budget` of system memory together.
+    pub fn with_budgets(platform: P, vram_budget: u64, host_budget: u64) -> Self {
         Self {
             platform,
             vram_budget,
+            host_budget,
             held: AtomicBool::new(false),
             state: UnsafeCell::new(State {
                 sessions: Vec::new(),
@@ -616,21 +712,32 @@ impl<P: EncoderPlatform> Decoders<P> {
         let mut total = slot.total;
         total.add(&slot.period);
         let description = slot.describe();
+        let held = slot.decoder.host_bytes();
+        let grown = slot.decoder.grown();
+        let before = self.platform.heap();
         let closed = slot.decoder.close();
         if closed.keeps_file {
             state.refused = Some("a decoder session's channel stayed busy this boot");
         }
+        let keeps_file = closed.keeps_file;
+        // The file's close gives its buffers back to nouveau, and their
+        // pages to the host's heap.
+        self.platform.close_node(closed.node, keeps_file);
+        let after = self.platform.heap();
         let lived = self.platform.now_ns().saturating_sub(slot.opened_at) / 1_000_000;
         self.log(format_args!(
-            "{} closed ({why}) after {lived} ms: {description}, {total}{}",
+            "{} closed ({why}) after {lived} ms: {description}, {total}, held {} MiB of host \
+             memory (bitstream grown {grown}, staging let go {}){}{}",
             slot.id,
-            if closed.keeps_file {
+            held >> 20,
+            slot.trims,
+            heap_change(before, after),
+            if keeps_file {
                 ", a channel still busy: its file stays open, and no session opens again"
             } else {
                 ""
             }
         ));
-        self.platform.close_node(closed.node, closed.keeps_file);
     }
 
     /// Evicts the session of slot `index`, idle `idle_ns`: it is closed
@@ -655,41 +762,73 @@ impl<P: EncoderPlatform> Decoders<P> {
         state.evicted.push((id, connection));
     }
 
-    /// Whether a session of `needed` bytes of video memory fits, after
+    /// Whether a session of `needs` fits (the sessions' count, video memory
+    /// and system memory, and the host's heap left free by `heap`), after
     /// evicting the sessions idle at least [`EVICT_IDLE_NS`], least
-    /// recently called first, that make it fit. Nothing is evicted when
-    /// evicting every such session would not make it fit.
-    fn make_room(&self, state: &mut State<P::Node>, connection: NonZeroU64, needed: u64) -> bool {
-        let fits =
-            |count: usize, taken: u64| count < MAX_SESSIONS && taken + needed <= self.vram_budget;
+    /// recently called first, that make it fit; else what it is short of.
+    /// Nothing is evicted when evicting every such session would not make
+    /// it fit.
+    fn make_room(
+        &self,
+        state: &mut State<P::Node>,
+        connection: NonZeroU64,
+        needs: decoder::Needs,
+        heap: Option<HostHeap>,
+    ) -> Result<(), Short> {
+        // `freed`: the system memory the sessions evicted so far give back.
+        let short = |count: usize, vram: u64, host: u64, freed: u64| {
+            if count >= MAX_SESSIONS {
+                Some(Short::Sessions)
+            } else if vram + needs.vram > self.vram_budget {
+                Some(Short::Vram)
+            } else if host + needs.host > self.host_budget {
+                Some(Short::Host)
+            } else if heap.is_some_and(|heap| heap.free() + freed < needs.host + HEAP_FREE_LEAST) {
+                Some(Short::HeapFree)
+            } else {
+                None
+            }
+        };
         let mut count = state.sessions.len();
-        let mut taken: u64 = state
+        let mut vram: u64 = state
             .sessions
             .iter()
             .map(|slot| slot.decoder.layout().vram_bytes())
             .sum();
-        if fits(count, taken) {
-            return true;
+        let mut host: u64 = state.sessions.iter().map(Slot::host_counted).sum();
+        let mut freed = 0;
+        if short(count, vram, host, freed).is_none() {
+            return Ok(());
         }
         let now = self.platform.now_ns();
-        let mut idle: Vec<(u64, u64, u64)> = state
+        let mut idle: Vec<(u64, u64, u64, u64, u64)> = state
             .sessions
             .iter()
             .filter(|slot| now.saturating_sub(slot.last_call) >= EVICT_IDLE_NS)
-            .map(|slot| (slot.last_call, slot.id, slot.decoder.layout().vram_bytes()))
+            .map(|slot| {
+                (
+                    slot.last_call,
+                    slot.id,
+                    slot.decoder.layout().vram_bytes(),
+                    slot.host_counted(),
+                    slot.decoder.host_bytes(),
+                )
+            })
             .collect();
         idle.sort_unstable();
         let mut chosen = Vec::new();
-        for (last_call, id, bytes) in idle {
-            if fits(count, taken) {
+        for (last_call, id, bytes, counted, held) in idle {
+            if short(count, vram, host, freed).is_none() {
                 break;
             }
             count -= 1;
-            taken -= bytes;
+            vram -= bytes;
+            host -= counted;
+            freed += held;
             chosen.push((id, last_call));
         }
-        if !fits(count, taken) {
-            return false;
+        if let Some(why) = short(count, vram, host, freed) {
+            return Err(why);
         }
         for (id, last_call) in chosen {
             if let Some(index) = state.sessions.iter().position(|slot| slot.id == id) {
@@ -701,30 +840,86 @@ impl<P: EncoderPlatform> Decoders<P> {
                 );
             }
         }
-        true
+        Ok(())
     }
 
-    /// Evicts the sessions but `keep` idle at least [`RELEASE_IDLE_NS`],
-    /// looking at most once every [`SWEEP_NS`].
+    /// Evicts every session but `keep` idle at least `idle_ns`, for `why`;
+    /// how many.
+    fn evict_idle(
+        &self,
+        state: &mut State<P::Node>,
+        keep: Option<u64>,
+        idle_ns: u64,
+        why: fmt::Arguments<'_>,
+    ) -> usize {
+        let now = self.platform.now_ns();
+        let mut evicted = 0;
+        while let Some(index) = state
+            .sessions
+            .iter()
+            .position(|slot| Some(slot.id) != keep && now.saturating_sub(slot.last_call) >= idle_ns)
+        {
+            let idle = now.saturating_sub(state.sessions[index].last_call);
+            self.evict(state, index, idle, why);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// Looks at the sessions but `keep`, at most once every [`SWEEP_NS`]:
+    /// those idle [`RELEASE_IDLE_NS`] are evicted, and while the host's
+    /// heap is low (less than [`HEAP_FREE_LEAST`] free, or no extent of
+    /// [`HEAP_LARGEST_LEAST`]) those idle [`EVICT_IDLE_NS`]; those idle
+    /// [`TRIM_IDLE_NS`] let their staging go.
     fn sweep(&self, state: &mut State<P::Node>, keep: Option<u64>) {
         let now = self.platform.now_ns();
         if now.saturating_sub(state.swept) < SWEEP_NS {
             return;
         }
         state.swept = now;
-        while let Some(index) = state.sessions.iter().position(|slot| {
-            Some(slot.id) != keep && now.saturating_sub(slot.last_call) >= RELEASE_IDLE_NS
-        }) {
-            let idle_ns = now.saturating_sub(state.sessions[index].last_call);
-            self.evict(
+        self.evict_idle(
+            state,
+            keep,
+            RELEASE_IDLE_NS,
+            format_args!(
+                "to give its video memory back: no call in {} s",
+                RELEASE_IDLE_NS / 1_000_000_000
+            ),
+        );
+        if !state.sessions.is_empty()
+            && let Some(heap) = self.platform.heap()
+            && heap_low(&heap)
+        {
+            self.evict_idle(
                 state,
-                index,
-                idle_ns,
+                keep,
+                EVICT_IDLE_NS,
                 format_args!(
-                    "to give its video memory back: no call in {} s",
-                    RELEASE_IDLE_NS / 1_000_000_000
+                    "to give the host's heap back: {} MiB free, largest {} MiB",
+                    heap.free() >> 20,
+                    heap.largest >> 20
                 ),
             );
+        }
+        for slot in &mut state.sessions {
+            if Some(slot.id) == keep
+                || slot.opening
+                || now.saturating_sub(slot.last_call) < TRIM_IDLE_NS
+            {
+                continue;
+            }
+            let held = slot.decoder.host_bytes();
+            if slot.decoder.trim() {
+                slot.trims += 1;
+                let line = alloc::format!(
+                    "{} let its staging go (idle {} ms): {} -> {} MiB of host memory",
+                    slot.id,
+                    now.saturating_sub(slot.last_call) / 1_000_000,
+                    held >> 20,
+                    slot.decoder.host_bytes() >> 20
+                );
+                self.log(format_args!("{line}"));
+            }
         }
     }
 
@@ -788,10 +983,11 @@ impl<P: EncoderPlatform> Decoders<P> {
                     let (pieces, _) = slot.decoder.made();
                     let took = self.platform.now_ns().saturating_sub(slot.opened_at);
                     let opened = slot.decoder.opened();
+                    let heap = self.platform.heap();
                     let line = alloc::format!(
                         "{} open for connection {connection}: {}, coded {}x{}, {} slots on {} \
-                         surfaces, {pieces} pieces in {} ms, {} MiB of video memory, copy channel \
-                         {}{}",
+                         surfaces, {pieces} pieces in {} ms, {} MiB of video memory, {} MiB of \
+                         host memory ({} MiB with its staging), copy channel {}{}{}",
                         slot.id,
                         slot.describe(),
                         opened.coded.0,
@@ -800,7 +996,10 @@ impl<P: EncoderPlatform> Decoders<P> {
                         opened.surfaces,
                         took / 1_000_000,
                         slot.decoder.layout().vram_bytes() >> 20,
+                        slot.decoder.host_bytes() >> 20,
+                        slot.host_needed >> 20,
                         slot.decoder.copy_channel().unwrap_or(-1),
+                        heap_change(slot.heap_before, heap),
                         self.gpu_state()
                     );
                     self.log(format_args!("{line}"));
@@ -882,9 +1081,10 @@ impl<P: EncoderPlatform> Decoders<P> {
         caller
             .read(request.config.address, &mut record)
             .map_err(fault)?;
-        // Admitted by video memory, before any file opens.
-        let needed = match decoder::vram_bytes(codec, &record) {
-            Ok(bytes) => bytes,
+        // Admitted by video memory and the host's heap, before any file
+        // opens.
+        let needs = match decoder::needs(codec, &record) {
+            Ok(needs) => needs,
             Err(error) => {
                 self.log(format_args!(
                     "refused a {} stream for connection {connection}: {error:?}",
@@ -899,40 +1099,81 @@ impl<P: EncoderPlatform> Decoders<P> {
             }
         };
         // Sessions idle long enough make room, least recently called first.
-        let room = self.make_room(state, connection, needed);
-        if !room && state.sessions.len() >= MAX_SESSIONS {
-            self.log(format_args!(
-                "refused a {} stream for connection {connection}: {MAX_SESSIONS} sessions open \
-                 ({})",
-                codec.name(),
-                self.idle_list(state)
-            ));
-            return Err(Fault::new(
-                Status::Unsupported,
-                "every video decoder session of the GPU is in use",
-            )
-            .value(MAX_SESSIONS as u64));
+        let mut heap = self.platform.heap();
+        let mut room = self.make_room(state, connection, needs, heap);
+        // A heap in pieces: the idle sessions' pages may join extents.
+        if room.is_ok()
+            && heap.is_some_and(|heap| heap.largest < HEAP_LARGEST_LEAST)
+            && self.evict_idle(
+                state,
+                None,
+                EVICT_IDLE_NS,
+                format_args!(
+                    "for a new session of connection {connection}: the host's heap has no \
+                     extent of {} MiB",
+                    HEAP_LARGEST_LEAST >> 20
+                ),
+            ) > 0
+        {
+            heap = self.platform.heap();
         }
-        let taken: u64 = state
-            .sessions
-            .iter()
-            .map(|slot| slot.decoder.layout().vram_bytes())
-            .sum();
-        if !room {
+        if room.is_ok() && heap.is_some_and(|heap| heap.largest < HEAP_LARGEST_LEAST) {
+            room = Err(Short::HeapLargest);
+        }
+        if let Err(short) = room {
+            let vram: u64 = state
+                .sessions
+                .iter()
+                .map(|slot| slot.decoder.layout().vram_bytes())
+                .sum();
+            let host: u64 = state.sessions.iter().map(Slot::host_counted).sum();
+            let (why, value) = match short {
+                Short::Sessions => (
+                    alloc::format!("{MAX_SESSIONS} sessions open"),
+                    MAX_SESSIONS as u64,
+                ),
+                Short::Vram => (
+                    alloc::format!(
+                        "it takes {} MiB of video memory, {} MiB of {} MiB are taken",
+                        needs.vram >> 20,
+                        vram >> 20,
+                        self.vram_budget >> 20
+                    ),
+                    needs.vram,
+                ),
+                Short::Host => (
+                    alloc::format!(
+                        "it takes {} MiB of host memory, {} MiB of {} MiB are taken",
+                        needs.host >> 20,
+                        host >> 20,
+                        self.host_budget >> 20
+                    ),
+                    needs.host,
+                ),
+                Short::HeapFree | Short::HeapLargest => {
+                    let heap = heap.unwrap_or_default();
+                    (
+                        alloc::format!(
+                            "it takes {} MiB of host memory and the host's heap is low: {} MiB \
+                             free of {} MiB (at least {} MiB stay free), largest extent {} MiB \
+                             (at least {} MiB)",
+                            needs.host >> 20,
+                            heap.free() >> 20,
+                            heap.total >> 20,
+                            HEAP_FREE_LEAST >> 20,
+                            heap.largest >> 20,
+                            HEAP_LARGEST_LEAST >> 20
+                        ),
+                        heap.largest,
+                    )
+                }
+            };
             self.log(format_args!(
-                "refused a {} stream for connection {connection}: it takes {} MiB of video \
-                 memory, {} MiB of {} MiB are taken ({})",
+                "refused a {} stream for connection {connection}: {why} ({})",
                 codec.name(),
-                needed >> 20,
-                taken >> 20,
-                self.vram_budget >> 20,
                 self.idle_list(state)
             ));
-            return Err(Fault::new(
-                Status::Unsupported,
-                "the video memory of the GPU's decoder sessions is taken",
-            )
-            .value(needed));
+            return Err(Fault::new(Status::Unsupported, short.fault()).value(value));
         }
         let node = self
             .platform
@@ -992,6 +1233,9 @@ impl<P: EncoderPlatform> Decoders<P> {
             last_call: now,
             period: Counts::default(),
             total: Counts::default(),
+            host_needed: needs.host,
+            heap_before: heap,
+            trims: 0,
         });
         Ok(state.sessions.len() - 1)
     }

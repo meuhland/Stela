@@ -403,6 +403,9 @@ pub struct VmBindOp {
 
 /// `DRM_NOUVEAU_VM_BIND_OP_MAP`.
 pub const VM_BIND_OP_MAP: u32 = 0;
+/// `DRM_NOUVEAU_VM_BIND_OP_UNMAP`: the range at `addr` is let go (the
+/// handle is not read).
+pub const VM_BIND_OP_UNMAP: u32 = 1;
 
 /// `struct drm_nouveau_vm_bind`; `flags` zero runs it synchronously.
 #[repr(C)]

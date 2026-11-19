@@ -10,7 +10,10 @@
 //!   surfaces unmapped for the CPU (pictures leave by the copy engine
 //!   alone), and the copy engine's [`Copier`] last, its ring past the
 //!   layout ([`copy::ring_after`]) and its staging buffer one displayed
-//!   picture.
+//!   picture, made by the first copy and let go by [`Decoder::trim`]. The
+//!   bitstream buffers start small and grow for a sample they do not hold
+//!   ([`session::first_bitstream_bytes`]): the system memory of both is the
+//!   host's heap.
 //! - **A sample** ([`Decoder::submit`], then [`Decoder::poll`]): parsed into
 //!   its picture, which is submitted to NVDEC; once the engine releases it,
 //!   the pictures it shows ([`Picture::outputs`]) join the queue of pictures
@@ -283,6 +286,48 @@ pub fn vram_bytes(codec: Codec, record: &[u8]) -> Result<u64, Error> {
     plan(codec, record).map(|(_, _, _, layout)| layout.vram_bytes())
 }
 
+/// What a session for the stream `record` describes takes of each memory
+/// once it shows its first picture, before anything is opened: video
+/// memory, and system memory (nouveau's GART), which the host's heap backs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Needs {
+    pub vram: u64,
+    pub host: u64,
+}
+
+/// The [`Needs`] of a session for the stream `record` describes: its
+/// layout's video memory, and its system memory as it first makes it
+/// (the bitstream buffers at [`session::first_bitstream_bytes`]), with the
+/// copier's ring and a displayed picture's staging.
+pub fn needs(codec: Codec, record: &[u8]) -> Result<Needs, Error> {
+    let (_, sequence, _, layout) = plan(codec, record)?;
+    let gart: u64 = layout
+        .plans
+        .iter()
+        .enumerate()
+        .filter(|(_, plan)| plan.domain == crate::nvenc::layout::Domain::Gart)
+        .map(|(index, plan)| {
+            if layout.bitstream.contains(&index) {
+                session::first_bitstream_bytes(plan.bytes)
+            } else {
+                plan.bytes.next_multiple_of(0x1000)
+            }
+        })
+        .sum();
+    let sample_bytes = if sequence.bit_depth > 8 { 2 } else { 1 };
+    let crop = Crop {
+        left: 0,
+        top: 0,
+        width: sequence.display.0,
+        height: sequence.display.1,
+    };
+    let staging = copy::picture_bytes(&crop, sample_bytes).next_multiple_of(0x1000);
+    Ok(Needs {
+        vram: layout.vram_bytes(),
+        host: gart + copy::RING_BYTES + staging,
+    })
+}
+
 impl<N: Node> Decoder<N> {
     /// Opens a `codec` session for the stream `record` (`avcC`/`hvcC`)
     /// describes, on `node`, a fresh render node file of `chipset`'s GPU:
@@ -385,6 +430,30 @@ impl<N: Node> Decoder<N> {
     /// The copy engine's channel, once made.
     pub fn copy_channel(&self) -> Option<i32> {
         self.copier.as_ref().map(Copier::channel)
+    }
+
+    /// The bytes of system memory (nouveau's GART, which the host's heap
+    /// backs) the session's buffers and copier hold now.
+    pub fn host_bytes(&self) -> u64 {
+        self.session.host_bytes() + self.copier.as_ref().map_or(0, Copier::host_bytes)
+    }
+
+    /// The bitstream buffers grown for samples they did not hold.
+    pub fn grown(&self) -> u32 {
+        self.session.grown()
+    }
+
+    /// Lets the copier's staging buffer go while nothing is in it or being
+    /// copied into it: an idle session then holds no picture's system
+    /// memory until it shows the next. Whether it went.
+    pub fn trim(&mut self) -> bool {
+        if self.staging != Staging::Empty {
+            return false;
+        }
+        match self.copier.as_mut() {
+            Some(copier) => copier.trim(self.session.node()),
+            None => false,
+        }
     }
 
     /// Whether a picture is in flight.

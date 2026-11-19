@@ -18,7 +18,7 @@ use crate::nvenc::{
     CHANNEL_ALLOC, CHANNEL_FREE, ChannelAlloc, ChannelFree, DOMAIN_VRAM, EXEC, Exec, ExecPush,
     GEM_CLOSE, GEM_NEW, GROBJ_ALLOC, GemClose, GemNew, GrobjAlloc, Node, SUBCHANNEL,
     SYNCOBJ_CREATE, SYNCOBJ_DESTROY, SYNCOBJ_WAIT, Sync, SyncobjCreate, SyncobjWait, VM_BIND,
-    VM_BIND_OP_MAP, VM_INIT, VmBind, VmBindOp, VmInit,
+    VM_BIND_OP_MAP, VM_BIND_OP_UNMAP, VM_INIT, VmBind, VmBindOp, VmInit,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -102,6 +102,8 @@ pub struct Gpu {
     pub closed: Vec<u32>,
     pub mapped: usize,
     pub unmapped: usize,
+    /// `VM_BIND` unmaps.
+    pub unbound: usize,
     pub clock: u64,
     pub vm_init: bool,
     pub channel_freed: bool,
@@ -142,6 +144,7 @@ impl Gpu {
             closed: Vec::new(),
             mapped: 0,
             unmapped: 0,
+            unbound: 0,
             clock: 1_000_000_000,
             vm_init: false,
             channel_freed: false,
@@ -555,6 +558,18 @@ unsafe impl Node for Gpu {
                 assert_eq!((bind.op_count, bind.flags), (1, 0));
                 // SAFETY: the session's op.
                 let op = unsafe { *(bind.op_ptr as *const VmBindOp) };
+                if op.op == VM_BIND_OP_UNMAP {
+                    // A whole binding, let go: its addresses are free again.
+                    let buffer = self
+                        .buffers
+                        .iter_mut()
+                        .find(|buffer| buffer.address == Some(op.addr))
+                        .unwrap_or_else(|| panic!("nothing bound at {:#x} to unmap", op.addr));
+                    assert_eq!(op.range, buffer.bytes, "a whole binding");
+                    buffer.address = None;
+                    self.unbound += 1;
+                    return 0;
+                }
                 assert_eq!(op.op, VM_BIND_OP_MAP);
                 let index = op.handle as usize - 1;
                 let buffer = &self.buffers[index];
