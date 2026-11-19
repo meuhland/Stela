@@ -12,6 +12,7 @@ use crate::metal::{
     command_buffer::Segment,
     error::{Error, Result},
     pass::ClearValue,
+    pipeline::MAX_COLOR_ATTACHMENTS,
     pixel_format::BlockKernel,
     vulkan::{
         Access, StencilOp,
@@ -81,6 +82,50 @@ fn clear(value: ClearValue) -> vk::ClearValue {
         ClearValue::DepthStencil { depth, stencil } => vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue { depth, stencil },
         },
+    }
+}
+
+fn viewport(viewport: &crate::metal::vulkan::command::Viewport) -> vk::Viewport {
+    vk::Viewport {
+        x: viewport.x,
+        y: viewport.y,
+        width: viewport.width,
+        height: viewport.height,
+        min_depth: viewport.min_depth,
+        max_depth: viewport.max_depth,
+    }
+}
+
+fn scissor(rect: &crate::metal::vulkan::command::Rect) -> vk::Rect2D {
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: rect.offset[0],
+            y: rect.offset[1],
+        },
+        extent: vk::Extent2D {
+            width: rect.extent[0],
+            height: rect.extent[1],
+        },
+    }
+}
+
+/// `slots` converted, in `inline` when they fit, as a pass's color
+/// attachments do (Metal's plans keep every slot, holes too), else in
+/// `heap`: a pass allocates nothing for them.
+fn converted<'a, S, T: Copy, const N: usize>(
+    slots: &[S],
+    inline: &'a mut [T; N],
+    heap: &'a mut Vec<T>,
+    convert: impl Fn(&S) -> T,
+) -> &'a [T] {
+    if slots.len() <= N {
+        for (into, slot) in inline.iter_mut().zip(slots) {
+            *into = convert(slot);
+        }
+        &inline[..slots.len()]
+    } else {
+        heap.extend(slots.iter().map(convert));
+        heap
     }
 }
 
@@ -273,11 +318,11 @@ impl Recorder<'_> {
     }
 
     fn begin_rendering(&self, rendering: &Rendering) {
-        let colors: Vec<_> = rendering
-            .color
-            .iter()
-            .map(|slot| slot.as_ref().map_or_else(Default::default, attachment))
-            .collect();
+        let mut inline = [vk::RenderingAttachmentInfo::default(); MAX_COLOR_ATTACHMENTS];
+        let mut heap = Vec::new();
+        let colors = converted(&rendering.color, &mut inline, &mut heap, |slot| {
+            slot.as_ref().map_or_else(Default::default, attachment)
+        });
         let depth = rendering.depth.as_ref().map(attachment);
         let stencil = rendering.stencil.as_ref().map(attachment);
         let [width, height] = rendering.extent;
@@ -287,7 +332,7 @@ impl Recorder<'_> {
                 extent: vk::Extent2D { width, height },
             })
             .layer_count(rendering.layer_count)
-            .color_attachments(&colors);
+            .color_attachments(colors);
         if let Some(depth) = depth.as_ref() {
             info = info.depth_attachment(depth);
         }
@@ -409,34 +454,18 @@ impl Recorder<'_> {
                     handle(pipeline.0),
                 ),
                 Command::PushConstants(constants) => self.push_constants(constants),
+                Command::SetViewport(set) => {
+                    device.cmd_set_viewport_with_count(buffer, &[viewport(set)]);
+                }
                 Command::SetViewports(viewports) => {
-                    let viewports: Vec<_> = viewports
-                        .iter()
-                        .map(|viewport| vk::Viewport {
-                            x: viewport.x,
-                            y: viewport.y,
-                            width: viewport.width,
-                            height: viewport.height,
-                            min_depth: viewport.min_depth,
-                            max_depth: viewport.max_depth,
-                        })
-                        .collect();
+                    let viewports: Vec<_> = viewports.iter().map(viewport).collect();
                     device.cmd_set_viewport_with_count(buffer, &viewports);
                 }
+                Command::SetScissor(rect) => {
+                    device.cmd_set_scissor_with_count(buffer, &[scissor(rect)]);
+                }
                 Command::SetScissors(rects) => {
-                    let rects: Vec<_> = rects
-                        .iter()
-                        .map(|rect| vk::Rect2D {
-                            offset: vk::Offset2D {
-                                x: rect.offset[0],
-                                y: rect.offset[1],
-                            },
-                            extent: vk::Extent2D {
-                                width: rect.extent[0],
-                                height: rect.extent[1],
-                            },
-                        })
-                        .collect();
+                    let rects: Vec<_> = rects.iter().map(scissor).collect();
                     device.cmd_set_scissor_with_count(buffer, &rects);
                 }
                 &Command::SetDepthBias {
@@ -855,4 +884,25 @@ fn buffer_image(
         .image_subresource(subresource(region.subresource))
         .image_offset(offset(region.offset))
         .image_extent(extent(region.extent))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::converted;
+    use alloc::vec::Vec;
+
+    /// Slots that fit convert in place; more than fit convert into the
+    /// heap; none convert to none.
+    #[test]
+    fn color_slots_convert_in_place_when_they_fit() {
+        let double = |slot: &Option<u32>| slot.map_or(0, |value| value * 2);
+        let (mut inline, mut heap) = ([0; 4], Vec::new());
+        let slots = [Some(1), None, Some(3)];
+        assert_eq!(converted(&slots, &mut inline, &mut heap, double), [2, 0, 6]);
+        assert!(heap.capacity() == 0);
+        let (mut inline, mut heap) = ([0; 2], Vec::new());
+        assert_eq!(converted(&slots, &mut inline, &mut heap, double), [2, 0, 6]);
+        let (mut inline, mut heap) = ([0; 2], Vec::new());
+        assert!(converted(&[], &mut inline, &mut heap, double).is_empty());
+    }
 }

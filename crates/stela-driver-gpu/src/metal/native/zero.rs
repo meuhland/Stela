@@ -396,7 +396,9 @@ pub(super) fn first_writes(
             | Command::RegionBarrier(_)
             | Command::BindPipeline { .. }
             | Command::PushConstants(_)
+            | Command::SetViewport(_)
             | Command::SetViewports(_)
+            | Command::SetScissor(_)
             | Command::SetScissors(_)
             | Command::SetDepthBias { .. }
             | Command::SetBlendConstants(_)

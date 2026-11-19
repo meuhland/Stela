@@ -517,11 +517,11 @@ impl CommandBuffer {
         };
         let features = self.features;
         let recorder = &mut self.recorder;
-        recorder.push(Command::SetViewports(alloc::vec![flip(viewport)]));
-        recorder.push(Command::SetScissors(alloc::vec![Rect {
+        recorder.push(Command::SetViewport(flip(viewport)));
+        recorder.push(Command::SetScissor(Rect {
             offset: [0, 0],
-            extent: [width, height]
-        }]));
+            extent: [width, height],
+        }));
         recorder.push(Command::SetCullMode(CullMode::EMPTY));
         recorder.push(Command::SetFrontFace(FrontFace::Clockwise));
         recorder.push(Command::SetDepthBias {
@@ -1073,8 +1073,17 @@ fn drawn_area(commands: &[Command], extent: [u32; 2]) -> (Vec<[u32; 4]>, bool) {
                 scissors.clone_from(rects);
                 continue;
             }
+            Command::SetScissor(rect) => {
+                scissors.clear();
+                scissors.push(*rect);
+                continue;
+            }
             Command::SetViewports(set) => {
                 viewports = viewport_bounds(set, extent);
+                continue;
+            }
+            Command::SetViewport(set) => {
+                viewports = viewport_bounds(core::slice::from_ref(set), extent);
                 continue;
             }
             Command::SetPrimitiveTopology(set) => {
@@ -1658,9 +1667,11 @@ impl CommandBuffer {
             "between 1 and 16 viewports",
         )?;
         render.depth_range = [viewports[0].znear as f32, viewports[0].zfar as f32];
-        self.recorder.push(Command::SetViewports(
-            viewports.iter().copied().map(flip).collect(),
-        ));
+        let command = match viewports {
+            [viewport] => Command::SetViewport(flip(*viewport)),
+            _ => Command::SetViewports(viewports.iter().copied().map(flip).collect()),
+        };
+        self.recorder.push(command);
         Ok(())
     }
 
@@ -1670,8 +1681,7 @@ impl CommandBuffer {
             (1..=16).contains(&rects.len()),
             "between 1 and 16 scissor rectangles",
         )?;
-        let mut scissors = Vec::with_capacity(rects.len());
-        for rect in rects {
+        let scissor = |rect: &ScissorRect| {
             let inside = rect
                 .x
                 .checked_add(rect.width)
@@ -1681,12 +1691,16 @@ impl CommandBuffer {
                     .checked_add(rect.height)
                     .is_some_and(|bottom| bottom <= u64::from(height));
             ensure(inside, "scissor rectangles lie within the render target")?;
-            scissors.push(Rect {
+            Ok(Rect {
                 offset: [rect.x as i32, rect.y as i32],
                 extent: [rect.width as u32, rect.height as u32],
-            });
-        }
-        self.recorder.push(Command::SetScissors(scissors));
+            })
+        };
+        let command = match rects {
+            [rect] => Command::SetScissor(scissor(rect)?),
+            _ => Command::SetScissors(rects.iter().map(scissor).collect::<Result<_>>()?),
+        };
+        self.recorder.push(command);
         Ok(())
     }
 

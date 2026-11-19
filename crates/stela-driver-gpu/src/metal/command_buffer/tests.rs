@@ -960,6 +960,74 @@ fn dispatches_through_pixel_coordinate_samplers_run_the_variant_reading_them() {
     assert_eq!(variants, [1 << 0]);
 }
 
+/// One viewport or scissor rectangle records as its own command, which
+/// allocates nothing; several record together; a rectangle outside the
+/// target is refused either way.
+#[test]
+fn single_viewports_and_scissors_record_without_a_list() {
+    let color = texture(PixelFormat::Rgba8Unorm);
+    let mut resolver = MockResolver::default();
+    let mut commands = CommandBuffer::new(FEATURES);
+    commands
+        .begin_render(
+            &mut resolver,
+            pass(&color, StoreAction::Store, false),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+    let viewport = Viewport {
+        origin_x: 0.0,
+        origin_y: 0.0,
+        width: 32.0,
+        height: 16.0,
+        znear: 0.0,
+        zfar: 1.0,
+    };
+    let rect = |x, width| ScissorRect {
+        x,
+        y: 0,
+        width,
+        height: 8,
+    };
+    commands.set_viewports(&[viewport]).unwrap();
+    commands.set_viewports(&[viewport, viewport]).unwrap();
+    commands.set_scissor_rects(&[rect(4, 8)]).unwrap();
+    commands
+        .set_scissor_rects(&[rect(0, 8), rect(8, 8)])
+        .unwrap();
+    assert!(commands.set_scissor_rects(&[rect(60, 8)]).is_err());
+    assert!(
+        commands
+            .set_scissor_rects(&[rect(0, 8), rect(60, 8)])
+            .is_err()
+    );
+    let recorded: Vec<_> = commands
+        .recorder
+        .commands()
+        .iter()
+        .filter_map(|command| match command {
+            Command::SetViewport(set) => Some(("viewport", 1, set.height)),
+            Command::SetViewports(set) => Some(("viewports", set.len(), set[0].height)),
+            Command::SetScissor(set) => Some(("scissor", 1, set.extent[0] as f32)),
+            Command::SetScissors(set) => Some(("scissors", set.len(), set[1].offset[0] as f32)),
+            _ => None,
+        })
+        .collect();
+    // The pass's own defaults first, then the four sets, flipped.
+    assert_eq!(
+        recorded,
+        [
+            ("viewport", 1, -32.0),
+            ("scissor", 1, 64.0),
+            ("viewport", 1, -16.0),
+            ("viewports", 2, -16.0),
+            ("scissor", 1, 8.0),
+            ("scissors", 2, 8.0),
+        ]
+    );
+}
+
 #[test]
 fn a_draw_binds_state_buffers_and_tables() {
     let color = texture(PixelFormat::Rgba8Unorm);
@@ -1024,7 +1092,7 @@ fn a_draw_binds_state_buffers_and_tables() {
         pipeline: Pipeline(42),
     }));
     let flipped = commands.iter().find_map(|command| match command {
-        Command::SetViewports(viewports) if viewports[0].height < 0.0 => Some(viewports[0]),
+        Command::SetViewport(viewport) if viewport.height < 0.0 => Some(*viewport),
         _ => None,
     });
     assert_eq!(
