@@ -177,7 +177,8 @@ fn a_slot_links_relinks_and_unlinks_while_it_runs() {
     // An address the slot's point needs a pad at.
     let at = page.address() + 5;
     let site = at + POLLED_LINK_BYTES as u64;
-    let mut code = empty_link_at(at, POLLED_LINK_BYTES);
+    let mut code = alloc::vec![0; POLLED_LINK_BYTES];
+    empty_link_at(at, &mut code);
     code.extend(direct_exit_at(site, TARGET, ExitKind::Direct));
     page.write(at, &code);
     let point = slot_patch(at);

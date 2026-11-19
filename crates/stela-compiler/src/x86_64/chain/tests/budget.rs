@@ -120,7 +120,8 @@ fn direct(mapping: &Mapping, policy: Interruption) -> Vec<u8> {
 /// into itself, and the exit.
 fn slot(mapping: &Mapping) -> Vec<u8> {
     let at = mapping.address();
-    let mut code = empty_link_at(at, POLLED_LINK_BYTES);
+    let mut code = alloc::vec![0; POLLED_LINK_BYTES];
+    empty_link_at(at, &mut code);
     code.extend(direct_exit_at(
         at + POLLED_LINK_BYTES as u64,
         TARGET,

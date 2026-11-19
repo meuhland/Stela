@@ -2115,11 +2115,18 @@ pub fn align_link_slot(code: &mut [u8], offset: usize, bytes: usize, at: u64) ->
     let Some(slot) = code.get_mut(offset..offset + bytes) else {
         return false;
     };
-    if !(0..8).any(|residue| *slot == empty_link_at(residue, bytes)) {
+    if bytes > MAX_LINK_BYTES {
         return false;
     }
-    let empty = empty_link_at(at + offset as u64, bytes);
-    slot.copy_from_slice(&empty);
+    let mut empty = [0; MAX_LINK_BYTES];
+    let empty = &mut empty[..bytes];
+    if !(0..8).any(|residue| {
+        empty_link_at(residue, empty);
+        *slot == *empty
+    }) {
+        return false;
+    }
+    empty_link_at(at + offset as u64, slot);
     true
 }
 
@@ -2159,15 +2166,23 @@ pub(super) fn empty_link(asm: &mut crate::x86_64::asm::Asm, bytes: usize) {
     }
 }
 
-/// The empty link slot of `bytes` at host address `at`: the pad, then the
-/// patch point's jump to the exit after the slot, then INT3s.
-fn empty_link_at(at: u64, bytes: usize) -> Vec<u8> {
+/// The largest link slot.
+const MAX_LINK_BYTES: usize = if LINK_BYTES > POLLED_LINK_BYTES {
+    LINK_BYTES
+} else {
+    POLLED_LINK_BYTES
+};
+
+/// Write into `slot` the empty link slot of its length at host address
+/// `at`: the pad, then the patch point's jump to the exit after the slot,
+/// then INT3s.
+fn empty_link_at(at: u64, slot: &mut [u8]) {
+    let bytes = slot.len();
     let pad = patch_pad(at);
-    let mut slot = alloc::vec![0xcc; bytes];
+    slot.fill(0xcc);
     slot[..pad].copy_from_slice(NOPS[pad]);
     let jump = jump(at + pad as u64, at + bytes as u64).expect("an exit right after its slot");
     slot[pad..pad + PATCH_BYTES].copy_from_slice(&jump);
-    slot
 }
 
 /// The patch that undoes the link of the direct exit at host address
@@ -3104,11 +3119,9 @@ pub fn without_failures(code: &[u8]) -> &[u8] {
 
 /// `jmp rel32` at host address `at` to `to`, or `None` out of reach.
 pub fn jump(at: u64, to: u64) -> Option<[u8; JUMP_BYTES]> {
-    let relative = relative(at + JUMP_BYTES as u64, to)?;
-    let mut code = Code::new();
-    let field = code.asm().jmp();
-    code.patch(field.offset(), relative.to_le_bytes());
-    code.try_into().ok()
+    let relative = relative(at + JUMP_BYTES as u64, to)?.to_le_bytes();
+    // `jmp rel32`, as `Asm::jmp` emits it.
+    Some([0xe9, relative[0], relative[1], relative[2], relative[3]])
 }
 
 /// The rel32 displacement of a branch ending at host address `end` to
