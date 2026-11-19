@@ -107,6 +107,24 @@ pub const LATE_NS: u64 = 2_000_000;
 const H264_1080P_NS: u64 = 2_300_000;
 const HEVC_1080P_NS: u64 = 5_800_000;
 
+/// The host's heap, in bytes, as [`EncoderPlatform::heap`] reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostHeap {
+    pub total: u64,
+    /// Allocated and not freed.
+    pub used: u64,
+    /// The largest free extent.
+    pub largest: u64,
+}
+
+impl HostHeap {
+    /// The bytes not allocated: free extents, holes between live blocks
+    /// included.
+    pub fn free(&self) -> u64 {
+        self.total.saturating_sub(self.used)
+    }
+}
+
 /// What the platform gives the encoders of one GPU.
 pub trait EncoderPlatform: Send + Sync + 'static {
     type Node: Node + Send;
@@ -135,6 +153,12 @@ pub trait EncoderPlatform: Send + Sync + 'static {
     /// (`pstate=P8 pcie=gen1x16`), which the session lines end with: the
     /// engine's time follows the P-state's clocks. `None` leaves it out.
     fn gpu_state(&self) -> Option<alloc::string::String> {
+        None
+    }
+    /// The host's heap now, which backs nouveau's system memory (GART
+    /// buffers, page tables) as well as the engine's own: the decoders
+    /// admit sessions by it. `None` when the platform does not say.
+    fn heap(&self) -> Option<HostHeap> {
         None
     }
     /// Waits a moment for another holder of the encoders, in a wait with

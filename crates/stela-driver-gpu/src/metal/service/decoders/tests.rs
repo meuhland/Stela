@@ -32,6 +32,8 @@ struct Platform {
     opened: AtomicU32,
     closed: Mutex<Vec<(Gpu, bool)>>,
     lines: Mutex<Vec<String>>,
+    /// The host's heap the platform reports: none unless a test sets it.
+    heap: Mutex<Option<HostHeap>>,
 }
 
 impl Platform {
@@ -44,7 +46,16 @@ impl Platform {
             opened: AtomicU32::new(0),
             closed: Mutex::new(Vec::new()),
             lines: Mutex::new(Vec::new()),
+            heap: Mutex::new(None),
         }
+    }
+
+    fn set_heap(&self, used: u64, largest: u64) {
+        *self.heap.lock().unwrap() = Some(HostHeap {
+            total: 4 << 30,
+            used,
+            largest,
+        });
     }
 
     fn logged(&self, part: &str) -> bool {
@@ -96,6 +107,10 @@ impl EncoderPlatform for Platform {
 
     fn log(&self, line: fmt::Arguments<'_>) {
         self.lines.lock().unwrap().push(alloc::format!("{line}"));
+    }
+
+    fn heap(&self) -> Option<HostHeap> {
+        *self.heap.lock().unwrap()
     }
 }
 
@@ -1259,4 +1274,204 @@ fn sessions_are_admitted_by_video_memory() {
     decoders.close_all();
     let (third, _) = open(&decoders, ONE, 3, Codec::H264, &h264, &mut memory);
     third.unwrap();
+}
+
+/// Sessions are admitted by the host's heap too: an open that would leave
+/// less than HEAP_FREE_LEAST free, or that finds no extent of
+/// HEAP_LARGEST_LEAST, is refused before any file opens; one that fits logs
+/// the host memory it holds and the heap before and after, as its close
+/// does.
+#[test]
+fn sessions_are_admitted_by_the_host_heap() {
+    let (h264, _) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let needs = crate::nvdec::decoder::needs(Codec::H264, &h264).unwrap();
+    // 1080p H.264: four 512 KiB bitstream buffers, the push ring, the
+    // fence and setup pages, the copier's ring and a 1080p NV12 staging.
+    assert_eq!(
+        needs.host,
+        4 * 0x8_0000
+            + 0x4_0000
+            + 0x1000
+            + 4 * 0x1000
+            + 0x1_0000
+            + 0x2f_7600_u64.next_multiple_of(0x1000)
+    );
+    let decoders = Decoders::new(Platform::new(Engine::Decode(Tiling::NVDEC)));
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x1000);
+    let platform = decoders.platform();
+    let total: u64 = 4 << 30;
+    // Short of free bytes by one.
+    platform.set_heap(total - (needs.host + HEAP_FREE_LEAST) + 1, 1 << 30);
+    let (refused, _) = open(&decoders, ONE, 1, Codec::H264, &h264, &mut memory);
+    let fault = refused.unwrap_err();
+    assert_eq!(fault.status, Status::Unsupported);
+    assert_eq!(fault.reason, "the host's heap is low");
+    assert_eq!(platform.opened.load(Ordering::Relaxed), 0);
+    assert!(platform.logged(&alloc::format!(
+        "refused a h264 stream for connection 1: it takes {} MiB of host memory and the \
+         host's heap is low: ",
+        needs.host >> 20
+    )));
+    // Enough free, but in pieces.
+    platform.set_heap(1 << 30, 32 << 20);
+    let (refused, _) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    assert_eq!(refused.unwrap_err().status, Status::Unsupported);
+    assert!(platform.logged("largest extent 32 MiB (at least 64 MiB)"));
+    assert_eq!(platform.opened.load(Ordering::Relaxed), 0);
+    // A heap that holds it.
+    platform.set_heap(1 << 30, 1 << 30);
+    let (opened, a) = open(&decoders, ONE, 3, Codec::H264, &h264, &mut memory);
+    opened.unwrap();
+    assert!(platform.logged(&alloc::format!(
+        "{} open for connection 1: h264 1920x1080 8-bit nv12 display order",
+        a.decoder
+    )));
+    // Without its staging, which the first picture makes.
+    assert!(platform.logged(&alloc::format!(
+        "MiB of video memory, 2 MiB of host memory ({} MiB with its staging), copy channel 6 \
+         | heap 1024->1024M used of 4096M, largest 1024M",
+        needs.host >> 20
+    )));
+    close_session(&decoders, ONE, a.decoder, &mut memory).unwrap();
+    assert!(platform.logged(
+        ", held 2 MiB of host memory (bitstream grown 0, staging let go 0) | heap \
+         1024->1024M used of 4096M, largest 1024M"
+    ));
+}
+
+/// The decoders' sessions take at most HOST_BUDGET of system memory
+/// together: past it an open is refused, unless an idle session is
+/// evicted for it.
+#[test]
+fn an_open_over_the_host_budget_is_refused_or_evicts() {
+    let (h264, _) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let needs = crate::nvdec::decoder::needs(Codec::H264, &h264).unwrap();
+    let decoders = Decoders::with_budgets(
+        Platform::new(Engine::Decode(Tiling::NVDEC)),
+        VRAM_BUDGET,
+        needs.host + needs.host / 2,
+    );
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x1000);
+    let (first, a) = open(&decoders, ONE, 1, Codec::H264, &h264, &mut memory);
+    first.unwrap();
+    let (second, _) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    let fault = second.unwrap_err();
+    assert_eq!(
+        fault.reason,
+        "the host memory of the GPU's decoder sessions is taken"
+    );
+    let platform = decoders.platform();
+    assert!(platform.logged(&alloc::format!(
+        "it takes {} MiB of host memory, {} MiB of {} MiB are taken (1 for connection 1, ",
+        needs.host >> 20,
+        needs.host >> 20,
+        (needs.host + needs.host / 2) >> 20
+    )));
+    platform.clock.fetch_add(EVICT_IDLE_NS, Ordering::Relaxed);
+    let (third, _) = open(&decoders, ONE, 3, Codec::H264, &h264, &mut memory);
+    third.unwrap();
+    assert!(platform.logged(&alloc::format!(
+        "{} evicted (idle 10000 ms) for a new session of connection 1",
+        a.decoder
+    )));
+}
+
+/// While the host's heap is low, a session idle EVICT_IDLE_NS is evicted
+/// at the next call of another; with a heap that is not, it stays.
+#[test]
+fn a_low_heap_evicts_idle_sessions() {
+    let (h264, _) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let decoders = Decoders::new(Platform::new(Engine::Decode(Tiling::NVDEC)));
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x1000);
+    let (_, a) = open(&decoders, ONE, 1, Codec::H264, &h264, &mut memory);
+    let (_, b) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    let platform = decoders.platform();
+    platform.set_heap(1 << 30, 1 << 30);
+    platform.clock.fetch_add(EVICT_IDLE_NS, Ordering::Relaxed);
+    touch(&decoders, ONE, b.decoder, &mut memory).unwrap();
+    assert_eq!(decoders.open_sessions(), 2);
+    platform.set_heap(1 << 30, 3 << 20);
+    platform.clock.fetch_add(SWEEP_NS, Ordering::Relaxed);
+    touch(&decoders, ONE, b.decoder, &mut memory).unwrap();
+    assert_eq!(decoders.open_sessions(), 1);
+    assert!(platform.logged(&alloc::format!(
+        "{} evicted (idle 11000 ms) to give the host's heap back: 3072 MiB free, largest 3 MiB",
+        a.decoder
+    )));
+    assert_eq!(
+        touch(&decoders, ONE, a.decoder, &mut memory)
+            .unwrap_err()
+            .status,
+        Status::Evicted
+    );
+}
+
+/// A session idle TRIM_IDLE_NS lets its staging go at another's call; its
+/// next picture makes it again, and is shown whole.
+#[test]
+fn an_idle_session_lets_its_staging_go_and_makes_it_again() {
+    let (h264, samples) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let needs = crate::nvdec::decoder::needs(Codec::H264, &h264).unwrap();
+    let decoders = Decoders::new(Platform::new(Engine::Decode(Tiling::NVDEC)));
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 2 * 0x40_0000);
+    let (outcome, a) = open_with(
+        &decoders,
+        ONE,
+        1,
+        Codec::H264,
+        &h264,
+        DECODER_OPEN_DECODE_ORDER,
+        &mut memory,
+    );
+    outcome.unwrap();
+    let (_, b) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    let shown = decode_all(
+        &decoders,
+        ONE,
+        &a,
+        &samples[..3],
+        (1920, 1088),
+        2,
+        &mut memory,
+    );
+    assert_eq!(shown.frames, [100, 101, 102]);
+    let held = |decoders: &Decoders<Platform>| {
+        let mut held = decoders.hold();
+        held.state().sessions[0].decoder.host_bytes()
+    };
+    assert_eq!(held(&decoders), needs.host);
+    let platform = decoders.platform();
+    platform
+        .clock
+        .fetch_add(TRIM_IDLE_NS / 2, Ordering::Relaxed);
+    touch(&decoders, ONE, b.decoder, &mut memory).unwrap();
+    assert!(!platform.logged("let its staging go"));
+    platform
+        .clock
+        .fetch_add(TRIM_IDLE_NS / 2, Ordering::Relaxed);
+    touch(&decoders, ONE, b.decoder, &mut memory).unwrap();
+    assert!(platform.logged(&alloc::format!(
+        "{} let its staging go (idle 3000 ms): {} -> 2 MiB of host memory",
+        a.decoder,
+        needs.host >> 20
+    )));
+    assert_eq!(held(&decoders), needs.host - 0x2f_8000);
+    // The next picture, from the stream's start.
+    let pictures = Pictures::new(&a, 64);
+    memory.put(SAMPLE, &samples[0]);
+    pictures.destinations(&mut memory, 2);
+    let request = decode_request(a.decoder, 200, samples[0].len(), 2, DECODE_RESET);
+    let (outcome, response, _) = call_through::<_, DecoderDecodeResponse>(
+        &decoders,
+        ONE,
+        Operation::DecoderDecode,
+        &request,
+        &mut memory,
+    );
+    outcome.unwrap();
+    assert_eq!(response.outputs, 1);
+    assert!(pictures.picture(&memory, 0) == expected((1920, 1088), &pictures, 3));
+    assert_eq!(held(&decoders), needs.host);
+    close_session(&decoders, ONE, a.decoder, &mut memory).unwrap();
+    assert!(platform.logged("(bitstream grown 0, staging let go 1)"));
 }

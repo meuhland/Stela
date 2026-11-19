@@ -352,6 +352,17 @@ impl EncoderPlatform for GateGpu {
         Some(super::perf_now())
     }
 
+    fn heap(&self) -> Option<stela_drivers::gpu::metal::service::encoders::HostHeap> {
+        // The engine's heap, which also backs Linux's pages (nouveau's GART
+        // buffers among them): one look under its lock.
+        let usage = crate::ALLOCATOR.usage();
+        Some(stela_drivers::gpu::metal::service::encoders::HostHeap {
+            total: usage.total as u64,
+            used: usage.live as u64,
+            largest: usage.largest as u64,
+        })
+    }
+
     fn run(&self, body: &mut dyn FnMut()) {
         // SAFETY: the stack lives for the boot, and only the encoders'
         // lock's holder runs on it.

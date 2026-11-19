@@ -19,7 +19,9 @@
 //!   ring, and the semaphore at [`SEMAPHORE_OFFSET`];
 //! - **the staging buffer** ([`STAGING_ADDRESS`]): the pitch-linear output,
 //!   in system memory (GART) the CPU maps write-back on x86, where the GPU's
-//!   writes are snooped.
+//!   writes are snooped. The host's heap backs it (a 4K P010 picture is
+//!   24 MiB), so the first copy makes it and [`Copier::trim`] lets an idle
+//!   session's go, unbound, until its next copy.
 //!
 //! **The methods** ([`words`]), as Mesa's NVK copies a block-linear image to
 //! a buffer (`nvk_cmd_copy.c`, `nouveau_copy_rect`) and NVIDIA's UVM
@@ -55,7 +57,7 @@ use crate::nvenc::{
     CHANNEL_ALLOC, CHANNEL_FREE, ChannelAlloc, ChannelFree, DOMAIN_COHERENT, DOMAIN_GART, EXEC,
     Exec, ExecPush, GEM_CLOSE, GEM_NEW, GROBJ_ALLOC, GemClose, GemInfo, GemNew, GrobjAlloc, Node,
     SUBCHANNEL, SYNCOBJ_CREATE, SYNCOBJ_DESTROY, SYNCOBJ_WAIT, Sync, SyncobjCreate, SyncobjDestroy,
-    SyncobjWait, VM_BIND, VM_BIND_OP_MAP, VmBind, VmBindOp, header,
+    SyncobjWait, VM_BIND, VM_BIND_OP_MAP, VM_BIND_OP_UNMAP, VmBind, VmBindOp, header,
 };
 use alloc::vec::Vec;
 use core::fmt;
@@ -532,6 +534,15 @@ impl Copier {
             self.ring,
             &mut self.buffers,
         )?;
+        Ok(())
+    }
+
+    /// Makes the staging buffer, unless it is there: the first copy makes
+    /// it, and [`Copier::trim`] lets it go.
+    fn ensure_staging<N: Node>(&mut self, node: &mut N) -> Result<(), Error> {
+        if self.buffers.len() > STAGING {
+            return Ok(());
+        }
         let bytes = self.staging.next_multiple_of(0x1000);
         make(
             node,
@@ -542,6 +553,45 @@ impl Copier {
             &mut self.buffers,
         )?;
         Ok(())
+    }
+
+    /// Lets the staging buffer go (its mapping, binding and handle), when
+    /// it is there and no copy is in flight: an idle session's pictures
+    /// take no system memory until its next copy makes it again. Whether
+    /// it went. A refused unbinding leaves the buffer as it was.
+    pub fn trim<N: Node>(&mut self, node: &mut N) -> bool {
+        if self.state != State::Open || self.in_flight.is_some() || self.buffers.len() <= STAGING {
+            return false;
+        }
+        let buffer = &self.buffers[STAGING];
+        let (handle, bytes) = (buffer.handle, buffer.bytes);
+        let mut op = VmBindOp {
+            op: VM_BIND_OP_UNMAP,
+            addr: self.staging_address(),
+            range: bytes,
+            ..VmBindOp::default()
+        };
+        let mut unbind = VmBind {
+            op_count: 1,
+            op_ptr: (&raw mut op) as u64,
+            ..VmBind::default()
+        };
+        if control(node, VM_BIND, &mut unbind, "copy staging unmap").is_err() {
+            return false;
+        }
+        if let Some(cpu) = self.buffers[STAGING].cpu.take() {
+            node.unmap(cpu, bytes as usize);
+        }
+        self.buffers.truncate(STAGING);
+        close_handle(node, handle);
+        true
+    }
+
+    /// The bytes of system memory (nouveau's GART, which the host's heap
+    /// backs) the copier's buffers hold now: the ring, and the staging
+    /// buffer while it is there.
+    pub fn host_bytes(&self) -> u64 {
+        self.buffers.iter().map(|buffer| buffer.bytes).sum()
     }
 
     /// The channel nouveau gave.
@@ -642,6 +692,8 @@ impl Copier {
         if let Some(why) = blits.iter().find_map(|blit| blit.refusal(start, end)) {
             return Err(Error::Config(why));
         }
+        // Nothing was submitted: a refusal leaves the copier open.
+        self.ensure_staging(node)?;
         let started = node.now_ns();
         self.sequence = self.sequence.wrapping_add(1).max(1);
         let payload = self.sequence;

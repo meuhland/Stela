@@ -28,8 +28,8 @@ use crate::nvenc::{
     CHANNEL_ALLOC, CHANNEL_FREE, ChannelAlloc, ChannelFree, DOMAIN_COHERENT, DOMAIN_GART,
     DOMAIN_MAPPABLE, DOMAIN_VRAM, EXEC, Exec, ExecPush, GEM_CLOSE, GEM_NEW, GROBJ_ALLOC, GemClose,
     GemInfo, GemNew, GrobjAlloc, Node, SYNCOBJ_CREATE, SYNCOBJ_DESTROY, SYNCOBJ_WAIT, Sync,
-    SyncobjCreate, SyncobjDestroy, SyncobjWait, VM_BIND, VM_BIND_OP_MAP, VM_INIT, VmBind, VmBindOp,
-    VmInit,
+    SyncobjCreate, SyncobjDestroy, SyncobjWait, VM_BIND, VM_BIND_OP_MAP, VM_BIND_OP_UNMAP, VM_INIT,
+    VmBind, VmBindOp, VmInit,
 };
 use alloc::vec::Vec;
 use core::ptr::NonNull;
@@ -43,6 +43,35 @@ const ETIMEDOUT: i64 = -110;
 pub const CLOSE_WAIT_NS: u64 = 50_000_000;
 /// Zeros written after each picture's slices.
 const TAIL_BYTES: usize = 64;
+/// The least a bitstream buffer is made with.
+const BITSTREAM_LEAST: u64 = 0x4_0000;
+
+/// The bytes a bitstream buffer whose addresses span `span` is first made
+/// with: an eighth of it (NVIDIA's span is two bytes a sample, so this is a
+/// quarter of a 4:2:0 picture's 8-bit samples: 2 MiB at 2160p, 0.5 MiB at
+/// 1080p), at least [`BITSTREAM_LEAST`]. A sample that does not fit grows
+/// its buffer ([`Session::submit`]), up to the span.
+///
+/// The buffers are system memory the host's heap backs (nouveau's GART),
+/// four a session: made whole, a 4K session's took 64 MiB of the heap for
+/// slices of a few hundred KiB.
+pub fn first_bitstream_bytes(span: u64) -> u64 {
+    (span / 8)
+        .max(BITSTREAM_LEAST)
+        .min(span)
+        .next_multiple_of(0x1000)
+}
+
+/// What a bitstream buffer of `bytes` grows to for `need` bytes: twice
+/// as much or `need`'s next power of two, whichever is more, at most
+/// `span` (and never less than `need`).
+pub fn grown_bitstream_bytes(bytes: u64, need: u64, span: u64) -> u64 {
+    need.next_power_of_two()
+        .max(bytes.saturating_mul(2))
+        .min(span)
+        .max(need)
+        .next_multiple_of(0x1000)
+}
 
 /// What went wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +183,8 @@ pub struct Session<N: Node> {
     /// Another channel on the file (the copy engine's) has a job that never
     /// finished reading the surfaces: [`Session::close`] keeps everything.
     held: bool,
+    /// Bitstream buffers grown for a sample they did not hold.
+    grown: u32,
 }
 
 impl<N: Node> Session<N> {
@@ -230,6 +261,7 @@ impl<N: Node> Session<N> {
             state: State::Open,
             in_flight: None,
             held: false,
+            grown: 0,
         };
         match session.start_channel() {
             Ok(()) => Ok(session),
@@ -294,9 +326,23 @@ impl<N: Node> Session<N> {
         Ok(())
     }
 
-    /// Makes, binds and maps the layout's buffer `index`.
+    /// Makes, binds and maps the layout's buffer `index`: a bitstream
+    /// buffer at [`first_bitstream_bytes`], any other whole.
     fn make(&mut self, index: usize) -> Result<Buffer, Error> {
         let plan = self.layout.plans[index];
+        let bytes = if self.layout.bitstream.contains(&index) {
+            first_bitstream_bytes(plan.bytes)
+        } else {
+            plan.bytes
+        };
+        self.make_sized(index, bytes)
+    }
+
+    /// Makes `bytes` of the layout's buffer `index`, binds them at its
+    /// address and maps them when the CPU writes it.
+    fn make_sized(&mut self, index: usize, bytes: u64) -> Result<Buffer, Error> {
+        let plan = self.layout.plans[index];
+        let wanted = bytes;
         let domain = match plan.domain {
             Domain::Vram if plan.mappable => DOMAIN_VRAM | DOMAIN_MAPPABLE,
             Domain::Vram => DOMAIN_VRAM,
@@ -304,7 +350,7 @@ impl<N: Node> Session<N> {
         };
         let mut new = GemNew {
             info: GemInfo {
-                size: plan.bytes,
+                size: wanted,
                 domain,
                 tile_flags: u32::from(plan.kind) << 8,
                 ..GemInfo::default()
@@ -355,15 +401,82 @@ impl<N: Node> Session<N> {
             };
             // SAFETY: the mapping is `bytes` long and writable. Surfaces
             // are zeroed too, so a picture the engine never wrote reads 0.
-            unsafe { cpu.as_ptr().write_bytes(0, plan.bytes as usize) };
+            unsafe { cpu.as_ptr().write_bytes(0, wanted as usize) };
             buffer.cpu = Some(cpu);
         }
         Ok(buffer)
     }
 
     fn close_handle(&mut self, handle: u32) {
+        if handle == 0 {
+            return;
+        }
         let mut close = GemClose { handle, pad: 0 };
         self.node.control(GEM_CLOSE, (&raw mut close).cast());
+    }
+
+    /// Grows the layout's bitstream buffer `index` to hold `need` bytes:
+    /// its mapping, binding and handle are let go (nothing is in flight, so
+    /// the engine reads none of it) and a larger one is made at the same
+    /// address. A refusal on the way leaves the session dead, its channel
+    /// idle: the caller decodes another way.
+    fn grow_bitstream(&mut self, index: usize, need: u64) -> Result<(), Error> {
+        let plan = self.layout.plans[index];
+        let old = self.buffers[index].bytes;
+        let bytes = grown_bitstream_bytes(old, need, plan.span);
+        if let Some(cpu) = self.buffers[index].cpu.take() {
+            self.node.unmap(cpu, old as usize);
+        }
+        let mut op = VmBindOp {
+            op: VM_BIND_OP_UNMAP,
+            addr: plan.address,
+            range: old,
+            ..VmBindOp::default()
+        };
+        let mut unbind = VmBind {
+            op_count: 1,
+            op_ptr: (&raw mut op) as u64,
+            ..VmBind::default()
+        };
+        if let Err(error) = self.control(VM_BIND, &mut unbind, "bitstream unmap") {
+            // Still bound: the handle goes at the close, with the file.
+            self.state = State::Dead {
+                keeps_channel: false,
+            };
+            return Err(error);
+        }
+        let handle = core::mem::replace(&mut self.buffers[index].handle, 0);
+        self.buffers[index].bytes = 0;
+        self.close_handle(handle);
+        match self.make_sized(index, bytes) {
+            Ok(buffer) => {
+                self.buffers[index] = buffer;
+                self.grown += 1;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = State::Dead {
+                    keeps_channel: false,
+                };
+                Err(error)
+            }
+        }
+    }
+
+    /// The bytes of system memory (nouveau's GART, which the host's heap
+    /// backs) the session's buffers hold now.
+    pub fn host_bytes(&self) -> u64 {
+        self.buffers
+            .iter()
+            .zip(&self.layout.plans)
+            .filter(|(_, plan)| plan.domain == Domain::Gart)
+            .map(|(buffer, _)| buffer.bytes)
+            .sum()
+    }
+
+    /// The bitstream buffers grown so far.
+    pub fn grown(&self) -> u32 {
+        self.grown
     }
 
     /// Unmaps every mapping and, unless a channel is busy, gives back the
@@ -526,16 +639,20 @@ impl<N: Node> Session<N> {
             .page(&self.geometry)
             .map_err(|why| Error::Config(why.0))?;
         let data = picture.bitstream();
-        let capacity = self.layout.bitstream_bytes() as usize;
-        if data.len() + TAIL_BYTES > capacity {
+        if data.len() + TAIL_BYTES > self.layout.bitstream_bytes() as usize {
             return Err(Error::Config(
                 "the picture's slices exceed the bitstream buffer",
             ));
         }
         let index = self.decoded;
         let ring = index as usize % self.layout.setup.len();
-        // SAFETY: the bitstream buffer's mapping holds `capacity` bytes, and
-        // nothing else holds it while no picture is in flight.
+        let buffer = self.layout.bitstream[ring];
+        let need = (data.len() + TAIL_BYTES) as u64;
+        if need > self.buffers[buffer].bytes {
+            self.grow_bitstream(buffer, need)?;
+        }
+        // SAFETY: the bitstream buffer's mapping holds at least `need`
+        // bytes, and nothing else holds it while no picture is in flight.
         unsafe {
             let at = self.cpu(self.layout.bitstream[ring]).as_ptr();
             core::ptr::copy_nonoverlapping(data.as_ptr(), at, data.len());
@@ -726,5 +843,137 @@ impl<N: Node> Session<N> {
             out
         };
         Some((read(0, luma_bytes), read(chroma_at, chroma_bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nvdec::mock::{Engine, Gpu};
+    use crate::nvdec::surface::Tiling;
+    use crate::nvdec::{H264_CLIP, Parsed};
+
+    const GA106: u16 = 0x176;
+
+    #[test]
+    fn bitstream_buffers_start_at_an_eighth_of_their_span() {
+        // 2160p, 1080p (0x3fc000), 720p (0x1cc000), and a tiny one.
+        assert_eq!(first_bitstream_bytes(0xff_0000), 0x1f_e000);
+        assert_eq!(first_bitstream_bytes(0x3f_c000), 0x8_0000);
+        assert_eq!(first_bitstream_bytes(0x1c_c000), 0x4_0000);
+        assert_eq!(first_bitstream_bytes(0x2_0000), 0x2_0000);
+        // Growth: the need's power of two or twice, at most the span.
+        assert_eq!(
+            grown_bitstream_bytes(0x8_0000, 0x8_0001, 0x3f_c000),
+            0x10_0000
+        );
+        assert_eq!(
+            grown_bitstream_bytes(0x8_0000, 0x30_0000, 0x3f_c000),
+            0x3f_c000
+        );
+        assert_eq!(
+            grown_bitstream_bytes(0x8_0000, 0x3f_c000, 0x3f_c000),
+            0x3f_c000
+        );
+        assert_eq!(
+            grown_bitstream_bytes(0x1f_e000, 0x20_0040, 0xff_0000),
+            0x40_0000
+        );
+    }
+
+    /// The H.264 clip's pictures, the first `padded` with slices of
+    /// `bytes` (the engine reads the start code and the last byte).
+    fn pictures(padded: usize, bytes: usize) -> Vec<Picture> {
+        let mut pictures = Picture::all(Codec::H264, H264_CLIP).unwrap();
+        for picture in pictures.iter_mut().take(padded) {
+            if let Parsed::H264(parsed) = &mut picture.parsed {
+                parsed.bitstream.resize(bytes, 0xa5);
+            }
+        }
+        pictures
+    }
+
+    #[test]
+    fn a_sample_larger_than_its_bitstream_buffer_grows_it_in_place() {
+        let all = pictures(5, 0x9_0000);
+        let geometry = all[0].geometry().unwrap();
+        let mut session = Session::open(
+            Gpu::new(Engine::Decode(Tiling::NVDEC)),
+            GA106,
+            Codec::H264,
+            geometry,
+            4,
+            1_000_000_000,
+        )
+        .map_err(|(error, _)| error)
+        .unwrap();
+        let layout = session.layout().clone();
+        // 4 bitstream buffers of 512 KiB, not 4 of 4 MiB.
+        for &index in &layout.bitstream {
+            assert_eq!(session.buffers[index].bytes, 0x8_0000);
+        }
+        let small = session.host_bytes();
+        assert_eq!(
+            small,
+            PUSH_BYTES + 0x1000 + 4 * (PAGE_BYTES as u64).next_multiple_of(0x1000) + 4 * 0x8_0000
+        );
+        let first = session.node().buffers.len();
+        for picture in &all[..5] {
+            session.decode(picture).unwrap();
+        }
+        // Each ring buffer grew once, unbound and closed, then made at its
+        // own address; the fifth picture found its buffer grown.
+        assert_eq!(session.grown(), 4);
+        assert_eq!(session.node().unbound, 4);
+        for (k, &index) in layout.bitstream.iter().enumerate() {
+            assert_eq!(session.buffers[index].bytes, 0x10_0000);
+            let handle = session.buffers[index].handle as usize;
+            let made = &session.node().buffers[handle - 1];
+            assert_eq!(made.address, Some(layout.address(index)), "ring {k}");
+        }
+        assert_eq!(session.host_bytes(), small + 4 * 0x8_0000);
+        // The engine read every picture's slices at the ring's addresses.
+        let gpu = session.node();
+        assert_eq!(gpu.frames, 5);
+        assert_eq!(gpu.buffers.len(), first + 4);
+        let closed = session.close();
+        assert!(!closed.keeps_file);
+        let gpu = closed.node;
+        assert_eq!(gpu.mapped, gpu.unmapped);
+        // Every handle made is closed once: the grown ones at the growth.
+        let mut handles = gpu.closed.clone();
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), gpu.closed.len());
+    }
+
+    #[test]
+    fn a_refused_growth_leaves_the_session_dead_and_idle() {
+        let all = pictures(1, 0x9_0000);
+        let geometry = all[0].geometry().unwrap();
+        let mut session = Session::open(
+            Gpu::new(Engine::Decode(Tiling::NVDEC)),
+            GA106,
+            Codec::H264,
+            geometry,
+            4,
+            1_000_000_000,
+        )
+        .map_err(|(error, _)| error)
+        .unwrap();
+        session.node().refuse.push((GEM_NEW, -12));
+        let error = session.decode(&all[0]).unwrap_err();
+        assert_eq!(
+            error,
+            Error::Refused {
+                step: "bitstream",
+                errno: -12
+            }
+        );
+        assert_eq!(session.dead(), Some(false));
+        assert_eq!(session.decode(&all[0]).unwrap_err(), Error::Dead);
+        let closed = session.close();
+        assert!(!closed.keeps_file);
+        assert!(closed.node.channel_freed);
     }
 }

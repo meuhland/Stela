@@ -306,36 +306,59 @@ fn a_copy_lands_the_displayed_nv12_picture_in_system_memory() {
 }
 
 #[test]
-fn opening_asks_for_a_channel_the_class_a_syncobj_and_two_buffers() {
+fn opening_asks_for_a_channel_the_class_a_syncobj_and_the_ring() {
     let (mut session, _) = decoded(Gpu::new(Engine::Decode(surface::Tiling::NVDEC)));
     let before = session.node().requests.len();
-    let copier = Copier::open(session.node(), nv12_bytes(&FULL), 1).unwrap();
+    let mut copier = Copier::open(session.node(), nv12_bytes(&FULL), 1).unwrap();
     assert_eq!(
         session.node().requests[before..],
-        [
-            CHANNEL_ALLOC,
-            GROBJ_ALLOC,
-            SYNCOBJ_CREATE,
-            GEM_NEW,
-            VM_BIND,
-            GEM_NEW,
-            VM_BIND
-        ]
+        [CHANNEL_ALLOC, GROBJ_ALLOC, SYNCOBJ_CREATE, GEM_NEW, VM_BIND]
     );
-    let bound: Vec<(u64, u64, u8)> = session
-        .node()
-        .buffers
-        .iter()
-        .rev()
-        .take(2)
-        .map(|b| (b.address.unwrap(), b.bytes, b.kind))
-        .collect();
+    let ring = session.node().buffers.last().unwrap();
     assert_eq!(
-        bound,
-        [
-            (STAGING_ADDRESS, 0x2f_8000, 0),
-            (RING_ADDRESS, RING_BYTES, 0)
-        ]
+        (ring.address, ring.bytes, ring.kind),
+        (Some(RING_ADDRESS), RING_BYTES, 0)
+    );
+    // The host's heap holds the ring alone until the first copy.
+    assert_eq!(copier.host_bytes(), RING_BYTES);
+    assert!(copier.output(1).is_none());
+    assert!(!copier.trim(session.node()), "no staging to let go");
+    // The first copy makes the staging buffer.
+    let (luma_at, chroma_at) = session.layout().surface(0);
+    let blits = nv12(luma_at, chroma_at, &hd(), &FULL, STAGING_ADDRESS);
+    let before = session.node().requests.len();
+    copier.copy(session.node(), &blits).unwrap();
+    assert_eq!(
+        session.node().requests[before..before + 2],
+        [GEM_NEW, VM_BIND]
+    );
+    let staging = session.node().buffers.len();
+    let made = session.node().buffers.last().unwrap();
+    assert_eq!(
+        (made.address, made.bytes),
+        (Some(STAGING_ADDRESS), 0x2f_8000)
+    );
+    assert_eq!(copier.host_bytes(), RING_BYTES + 0x2f_8000);
+    let want = copier.output(nv12_bytes(&FULL) as usize).unwrap().to_vec();
+    // Trimmed: unbound, unmapped and closed; the ring stays.
+    let (unmapped, closed) = (session.node().unmapped, session.node().closed.len());
+    assert!(copier.trim(session.node()));
+    assert_eq!(session.node().unbound, 1);
+    assert_eq!(session.node().unmapped, unmapped + 1);
+    assert_eq!(session.node().closed[closed..], [staging as u32]);
+    assert_eq!(session.node().buffers[staging - 1].address, None);
+    assert_eq!(copier.host_bytes(), RING_BYTES);
+    assert!(copier.output(1).is_none());
+    // The next copy makes it again at its address, and copies the same.
+    copier.copy(session.node(), &blits).unwrap();
+    let again = session.node().buffers.last().unwrap();
+    assert_eq!(
+        (again.address, again.bytes),
+        (Some(STAGING_ADDRESS), 0x2f_8000)
+    );
+    assert_eq!(
+        copier.output(nv12_bytes(&FULL) as usize).unwrap(),
+        &want[..]
     );
     let closed_before = session.node().closed.len();
     let before = session.node().requests.len();
@@ -345,6 +368,22 @@ fn opening_asks_for_a_channel_the_class_a_syncobj_and_two_buffers() {
         [GEM_CLOSE, GEM_CLOSE, SYNCOBJ_DESTROY, CHANNEL_FREE]
     );
     assert_eq!(session.node().closed.len(), closed_before + 2);
+}
+
+#[test]
+fn a_refused_unbinding_keeps_the_staging() {
+    let (mut session, _) = decoded(Gpu::new(Engine::Decode(surface::Tiling::NVDEC)));
+    let mut copier = Copier::open(session.node(), nv12_bytes(&FULL), 1).unwrap();
+    let (luma_at, chroma_at) = session.layout().surface(0);
+    let blits = nv12(luma_at, chroma_at, &hd(), &FULL, STAGING_ADDRESS);
+    copier.copy(session.node(), &blits).unwrap();
+    session.node().refuse.push((VM_BIND, -16));
+    assert!(!copier.trim(session.node()));
+    session.node().refuse.clear();
+    assert!(copier.output(1).is_some());
+    assert_eq!(copier.host_bytes(), RING_BYTES + 0x2f_8000);
+    copier.copy(session.node(), &blits).unwrap();
+    assert!(!copier.close(session.node()));
 }
 
 #[test]
