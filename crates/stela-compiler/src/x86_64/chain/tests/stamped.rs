@@ -294,9 +294,12 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             pc,
             u64::from(ExitWord::from(ExitKind::Direct).encoded() | ran << ExitWord::RAN_SHIFT),
         );
+        // The cell probe then exits, or takes the table's entry of the key
+        // the ITLB holds now, which may be another block or the same one,
+        // counted as a table probe's.
         let evicted = !(resident.pc == page && resident.key == context)
             && keys.get(&(page, context)) == Some(&cell.key)
-            && rb == exit
+            && (rb == exit || rb.1 == 99)
             && linked.is_some_and(|linked| linked.entry == cell.entry)
             && (ra == (0x7700 + u64::from(cell.block), 99)
                 // Or no budget: the stamped tail spent it, as a transfer.

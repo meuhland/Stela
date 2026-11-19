@@ -372,3 +372,57 @@ fn the_serial_starts_at_one_and_skips_zero() {
         next_jump_serial(0);
     }
 }
+
+/// An entry another PC's put beside its slot, then replaced there with the
+/// slot empty again or held: the older entry leaves its set and the jump
+/// caches, so a branch tail of a BTYPE the new entry refuses exits as the
+/// probe does, where the cache's entry of the older one entered, and the
+/// older one never comes back when the new one leaves.
+#[test]
+fn an_older_entry_beside_its_replacement_leaves_with_its_cache_entry() {
+    const PC: u64 = 0x4_0000_0200;
+    let key = block_key(0x4000_0000, 1);
+    let branch = (PC, ExitKind::Indirect as u64 | (RAN as u64) << 20);
+    for slot_held in [false, true] {
+        let mut world = World::new();
+        let slot = world.table.slot(PC, key);
+        // Another PC whose entry takes the same slot.
+        let other = (1..1 << 20)
+            .map(|step| PC + 0x1000 * step)
+            .find(|&pc| world.table.slot(pc, key) == slot)
+            .expect("a PC of the same slot");
+        let resident = LookupEntry {
+            pc: other,
+            key,
+            entry: world.blocks.0 as u64 + 64 * 7,
+            block: 7,
+            targets: 0b1111,
+        };
+        world.map(PC, key, 2, 0b1111);
+        // The other PC's entry puts it beside the slot.
+        world.table.insert(slot, resident);
+        assert_eq!(world.table.entry(neighbour(slot)).pc, PC);
+        // Filled by the BTYPE 2 probe from the entry beside, which accepts
+        // BTYPE 2, and taken from the cache.
+        assert_eq!(world.run(32, PC), (0x7702, 99));
+        assert_eq!(world.run(32, PC), (0x7702, 99));
+        if !slot_held {
+            world.table.forget_block(other, key, 7);
+        }
+        // The same block again, refusing BTYPE 2.
+        world.map(PC, key, 2, 0b0011);
+        // The engine counts that insert as a replacement of the entry it
+        // finds in the set (`insert_target`), which moves the jump cache's
+        // serial at the next native entry, as here.
+        world.enter();
+        assert_eq!(world.run(32, PC), branch, "slot held {slot_held}");
+        assert_eq!(world.table.entry(slot).targets, 0b0011);
+        let beside = world.table.entry(neighbour(slot));
+        assert_eq!(beside.pc, if slot_held { other } else { 0 });
+        // The new entry leaves with its block; nothing of the PC is left.
+        world.table.set(slot, LookupEntry::default());
+        let held = world.table.find(slot, PC, key);
+        assert!(!(held.pc == PC && held.key == key), "slot held {slot_held}");
+        assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
+    }
+}
