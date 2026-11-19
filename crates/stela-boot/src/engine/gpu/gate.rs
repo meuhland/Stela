@@ -88,8 +88,9 @@ fn run(stack: u64, body: &mut dyn FnMut()) {
     let job = COMPILE_STACKS
         .iter()
         .any(|compile| compile.load(Ordering::Relaxed) == stack);
-    // SAFETY: a service's stack lives for the boot, and only the opener, a
-    // turn's holder or the compile lock's holder is here.
+    // SAFETY: the opener keeps the stack mapped for its call, an open
+    // service's lives for the boot, and only the opener, a turn's holder or
+    // the compile lock's holder is here.
     let mut on_stack = || unsafe { stack::on_stack(stack, &mut *body) };
     if job {
         // SAFETY: a job runs where long host work is allowed, from a run
@@ -1306,8 +1307,6 @@ fn open_gpu(
         return refuse("no memory for its service");
     };
     let top = stack.top();
-    // It serves for the boot.
-    core::mem::forget(stack);
     let target = Gpu {
         pci: PciBusInfo {
             domain: bound.drm.segment.into(),
@@ -1329,7 +1328,13 @@ fn open_gpu(
         construct(constructed);
         opened = Some(service(&target, top));
     });
-    match opened? {
+    // A service that did not open leaves its stack, which is unmapped.
+    let opened = opened?;
+    // An open service, published or kept unreleased, uses it for the boot.
+    if opened.is_ok() {
+        core::mem::forget(stack);
+    }
+    match opened {
         Ok(service) => {
             // The guest's video encoder sessions, beside Metal on its gate.
             if let Some(encoders) = super::nvenc::attach(gpu.window, index, &bound.name, chipset) {
