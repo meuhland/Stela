@@ -485,10 +485,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         match exit {
             NativeExit::Exit { next_pc, kind } => {
                 let (kind, skipped) = ExitWord::split(kind);
+                // What a loop or region retired past the rows of its exit
+                // (`GuestState::loop_retired`): its direct exits move it
+                // themselves, an exit at an instruction leaves it here.
+                let iterations = core::mem::take(&mut self.cpu.state.loop_retired);
                 self.cpu.retired = self
                     .cpu
                     .retired
                     .wrapping_add(retired)
+                    .wrapping_add(iterations)
                     .wrapping_sub(u64::from(skipped));
                 if transitioned {
                     // The last block's instructions, which its exit counts,
