@@ -4312,11 +4312,11 @@ fn sctlr_fields_outside_translation_keep_every_translation() {
     assert_ne!(machine.translation_generation, generation);
 }
 
-/// BLR and BR exits are redirected through lookup thunks that set their
-/// BTYPE: a BR through other than X16 or X17 sets 0b11 from a guarded
-/// page, whose blocks are compiled apart, and 0b01 elsewhere. A target
-/// in a guarded page accepts the BTYPEs its first instruction is
-/// compatible with.
+/// BLR and BR exits are redirected, once their target is translated,
+/// through tails that predict it and call the probes of their BTYPE: a BR
+/// through other than X16 or X17 sets 0b11 from a guarded page, whose
+/// blocks are compiled apart, and 0b01 elsewhere. A target in a guarded
+/// page accepts the BTYPEs its first instruction is compatible with.
 #[test]
 fn indirect_branches_go_through_lookups_that_check_the_target() {
     const BLR_X8: u32 = 0xd63f_0100;
@@ -4331,6 +4331,11 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     let mut machine = machine(&words);
     let base = machine.cpu.pc;
     let far = base + 0x1000;
+    // The target first: a branch to a target not yet translated leaves its
+    // exit open.
+    let Ok(Fetched::Block(target)) = machine.fetch_block(far, false) else {
+        panic!("the target's block");
+    };
     let exit = |kind: ExitKind| NativeExit::Exit {
         next_pc: far,
         kind: kind as u64,
@@ -4358,19 +4363,20 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     machine.cpu.pc = base + 8;
     machine.cpu.pstate.btype = 0;
     machine.step().unwrap();
-    assert_eq!(machine.code.blocks.len(), 4);
-    assert!(!machine.block_variant(2).guarded_page && machine.block_variant(3).guarded_page);
+    assert_eq!(machine.code.blocks.len(), 5);
+    assert!(!machine.block_variant(3).guarded_page && machine.block_variant(4).guarded_page);
     for (index, kind, btype) in [
-        (0, ExitKind::Call, 0b10),
-        (1, ExitKind::Indirect, 0b01),
+        (1, ExitKind::Call, 0b10),
         (2, ExitKind::Indirect, 0b01),
-        (3, ExitKind::Indirect, 0b11),
+        (3, ExitKind::Indirect, 0b01),
+        (4, ExitKind::Indirect, 0b11),
     ] {
         let dispatcher = chain::lookup_dispatcher(btype).unwrap();
         assert!(machine.host.installed.contains(&dispatcher), "{kind:?}");
         assert!(!machine.code.blocks.record(index).dynamic_open(), "{index}");
     }
     assert_eq!(machine.statistics.lookups, 4);
+    assert_eq!(machine.statistics.predicted_tails, 4);
     machine.fetch[page].as_mut().unwrap().guarded = false;
     // The target outside a guarded page accepts every BTYPE; in one, the
     // BTYPEs BTI c is compatible with.
@@ -4380,7 +4386,7 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
         kind: ExitKind::Fallthrough as u64,
     }];
     machine.step().unwrap();
-    let target = machine.code.blocks.len() - 1;
+    assert_eq!(machine.code.blocks.len(), 5);
     assert_eq!(machine.code.blocks[target].pc, far);
     assert_eq!(
         machine
@@ -4436,10 +4442,11 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
             ..current
         },
     ));
+    // From the block the step at the base enters, the BLR's.
     let offset = machine.code.blocks[target]
         .code
         .0
-        .wrapping_sub(machine.code.blocks[0].code.0);
+        .wrapping_sub(machine.code.blocks[1].code.0);
     machine.host.exits = vec![NativeExit::Fault(NativeFault {
         origin: crate::machine::NativeFaultOrigin::Exception,
         trap: 14,

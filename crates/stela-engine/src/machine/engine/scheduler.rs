@@ -912,16 +912,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// page and 0b01 elsewhere. Blocks are compiled per guarded page, so
     /// the page's BTYPE is the block's.
     ///
-    /// The exit of a BRA* thunk, which just authenticated `target`, first
-    /// compares the target with it ([`chain::predicted_tail`]): an arm64e
-    /// auth stub's BRAA X16, X17 has one target, and most BRA* transfers are
-    /// at such sites, so an equal target takes a direct exit linked through
-    /// a cell, which a hot site turns into a direct jump into the target's
-    /// block ([`chain::stamped_branch_tail`]). The thunk's memo still
-    /// authenticates every transfer: only which block an authenticated
-    /// target enters is cached, and validated as every cell is. RETA* and
-    /// BLRA* sites mostly see several targets, where the compare would cost
-    /// a mispredicted branch at each predicted one: they keep the lookup.
+    /// The exit of a BR or BLR form first compares the target with the one
+    /// it just took ([`chain::predicted_tail`]): an equal target takes a
+    /// direct exit linked through a cell, which a hot site turns into a
+    /// direct jump into the target's block ([`chain::stamped_branch_tail`]),
+    /// and any other the lookup. Most sites have one target, and at a site
+    /// of several the compare's cost is less than the jump cache misses it
+    /// saves (`spread_transfer_costs`: two random targets a site, 40 TSC
+    /// ticks a transfer against the lookup's 75 at 16384 sites). A PAC
+    /// form's thunk still authenticates every transfer: only which block an
+    /// authenticated target enters is cached, and validated as every cell
+    /// is. Returns keep their paired tails.
     pub(super) fn link_dynamic(&mut self, index: usize, btype: u8, target: u64) {
         // Decided on the board borrowed: nearly every such exit has its
         // dispatcher already, and a clone of the board's `Arc` would write
@@ -948,12 +949,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 return;
             }
             let retired = u32::from(block.instructions);
-            // Bit 11 selects the PAC forms of RET, BR and BLR, whose exit
-            // is their thunk's.
-            let predicted = matches!(
-                dynamic_branch(block.terminal),
-                Some((ExitKind::Indirect, _))
-            ) && block.terminal & 1 << 11 != 0;
+            let predicted = matches!(kind, ExitKind::Indirect | ExitKind::Call);
             (chain::dynamic_patch(site.get()), kind, retired, predicted)
         };
         let code = Arc::clone(&self.code);
