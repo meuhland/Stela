@@ -20,6 +20,27 @@
 //! size, which equals the captured 1920x1080 field for field, and its rate
 //! control: the frame rate, the bitrate (NVIDIA's H.264 setups drift it from
 //! frame to frame; the session's own is kept) or a constant QP.
+//!
+//! **The real-time profile** ([`Config::realtime`]) changes two things of the
+//! captured ultra-low-latency setups, and nothing the capture never set:
+//!
+//! - The CPB (`buffersize`, `nal_cpb_size`, `vcl_cpb_size`, bits) is one
+//!   frame's share of the bitrate instead of two seconds, and `Bmin` keeps
+//!   its captured proportion to it. `Bmin` (23.8 bits a pixel: 490 is 4.0
+//!   Mbit of 1920x1088, a tenth of the captured 40 Mbit) is where the
+//!   engine's own buffer model starts: the captured IDR's `hrdFullness`
+//!   (bits times 16) is 4.0 Mbit plus the IDR's bits less one frame's
+//!   share. Left at 490 beside a one-frame CPB it would start the model
+//!   twelve CPBs full. That reading is inferred from one capture; the CPB
+//!   fields themselves are already rescaled at every bitrate change.
+//! - H.264 P frames reference the previous picture only: the captured frame
+//!   1 setup's form (one L0 entry, `num_ref_idx_active_override_flag` 1),
+//!   which every first P frame after an IDR already sends. HEVC's P frames
+//!   always did.
+//!
+//! `single_frame_VBV` ("VBV buffer size is set to average frame size") stays
+//! 0, as captured, and so do the intra-refresh fields: the capture never set
+//! either, so their effect on the engine is unknown.
 use super::fields::{h264 as f4, hevc as f5};
 use super::layout::{Geometry, Layout};
 use super::{Codec, Config, Rate};
@@ -223,20 +244,25 @@ impl Templates {
         if !layout_ok(codec, &idr) || !layout_ok(codec, &p) {
             return Err("the captured setups are not laid out as nvenc_drv.h says");
         }
-        // NVIDIA's IDR bitrate, which its P setups drift away from.
-        let captured_bitrate = match codec {
-            Codec::H264 => f4::RATE_CONTROL_NAL_BITRATE.get(&idr),
-            Codec::Hevc => f5::RATE_CONTROL_NAL_BITRATE.get(&idr),
+        // NVIDIA's IDR rate control, whose bitrate its P setups drift away
+        // from.
+        let captured = Captured {
+            bitrate: rc(codec).bitrate.get(&idr),
+            cpb: rc(codec).cpbs[0].get(&idr),
+            bmin: rc(codec).bmin.get(&idr),
         };
         for setup in [&mut idr, &mut p] {
             size(codec, setup, geometry, layout);
-            rate(codec, setup, config, captured_bitrate);
+            rate(codec, setup, config, &captured);
         }
-        let max_refs = match codec {
+        let pps_refs = match codec {
             Codec::H264 => f4::PPS_DATA_NUM_REF_IDX_L0_ACTIVE_MINUS1.get(&p),
             Codec::Hevc => f5::PPS_DATA_NUM_REF_IDX_L0_ACTIVE_MINUS1.get(&p),
         } as u32
             + 1;
+        // The profile's one reference goes out in each slice's override, as
+        // the captured first P frame's did; the PPS keeps its default.
+        let max_refs = if config.realtime { 1 } else { pps_refs };
         Ok(Self {
             codec,
             idr,
@@ -244,6 +270,121 @@ impl Templates {
             max_refs,
         })
     }
+
+    /// What the P template asks of the rate control.
+    pub fn rate_control(&self) -> RateControl {
+        let rc = rc(self.codec);
+        let setup = &self.p;
+        RateControl {
+            bitrate: rc.bitrate.get(setup),
+            cpb_bits: rc.cpbs[0].get(setup),
+            bmin: rc.bmin.get(setup),
+            framerate: rc.framerate.get(setup) >> 8,
+            refs: self.max_refs,
+            gop: rc.gop.get(setup),
+            lookahead: rc.ab_beta.get(setup) != 0 || rc.prev_act.get(setup) != 0,
+        }
+    }
+}
+
+/// A template's rate control as the lines tell it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateControl {
+    /// `nal_bitrate`, bits a second.
+    pub bitrate: u64,
+    /// `buffersize` (and both CPB sizes), bits.
+    pub cpb_bits: u64,
+    /// `Bmin`, 23.8 bits a pixel.
+    pub bmin: u64,
+    /// Frames a second.
+    pub framerate: u64,
+    /// The most L0 references of a P frame.
+    pub refs: u32,
+    /// `gop_length`: NVIDIA's 999999, an IDR only when the driver sends one.
+    pub gop: u64,
+    /// Whether `ab_beta` or `prev_act` carries lookahead information.
+    pub lookahead: bool,
+}
+
+impl RateControl {
+    /// The CPB in tenths of a frame's share of the bitrate.
+    pub fn cpb_tenth_frames(&self) -> u64 {
+        (self.cpb_bits * self.framerate * 10)
+            .checked_div(self.bitrate)
+            .unwrap_or(0)
+    }
+}
+
+/// NVIDIA's own IDR setup's rate control, before the session's.
+struct Captured {
+    bitrate: u64,
+    cpb: u64,
+    bmin: u64,
+}
+
+/// The rate-control fields of one codec's setup.
+struct RcFields {
+    framerate: Field,
+    qp: [Field; 3],
+    slice_qp: Field,
+    bitrate: Field,
+    vcl_bitrate: Field,
+    cpbs: [Field; 3],
+    bmin: Field,
+    gop: Field,
+    ab_beta: Field,
+    prev_act: Field,
+}
+
+const fn rc(codec: Codec) -> RcFields {
+    match codec {
+        Codec::H264 => RcFields {
+            framerate: f4::RATE_CONTROL_FRAMERATE,
+            qp: f4::RATE_CONTROL_QP,
+            slice_qp: f4::SLICE_QP_AVR,
+            bitrate: f4::RATE_CONTROL_NAL_BITRATE,
+            vcl_bitrate: f4::RATE_CONTROL_VCL_BITRATE,
+            cpbs: [
+                f4::RATE_CONTROL_BUFFERSIZE,
+                f4::RATE_CONTROL_NAL_CPB_SIZE,
+                f4::RATE_CONTROL_VCL_CPB_SIZE,
+            ],
+            bmin: f4::RATE_CONTROL_BMIN,
+            gop: f4::RATE_CONTROL_GOP_LENGTH,
+            ab_beta: f4::RATE_CONTROL_AB_BETA,
+            prev_act: f4::RATE_CONTROL_PREV_ACT,
+        },
+        Codec::Hevc => RcFields {
+            framerate: f5::RATE_CONTROL_FRAMERATE,
+            qp: f5::RATE_CONTROL_QP,
+            slice_qp: f5::SLICE_QP_AVR,
+            bitrate: f5::RATE_CONTROL_NAL_BITRATE,
+            vcl_bitrate: f5::RATE_CONTROL_VCL_BITRATE,
+            cpbs: [
+                f5::RATE_CONTROL_BUFFERSIZE,
+                f5::RATE_CONTROL_NAL_CPB_SIZE,
+                f5::RATE_CONTROL_VCL_CPB_SIZE,
+            ],
+            bmin: f5::RATE_CONTROL_BMIN,
+            gop: f5::RATE_CONTROL_GOP_LENGTH,
+            ab_beta: f5::RATE_CONTROL_AB_BETA,
+            prev_act: f5::RATE_CONTROL_PREV_ACT,
+        },
+    }
+}
+
+/// The real-time profile's CPB: one frame's share of `bitrate` at `fps`,
+/// in bits, rounded up.
+pub fn one_frame_bits(bitrate: u32, fps: u32) -> u64 {
+    u64::from(bitrate).div_ceil(u64::from(fps.max(1)))
+}
+
+/// `Bmin` in the same proportion to a CPB of `cpb` bits as NVIDIA's
+/// `captured_bmin` was to its `captured_cpb`, rounded to nearest.
+fn scaled_bmin(captured_bmin: u64, cpb: u64, captured_cpb: u64) -> u64 {
+    (captured_bmin * cpb + captured_cpb / 2)
+        .checked_div(captured_cpb)
+        .unwrap_or(captured_bmin)
 }
 
 /// The geometry-dependent fields: each surface configuration, the history
@@ -297,50 +438,38 @@ fn size(codec: Codec, setup: &mut [u8], geometry: &Geometry, layout: &Layout) {
 }
 
 /// The session's rate control: its frame rate, and its bitrate or QP.
-fn rate(codec: Codec, setup: &mut [u8], config: &Config, captured_bitrate: u64) {
-    let (framerate, qp, slice_qp, bitrate, vcl_bitrate, cpbs) = match codec {
-        Codec::H264 => (
-            f4::RATE_CONTROL_FRAMERATE,
-            f4::RATE_CONTROL_QP,
-            f4::SLICE_QP_AVR,
-            f4::RATE_CONTROL_NAL_BITRATE,
-            f4::RATE_CONTROL_VCL_BITRATE,
-            [
-                f4::RATE_CONTROL_NAL_CPB_SIZE,
-                f4::RATE_CONTROL_VCL_CPB_SIZE,
-                f4::RATE_CONTROL_BUFFERSIZE,
-            ],
-        ),
-        Codec::Hevc => (
-            f5::RATE_CONTROL_FRAMERATE,
-            f5::RATE_CONTROL_QP,
-            f5::SLICE_QP_AVR,
-            f5::RATE_CONTROL_NAL_BITRATE,
-            f5::RATE_CONTROL_VCL_BITRATE,
-            [
-                f5::RATE_CONTROL_NAL_CPB_SIZE,
-                f5::RATE_CONTROL_VCL_CPB_SIZE,
-                f5::RATE_CONTROL_BUFFERSIZE,
-            ],
-        ),
-    };
-    framerate.put(setup, u64::from(config.fps) << 8);
+fn rate(codec: Codec, setup: &mut [u8], config: &Config, captured: &Captured) {
+    let rc = rc(codec);
+    rc.framerate.put(setup, u64::from(config.fps) << 8);
     match config.rate {
         Rate::ConstQp(value) => {
-            bitrate.put(setup, captured_bitrate);
-            for field in qp {
+            rc.bitrate.put(setup, captured.bitrate);
+            for field in rc.qp {
                 field.put(setup, u64::from(value));
             }
-            slice_qp.put(setup, u64::from(value));
+            rc.slice_qp.put(setup, u64::from(value));
+        }
+        Rate::Cbr { bitrate: wanted } if config.realtime => {
+            // One frame's bits, and Bmin in its captured proportion to
+            // them (the module's notes). Ravg, R and rhopbi stay as
+            // captured, as at any bitrate.
+            let cpb = one_frame_bits(wanted, config.fps);
+            rc.bitrate.put(setup, u64::from(wanted));
+            rc.vcl_bitrate.put(setup, u64::from(wanted));
+            for field in rc.cpbs {
+                field.put(setup, cpb);
+            }
+            rc.bmin
+                .put(setup, scaled_bmin(captured.bmin, cpb, captured.cpb));
         }
         Rate::Cbr { bitrate: wanted } => {
-            bitrate.put(setup, u64::from(wanted));
+            rc.bitrate.put(setup, u64::from(wanted));
             // NVIDIA's other sizes are for its 20 Mb/s: a two-second CPB.
             // Another bitrate scales them; the rest of its rate control
             // (Bmin, Ravg, R, rhopbi) is kept as captured.
-            if u64::from(wanted) != captured_bitrate {
-                vcl_bitrate.put(setup, u64::from(wanted));
-                for field in cpbs {
+            if u64::from(wanted) != captured.bitrate {
+                rc.vcl_bitrate.put(setup, u64::from(wanted));
+                for field in rc.cpbs {
                     field.put(setup, 2 * u64::from(wanted));
                 }
             }

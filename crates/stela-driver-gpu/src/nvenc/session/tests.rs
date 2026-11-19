@@ -578,3 +578,212 @@ fn a_1440p_session_runs_on_its_scaled_layout() {
     // The SPS crops nothing: 1440 is whole macroblocks.
     assert_eq!(session.geometry().coded_height, 1440);
 }
+
+fn realtime(codec: Codec, rate: Rate) -> Config {
+    Config {
+        realtime: true,
+        ..Config::hd(codec, rate)
+    }
+}
+
+/// NVIDIA's captured setups (`-preset p1 -tune ull -rc cbr -g 999999 -bf 0
+/// -delay 0 -zerolatency 1`) are already ultra-low-latency in all but the
+/// CPB and H.264's references: low-latency CBR (`hrd_type` 0x22), no
+/// lookahead, no B pictures or L1 list, no intra refresh, an I picture's
+/// target the average's, one slice a picture, and a GOP NVIDIA's driver
+/// never ended. The CPB is two seconds, ffmpeg's default `-bufsize`.
+#[test]
+fn the_captured_setups_are_already_ultra_low_latency() {
+    use super::super::fields::{h264 as f4, hevc as f5};
+    for codec in [Codec::H264, Codec::Hevc] {
+        let (_, _, _, templates) = hd(codec, CBR);
+        for (setup, kind) in [(&templates.idr, 3), (&templates.p, 0)] {
+            assert_eq!(setup::picture_type(codec, setup), kind);
+            let fields = match codec {
+                Codec::H264 => [
+                    f4::RATE_CONTROL_HRD_TYPE,
+                    f4::RATE_CONTROL_GOP_LENGTH,
+                    f4::RATE_CONTROL_NP,
+                    f4::RATE_CONTROL_AB_BETA,
+                    f4::RATE_CONTROL_PREV_ACT,
+                    f4::RATE_CONTROL_SINGLE_FRAME_VBV,
+                    f4::RATE_CONTROL_I_SIZE_RATIO_X,
+                    f4::RATE_CONTROL_I_SIZE_RATIO_Y,
+                    f4::PPS_DATA_NUM_REF_IDX_L1_ACTIVE_MINUS1,
+                    f4::MD_INTRA_REFRESH_CNT,
+                    f4::PIC_CONTROL_MAX_SLICE_SIZE,
+                    f4::PIC_CONTROL_SLICE_MODE,
+                    f4::RATE_CONTROL_BUFFERSIZE,
+                    f4::RATE_CONTROL_BMIN,
+                ],
+                Codec::Hevc => [
+                    f5::RATE_CONTROL_HRD_TYPE,
+                    f5::RATE_CONTROL_GOP_LENGTH,
+                    f5::RATE_CONTROL_NP,
+                    f5::RATE_CONTROL_AB_BETA,
+                    f5::RATE_CONTROL_PREV_ACT,
+                    f5::RATE_CONTROL_SINGLE_FRAME_VBV,
+                    f5::RATE_CONTROL_I_SIZE_RATIO_X,
+                    f5::RATE_CONTROL_I_SIZE_RATIO_Y,
+                    f5::PPS_DATA_NUM_REF_IDX_L1_ACTIVE_MINUS1,
+                    f5::MD_INTRA_REFRESH_CNT,
+                    f5::PIC_CONTROL_MAX_SLICE_SIZE,
+                    f5::PIC_CONTROL_SLICE_MODE,
+                    f5::RATE_CONTROL_BUFFERSIZE,
+                    f5::RATE_CONTROL_BMIN,
+                ],
+            };
+            let values: Vec<u64> = fields.iter().map(|field| field.get(setup)).collect();
+            assert_eq!(
+                values,
+                [
+                    0x22, 999_999, 999_998, 0, 0, 0, 1, 1, 0, 0, 0, 0, 40_000_000, 490
+                ],
+                "{codec:?} {kind}"
+            );
+        }
+        if codec == Codec::H264 {
+            assert_eq!(f4::PIC_CONTROL_INTRA_REFRESH_COUNT.get(&templates.p), 0);
+            // Kept as captured, whatever it means to the engine: 1 for
+            // H.264, 0 for HEVC.
+            assert_eq!(f4::RATE_CONTROL_TWO_PASS_RC.get(&templates.p), 1);
+        } else {
+            assert_eq!(f5::RATE_CONTROL_TWO_PASS_RC.get(&templates.p), 0);
+        }
+        let rc = templates.rate_control();
+        assert_eq!(
+            (rc.cpb_bits, rc.bmin, rc.refs, rc.lookahead, rc.gop),
+            (
+                40_000_000,
+                490,
+                if codec == Codec::H264 { 3 } else { 1 },
+                false,
+                999_999
+            )
+        );
+        assert_eq!(rc.cpb_tenth_frames(), 1200);
+    }
+}
+
+/// The real-time profile changes the CPB to one frame's bits and `Bmin` in
+/// proportion, and nothing else of either template: at 20 Mb/s and 60 fps
+/// 333,334 bits and 490 * 333,334 / 40,000,000 = 4; at 10 Mb/s 166,667
+/// and 2. H.264 then takes one reference, HEVC's one already.
+#[test]
+fn the_realtime_profile_changes_the_cpb_and_bmin_alone() {
+    let geometry = Geometry::new(1920, 1080).unwrap();
+    for codec in [Codec::H264, Codec::Hevc] {
+        let layout = Layout::new(codec, &geometry, false);
+        let (_, _, _, captured) = hd(codec, CBR);
+        let ours = Templates::new(&realtime(codec, CBR), &geometry, &layout).unwrap();
+        // buffersize, nal_cpb_size, vcl_cpb_size and Bmin.
+        let allowed = match codec {
+            Codec::H264 => [140..148, 152..156, 168..172],
+            Codec::Hevc => [144..152, 156..160, 172..176],
+        };
+        for (theirs, mine) in [(&captured.idr, &ours.idr), (&captured.p, &ours.p)] {
+            let differing: Vec<usize> = (0..theirs.len())
+                .filter(|&i| theirs[i] != mine[i])
+                .collect();
+            assert!(!differing.is_empty());
+            assert!(
+                differing
+                    .iter()
+                    .all(|i| allowed.iter().any(|range| range.contains(i))),
+                "{codec:?} {differing:?}"
+            );
+        }
+        let rc = ours.rate_control();
+        assert_eq!((rc.cpb_bits, rc.bmin, rc.refs), (333_334, 4, 1));
+        assert_eq!(rc.cpb_tenth_frames(), 10);
+        let slower = realtime(
+            codec,
+            Rate::Cbr {
+                bitrate: 10_000_000,
+            },
+        );
+        let rc = Templates::new(&slower, &geometry, &layout)
+            .unwrap()
+            .rate_control();
+        assert_eq!((rc.bitrate, rc.cpb_bits, rc.bmin), (10_000_000, 166_667, 2));
+        // A fixed QP has no buffer: only the reference changes.
+        let qp = Templates::new(&realtime(codec, Rate::ConstQp(25)), &geometry, &layout).unwrap();
+        let (_, _, _, theirs) = hd(codec, Rate::ConstQp(25));
+        assert_eq!((qp.idr == theirs.idr, qp.p == theirs.p), (true, true));
+        assert_eq!(qp.max_refs, 1);
+    }
+}
+
+/// In the real-time profile every H.264 P frame is the captured first P
+/// frame's form: one L0 entry, the previous picture's DPB slot, given in
+/// the slice's override, and one reference bound in the submission.
+#[test]
+fn realtime_p_frames_reference_the_previous_picture_alone() {
+    use super::super::fields::h264 as f;
+    for codec in [Codec::H264, Codec::Hevc] {
+        let mut session = open(Engine::Encode, realtime(codec, CBR));
+        for n in 0..7 {
+            let encoded = encode_pattern(&mut session, n, Options::default()).unwrap();
+            assert_eq!(encoded.idr, n == 0);
+        }
+        let mut gpu = session.close().node;
+        for n in 1..7u32 {
+            let methods = super::super::tests::decode(&gpu.submissions[n as usize]);
+            let refs: Vec<u32> = methods
+                .iter()
+                .filter(|(_, m, _)| {
+                    (method::SET_IN_REF_PIC0_LUMA..method::SET_IN_REF_PIC0_CHROMA).contains(m)
+                })
+                .map(|(_, m, _)| (m - method::SET_IN_REF_PIC0_LUMA) / 4)
+                .collect();
+            let slot = match codec {
+                Codec::H264 => (n - 1) % 4,
+                Codec::Hevc => 0,
+            };
+            assert_eq!(refs, [slot], "{codec:?} frame {n}");
+            if codec == Codec::Hevc {
+                continue;
+            }
+            let address = methods
+                .iter()
+                .find(|(_, m, _)| *m == method::SET_IN_DRV_PIC_SETUP)
+                .map(|(_, _, data)| u64::from(*data) << 8)
+                .unwrap();
+            let setup = gpu.read(address, codec.setup_bytes());
+            assert_eq!(f::PIC_CONTROL_L0[0].get(&setup), u64::from(2 * slot));
+            assert_eq!(f::PIC_CONTROL_L0[1].get(&setup), 0xfe);
+            assert_eq!(f::PIC_CONTROL_TEMP_DIST_L0[0].get(&setup), 1);
+            assert_eq!(f::PIC_CONTROL_TEMP_DIST_L0[1].get(&setup), 0xff);
+            assert_eq!(f::SLICE_NUM_REF_IDX_ACTIVE_OVERRIDE_FLAG.get(&setup), 1);
+            assert_eq!(f::SLICE_NUM_REF_IDX_L0_ACTIVE_MINUS1.get(&setup), 0);
+            assert_eq!(f::RATE_CONTROL_BUFFERSIZE.get(&setup), 333_334);
+        }
+    }
+}
+
+/// A bitrate change keeps the profile and rescales its CPB; turning the
+/// profile off gives back NVIDIA's captured setups.
+#[test]
+fn the_profile_follows_the_bitrate_and_turns_off() {
+    let mut session = open(Engine::Encode, realtime(Codec::Hevc, CBR));
+    encode_pattern(&mut session, 0, Options::default()).unwrap();
+    session
+        .set_rate(Rate::Cbr {
+            bitrate: 30_000_000,
+        })
+        .unwrap();
+    assert!(session.config().realtime);
+    assert_eq!(session.rate_control().cpb_bits, 500_000);
+    encode_pattern(&mut session, 1, Options::default()).unwrap();
+    session.set_realtime(false).unwrap();
+    let (_, _, _, captured) = hd(
+        Codec::Hevc,
+        Rate::Cbr {
+            bitrate: 30_000_000,
+        },
+    );
+    assert_eq!(session.templates.p, captured.p);
+    assert_eq!(session.templates.idr, captured.idr);
+    assert_eq!(session.rate_control().cpb_bits, 60_000_000);
+    encode_pattern(&mut session, 2, Options::default()).unwrap();
+}

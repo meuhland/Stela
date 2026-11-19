@@ -681,6 +681,35 @@ fn nvenc_sessions_are_on_unless_no_nvenc() {
     assert!(usual.to_string().contains(" --nvenc-selftest --no-nvenc"));
 }
 
+/// The NVENC sessions' real-time profile is on unless
+/// `--no-nvenc-realtime-profile`, which round-trips alone and beside the
+/// boot's usual flags, and changes nothing else.
+#[test]
+fn the_nvenc_realtime_profile_is_on_unless_turned_off() {
+    assert!(System::default().nvenc_realtime_profile);
+    assert!(!round_trip("--system").to_string().contains("realtime"));
+    let off = round_trip(&format!("--system {NO_NVENC_REALTIME_PROFILE}"));
+    assert!(!off.nvenc_realtime_profile && off.nvenc);
+    assert_eq!(off.to_string(), "--system --no-nvenc-realtime-profile");
+    assert_eq!(
+        System {
+            nvenc_realtime_profile: true,
+            ..off
+        },
+        System::default()
+    );
+    let usual = round_trip(&format!(
+        "--system --input --parallel {GPU_BOOST} {NO_NVENC_REALTIME_PROFILE} {NVENC_SELFTEST}"
+    ));
+    assert!(!usual.nvenc_realtime_profile && usual.gpu_boost && usual.nvenc_selftest);
+    assert!(
+        usual
+            .to_string()
+            .contains(" --nvenc-selftest --no-nvenc-realtime-profile --gpu-boost"),
+        "{usual}"
+    );
+}
+
 /// The guest's NVDEC sessions are on unless `--no-nvdec`, which round-trips
 /// alone and beside `--no-nvenc` and the self-test, and changes nothing
 /// else.

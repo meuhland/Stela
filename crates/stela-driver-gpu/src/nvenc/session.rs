@@ -27,7 +27,7 @@ use super::layout::{
     VA_TOP,
 };
 use super::push::{self, MOST_WORDS};
-use super::setup::{self, Picture, Templates};
+use super::setup::{self, Picture, RateControl, Templates};
 use super::surface::{self, Nv12, Rgb};
 use super::*;
 use alloc::vec::Vec;
@@ -636,17 +636,34 @@ impl<N: Node> Session<N> {
     /// parameter sets carry no rate, so the stream goes on unchanged.
     pub fn set_rate(&mut self, rate: Rate) -> Result<(), Error> {
         rate_ok(rate)?;
+        self.reconfigure(Config {
+            rate,
+            ..self.config
+        })
+    }
+
+    /// Turns the real-time profile ([`Config::realtime`]) on or off from
+    /// the next frame on, as [`Session::set_rate`] changes the rate.
+    pub fn set_realtime(&mut self, realtime: bool) -> Result<(), Error> {
+        self.reconfigure(Config {
+            realtime,
+            ..self.config
+        })
+    }
+
+    fn reconfigure(&mut self, config: Config) -> Result<(), Error> {
         if self.in_flight.is_some() {
             return Err(Error::Input("a frame is in flight"));
         }
-        let config = Config {
-            rate,
-            ..self.config
-        };
         self.templates =
             Templates::new(&config, &self.geometry, &self.layout).map_err(Error::Config)?;
         self.config = config;
         Ok(())
+    }
+
+    /// What the session's setups ask of the rate control now.
+    pub fn rate_control(&self) -> RateControl {
+        self.templates.rate_control()
     }
 
     /// Whether a frame was submitted and not yet seen complete.
