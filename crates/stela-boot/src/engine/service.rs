@@ -92,6 +92,39 @@ pub(super) fn set_input_kick(kick: bool) {
     INPUT_KICK.store(kick, Ordering::Relaxed);
 }
 
+/// Whether the boot PE steps in for the inputs after [`QUIET_STARVED_MILLIS`]
+/// when its slice ended quiet (`--input-quiet-step`).
+static INPUT_QUIET_STEP: AtomicBool = AtomicBool::new(false);
+
+/// The steps [`quiet_starved`] gave since the last report.
+static QUIET_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// How long the host may go unserved before a boot PE whose slice ended
+/// quiet serves it, with `--input-quiet-step`: an idle input device's poll
+/// interval (`input::IDLE_MILLIS`). Under a full load no PE waits, so
+/// without it the inputs wait for [`STARVED_MILLIS`].
+const QUIET_STARVED_MILLIS: u64 = 8;
+
+pub(super) fn set_input_quiet_step(step: bool) {
+    INPUT_QUIET_STEP.store(step, Ordering::Relaxed);
+}
+
+/// Whether a boot PE whose slice ended quiet (waiting, or at EL0, where it
+/// holds no kernel lock another PE spins on) should take a step: with
+/// `--input-quiet-step`, once no PE served the host for
+/// [`QUIET_STARVED_MILLIS`].
+pub(super) fn quiet_starved() -> bool {
+    if !INPUT_QUIET_STEP.load(Ordering::Relaxed) {
+        return false;
+    }
+    let starved = host::fresh_counter().wrapping_sub(SERVED.load(Ordering::Acquire))
+        >= host::COUNTER_HZ / 1000 * QUIET_STARVED_MILLIS;
+    if starved {
+        QUIET_STEPS.fetch_add(1, Ordering::Relaxed);
+    }
+    starved
+}
+
 /// How long the host may go unserved before the boot PE serves it: a PE's
 /// wait returns to its run loop at least this often
 /// (`WAIT_POLLS_PER_SECOND`), so with any PE idle it is served first. A
@@ -898,9 +931,10 @@ pub(super) fn report(tsc_hz: u64) -> String {
         format!("{}:{}", site.file(), site.line())
     });
     let mut line = format!(
-        "services waiting={} boot={} host_drivers_waited_us={waited}/{longest} host_drivers_held_us={held}@{holder} undelivered_doorbells={} longest_us",
+        "services waiting={} boot={} quiet_steps={} host_drivers_waited_us={waited}/{longest} host_drivers_held_us={held}@{holder} undelivered_doorbells={} longest_us",
         services[0],
         services[1],
+        QUIET_STEPS.swap(0, Ordering::Relaxed),
         host::undelivered_doorbells(),
     );
     for (name, longest) in NAMES.iter().zip(&LONGEST) {

@@ -164,6 +164,19 @@ fn input_kick_is_off_by_default_and_round_trips() {
     assert!(both.to_string().contains(INPUT_KICK));
 }
 
+/// `--input-quiet-step` is off by default, reads back the same, and goes
+/// with the other input flags.
+#[test]
+fn input_quiet_step_is_off_by_default_and_round_trips() {
+    assert!(!System::default().input_quiet_step);
+    assert!(!round_trip("--system --input").input_quiet_step);
+    let all = round_trip(&format!(
+        "--system --input {INPUT_EVERY_TURN} {INPUT_KICK} {INPUT_QUIET_STEP}"
+    ));
+    assert!(all.input_quiet_step && all.input_kick && all.input_every_turn);
+    assert!(all.to_string().contains(INPUT_QUIET_STEP));
+}
+
 #[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));

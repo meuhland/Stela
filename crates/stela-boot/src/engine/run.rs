@@ -852,11 +852,12 @@ pub(super) fn run<H: Host>(
             // It serves whole only while it waits itself: a PE in guest code
             // that serves holds its guest's thread, and at EL1 maybe a lock
             // other PEs time (`clock`). Waiting PEs serve; with none for a while, it takes one
-            // bounded step between slices.
+            // bounded step between slices, sooner with `--input-quiet-step`
+            // when its slice ended at EL0, which holds no such lock.
             if !machine.runs_parallel() || idle {
                 let watch = machine.guest_watch();
                 machine.exclude_host_time(|_| service::serve(true, false, &watch));
-            } else if service::starved(requested) {
+            } else if service::starved(requested) || (quiet && service::quiet_starved()) {
                 let watch = machine.guest_watch();
                 machine.exclude_host_time(|_| service::serve(true, true, &watch));
             }

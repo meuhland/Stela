@@ -82,6 +82,10 @@ pub const INPUT_EVERY_TURN: &str = "--input-every-turn";
 /// Bring the home machine to the guest's USB controller as soon as host
 /// input reaches it ([`System::input_kick`]).
 pub const INPUT_KICK: &str = "--input-kick";
+/// Let the boot PE take a short host service step for the inputs once the
+/// host has gone unserved for an input poll's interval, when its slice ends
+/// at EL0 or waiting ([`System::input_quiet_step`]).
+pub const INPUT_QUIET_STEP: &str = "--input-quiet-step";
 /// Has GSP-RM hold each NVIDIA GPU at its highest performance level for the
 /// boot ([`System::gpu_boost`]).
 pub const GPU_BOOST: &str = "--gpu-boost";
@@ -366,6 +370,13 @@ pub struct System {
     /// guest's USB controller at once (`--input-kick`), where by default it
     /// finds the controller's new deadline at its next step of its own.
     pub input_kick: bool,
+    /// While every PE runs guest code, none waits to serve the host, and the
+    /// boot PE steps in only after the host went unserved for 50 ms: under
+    /// a full load the inputs are polled that rarely. With this the boot PE
+    /// also takes a step once the host went unserved for an input poll's
+    /// interval, when its slice ended at EL0 (where it holds no kernel lock
+    /// another PE spins on) or waiting (`--input-quiet-step`).
+    pub input_quiet_step: bool,
     /// Explicit native executors and guest PEs (`--native-cores N`), one per
     /// logical processor; SMT siblings count after every physical core.
     pub native_cores: Option<usize>,
@@ -562,6 +573,7 @@ impl Default for System {
             input: false,
             input_every_turn: false,
             input_kick: false,
+            input_quiet_step: false,
             native_cores: None,
             guest_pes: None,
             native_bootstrap_check: false,
@@ -1043,6 +1055,7 @@ impl fmt::Display for System {
         line.flag("--input", self.input)?;
         line.flag(INPUT_EVERY_TURN, self.input_every_turn)?;
         line.flag(INPUT_KICK, self.input_kick)?;
+        line.flag(INPUT_QUIET_STEP, self.input_quiet_step)?;
         line.flag("--idle-skip", self.idle_skip)?;
         line.flag("--survey", self.survey)?;
         line.flag("--sep-observe", self.sep_observe)?;

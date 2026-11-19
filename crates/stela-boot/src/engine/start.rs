@@ -3197,6 +3197,7 @@ fn start_devices(
             }
             super::service::set_input_every_turn(options.input_every_turn);
             super::service::set_input_kick(options.input_kick);
+            super::service::set_input_quiet_step(options.input_quiet_step);
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
                 translations::set_partition(store);
