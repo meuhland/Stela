@@ -14,7 +14,8 @@
  *
  * The host parses the stream (its avcC/hvcC record, then each sample of
  * length-prefixed NAL units), decodes on NVDEC, and writes each picture it
- * shows, in display order, into a destination the caller gave: the planes of
+ * shows, in display order (or in decode order, as open_flags asks), into a
+ * destination the caller gave: the planes of
  * a pixel buffer, 420v (NV12) or x420 (P010) as the open answered, the
  * stream's displayed size. A sample may show no picture (a B-frame stream's
  * first ones), one, or several; every picture decoded is shown once, with
@@ -29,7 +30,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define STELA_DECODER_API_VERSION 1u
+/* Version 2 adds `open_flags` (the order pictures are shown in) after the
+ * version 1 table, which stays as it was: a version 2 table serves a
+ * StelaVD built for version 1, and StelaVD takes a version 1 table, whose
+ * sessions show their pictures in display order. */
+#define STELA_DECODER_API_VERSION 2u
+/* The oldest table StelaVD takes. */
+#define STELA_DECODER_API_MIN_VERSION 1u
 #define STELAVD_USE_DECODERS "StelaVD_UseDecoders"
 #define STELA_DECODER_CLASS "StelaGPUDecoders"
 /* The most destinations one decode gives. */
@@ -45,6 +52,13 @@ enum {
 	StelaDecoderNV12 = 0,
 	/* 'x420': 16-bit samples, the 10 bits high, then interleaved CbCr. */
 	StelaDecoderP010 = 1,
+};
+/* open_flags' flags (the gate's DECODER_OPEN_*). */
+enum {
+	/* Show each picture right after its decode, in decode order
+	 * (VideoToolbox without temporal processing), rather than in display
+	 * order. */
+	StelaDecoderOpenDecodeOrder = 1,
 };
 /* StelaDecoderSample.flags. */
 enum {
@@ -79,6 +93,10 @@ typedef enum {
 	/* The host's parser or the engine refused the sample: it showed
 	 * nothing, and the session goes on with the next. */
 	StelaDecoderDropped = 13,
+	/* The host closed the session, idle, to make room for another or to
+	 * give its video memory back: nothing of the call took effect. Close it
+	 * and open a new one at the stream's next sync sample. */
+	StelaDecoderEvicted = 14,
 	/* The bundle's own: no Metal device of this process opened its gate. */
 	StelaDecoderNoGate = 100,
 	/* The bundle's own: out of memory. */
@@ -169,7 +187,12 @@ typedef struct {
 	/* Decodes one sample and shows what is ready, waiting for it. */
 	StelaDecoderStatus (*decode)(StelaDecoderSession *session, StelaDecoderSample *sample, StelaDecoderResult *result,
 				     char *reason, size_t reason_bytes);
+	/* Closes a session, an evicted one too. */
 	void (*close)(StelaDecoderSession *session);
+	/* Version 2: `open` with StelaDecoderOpen* `flags`. */
+	StelaDecoderStatus (*open_flags)(uint32_t codec, uint32_t flags, const void *config, size_t config_bytes,
+					 StelaDecoderStream *stream, StelaDecoderSession **session, char *reason,
+					 size_t reason_bytes);
 } StelaDecoderAPI;
 
 /* StelaVT's export for StelaVD: keeps `api`, which lives as long as the

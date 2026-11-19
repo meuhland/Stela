@@ -116,10 +116,16 @@ static StelaDecoderStatus capabilities(StelaDecoderCapabilities *out, char *reas
 	return status;
 }
 
-static StelaDecoderStatus open_session(uint32_t codec, const void *config, size_t config_bytes,
-				       StelaDecoderStream *stream, StelaDecoderSession **session, char *reason,
-				       size_t reason_bytes)
+/* A session shown in the order `flags` ask (StelaDecoderOpen*, the gate's
+ * DECODER_OPEN_* bits). */
+static StelaDecoderStatus open_session_flags(uint32_t codec, uint32_t flags, const void *config,
+					     size_t config_bytes, StelaDecoderStream *stream,
+					     StelaDecoderSession **session, char *reason, size_t reason_bytes)
 {
+	if (flags & ~(uint32_t)StelaDecoderOpenDecodeOrder) {
+		copy_reason(reason, reason_bytes, "open flags the host does not know");
+		return StelaDecoderInvalid;
+	}
 	StelaFailure failure = {};
 	StelaGate *gate = serving_gate(&failure);
 	if (!gate) {
@@ -133,7 +139,7 @@ static StelaDecoderStatus open_session(uint32_t codec, const void *config, size_
 	}
 	StelaDecoderOpenRequest request = {
 		.codec = codec,
-		.flags = 0,
+		.flags = flags,
 		.config = stela_span(config, config_bytes),
 	};
 	/* Names the open across its calls answered Pending. */
@@ -161,6 +167,14 @@ static StelaDecoderStatus open_session(uint32_t codec, const void *config, size_
 	};
 	*session = made;
 	return StelaDecoderOk;
+}
+
+/* Version 1's open: display order. */
+static StelaDecoderStatus open_session(uint32_t codec, const void *config, size_t config_bytes,
+				       StelaDecoderStream *stream, StelaDecoderSession **session, char *reason,
+				       size_t reason_bytes)
+{
+	return open_session_flags(codec, 0, config, config_bytes, stream, session, reason, reason_bytes);
 }
 
 static StelaDecoderStatus decode(StelaDecoderSession *session, StelaDecoderSample *sample,
@@ -249,6 +263,7 @@ static const StelaDecoderAPI api = {
 	.open = open_session,
 	.decode = decode,
 	.close = close_session,
+	.open_flags = open_session_flags,
 };
 
 const StelaDecoderAPI *stela_decoder_api(void)
