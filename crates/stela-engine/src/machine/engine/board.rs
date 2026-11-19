@@ -36,6 +36,8 @@ use core::sync::atomic::{
 };
 use stela_compiler::x86_64::chain::{self, LookupTable, TableReader};
 
+#[cfg(test)]
+mod replay;
 mod ring;
 #[cfg(test)]
 mod tests;

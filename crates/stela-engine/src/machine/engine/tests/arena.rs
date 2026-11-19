@@ -1654,7 +1654,8 @@ fn open_part(ring: &board::Ring, stream: usize) -> usize {
 #[test]
 fn the_tenured_part_entered_least_goes_first_and_age_and_holes_bound_the_rest() {
     let grace = board::Grace::new(1);
-    let ring = board::Ring::new(16, 1024);
+    // A quarter young, so both generations hold several parts.
+    let ring = board::Ring::with_nursery(16, 1024, 4);
     assert_eq!(ring.young_parts, 4);
     // Young code fills the ring alone: first in, first out.
     let mut young = Vec::new();

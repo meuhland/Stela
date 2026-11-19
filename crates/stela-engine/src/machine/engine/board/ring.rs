@@ -57,6 +57,13 @@ pub(in crate::machine::engine) const YOUNG: usize = 0;
 pub(in crate::machine::engine) const TENURED: usize = 1;
 /// The fewest parts a ring keeps a tenured generation in.
 const TENURE_PARTS: usize = 8;
+/// The share of a ring's parts (a fraction's denominator) young code keeps
+/// when tenured code wants room ([`Ring::young_parts`]). Code run once
+/// dies there without taking tenured room: on a replay of sign-in
+/// (`replay.rs`, 1.3 million hot blocks, 90 thousand new a heartbeat) a
+/// window that holds the hot code installs 63 thousand blocks again a
+/// heartbeat with an eighth young, 219 thousand with a quarter.
+pub(in crate::machine::engine) const NURSERY_SHARE: u32 = 8;
 /// Turns of the ring a tenured part lives at most.
 pub(in crate::machine::engine) const AGE_TURNS: u32 = 4;
 /// A part whose blocks left the index for at least this share (in
@@ -188,13 +195,23 @@ fn atomics<T: Default>(parts: usize) -> Box<[T]> {
 impl Ring {
     /// `parts` parts of `part_bytes` each; young code takes the first.
     pub(in crate::machine::engine) fn new(parts: usize, part_bytes: usize) -> Self {
+        Self::with_nursery(parts, part_bytes, NURSERY_SHARE)
+    }
+
+    /// A ring whose young code keeps a `share`th of its parts when tenured
+    /// code wants room.
+    pub(in crate::machine::engine) fn with_nursery(
+        parts: usize,
+        part_bytes: usize,
+        share: u32,
+    ) -> Self {
         assert!(
             (MIN_PARTS..=MAX_PARTS).contains(&parts),
             "a ring of three to 64 parts"
         );
         let part_bytes = u32::try_from(part_bytes).expect("a part below 4 GiB");
         let young_parts = if parts >= TENURE_PARTS {
-            (parts as u32 / 4).max(2)
+            (parts as u32 / share).max(2)
         } else {
             0
         };
