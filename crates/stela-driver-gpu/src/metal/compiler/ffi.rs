@@ -191,6 +191,78 @@ impl Reflection {
         // SAFETY: every member is an integer or an array of integers.
         unsafe { alloc::boxed::Box::new_zeroed().assume_init() }
     }
+
+    /// The only member wider than four bytes sits at eight after two
+    /// 32-bit ones, the others are 32-bit words or bytes, and the names
+    /// end the record: no byte of it is padding.
+    const NO_PADDING: bool = core::mem::offset_of!(Self, threadgroup_bytes) == 8
+        && core::mem::offset_of!(Self, buffer_count) == 16
+        && core::mem::offset_of!(Self, names) + NAME_BYTES == size_of::<Self>();
+
+    /// The record's bytes, which a later boot's [`Self::unpack`] makes the
+    /// same record of: its size, then runs of a zero count and a count of
+    /// bytes, as 32-bit little-endian numbers, each followed by those
+    /// bytes. A reflection's arrays are mostly unused rows of zeros, so a
+    /// record of 18 KiB packs into a few hundred bytes.
+    pub(super) fn pack(&self) -> alloc::vec::Vec<u8> {
+        const { assert!(Self::NO_PADDING) };
+        let bytes = self.bytes();
+        let mut packed = alloc::vec::Vec::with_capacity(512);
+        packed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        let mut at = 0;
+        while at < bytes.len() {
+            let zeros = bytes[at..].iter().take_while(|&&byte| byte == 0).count();
+            let start = at + zeros;
+            // A literal ends at a run of eight zeros or the record's end.
+            let mut end = start;
+            while end < bytes.len() && bytes[end..].iter().take(8).any(|&byte| byte != 0) {
+                end += 1;
+            }
+            packed.extend_from_slice(&(zeros as u32).to_le_bytes());
+            packed.extend_from_slice(&((end - start) as u32).to_le_bytes());
+            packed.extend_from_slice(&bytes[start..end]);
+            at = end;
+        }
+        packed
+    }
+
+    /// The record [`Self::pack`] packed; `None` for bytes that are not a
+    /// whole record of this layout's size.
+    pub(super) fn unpack(packed: &[u8]) -> Option<alloc::boxed::Box<Self>> {
+        let word = |at: usize| -> Option<usize> {
+            let bytes = packed.get(at..at.checked_add(4)?)?;
+            Some(u32::from_le_bytes(bytes.try_into().ok()?) as usize)
+        };
+        if word(0)? != size_of::<Self>() {
+            return None;
+        }
+        let mut record = Self::zeroed();
+        let bytes = record.bytes_mut();
+        let (mut read, mut at): (usize, usize) = (4, 0);
+        while read < packed.len() {
+            let zeros = word(read)?;
+            let literal = word(read + 4)?;
+            read += 8;
+            let start = at.checked_add(zeros)?;
+            let end = start.checked_add(literal)?;
+            bytes
+                .get_mut(start..end)?
+                .copy_from_slice(packed.get(read..read.checked_add(literal)?)?);
+            (read, at) = (read + literal, end);
+        }
+        Some(record)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: integers and arrays of integers that leave no padding
+        // (`NO_PADDING`), so every byte is a member's.
+        unsafe { core::slice::from_raw_parts(ptr::from_ref(self).cast(), size_of::<Self>()) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `bytes`; every byte pattern is a valid record.
+        unsafe { core::slice::from_raw_parts_mut(ptr::from_mut(self).cast(), size_of::<Self>()) }
+    }
 }
 
 /// `enum stela_metal_binding_kind`.

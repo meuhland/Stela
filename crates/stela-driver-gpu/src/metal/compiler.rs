@@ -19,7 +19,13 @@
 //! reflections and compiled NIR are kept for the device's boot by what they
 //! read, so a function or pipeline made again skips the service; a miss may
 //! defer its compilation to run outside the service's lock
-//! ([`AirCompiler::set_deferring`], `service/shared.rs`).
+//! ([`AirCompiler::set_deferring`], `service/shared.rs`). Where the image
+//! keeps compilations across boots ([`AirCompiler::persist`]), each
+//! reflection goes to the pipeline store too, its record packed
+//! ([`ffi::Reflection::pack`]) under the digest a deferred reflection is
+//! known by, and a later boot decodes it in the call's turn: a warm boot's
+//! functions reflect without LLVM and defer nothing (a boot reflected about
+//! 1200 functions, each a job and a wait of the calling thread).
 //!
 //! A stage's [`Linking`] reaches the service as the AIR modules of its
 //! functions, with their function constant values, and of every function
@@ -348,6 +354,8 @@ pub struct AirCompiler {
     /// recalled.
     restored: u64,
     recalled: u64,
+    /// Reflections an earlier boot kept, decoded in place of reflecting.
+    reflections_restored: u64,
 }
 
 /// Where a compilation's serialized NIR goes for the next boot, by key.
@@ -453,13 +461,16 @@ impl AirCompiler {
             recall: None,
             restored: 0,
             recalled: 0,
+            reflections_restored: 0,
         }
     }
 
-    /// Takes `stored`, NIR an earlier boot's compilations serialized by key,
-    /// and gives this boot's compilations to `persist`, which `recall` finds
-    /// again: a compilation either holds deserializes instead of lowering
-    /// AIR again, so one the NIR cache evicted is not compiled twice.
+    /// Takes `stored`, NIR an earlier boot's compilations serialized by key
+    /// and its packed reflections, and gives this boot's compilations and
+    /// reflections to `persist`, which `recall` finds again: a compilation
+    /// either holds deserializes instead of lowering AIR again, so one the
+    /// NIR cache evicted is not compiled twice, and a stored reflection
+    /// decodes instead of reflecting.
     pub fn persist(
         &mut self,
         stored: impl IntoIterator<Item = ([u8; 32], &'static [u8])>,
@@ -633,7 +644,9 @@ impl AirCompiler {
             digest,
             key,
             result,
+            packed,
         } = reflected;
+        self.keep_serialized(&digest, packed.as_deref());
         match (result, self.reflections.as_mut()) {
             (Some((reflection, provenance)), Some(cache)) => {
                 self.reflected += 1;
@@ -667,12 +680,14 @@ impl AirCompiler {
         }
     }
 
-    /// `GPU COMPILER reflected=… reflections=… nir_hits=… nir_misses=…
-    /// compiled=… restored=…/stored deferred=… nir=entries/MiB evicted=…
-    /// recalled=…`, since the device opened: reflections and compilations
-    /// the service ran, cache hits and misses, stored NIR deserialized of
-    /// what the store held, calls that compiled outside the lock, the cache,
-    /// and evicted compilations of this boot deserialized again.
+    /// `GPU COMPILER reflected=… reflections=… reflections_restored=…
+    /// nir_hits=… nir_misses=… compiled=… restored=…/stored deferred=…
+    /// nir=entries/MiB evicted=… recalled=…`, since the device opened:
+    /// reflections the service ran, those cached, and those an earlier boot
+    /// kept that were decoded instead, compilations the service ran, cache
+    /// hits and misses, stored NIR deserialized of what the store held (its
+    /// reflections counted with it), calls that compiled outside the lock,
+    /// the cache, and evicted compilations of this boot deserialized again.
     pub fn report(&self) -> String {
         let (hits, misses, entries, bytes, evicted) =
             self.nir.as_ref().map_or((0, 0, 0, 0, 0), |nir| {
@@ -685,11 +700,12 @@ impl AirCompiler {
                 )
             });
         alloc::format!(
-            "GPU COMPILER reflected={} reflections={} nir_hits={hits} nir_misses={misses} \
-             compiled={} restored={}/{} deferred={} nir={entries}/{}M evicted={evicted} \
-             recalled={}",
+            "GPU COMPILER reflected={} reflections={} reflections_restored={} nir_hits={hits} \
+             nir_misses={misses} compiled={} restored={}/{} deferred={} nir={entries}/{}M \
+             evicted={evicted} recalled={}",
             self.reflected,
             self.reflections.as_ref().map_or(0, ReflectionCache::len),
+            self.reflections_restored,
             self.compiled,
             self.restored,
             self.stored.len(),
@@ -719,6 +735,12 @@ impl AirCompiler {
             && let Some(hit) = cache.get(key)
         {
             return Ok(hit);
+        }
+        // An earlier boot's reflection decodes in the turn, without LLVM.
+        if let Some(key) = &key
+            && let Some(restored) = self.restore_reflection(library, entry, key)
+        {
+            return Ok(restored);
         }
         // A large module's reflection, which parses and specializes its
         // AIR, can take seconds: it runs outside the turn like a compile.
@@ -762,10 +784,37 @@ impl AirCompiler {
         let selected = select(&self.libraries, library, entry)?;
         self.reflected += 1;
         let decoded = selected.decode_reflection(&reflection)?;
+        if let Some(key) = &key
+            && self.persist.is_some()
+        {
+            self.keep_serialized(&reflection_digest(key), Some(&reflection.pack()));
+        }
         if let (Some(cache), Some(key)) = (&mut self.reflections, key) {
             cache.insert(key, decoded.0.clone(), decoded.1.clone());
         }
         Ok(decoded)
+    }
+
+    /// The reflection of `key`, of `entry` of `library`, that an earlier
+    /// boot kept ([`AirCompiler::persist`]), decoded and cached; `None` when
+    /// none was kept or it does not decode, and the function reflects.
+    fn restore_reflection(
+        &mut self,
+        library: u64,
+        entry: &str,
+        key: &ReflectionKey,
+    ) -> Option<(Reflection, Provenance)> {
+        let packed = self.stored.get(&reflection_digest(key))?;
+        let reflection = ffi::Reflection::unpack(packed)?;
+        let decoded = select(&self.libraries, library, entry)
+            .ok()?
+            .decode_reflection(&reflection)
+            .ok()?;
+        self.reflections_restored += 1;
+        if let Some(cache) = &mut self.reflections {
+            cache.insert(key.clone(), decoded.0.clone(), decoded.1.clone());
+        }
+        Some(decoded)
     }
 
     /// The detail of the last call the service refused.
@@ -1635,11 +1684,12 @@ struct ReflectJob {
 unsafe impl Send for ReflectJob {}
 
 /// What a [`ReflectJob`] made: the reflection, or `None` when the service
-/// refused it.
+/// refused it, and its record packed for the next boot.
 struct Reflected {
     digest: [u8; 32],
     key: ReflectionKey,
     result: Option<(Reflection, Provenance)>,
+    packed: Option<Vec<u8>>,
 }
 
 // SAFETY: plain values the job made, which only the adopting turn reads.
@@ -1648,18 +1698,22 @@ unsafe impl Send for Reflected {}
 impl ReflectJob {
     fn run(self) -> Reflected {
         let (_, entry, values) = &self.key;
+        let mut packed = None;
         let result = self.library.select(entry).ok().and_then(|selected| {
             let raw = values.as_deref().map(constant_values);
             let mut refusal = None;
             let reflection = selected
                 .reflect_raw(&self.service, raw.as_deref(), &mut refusal)
                 .ok()?;
-            selected.decode_reflection(&reflection).ok()
+            let decoded = selected.decode_reflection(&reflection).ok()?;
+            packed = Some(reflection.pack());
+            Some(decoded)
         });
         Reflected {
             digest: self.digest,
             key: self.key,
             result,
+            packed,
         }
     }
 }

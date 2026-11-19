@@ -627,3 +627,138 @@ fn a_call_that_does_not_defer_deserializes_stored_nir_in_its_turn() {
             .contains("compiled=0 restored=1/1 deferred=0")
     );
 }
+
+std::thread_local! {
+    /// What the compiler gave the next boot: keys and blobs.
+    static KEPT: core::cell::RefCell<Vec<([u8; 32], Vec<u8>)>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+fn keep(key: &[u8; 32], blob: &[u8]) {
+    KEPT.with_borrow_mut(|kept| kept.push((*key, blob.to_vec())));
+}
+
+fn recall_none(_: &[u8; 32]) -> Option<Vec<u8>> {
+    None
+}
+
+/// The digest a reflection of `entry` with `values` is kept by.
+fn reflection_key(
+    compiler: &AirCompiler,
+    library: u64,
+    entry: &str,
+    values: Option<&[(u32, Vec<u8>)]>,
+) -> [u8; 32] {
+    let selected = select(&compiler.libraries, library, entry).unwrap();
+    reflection_digest(&(
+        selected.module.slice_hash,
+        String::from(entry),
+        values.map(<[_]>::to_vec),
+    ))
+}
+
+#[test]
+fn a_reflection_record_packs_small_and_unpacks_the_same() {
+    let mut record = ffi::Reflection::zeroed();
+    record.stage = 3;
+    record.threadgroup_bytes = 0x1234_5678_9abc;
+    record.buffer_count = 2;
+    record.buffers[1].index = 7;
+    record.names[..5].copy_from_slice(b"hello");
+    record.names[ffi::NAME_BYTES - 1] = 9;
+    let packed = record.pack();
+    assert!(packed.len() < 128, "{} bytes", packed.len());
+    let unpacked = ffi::Reflection::unpack(&packed).unwrap();
+    assert_eq!(unpacked.pack(), packed);
+    assert_eq!(
+        (
+            unpacked.stage,
+            unpacked.threadgroup_bytes,
+            unpacked.buffers[1].index
+        ),
+        (3, 0x1234_5678_9abc, 7)
+    );
+    assert_eq!(&unpacked.names[..5], b"hello");
+    assert_eq!(unpacked.names[ffi::NAME_BYTES - 1], 9);
+    let empty = ffi::Reflection::zeroed();
+    assert_eq!(
+        ffi::Reflection::unpack(&empty.pack()).unwrap().pack(),
+        empty.pack()
+    );
+    // Damaged or of another layout: none.
+    assert!(ffi::Reflection::unpack(&packed[..packed.len() - 1]).is_none());
+    assert!(ffi::Reflection::unpack(&[1, 0, 0, 0]).is_none());
+    let mut past = packed.clone();
+    past.extend_from_slice(&[0xff, 0xff, 0, 0, 1, 0, 0, 0, 1]);
+    assert!(ffi::Reflection::unpack(&past).is_none());
+}
+
+/// A boot keeps each reflection, in a call's turn or in a job, under the
+/// digest its job is known by; a later boot decodes it in the turn of a
+/// call that may defer: no service call, no job.
+#[test]
+fn a_reflection_an_earlier_boot_kept_decodes_without_the_service_or_a_job() {
+    KEPT.with_borrow_mut(Vec::clear);
+    let (mut compiler, library) = caching();
+    compiler.persist = Some(keep);
+    let lock = compiler.compile_lock(core::hint::spin_loop);
+    let values = vec![(0, vec![1, 0, 0, 0])];
+    // In the turn.
+    compiler.prepare_function(library, "kernel", None).unwrap();
+    // In a job.
+    compiler.set_deferring(true);
+    assert_eq!(
+        compiler
+            .prepare_function(library, "kernel", Some(values.clone()))
+            .err(),
+        Some(DEFERRED)
+    );
+    let job = compiler.take_job().unwrap();
+    compiler.end_call();
+    compiler.adopt_job(job.run(&lock.hold(core::hint::spin_loop)));
+    let kept = KEPT.take();
+    let declared = reflection_key(&compiler, library, "kernel", None);
+    let specialized = reflection_key(&compiler, library, "kernel", Some(&values));
+    assert_eq!(
+        kept.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        [declared, specialized]
+    );
+    // The next boot.
+    let reflected = calls().0;
+    let (mut warm, library) = caching();
+    let blobs: Vec<&'static [u8]> = kept
+        .iter()
+        .map(|(_, blob)| &*alloc::boxed::Box::leak(blob.clone().into_boxed_slice()))
+        .collect();
+    warm.stored.insert(declared, blobs[0]);
+    warm.stored.insert(specialized, blobs[1]);
+    warm.persist = Some(keep);
+    warm.recall = Some(recall_none);
+    warm.set_deferring(true);
+    let prepared = warm
+        .prepare_function(library, "kernel", Some(values))
+        .unwrap();
+    assert_eq!(prepared.constants, vec![(0, vec![1, 0, 0, 0])]);
+    warm.prepare_function(library, "kernel", None).unwrap();
+    assert!(warm.take_job().is_none());
+    assert_eq!(calls().0, reflected, "the service reflected nothing");
+    assert!(KEPT.take().is_empty(), "nothing kept twice");
+    let report = warm.report();
+    assert!(
+        report.contains("reflected=0 reflections=2 reflections_restored=2"),
+        "{report}"
+    );
+}
+
+/// A kept reflection that does not unpack is reflected again, as with none.
+#[test]
+fn a_damaged_kept_reflection_reflects_again() {
+    static DAMAGED: [u8; 3] = [1, 2, 3];
+    let (mut compiler, library) = caching();
+    let key = reflection_key(&compiler, library, "kernel", None);
+    compiler.stored.insert(key, &DAMAGED);
+    let reflected = calls().0;
+    compiler.prepare_function(library, "kernel", None).unwrap();
+    assert_eq!(calls().0, reflected + 1);
+    assert!(compiler.report().contains("reflections_restored=0"));
+}
