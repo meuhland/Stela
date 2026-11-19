@@ -375,6 +375,11 @@ impl MmioDevice for Aic1 {
     fn name(&self) -> &'static str {
         NAME
     }
+    /// A write changes only the model's masks, software-pending bits,
+    /// targets and IPI state, and the CPUs' interrupt wires it drives.
+    fn reaches_only_itself(&self) -> bool {
+        true
+    }
     fn read(
         &mut self,
         offset: u64,

@@ -140,6 +140,14 @@ fn a_write_that_reaches_only_its_model_leaves_the_masters() {
     // A UART transmit settles without the master.
     d.write(0, UART + 0x20, 4, u64::from(b'a'), 0).unwrap();
     assert!(d.settle_write(0, 0, &mut Locked(&mut ram)).transfer.is_ok());
+    // So does an AIC unmask, as a kernel writes after each interrupt.
+    use stela_soc_data::aic::{AIC2_IRQ_CFG, AIC2_MAX_IRQ};
+    const AIC: u64 = 0x2_3b10_0000;
+    d.add_aic(AIC, 0x3a0, AicLayout::aic2(0x8000, 0)).unwrap();
+    let words = u64::from(AIC2_MAX_IRQ) / 32;
+    let mask_clear = AIC2_IRQ_CFG + 4 * u64::from(AIC2_MAX_IRQ) + 3 * 4 * words;
+    d.write(0, AIC + mask_clear, 4, 1, 0).unwrap();
+    assert!(d.settle_write(0, 0, &mut Locked(&mut ram)).transfer.is_ok());
     // A write to the CPM, which has no such promise, steps it.
     d.write(0, CPM + 0x250, 8, 1, 0).unwrap();
     let error = d
@@ -309,9 +317,23 @@ fn access_costs() {
             .transfer
             .unwrap();
     });
+    // An AIC unmask and its settle, on the same board with an AIC.
+    use stela_soc_data::aic::{AIC2_IRQ_CFG, AIC2_MAX_IRQ};
+    const AIC: u64 = 0x2_3b10_0000;
+    let mut a = board();
+    a.add_aic(AIC, 0x3a0, AicLayout::aic2(0x8000, 0)).unwrap();
+    let words = u64::from(AIC2_MAX_IRQ) / 32;
+    let mask_clear = AIC2_IRQ_CFG + 4 * u64::from(AIC2_MAX_IRQ) + 3 * 4 * words;
+    let aic_ns = time(&mut |n| {
+        a.write(0, AIC + mask_clear, 4, 1, n).unwrap();
+        a.settle_write(0, n, &mut Locked2(&mut ram))
+            .transfer
+            .unwrap();
+    });
     std::println!(
         "CPM counter read: locked {locked_ns} ns, passive {passive_ns} ns; \
-         write elsewhere + transfer: full {full_ns} ns, USB left to its work {settled_ns} ns"
+         write elsewhere + transfer: full {full_ns} ns, USB left to its work {settled_ns} ns; \
+         AIC unmask + settle {aic_ns} ns"
     );
 }
 

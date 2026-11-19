@@ -761,6 +761,13 @@ impl MmioDevice for Aic2 {
     fn name(&self) -> &'static str {
         NAME
     }
+    /// A write sets masks, software-pending bits, IRQ configuration, the
+    /// enable or a timestamp slot, all the model's own, and drives only the
+    /// CPUs' IRQ wires: the kernel's unmask after each interrupt settles
+    /// without stepping the DMA masters.
+    fn reaches_only_itself(&self) -> bool {
+        true
+    }
     fn lifecycle(&mut self) -> Option<&mut dyn Lifecycle> {
         Some(self)
     }
