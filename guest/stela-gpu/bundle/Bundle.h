@@ -14,6 +14,7 @@
 #include <stela/gate.h>
 
 #include "../stelavt/StelaEncoder.h"
+#include "../stelavt/StelaDecoder.h"
 
 /* The gate page of one device in this task. */
 typedef struct {
@@ -71,6 +72,10 @@ void stela_encoder_note_device(StelaGPUDevice *device);
 void stela_video_encoder_offer_hevc(void);
 /* Encoder.m: the calls StelaVT encodes on the host with. */
 const StelaEncoderAPI *stela_encoder_api(void);
+/* Decoder.m: `device`, whose gate opened, may serve StelaVD's video decoder
+ * sessions; the calls StelaVD decodes on the host with. */
+void stela_decoder_note_device(StelaGPUDevice *device);
+const StelaDecoderAPI *stela_decoder_api(void);
 /* Device.m: why this process's last device failed to open, empty if none. */
 extern char stela_device_open_failure[160];
 

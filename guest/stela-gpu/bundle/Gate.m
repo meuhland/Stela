@@ -52,7 +52,8 @@ static void report_unreachable(uint32_t operation, StelaSpans spans, StelaFailur
  * 0.2 ms, except an encode whose response says how long: until the engine
  * should have the frame done, so a frame costs one sleep, or no sleep at
  * all for a call that only ran out of its budget (1 us). Every wake-up
- * costs this emulated machine real time. */
+ * costs this emulated machine real time. A decode's response says how long
+ * the same way: until NVDEC or the copy engine should be done. */
 static void wait_pending(uint32_t operation, unsigned waits, void *response, size_t response_bytes)
 {
 	if (operation == StelaOperationEncoderEncode && response_bytes == sizeof(StelaEncoderEncodeResponse)) {
@@ -66,6 +67,18 @@ static void wait_pending(uint32_t operation, unsigned waits, void *response, siz
 			return;
 		}
 	}
+	if (operation == StelaOperationDecoderDecode && response_bytes == sizeof(StelaDecoderDecodeResponse)) {
+		StelaDecoderDecodeResponse *answer = response;
+		uint32_t retry = answer->retry_us;
+		answer->retry_us = 0;
+		if (retry > 0) {
+			if (retry > 20) {
+				usleep(retry < ENCODE_RETRY_MOST_US ? retry : ENCODE_RETRY_MOST_US);
+			}
+			return;
+		}
+	}
+	/* Encoders' and decoders' calls (0x0a00-0x0a1f). */
 	if ((operation & 0xff00u) == (StelaOperationEncoderCapabilities & 0xff00u)) {
 		usleep(200);
 		return;

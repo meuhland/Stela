@@ -20,8 +20,10 @@
  * StelaVT's decoder, StelaVD (stelavt/StelaVD.c), is registered here too, as
  * the process's hardware H.264 and HEVC decoder: Stela has no Apple video
  * decoder, so a hardware-only client gets none and the rest decode in
- * software. This first StelaVD runs Apple's software decoder inside each
- * session, which proves the path before the host's NVDEC is put behind it.
+ * software. StelaVD decodes on the host's NVDEC through this plugin's gate
+ * (Decoder.m), whose calls it gets here before it is registered
+ * (STELAVD_USE_DECODERS), and runs Apple's software decoder inside each
+ * session for every stream the host refuses or loses.
  * A file at STELAVD_OFF keeps it unregistered, without a rebuild.
  */
 #include "Apple.h"
@@ -72,6 +74,15 @@ static void register_stela_video_decoder(void *library, void *(*createDictionary
 	if (accessPath(STELAVD_OFF, 0) == 0) {
 		NSLog(@"StelaGPU: StelaVD not registered: " STELAVD_OFF " exists");
 		return;
+	}
+	/* The host's decoder, before VideoToolbox can make a session. A StelaVT
+	 * built before NVDEC has no such export: its StelaVD decodes with
+	 * Apple's software decoder alone. */
+	StelaVDUseDecoders useDecoders = (StelaVDUseDecoders)dlsym(library, STELAVD_USE_DECODERS);
+	if (useDecoders) {
+		useDecoders(stela_decoder_api());
+	} else {
+		NSLog(@"StelaGPU: this StelaVD takes no host decoder; it decodes with Apple's software decoder");
 	}
 	void *info = createDictionary(NULL, 0, keyCallBacks, valueCallBacks);
 	setValue(info, *hardwareKey, booleanTrue);
