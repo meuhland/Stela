@@ -3,7 +3,11 @@
 //! Explicit Stela initialization and kept physical observations are distinct.
 //! Committed inputs never become cache-power or quota completion by themselves.
 use crate::Result;
-use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    rc::Rc,
+    vec::Vec,
+};
 use core::cell::RefCell;
 use stela_contracts::Refusal;
 use stela_contracts::refuse;
@@ -183,16 +187,31 @@ pub enum Origin {
     RetainedObservation,
 }
 
+/// The committed writes a controller keeps, the most recent: nothing in the
+/// boot consumes them (they are its tests' record), so an unbounded log
+/// would hold the host's heap for good, as the PTD bank's did.
+pub const MOST_REQUESTS: usize = 1024;
+
 struct State {
     origin: Origin,
     resource: CacheResource,
     apertures: u8,
     lifecycle: LifecycleState,
     words: BTreeMap<(u8, u64), Observation>,
-    requests: Vec<Request>,
+    /// The last [`MOST_REQUESTS`] committed writes.
+    requests: VecDeque<Request>,
     serial: u64,
 }
 impl State {
+    /// Records a committed write, letting the oldest go past
+    /// [`MOST_REQUESTS`].
+    fn record(&mut self, request: Request) {
+        if self.requests.len() >= MOST_REQUESTS {
+            self.requests.pop_front();
+        }
+        self.requests.push_back(request);
+    }
+
     fn accessible(&self) -> Result<()> {
         if !self.lifecycle.powered || !self.lifecycle.clocked || self.lifecycle.quiesced {
             return Err(refuse!("MCC/DCS resource is paused by its actual owner"));
@@ -297,7 +316,7 @@ impl Controller {
             apertures,
             lifecycle,
             words,
-            requests: Vec::new(),
+            requests: VecDeque::new(),
             serial: 0,
         }))))
     }
@@ -329,8 +348,9 @@ impl Controller {
     pub fn observations(&self) -> Vec<Observation> {
         self.0.borrow().words.values().copied().collect()
     }
+    /// The last [`MOST_REQUESTS`] committed writes, oldest first.
     pub fn requests(&self) -> Vec<Request> {
-        self.0.borrow().requests.clone()
+        self.0.borrow().requests.iter().copied().collect()
     }
     pub fn lifecycle_state(&self) -> LifecycleState {
         self.0.borrow().lifecycle
@@ -571,7 +591,7 @@ impl MmioDevice for View {
             }
         }
         state.serial = serial;
-        state.requests.push(Request {
+        state.record(Request {
             serial,
             aperture: self.aperture,
             offset,

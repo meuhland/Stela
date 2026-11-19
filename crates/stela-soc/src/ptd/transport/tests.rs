@@ -128,6 +128,37 @@ fn overwrite_dropped_timestamp_and_consume_are_actual_transport_effects() {
     );
 }
 
+/// The request log keeps the last MOST_REQUESTS updates: every update
+/// macOS writes used to stay in it for the boot, until its doubling found
+/// no room in the host's heap (stela-main-nvdec7's stop).
+#[test]
+fn the_request_log_keeps_only_the_latest_updates() {
+    let mut bank = bank();
+    let mut latch = InterruptLatch::new();
+    let writes = MOST_REQUESTS as u64 * 3 + 5;
+    for n in 1..=writes {
+        write(&mut bank, 3, n, n, &mut latch).unwrap();
+    }
+    let requests = bank.requests();
+    assert_eq!(requests.len(), MOST_REQUESTS);
+    assert_eq!(
+        requests.first().unwrap().serial,
+        writes - MOST_REQUESTS as u64 + 1
+    );
+    assert_eq!(
+        *requests.last().unwrap(),
+        Request {
+            serial: writes,
+            entry: 3,
+            value: writes,
+            at: writes
+        }
+    );
+    // The serial still counts every update.
+    let mut access = Access::new(0, 0, &mut latch);
+    assert_eq!(bank.read(3 * 16, Width::Double, &mut access), Ok(writes));
+}
+
 #[test]
 fn aliases_share_identity_and_kept_pause_keeps_the_complete_prefix() {
     let mut bank = bank();
