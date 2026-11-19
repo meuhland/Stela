@@ -905,6 +905,17 @@ fn timed_frame(
     request: &EncoderEncodeRequest,
     memory: &mut Memory,
 ) -> (EncoderEncodeResponse, usize, Vec<u32>, u64) {
+    timed_frame_waking(encoders, request, memory, 0)
+}
+
+/// [`timed_frame`] with a frontend that comes back `wake_ns` after each
+/// sleep it was asked for.
+fn timed_frame_waking(
+    encoders: &Encoders<Platform>,
+    request: &EncoderEncodeRequest,
+    memory: &mut Memory,
+    wake_ns: u64,
+) -> (EncoderEncodeResponse, usize, Vec<u32>, u64) {
     let clock = encoders.platform().clock();
     let mut hints = Vec::new();
     let mut longest = 0;
@@ -927,7 +938,8 @@ fn timed_frame(
                 } else {
                     response.retry_us
                 };
-                clock.fetch_add(u64::from(sleep) * 1000, Ordering::Relaxed);
+                let wake = if sleep > 20 { wake_ns } else { 0 };
+                clock.fetch_add(u64::from(sleep) * 1000 + wake, Ordering::Relaxed);
             }
             Err(fault) => panic!("{fault}"),
         }
@@ -1013,9 +1025,10 @@ fn session_lines_end_with_the_gpus_state() {
 }
 
 /// HEVC at 5.8 ms, past one call's budget: the call that submits answers
-/// `Pending` at once with a hint near the engine's time, rather than spin
-/// out its budget, and the call after the frontend's one sleep gets the
-/// frame. Two calls and one sleep a frame.
+/// `Pending` at once with a hint near the engine's time less the
+/// frontend's expected wake-up, rather than spin out its budget, and the
+/// call after the frontend's one sleep gets the frame as it lands. Two
+/// calls and one sleep a frame.
 #[test]
 fn timed_hevc_frames_sleep_once() {
     let encoders = Encoders::new(Platform::timed(5_800_000, true));
@@ -1027,14 +1040,50 @@ fn timed_hevc_frames_sleep_once() {
         assert_eq!(calls, 2, "frame {frame}: {hints:?}");
         assert_eq!(response.calls, 2);
         assert!(
-            hints[0] >= 5_000 && hints[0] <= 6_000,
+            hints[0] >= 3_500 && hints[0] <= 6_000,
             "frame {frame}: hint {hints:?}"
         );
-        // The submitting call did not wait out its budget.
-        assert!(longest < 1_000_000, "frame {frame}: a call of {longest} ns");
+        assert!(
+            response.gpu_us >= 5_800 && response.gpu_us < 6_100,
+            "frame {frame}: {}",
+            response.gpu_us
+        );
+        // No call waited out its budget: the submitting one answered at
+        // once, the one after the sleep looks about the frontend's expected
+        // wake-up at most (1 ms before any is measured).
+        assert!(longest < 1_500_000, "frame {frame}: a call of {longest} ns");
     }
     close(&encoders, ONE, opened.encoder, &mut memory);
     assert_eq!(asks_of(&encoders), 0);
+}
+
+/// The boot of 2026-11-18 (`--gpu-boost`, P0): HEVC's engine takes 1.85 ms,
+/// the session expected the self-test's 5.8 ms (P8), and the frontend
+/// wakes about 3.5 ms after the sleep it is asked for. The expectation
+/// never moved, as no look saw a frame land: each frame slept 5.8 ms and
+/// was seen ~9.3 ms after its submit. The looks' bounds bring it down.
+#[test]
+fn timed_stale_expectation_comes_down() {
+    let encoders = Encoders::new(Platform::timed(1_850_000, true));
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::Hevc, &mut memory).unwrap();
+    let request = encode_request(opened.encoder, 1, 0);
+    let (first, ..) = timed_frame_waking(&encoders, &request, &mut memory, 3_500_000);
+    assert!(first.gpu_us > 7_000, "{}", first.gpu_us);
+    for frame in 2..=30 {
+        let request = encode_request(opened.encoder, frame, 0);
+        timed_frame_waking(&encoders, &request, &mut memory, 3_500_000);
+    }
+    let mut gpu_us = 0;
+    for frame in 31..=40 {
+        let request = encode_request(opened.encoder, frame, 0);
+        let (response, calls, hints, _) =
+            timed_frame_waking(&encoders, &request, &mut memory, 3_500_000);
+        assert!(calls <= 2, "frame {frame}: {hints:?}");
+        gpu_us += response.gpu_us;
+    }
+    assert!(gpu_us / 10 < 4_500, "{} us a frame", gpu_us / 10);
+    close(&encoders, ONE, opened.encoder, &mut memory);
 }
 
 /// Where Linux cannot run in place (the boot CPU), the call asks nouveau's

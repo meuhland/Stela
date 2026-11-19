@@ -892,8 +892,25 @@ impl Parser {
 
     /// Takes one access unit's NAL units: the parameter sets it carries,
     /// and its picture, if it has slices. The reference state moves on as
-    /// if the picture was decoded.
+    /// if the picture was decoded. A unit refused leaves the reference state
+    /// as it was (the parameter sets it carried stay), so the stream goes on
+    /// with the next one.
     pub fn access_unit(&mut self, nals: &[Nal<'_>]) -> Result<Option<Picture>> {
+        let sps = core::mem::take(&mut self.sps);
+        let pps = core::mem::take(&mut self.pps);
+        let saved = self.clone();
+        self.sps = sps;
+        self.pps = pps;
+        let result = self.unit(nals);
+        if result.is_err() {
+            let sps = core::mem::take(&mut self.sps);
+            let pps = core::mem::take(&mut self.pps);
+            *self = Self { sps, pps, ..saved };
+        }
+        result
+    }
+
+    fn unit(&mut self, nals: &[Nal<'_>]) -> Result<Option<Picture>> {
         let mut slices: Vec<(Nal<'_>, Slice)> = Vec::new();
         for nal in nals {
             match nal.h264_type() {

@@ -640,6 +640,9 @@ impl<N: Node> Session<N> {
         let Some(flight) = self.in_flight else {
             return Err(Error::Config("no picture is in flight"));
         };
+        // The clock before the semaphore, as NVENC's look: a release this
+        // look misses came after it.
+        let now = self.node.now_ns();
         let value = self.semaphore();
         if value == flight.payload {
             fence(Ordering::Acquire);
@@ -670,7 +673,7 @@ impl<N: Node> Session<N> {
                 },
             }));
         }
-        if self.node.now_ns() >= flight.deadline {
+        if now >= flight.deadline {
             let job_done = if ask {
                 flight.job_done
             } else {

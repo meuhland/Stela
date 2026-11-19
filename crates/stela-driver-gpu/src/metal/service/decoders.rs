@@ -32,8 +32,15 @@
 //!   software. A channel whose job is still pending keeps its file open,
 //!   and no session opens on the GPU again this boot.
 //!
-//! **Limits and cleanup.** A GPU serves [`MAX_SESSIONS`] sessions at once
-//! and each at most `decoder::VRAM_BUDGET` of video memory; a connection's
+//! **Pacing** ([`super::pace`], as the encoders'): a picture expected past
+//! the call's budget is answered `Pending` at once with the wait left less
+//! the frontend's wake-up, and the engine's expected time is what the looks
+//! measured, never the frontend's sleeps.
+//!
+//! **Limits and cleanup.** A GPU serves at most [`MAX_SESSIONS`] sessions at
+//! once, admitted while their video memory together stays within
+//! [`VRAM_BUDGET`] (each at most `decoder::VRAM_BUDGET`); a refusal lists
+//! the sessions open and how long each has been idle. A connection's
 //! close closes its sessions ([`GateDecoders::disconnect`]), as the PC's
 //! stop closes every one.
 //!
@@ -44,6 +51,7 @@
 //! (the CPU's copy into the caller) and `total_us` (a sample's calls).
 use super::encoders::EncoderPlatform;
 use super::gate::fault;
+use super::pace::{Pace, RETRY_AT_ONCE_US};
 use super::wire::{
     self, DECODE_FLUSH, DECODE_RESET, DECODER_OPEN_DECODE_ORDER, DECODER_PROFILE_H264_BASELINE,
     DECODER_PROFILE_H264_HIGH, DECODER_PROFILE_H264_MAIN, DECODER_PROFILE_HEVC_MAIN,
@@ -73,10 +81,15 @@ mod tests;
 /// decoder failed its probe or self-test.
 pub const NONE: Fault = Fault::new(Status::Unsupported, "the host serves no video decoder");
 
-/// Sessions one GPU decodes at once: GA106 has one NVDEC, which GSP-RM
-/// time-slices between channels, and a 4K Main 10 session takes up to
-/// 1 GiB of its video memory.
-pub const MAX_SESSIONS: usize = 2;
+/// Sessions one GPU decodes at once, at most: GA106 has one NVDEC, which
+/// GSP-RM time-slices between channels. What admits a session is mostly
+/// [`VRAM_BUDGET`]: a client may hold several (the Aerial wallpaper holds
+/// two at once, which left none for any other client at 2).
+pub const MAX_SESSIONS: usize = 8;
+/// The video memory the GPU's decoder sessions take together, at most: half
+/// the RTX 3050's 8 GiB, the rest left to macOS (NVK) and the encoders. A
+/// 4K Main 10 session takes about 0.45 GiB ([`decoder::vram_bytes`]).
+pub const VRAM_BUDGET: u64 = 4 << 30;
 /// Destinations one decode call may give.
 pub const MAX_DESTINATIONS: u32 = 16;
 /// About how long one call works before it answers `Pending`, as the
@@ -98,10 +111,6 @@ const H264_1080P_NS: u64 = 2_000_000;
 const HEVC_1080P_NS: u64 = 1_200_000;
 /// A 1080p readback by the copy engine (0.86 ms on hardware).
 const COPY_1080P_NS: u64 = 900_000;
-const RETRY_AT_ONCE_US: u32 = 1;
-const RETRY_LEAST_US: u64 = 50;
-const RETRY_MOST_US: u64 = 8_000;
-const RETRY_LATE_US: u32 = 300;
 
 /// A GPU's decoders as the shared service reaches them.
 pub trait GateDecoders: Send + Sync {
@@ -215,10 +224,32 @@ struct Counts {
     pending: u64,
     asks: u64,
     kicks: u64,
+    /// The engine's time where a look saw it closely
+    /// ([`super::pace::ACCURATE_NS`]).
+    engine_ns: u64,
+    engine_max: u64,
+    engine_samples: u64,
+    /// RASL pictures skipped, references stood in for, and CRAs that
+    /// started afresh ([`crate::nvdec::parse::hevc::Events`]).
+    skipped: u64,
+    concealed: u64,
+    restarted: u64,
 }
 
 impl Counts {
+    fn engine(&mut self, ns: u64) {
+        self.engine_ns += ns;
+        self.engine_max = self.engine_max.max(ns);
+        self.engine_samples += 1;
+    }
+
     fn add(&mut self, other: &Self) {
+        self.engine_ns += other.engine_ns;
+        self.engine_max = self.engine_max.max(other.engine_max);
+        self.engine_samples += other.engine_samples;
+        self.skipped += other.skipped;
+        self.concealed += other.concealed;
+        self.restarted += other.restarted;
         self.samples += other.samples;
         self.frames += other.frames;
         self.outputs += other.outputs;
@@ -238,21 +269,26 @@ impl Counts {
     }
 }
 
-/// `samples=… frames=… outputs=… errors=… gpu_us=avg/max ce_us=avg/max
-/// copy_us=avg/max total_us=avg/max calls=… pending=… asks=… kicks=…`:
-/// `gpu_us` per picture decoded, `ce_us` and `copy_us` per picture shown,
-/// `total_us` per sample.
+/// `samples=… frames=… outputs=… errors=… skipped=… concealed=…
+/// restarted=… gpu_us=avg/max ce_us=avg/max copy_us=avg/max total_us=avg/max
+/// calls=… pending=… engine_us=avg/max/samples asks=… kicks=…`: `gpu_us`
+/// per picture decoded, `ce_us` and `copy_us` per picture shown, `total_us`
+/// per sample; `engine_us` where a look saw the picture land.
 impl fmt::Display for Counts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let average = |total: u64, count: u64| total.checked_div(count).unwrap_or(0) / 1000;
         write!(
             formatter,
-            "samples={} frames={} outputs={} errors={} gpu_us={}/{} ce_us={}/{} copy_us={}/{} \
-             total_us={}/{} calls={} pending={} asks={} kicks={}",
+            "samples={} frames={} outputs={} errors={} skipped={} concealed={} restarted={} \
+             gpu_us={}/{} ce_us={}/{} copy_us={}/{} total_us={}/{} calls={} pending={} \
+             engine_us={}/{}/{} asks={} kicks={}",
             self.samples,
             self.frames,
             self.outputs,
             self.errors,
+            self.skipped,
+            self.concealed,
+            self.restarted,
             average(self.gpu_ns, self.frames),
             self.gpu_max / 1000,
             average(self.ce_ns, self.outputs),
@@ -263,6 +299,9 @@ impl fmt::Display for Counts {
             self.total_max / 1000,
             self.calls,
             self.pending,
+            average(self.engine_ns, self.engine_samples),
+            self.engine_max / 1000,
+            self.engine_samples,
             self.asks,
             self.kicks,
         )
@@ -331,11 +370,15 @@ struct Slot<N: Node> {
     opening: bool,
     lost: bool,
     work: Option<Work>,
-    /// The engine's expected time for a picture, and the copy engine's for
-    /// a readback: from the self-test, then running means.
-    engine_ns: u64,
+    /// When the engine should be done with a picture, and when the
+    /// frontend should call again ([`Pace`]).
+    pace: Pace,
+    /// The copy engine's expected time for a readback: from the self-test,
+    /// then a running mean.
     copy_ns: u64,
     opened_at: u64,
+    /// When the frontend last called for it.
+    last_call: u64,
     period: Counts,
     total: Counts,
 }
@@ -371,6 +414,8 @@ struct State<N: Node> {
 /// A GPU's decoders, over its platform.
 pub struct Decoders<P: EncoderPlatform> {
     platform: P,
+    /// The video memory its sessions may take together ([`VRAM_BUDGET`]).
+    vram_budget: u64,
     held: AtomicBool,
     state: UnsafeCell<State<P::Node>>,
 }
@@ -465,8 +510,14 @@ fn fits(span: Span, pitch: u32, rows: usize, row_bytes: usize) -> bool {
 
 impl<P: EncoderPlatform> Decoders<P> {
     pub fn new(platform: P) -> Self {
+        Self::with_vram_budget(platform, VRAM_BUDGET)
+    }
+
+    /// Decoders whose sessions take at most `vram_budget` bytes together.
+    pub fn with_vram_budget(platform: P, vram_budget: u64) -> Self {
         Self {
             platform,
+            vram_budget,
             held: AtomicBool::new(false),
             state: UnsafeCell::new(State {
                 sessions: Vec::new(),
@@ -682,6 +733,12 @@ impl<P: EncoderPlatform> Decoders<P> {
             .value(request.config.length));
         }
         if state.sessions.len() >= MAX_SESSIONS {
+            self.log(format_args!(
+                "refused a {} stream for connection {connection}: {MAX_SESSIONS} sessions open \
+                 ({})",
+                codec.name(),
+                self.idle_list(state)
+            ));
             return Err(Fault::new(
                 Status::Unsupported,
                 "every video decoder session of the GPU is in use",
@@ -692,6 +749,43 @@ impl<P: EncoderPlatform> Decoders<P> {
         caller
             .read(request.config.address, &mut record)
             .map_err(fault)?;
+        // Admitted by video memory, before any file opens.
+        let needed = match decoder::vram_bytes(codec, &record) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.log(format_args!(
+                    "refused a {} stream for connection {connection}: {error:?}",
+                    codec.name()
+                ));
+                return Err(match error {
+                    // A record the parser refuses is a stream the host
+                    // does not take: the frontend decodes it its way.
+                    Error::Parse(error) => Fault::new(Status::Unsupported, error.describe()),
+                    error => refusal(error),
+                });
+            }
+        };
+        let taken: u64 = state
+            .sessions
+            .iter()
+            .map(|slot| slot.decoder.layout().vram_bytes())
+            .sum();
+        if taken + needed > self.vram_budget {
+            self.log(format_args!(
+                "refused a {} stream for connection {connection}: it takes {} MiB of video \
+                 memory, {} MiB of {} MiB are taken ({})",
+                codec.name(),
+                needed >> 20,
+                taken >> 20,
+                self.vram_budget >> 20,
+                self.idle_list(state)
+            ));
+            return Err(Fault::new(
+                Status::Unsupported,
+                "the video memory of the GPU's decoder sessions is taken",
+            )
+            .value(needed));
+        }
         let node = self
             .platform
             .open_node()
@@ -735,6 +829,7 @@ impl<P: EncoderPlatform> Decoders<P> {
         );
         let id = state.next_id;
         state.next_id += 1;
+        let now = self.platform.now_ns();
         state.sessions.push(Slot {
             id,
             connection,
@@ -743,13 +838,35 @@ impl<P: EncoderPlatform> Decoders<P> {
             opening: true,
             lost: false,
             work: None,
-            engine_ns,
+            pace: Pace::new(engine_ns),
             copy_ns: scaled(COPY_1080P_NS, width, height, sample_bytes),
-            opened_at: self.platform.now_ns(),
+            opened_at: now,
+            last_call: now,
             period: Counts::default(),
             total: Counts::default(),
         });
         Ok(state.sessions.len() - 1)
+    }
+
+    /// `3 for connection 2, 410 MiB, idle 12 ms; …`: the sessions open, which
+    /// a refused open logs, so a session a client never closed shows.
+    fn idle_list(&self, state: &State<P::Node>) -> String {
+        let now = self.platform.now_ns();
+        let mut list = String::new();
+        for (k, slot) in state.sessions.iter().enumerate() {
+            if k > 0 {
+                list.push_str("; ");
+            }
+            list.push_str(&alloc::format!(
+                "{} for connection {}, {} MiB, {} frames, idle {} ms",
+                slot.id,
+                slot.connection,
+                slot.decoder.layout().vram_bytes() >> 20,
+                slot.total.samples + slot.period.samples,
+                now.saturating_sub(slot.last_call) / 1_000_000
+            ));
+        }
+        list
     }
 
     fn decode(
@@ -764,6 +881,8 @@ impl<P: EncoderPlatform> Decoders<P> {
         let started = self.platform.now_ns();
         let slot = &mut state.sessions[index];
         slot.period.calls += 1;
+        slot.last_call = started;
+        slot.pace.arrived(started);
         if slot.lost {
             return Err(lost());
         }
@@ -903,7 +1022,10 @@ impl<P: EncoderPlatform> Decoders<P> {
             return Err(fault(error));
         }
         slot.period.samples += 1;
-        match slot.decoder.submit(&sample, request.frame) {
+        let before = slot.decoder.events();
+        let submitted = slot.decoder.submit(&sample, request.frame);
+        self.note_events(slot, request.frame, before);
+        match submitted {
             Ok(true) => {
                 work.decoded = true;
                 let now = self.platform.now_ns();
@@ -937,6 +1059,56 @@ impl<P: EncoderPlatform> Decoders<P> {
         }
     }
 
+    /// Counts and logs (the first few) what the stream's parser did about
+    /// frame `frame`'s sample, against its events `before`.
+    fn note_events(
+        &self,
+        slot: &mut Slot<P::Node>,
+        frame: u64,
+        before: crate::nvdec::parse::hevc::Events,
+    ) {
+        let after = slot.decoder.events();
+        let skipped = after.skipped - before.skipped;
+        let concealed = after.concealed - before.concealed;
+        let restarted = after.restarted - before.restarted;
+        if skipped + concealed + restarted == 0 {
+            return;
+        }
+        let seen = slot.total.skipped
+            + slot.period.skipped
+            + slot.total.concealed
+            + slot.period.concealed
+            + slot.total.restarted
+            + slot.period.restarted;
+        slot.period.skipped += u64::from(skipped);
+        slot.period.concealed += u64::from(concealed);
+        slot.period.restarted += u64::from(restarted);
+        if seen < 8 {
+            self.log(format_args!(
+                "{} frame {frame}: {}{}{}",
+                slot.id,
+                if restarted > 0 {
+                    "a CRA starts afresh (after a flush, or its references were never decoded: \
+                     a seek or a loop); "
+                } else {
+                    ""
+                },
+                if skipped > 0 {
+                    "a RASL picture of a CRA that started afresh, skipped (shown dropped)"
+                } else {
+                    "decoded"
+                },
+                if concealed > 0 {
+                    alloc::format!(
+                        ", {concealed} reference(s) never decoded stood in for by the nearest"
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+
     /// Looks at the picture in flight until it is released or the call's
     /// budget from `started` is spent; whether it was released (its
     /// pictures then wait to be shown).
@@ -946,8 +1118,14 @@ impl<P: EncoderPlatform> Decoders<P> {
         loop {
             match slot.decoder.poll(false) {
                 Ok(Some(decoded)) => {
+                    let seen = self.platform.now_ns();
                     let gpu_ns = decoded.timing.gpu_ns;
-                    slot.engine_ns = (3 * slot.engine_ns + gpu_ns) / 4;
+                    if let Some(work) = slot.work
+                        && let Some(submitted) = work.submitted
+                        && let Some(engine) = slot.pace.done(submitted, work.looked, seen)
+                    {
+                        slot.period.engine(engine);
+                    }
                     slot.period.frames += 1;
                     slot.period.gpu_ns += gpu_ns;
                     slot.period.gpu_max = slot.period.gpu_max.max(gpu_ns);
@@ -967,13 +1145,14 @@ impl<P: EncoderPlatform> Decoders<P> {
                     if let Some(work) = slot.work.as_mut() {
                         work.looked = now;
                     }
-                    let expected = submitted.saturating_add(slot.engine_ns);
-                    if !asked && now > expected.saturating_add(LATE_NS) {
+                    // A late picture: ask nouveau's fence once a call,
+                    // which also lets the host's Linux run.
+                    if !asked && now > slot.pace.expected(submitted).saturating_add(LATE_NS) {
                         slot.decoder.ask_fence();
                         slot.period.asks += 1;
                         asked = true;
                     }
-                    if now >= budget_end || (expected > budget_end && now < expected) {
+                    if !slot.pace.keep_looking(now, submitted, budget_end) {
                         return Ok(false);
                     }
                     self.platform.pause();
@@ -1133,7 +1312,7 @@ impl<P: EncoderPlatform> Decoders<P> {
             destination.frame = head.token;
             destination.poc = head.poc;
             destination.flags = DESTINATION_WRITTEN
-                | if head.status.clean() {
+                | if head.status.clean() && !head.concealed {
                     0
                 } else {
                     DESTINATION_ERRORS
@@ -1151,20 +1330,18 @@ impl<P: EncoderPlatform> Decoders<P> {
     }
 
     /// `Pending` for a frame still worked on, its response's `retry_us`
-    /// saying when to call again.
-    fn goes_on(&self, slot: &Slot<P::Node>, frame: u64, response: &mut [u8]) -> Fault {
+    /// saying when to call again: about when the picture in flight lands,
+    /// less the frontend's wake-up ([`Pace::retry_us`]), else at once (the
+    /// call only ran out of budget showing pictures).
+    fn goes_on(&self, slot: &mut Slot<P::Node>, frame: u64, response: &mut [u8]) -> Fault {
         let calls = slot.work.map_or(0, |work| work.calls);
+        let now = self.platform.now_ns();
         let retry_us = match slot.work.and_then(|work| work.submitted) {
-            Some(submitted) if slot.decoder.in_flight() => {
-                let expected = submitted.saturating_add(slot.engine_ns);
-                let now = self.platform.now_ns();
-                if expected > now {
-                    ((expected - now) / 1000).clamp(RETRY_LEAST_US, RETRY_MOST_US) as u32
-                } else {
-                    RETRY_LATE_US
-                }
+            Some(submitted) if slot.decoder.in_flight() => slot.pace.retry_us(now, submitted),
+            _ => {
+                slot.pace.asked(now, RETRY_AT_ONCE_US);
+                RETRY_AT_ONCE_US
             }
-            _ => RETRY_AT_ONCE_US,
         };
         write_retry(response, frame, retry_us, calls);
         GOES_ON
