@@ -3317,6 +3317,29 @@ fn start_devices(
                 // And the guest's NVDEC sessions (`--no-nvdec`).
                 #[cfg(feature = "nvk")]
                 gpu::nvdec::set_serving(options.nvdec);
+                // The first output runs the monitor's preferred rate of the
+                // size, unless --display-fastest.
+                #[cfg(feature = "nvk")]
+                {
+                    use stela_drivers::gpu::metal::kms;
+                    kms::set_rate(match options.display_fastest {
+                        true => kms::Rate::Fastest,
+                        false => kms::Rate::Preferred,
+                    });
+                    output::arguments(format_args!(
+                        "GPU display: the first output runs the monitor's {} rate of the size{}\n",
+                        if options.display_fastest {
+                            "fastest"
+                        } else {
+                            "preferred"
+                        },
+                        if options.display_fastest {
+                            " (--display-fastest)"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
                 let firmware = handoff
                     .screen
                     .and_then(|screen| screen.pci_source)

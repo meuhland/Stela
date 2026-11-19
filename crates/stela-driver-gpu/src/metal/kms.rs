@@ -865,6 +865,57 @@ fn rates_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Vec<ModeInf
     rates
 }
 
+/// Which of its size's modes the output that gives the guest's mode runs
+/// ([`set_rate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rate {
+    /// The first progressive mode of the size that fits, as DRM lists them:
+    /// the monitor's preferred timing, which Linux sorts ahead of faster
+    /// ones of its size. A Samsung Odyssey G40B over HDMI stayed blank at
+    /// its fastest, 1920x1080 at 239.76 Hz, and showed its 60 Hz one.
+    Preferred,
+    /// [`mode_of`]: the fastest progressive mode of the size that fits.
+    Fastest,
+}
+
+/// The boot's [`Rate`]; [`Rate::Fastest`] until it says.
+static PREFERRED_RATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Sets the [`Rate`] the output that gives the guest's mode runs, before the
+/// display is taken.
+pub fn set_rate(rate: Rate) {
+    PREFERRED_RATE.store(
+        rate == Rate::Preferred,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The boot's [`Rate`] ([`set_rate`]).
+pub fn rate() -> Rate {
+    match PREFERRED_RATE.load(core::sync::atomic::Ordering::Relaxed) {
+        true => Rate::Preferred,
+        false => Rate::Fastest,
+    }
+}
+
+/// `modes`' mode of `size` that `rate` picks, else [`mode_of`]'s.
+fn mode_at(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>, rate: Rate) -> Option<ModeInfo> {
+    let preferred = || {
+        modes
+            .iter()
+            .find(|mode| {
+                size_of_mode(mode) == size
+                    && mode.flags & INTERLACED == 0
+                    && fits(size.0, size.1, refresh(mode))
+            })
+            .copied()
+    };
+    match rate {
+        Rate::Preferred => preferred().or_else(|| mode_of(modes, size, fits)),
+        Rate::Fastest => mode_of(modes, size, fits),
+    }
+}
+
 fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeInfo> {
     let mut sized = modes.iter().filter(|mode| size_of_mode(mode) == size);
     let fitting = sized
@@ -1530,7 +1581,7 @@ impl<D: Drm> Display<D> {
                 };
                 let (run, role, verdicts) = match heads.first() {
                     None => {
-                        let run = mode_of(&found.modes, size, fits);
+                        let run = mode_at(&found.modes, size, fits, rate());
                         let why = |other| lost(&modes, wanted, fits, size, other);
                         let verdicts = match &run {
                             Some(set) => listing::gives(&found.modes, size, set, fits, &why),

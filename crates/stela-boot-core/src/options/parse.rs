@@ -52,6 +52,7 @@ impl ParseState<'_> {
             SCANOUT_MIRROR => options.scanout_mirror = true,
             "--monitor-trace" => options.monitor_trace = true,
             "--display-trace" => options.display_trace = true,
+            "--display-fastest" => options.display_fastest = true,
             PROBE_NVENC => options.probe_nvenc = true,
             NVENC_SELFTEST => options.nvenc_selftest = true,
             PROBE_NVDEC => options.probe_nvdec = true,

@@ -533,6 +533,42 @@ fn a_display_taken_at_start_runs_the_monitors_own_mode() {
 /// be told of is passed over for the next of that size; with none of that
 /// size, the preferred one that fits, then any; and with no mode that fits
 /// at all, the choice is as without the test.
+/// The preferred rate runs the first fitting mode of the size DRM lists,
+/// the monitor's preferred timing, where the fastest rate runs the fastest
+/// that fits; a size with no fitting mode falls back alike.
+#[test]
+fn the_preferred_rate_runs_the_first_listed_mode_of_the_size() {
+    let at = |width, height, kind, vrefresh| ModeInfo {
+        vrefresh,
+        ..mode(width, height, kind)
+    };
+    let modes = [
+        at(1920, 1080, PREFERRED, 60),
+        at(1920, 1080, 0, 240),
+        at(1920, 1080, 0, 144),
+        at(1280, 720, 0, 60),
+    ];
+    let any: Fits<'_> = &|_, _, _| true;
+    let below_200: Fits<'_> = &|_, _, refresh| refresh < 200_000;
+    let size = (1920, 1080);
+    assert_eq!(mode_at(&modes, size, any, Rate::Preferred), Some(modes[0]));
+    assert_eq!(mode_at(&modes, size, any, Rate::Fastest), Some(modes[1]));
+    assert_eq!(
+        mode_at(&modes, size, below_200, Rate::Fastest),
+        Some(modes[2])
+    );
+    let only_fast: Fits<'_> = &|_, _, refresh| refresh > 100_000;
+    assert_eq!(
+        mode_at(&modes, size, only_fast, Rate::Preferred),
+        Some(modes[1])
+    );
+    let none: Fits<'_> = &|_, _, _| false;
+    assert_eq!(
+        mode_at(&modes, size, none, Rate::Preferred),
+        mode_of(&modes, size, none)
+    );
+}
+
 #[test]
 fn a_mode_the_guest_cannot_be_told_of_is_passed_over() {
     let at = |width, height, kind, vrefresh| ModeInfo {

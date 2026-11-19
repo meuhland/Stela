@@ -470,6 +470,10 @@ pub struct System {
     pub monitor_trace: bool,
     /// Log every display swap's DCP calls, present and callback (`--display-trace`).
     pub display_trace: bool,
+    /// The output that gives the guest's mode runs the monitor's fastest
+    /// rate of the size, where it runs its preferred one, the first DRM
+    /// lists (`--display-fastest`).
+    pub display_fastest: bool,
     /// Once the GPUs start, before macOS, check that each one's video
     /// encoder runs under GSP: a channel on its runlist, its class, and one
     /// semaphore release, logged as `NVENC PROBE` lines (`--probe-nvenc`).
@@ -590,6 +594,7 @@ impl Default for System {
             traces: Vec::new(),
             monitor_trace: false,
             display_trace: false,
+            display_fastest: false,
             probe_nvenc: false,
             nvenc_selftest: false,
             probe_nvdec: false,
@@ -1061,6 +1066,7 @@ impl fmt::Display for System {
         }
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
+        line.flag("--display-fastest", self.display_fastest)?;
         line.flag(PROBE_NVENC, self.probe_nvenc)?;
         line.flag(NVENC_SELFTEST, self.nvenc_selftest)?;
         line.flag(PROBE_NVDEC, self.probe_nvdec)?;

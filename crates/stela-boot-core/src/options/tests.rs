@@ -270,6 +270,15 @@ fn every_option_survives_a_round_trip() {
     assert!(options.audio_own_hpet);
     assert!(options.display_trace);
     assert!(!System::default().display_trace);
+    assert!(!System::default().display_fastest);
+    let fastest = System::parse("--system --display-fastest").unwrap();
+    assert!(fastest.display_fastest);
+    assert_eq!(
+        System::parse(&format!("{fastest}"))
+            .unwrap()
+            .display_fastest,
+        true
+    );
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(
