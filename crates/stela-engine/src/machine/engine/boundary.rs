@@ -47,6 +47,13 @@ pub trait PassiveRegisters: Send + Sync {
     /// The value a `bytes`-byte read at `physical` returns, if this serves
     /// it; `None` sends the read to [`Devices::read_scalar`].
     fn read(&self, physical: u64, bytes: u8) -> Option<u64>;
+    /// The word itself a `bytes`-byte read at `physical` loads, where this
+    /// serves it from one: native code reads it again at the same site
+    /// while it holds the value the engine read, the word being its own
+    /// epoch ([`PlainRead`]). `None` leaves every such read to the engine.
+    fn word(&self, _physical: u64, _bytes: u8) -> Option<Arc<core::sync::atomic::AtomicU64>> {
+        None
+    }
 }
 
 /// Device registers every PE reaches under the device's own lock instead of

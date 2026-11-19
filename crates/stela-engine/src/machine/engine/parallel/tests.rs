@@ -2727,6 +2727,72 @@ fn passive_registers_are_read_without_the_devices_lock() {
     assert_eq!(worker.read_scalar(1, 0x40, 4, 0), ScalarRead::Served(Ok(3)));
     assert_eq!(worker.read_scalar(1, 0x48, 8, 0), ScalarRead::Served(Ok(3)));
     assert_eq!(home.with(|devices| devices.reads), 2);
+    // A word read without its cell is not kept for native code.
+    assert_eq!(
+        worker.read_scalar(1, 0x40, 8, 0),
+        ScalarRead::Served(Ok(11))
+    );
+    assert!(worker.take_plain_read().is_none());
+}
+
+/// A passive word served from its own cell is a plain read whose epoch is
+/// the cell: native code's read (`device_read_thunk`) holds exactly while
+/// the cell still has the value the engine read, at any count, and a write
+/// of another value ends it.
+#[test]
+fn passive_words_are_kept_for_native_reads_while_they_hold_their_value() {
+    use super::super::PassiveRegisters;
+    struct Cell(Arc<AtomicU64>);
+    impl PassiveRegisters for Cell {
+        fn read(&self, physical: u64, bytes: u8) -> Option<u64> {
+            self.word(physical, bytes)
+                .map(|word| word.load(Ordering::Acquire))
+        }
+        fn word(&self, physical: u64, bytes: u8) -> Option<Arc<AtomicU64>> {
+            (physical == 0x40 && bytes == 8).then(|| Arc::clone(&self.0))
+        }
+    }
+    #[derive(Default)]
+    struct Board {
+        cell: Option<Arc<Cell>>,
+    }
+    impl Devices for Board {
+        fn passive_registers(&self) -> Option<Arc<dyn PassiveRegisters>> {
+            self.cell
+                .as_ref()
+                .map(|cell| Arc::clone(cell) as Arc<dyn PassiveRegisters>)
+        }
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Ok(3)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+    }
+    let word = Arc::new(AtomicU64::new(9));
+    let cell = Arc::new(Cell(Arc::clone(&word)));
+    let (hub, _) = hub(2);
+    let home = SharedDevices::new(Board { cell: Some(cell) }, hub);
+    let mut worker = home.worker();
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 5), ScalarRead::Served(Ok(9)));
+    let plain = worker.take_plain_read().expect("kept");
+    assert!(Arc::ptr_eq(&plain.epoch, &word));
+    assert_eq!((plain.seen, plain.value, plain.until), (9, 9, u64::MAX));
+    // What the native read checks: the epoch word against what it saw.
+    assert_eq!(plain.epoch.load(Ordering::Acquire), plain.seen);
+    word.store(10, Ordering::Release);
+    assert_ne!(plain.epoch.load(Ordering::Acquire), plain.seen);
+    // The next read keeps the new value; another width keeps nothing.
+    assert_eq!(
+        worker.read_scalar(1, 0x40, 8, 5),
+        ScalarRead::Served(Ok(10))
+    );
+    assert_eq!(worker.take_plain_read().map(|plain| plain.value), Some(10));
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 5), ScalarRead::Served(Ok(3)));
+    assert!(worker.take_plain_read().is_none());
 }
 
 #[test]

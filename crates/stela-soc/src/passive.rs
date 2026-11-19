@@ -5,19 +5,23 @@
 //! such word in a [`Words`] cell it shares with the board's [`PassiveMap`];
 //! its writes, which still take the lock, store there, and a read loads
 //! there. Any other width, offset or register reads the locked way, where
-//! the model answers or refuses as before.
+//! the model answers or refuses as before. Each word is shared on its own
+//! ([`PassiveRegisters::word`]), so that native code reads it again while it
+//! holds the value the engine read.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use stela_engine::machine::engine::PassiveRegisters;
 
 /// A model's passive words, by its own index.
 #[derive(Debug)]
-pub struct Words(Box<[AtomicU64]>);
+pub struct Words(Box<[Arc<AtomicU64>]>);
 
 impl Words {
     /// `count` words, each 0.
     pub fn new(count: usize) -> Arc<Self> {
-        Arc::new(Self((0..count).map(|_| AtomicU64::new(0)).collect()))
+        Arc::new(Self(
+            (0..count).map(|_| Arc::new(AtomicU64::new(0))).collect(),
+        ))
     }
 
     pub fn get(&self, index: usize) -> u64 {
@@ -68,6 +72,18 @@ impl PassiveRegisters for PassiveMap {
         let (_, words, index) = &self.0[at];
         Some(words.get(*index))
     }
+
+    fn word(&self, physical: u64, bytes: u8) -> Option<Arc<AtomicU64>> {
+        if bytes != 8 {
+            return None;
+        }
+        let at = self
+            .0
+            .binary_search_by_key(&physical, |&(at, ..)| at)
+            .ok()?;
+        let (_, words, index) = &self.0[at];
+        Some(Arc::clone(&words.0[*index]))
+    }
 }
 
 #[cfg(test)]
@@ -87,5 +103,11 @@ mod tests {
         assert_eq!(map.read(0x2000, 4), None);
         assert_eq!(map.read(0x1008, 8), None);
         assert_eq!(map.read(0x2004, 8), None);
+        // The word a read loads is the one the model writes, alone.
+        let word = map.word(0x2000, 8).expect("a placed word");
+        assert!(core::ptr::eq(&*word, words.cell(1)));
+        words.set(1, 12);
+        assert_eq!(word.load(Ordering::Acquire), 12);
+        assert!(map.word(0x2000, 4).is_none() && map.word(0x1008, 8).is_none());
     }
 }

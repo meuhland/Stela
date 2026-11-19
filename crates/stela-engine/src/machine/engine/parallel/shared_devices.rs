@@ -957,12 +957,26 @@ impl<D: Devices> Devices for SharedDevices<D> {
     }
     /// A passive register ([`Devices::passive_registers`]) is read without
     /// the lock: its value is what the last write published, and its read
-    /// changes nothing the lock would settle.
+    /// changes nothing the lock would settle. Read from its word, it is a
+    /// plain read whose epoch is the word itself: native code serves it
+    /// again while the word still holds the value read, at any count.
     fn read_scalar(&mut self, cpu: usize, physical: u64, bytes: u8, now: u64) -> ScalarRead {
-        if let Some(value) = self.passive.as_ref().and_then(|p| p.read(physical, bytes)) {
-            return ScalarRead::Served(Ok(value));
-        }
         self.last_plain = None;
+        if let Some(passive) = self.passive.as_ref() {
+            if let Some(word) = passive.word(physical, bytes) {
+                let value = word.load(Ordering::Acquire);
+                self.last_plain = Some(super::super::PlainRead {
+                    epoch: word,
+                    seen: value,
+                    value,
+                    until: u64::MAX,
+                });
+                return ScalarRead::Served(Ok(value));
+            }
+            if let Some(value) = passive.read(physical, bytes) {
+                return ScalarRead::Served(Ok(value));
+            }
+        }
         if let Some(own) = self.own_at(physical) {
             return ScalarRead::Served(
                 self.own_access(cpu, now, |now| own.read(cpu, physical, bytes, now)),
