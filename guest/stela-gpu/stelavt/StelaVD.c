@@ -10,12 +10,19 @@
  *   keeps the stream's avcC/hvcC and sets the pixel buffers' format (420v,
  *   or x420 at 10 bits); the first decodeFrame opens the host session, in
  *   display order when VideoToolbox asks for temporal processing
- *   (kVTDecodeFrame_EnableTemporalProcessing) and in decode order when not.
- *   Each sample goes to the host with pixel buffers from the session's pool
- *   as destinations; each picture the host shows in one is emitted with the
- *   frame token of the sample that decoded it, which StelaVD keeps by the
- *   number it gave that sample. A sample with no picture is emitted dropped
- *   at once. finishDelayedFrames flushes what the host still holds.
+ *   (kVTDecodeFrame_EnableTemporalProcessing) and in decode order when not
+ *   (StelaDecoderOpenDecodeOrder, from a version 2 table; a version 1 table
+ *   shows in display order). Each sample goes to the host with pixel buffers
+ *   from the session's pool as destinations; each picture the host shows in
+ *   one is emitted with the frame token of the sample that decoded it,
+ *   which StelaVD keeps by the number it gave that sample (a frame decoded
+ *   with kVTDecodeFrame_DoNotOutputFrame is emitted dropped, with no
+ *   picture). A sample with no picture is emitted dropped at once.
+ *   finishDelayedFrames flushes what the host still holds.
+ * - Eviction: the host closes a session left idle when another needs its
+ *   room (StelaDecoderEvicted). StelaVD lets it go quietly: what it held is
+ *   emitted dropped, and so is each frame until the next sync sample, which
+ *   opens a new host session (or, if the host refuses it, Apple's decoder).
  * - Apple's software decoder, in an inner VideoToolbox session whose
  *   pictures are emitted as StelaVD's own: for every stream the host
  *   refuses, when StelaGPU gave no host decoder, and after the host fails.
@@ -169,7 +176,7 @@ static _Atomic(const StelaDecoderAPI *) handed;
 /* StelaGPU.bundle calls this before it registers StelaVD. */
 __attribute__((visibility("default"))) void StelaVD_UseDecoders(const StelaDecoderAPI *api)
 {
-	if (api && api->version >= STELA_DECODER_API_VERSION) {
+	if (api && api->version >= STELA_DECODER_API_MIN_VERSION) {
 		atomic_store(&handed, api);
 	}
 }
@@ -191,7 +198,7 @@ static const StelaDecoderAPI *host(void)
 	}
 	const StelaDecoderAPI *(*message)(void *, void *) = (const StelaDecoderAPI *(*)(void *, void *))send;
 	api = message(class, registerName("api"));
-	if (!api || api->version < STELA_DECODER_API_VERSION) {
+	if (!api || api->version < STELA_DECODER_API_MIN_VERSION) {
 		return NULL;
 	}
 	atomic_store(&handed, api);
@@ -214,6 +221,9 @@ typedef enum {
 typedef struct {
 	uint64_t number;
 	VTVideoDecoderFrame frame;
+	/* Decoded with kVTDecodeFrame_DoNotOutputFrame: emitted with no
+	 * picture. */
+	bool silent;
 } Token;
 
 #define TOKENS 64
@@ -241,7 +251,14 @@ typedef struct {
 	/* The host's decoder. */
 	StelaDecoderSession *host;
 	StelaDecoderStream stream;
+	/* What VideoToolbox asked (no temporal processing), and whether the
+	 * host shows in decode order (a version 2 table). */
 	bool decodeOrder;
+	bool hostDecodeOrder;
+	/* The host evicted the session: frames are dropped until a sync
+	 * sample opens a new one. */
+	bool reopenAtSync;
+	uint64_t evictions;
 	uint64_t nextNumber;
 	Token tokens[TOKENS];
 	unsigned tokenCount;
@@ -371,7 +388,7 @@ static void decodeApple(Decoder *d, VTVideoDecoderFrame frame, CMSampleBufferRef
 
 /* ---- The host's NVDEC --------------------------------------------------- */
 
-static void addToken(Decoder *d, uint64_t number, VTVideoDecoderFrame frame)
+static void addToken(Decoder *d, uint64_t number, VTVideoDecoderFrame frame, bool silent)
 {
 	if (d->tokenCount == TOKENS) {
 		/* A picture the stream never shows: the oldest is given up. */
@@ -380,21 +397,41 @@ static void addToken(Decoder *d, uint64_t number, VTVideoDecoderFrame frame)
 		memmove(&d->tokens[0], &d->tokens[1], (TOKENS - 1) * sizeof(Token));
 		d->tokenCount--;
 	}
-	d->tokens[d->tokenCount++] = (Token){.number = number, .frame = frame};
+	d->tokens[d->tokenCount++] = (Token){.number = number, .frame = frame, .silent = silent};
 }
 
-/* The frame token of sample `number`, which leaves the table; NULL if none. */
-static VTVideoDecoderFrame takeToken(Decoder *d, uint64_t number)
+/* The frame token of sample `number`, which leaves the table (`*silent`
+ * says whether it shows no picture, when given); NULL if none. */
+static VTVideoDecoderFrame takeTokenSilent(Decoder *d, uint64_t number, bool *silent)
 {
 	for (unsigned i = 0; i < d->tokenCount; i++) {
 		if (d->tokens[i].number == number) {
 			VTVideoDecoderFrame frame = d->tokens[i].frame;
+			if (silent) {
+				*silent = d->tokens[i].silent;
+			}
 			memmove(&d->tokens[i], &d->tokens[i + 1], (d->tokenCount - i - 1) * sizeof(Token));
 			d->tokenCount--;
 			return frame;
 		}
 	}
 	return NULL;
+}
+
+static VTVideoDecoderFrame takeToken(Decoder *d, uint64_t number)
+{
+	return takeTokenSilent(d, number, NULL);
+}
+
+/* Emits every frame the host still held as dropped, not as errors: an
+ * evicted session's, which never come. */
+static void dropTokens(Decoder *d)
+{
+	for (unsigned i = 0; i < d->tokenCount; i++) {
+		d->dropped++;
+		vd.emit(d->session, d->tokens[i].frame, noErr, kVTDecodeInfo_FrameDropped, NULL);
+	}
+	d->tokenCount = 0;
 }
 
 /* Emits every frame the host still holds with `status`: they will never
@@ -491,12 +528,12 @@ static void tagColor(Decoder *d, CVPixelBufferRef buffer)
  * d->why.
  */
 static OSStatus decodeHost(Decoder *d, VTVideoDecoderFrame frame, const void *bytes, size_t length, uint32_t flags,
-    StelaDecoderStatus *refused, bool *decoded)
+    bool silent, StelaDecoderStatus *refused, bool *decoded)
 {
 	const StelaDecoderAPI *api = host();
 	uint64_t number = ++d->nextNumber;
 	if (frame) {
-		addToken(d, number, frame);
+		addToken(d, number, frame, silent);
 	}
 	*decoded = false;
 	for (unsigned calls = 0; calls < 64; calls++) {
@@ -552,10 +589,18 @@ static OSStatus decodeHost(Decoder *d, VTVideoDecoderFrame frame, const void *by
 				giveBuffer(d, buffers[i]);
 				continue;
 			}
-			VTVideoDecoderFrame shown = takeToken(d, destinations[i].frame);
+			bool quiet = false;
+			VTVideoDecoderFrame shown = takeTokenSilent(d, destinations[i].frame, &quiet);
 			if (!shown) {
 				/* A picture of a sample whose frame was already given up. */
 				giveBuffer(d, buffers[i]);
+				continue;
+			}
+			if (quiet) {
+				/* kVTDecodeFrame_DoNotOutputFrame: no picture for it. */
+				giveBuffer(d, buffers[i]);
+				d->dropped++;
+				vd.emit(d->session, shown, noErr, kVTDecodeInfo_FrameDropped, NULL);
 				continue;
 			}
 			tagColor(d, buffers[i]);
@@ -597,14 +642,40 @@ static void dropHost(Decoder *d, const char *why)
 	d->backend = BackendNone;
 }
 
-/* Opens the host session for the first frame, in display order when
- * VideoToolbox processes temporally and in decode order when not. */
+/* The host evicted the session, idle, for another: it is let go quietly.
+ * What it held is emitted dropped, and so is each frame until the next sync
+ * sample, which opens a new host session. */
+static void leaveEvicted(Decoder *d)
+{
+	d->evictions++;
+	os_log(logger(), "StelaVD: %{public}s session in %{public}s[%d]: the host evicted its idle NVDEC session (%{public}s); "
+	    "%u frames it held dropped, NVDEC again from the next sync sample",
+	    codecName(d->codec), getprogname(), getpid(), d->why, d->tokenCount);
+	dropTokens(d);
+	if (d->host) {
+		host()->close(d->host);
+		d->host = NULL;
+	}
+	releaseSpares(d);
+	d->drops = 0;
+	d->reopenAtSync = true;
+}
+
+/* Opens the host session for the first frame (or the first sync sample
+ * after an eviction), in display order when VideoToolbox processes
+ * temporally and in decode order when not. */
 static bool openHost(Decoder *d)
 {
 	const StelaDecoderAPI *api = host();
-	StelaDecoderStatus status = api->open(d->codec == kCMVideoCodecType_HEVC ? StelaDecoderHEVC : StelaDecoderH264,
-	    CFDataGetBytePtr(d->record), (size_t)CFDataGetLength(d->record), &d->stream, &d->host, d->why,
-	    sizeof(d->why));
+	uint32_t codec = d->codec == kCMVideoCodecType_HEVC ? StelaDecoderHEVC : StelaDecoderH264;
+	const void *config = CFDataGetBytePtr(d->record);
+	size_t configBytes = (size_t)CFDataGetLength(d->record);
+	/* A version 1 table opens in display order only. */
+	d->hostDecodeOrder = d->decodeOrder && api->version >= 2 && api->open_flags;
+	StelaDecoderStatus status = d->hostDecodeOrder
+	    ? api->open_flags(codec, StelaDecoderOpenDecodeOrder, config, configBytes, &d->stream, &d->host, d->why,
+		  sizeof(d->why))
+	    : api->open(codec, config, configBytes, &d->stream, &d->host, d->why, sizeof(d->why));
 	if (status != StelaDecoderOk) {
 		d->host = NULL;
 		os_log(logger(), "StelaVD: %{public}s session in %{public}s[%d]: the host decodes it not (%d: %{public}s); "
@@ -636,7 +707,7 @@ static bool openHost(Decoder *d)
 	    codecName(d->codec), getprogname(), getpid(), d->stream.coded_width, d->stream.coded_height,
 	    d->stream.display_width, d->stream.display_height, d->stream.bit_depth,
 	    d->stream.format == StelaDecoderP010 ? "x420" : "420v", d->stream.slots, d->stream.surfaces,
-	    d->decodeOrder ? "decode" : "display");
+	    d->hostDecodeOrder ? "decode" : d->decodeOrder ? "display (the host's table has no decode order)" : "display");
 	return true;
 }
 
@@ -689,10 +760,10 @@ static void logEnd(Decoder *d)
 	uint64_t shown = d->shown ? d->shown : 1;
 	os_log(logger(), "StelaVD: %{public}s %dx%d session in %{public}s ended: %{public}s, %llu frames, decode %.2f ms "
 	    "average, %.2f ms longest, %llu errors; NVDEC %llu pictures, %llu shown, %llu dropped, gpu %llu us, "
-	    "readback %llu us, copy %llu us average, %llu gate calls",
+	    "readback %llu us, copy %llu us average, %llu gate calls, %llu evictions",
 	    codecName(d->codec), size.width, size.height, getprogname(), backendName(d->backend), d->frames,
 	    d->frames ? d->decodeNs / 1e6 / d->frames : 0.0, d->maxNs / 1e6, d->errors, d->hostPictures, d->shown,
-	    d->dropped, d->gpuUs / pictures, d->ceUs / shown, d->copyUs / shown, d->hostCalls);
+	    d->dropped, d->gpuUs / pictures, d->ceUs / shown, d->copyUs / shown, d->hostCalls, d->evictions);
 }
 
 static void finalize(VDBaseObjectRef object)
@@ -807,6 +878,7 @@ static OSStatus startSession(VTVideoDecoderRef decoder, VTVideoDecoderSession se
 		host()->close(d->host);
 		d->host = NULL;
 	}
+	d->reopenAtSync = false;
 	releaseSpares(d);
 	d->session = session;
 	if (d->format) {
@@ -849,6 +921,75 @@ static OSStatus startSession(VTVideoDecoderRef decoder, VTVideoDecoderSession se
 	return status;
 }
 
+/* One sample through the host's session. A session the host evicted is let
+ * go quietly (leaveEvicted); at a sync sample a new one is opened for this
+ * very sample, else the frame is emitted dropped. `silent`: the frame shows
+ * no picture (kVTDecodeFrame_DoNotOutputFrame), though it is decoded, since
+ * later frames may refer to it. */
+static void decodeOnHost(Decoder *d, VTVideoDecoderFrame frame, CMSampleBufferRef sample, bool sync, bool silent)
+{
+	void *copy = NULL;
+	size_t length = 0;
+	const void *bytes = sampleBytes(sample, &length, &copy);
+	if (!bytes) {
+		d->errors++;
+		vd.emit(d->session, frame, kVTVideoDecoderBadDataErr, 0, NULL);
+		return;
+	}
+	StelaDecoderStatus refused = StelaDecoderOk;
+	bool decoded = false;
+	OSStatus status = decodeHost(d, frame, bytes, length, 0, silent, &refused, &decoded);
+	if (status != noErr && refused == StelaDecoderEvicted) {
+		/* This frame's token leaves with the rest, below or here. */
+		bool own = takeToken(d, d->nextNumber) == frame;
+		leaveEvicted(d);
+		if (!sync) {
+			if (own) {
+				d->dropped++;
+				vd.emit(d->session, frame, noErr, kVTDecodeInfo_FrameDropped, NULL);
+			}
+			free(copy);
+			return;
+		}
+		/* A sync sample: a new session starts with it. */
+		d->reopenAtSync = false;
+		if (!openHost(d)) {
+			if (startApple(d) == noErr) {
+				os_log(logger(), "StelaVD: %{public}s session in %{public}s[%d] goes on with Apple's software "
+				    "decoder", codecName(d->codec), getprogname(), getpid());
+				decodeApple(d, frame, sample);
+			} else {
+				d->errors++;
+				vd.emit(d->session, frame, kVTInvalidSessionErr, 0, NULL);
+			}
+			free(copy);
+			return;
+		}
+		status = decodeHost(d, frame, bytes, length, 0, silent, &refused, &decoded);
+	}
+	if (status != noErr) {
+		/* This frame never shows. */
+		if (takeToken(d, d->nextNumber) == frame) {
+			d->errors++;
+			vd.emit(d->session, frame, status, 0, NULL);
+		}
+		if (refused == StelaDecoderEvicted) {
+			/* Evicted again at once: wait for the next sync sample. */
+			leaveEvicted(d);
+		} else if (refused == StelaDecoderDropped && ++d->drops < MOST_DROPS) {
+			os_log_error(logger(), "StelaVD: %{public}s session in %{public}s[%d]: NVDEC refused a sample: %{public}s",
+			    codecName(d->codec), getprogname(), getpid(), d->why);
+		} else {
+			dropHost(d, refused == StelaDecoderLost ? "the host lost the session"
+			    : refused == StelaDecoderDropped     ? "three samples refused in a row"
+			                                         : "the host refused a sample");
+		}
+	} else {
+		d->drops = 0;
+	}
+	free(copy);
+}
+
 static OSStatus decodeFrame(VTVideoDecoderRef decoder, VTVideoDecoderFrame frame, CMSampleBufferRef sample,
     VTDecodeFrameFlags flags, VTDecodeInfoFlags *info)
 {
@@ -867,51 +1008,36 @@ static OSStatus decodeFrame(VTVideoDecoderRef decoder, VTVideoDecoderFrame frame
 		os_log(logger(), "StelaVD: %{public}s session in %{public}s[%d] goes on with Apple's software decoder",
 		    codecName(d->codec), getprogname(), getpid());
 	}
+	bool opened = true;
 	if (d->backend == BackendHost && !d->host) {
-		d->decodeOrder = !(flags & kVTDecodeFrame_EnableTemporalProcessing);
-		if (!openHost(d)) {
-			if (startApple(d) != noErr) {
-				vd.emit(d->session, frame, kVTInvalidSessionErr, 0, NULL);
-				return noErr;
+		if (d->reopenAtSync && !sync) {
+			/* Evicted: no picture until a sync sample opens a new session. */
+			d->dropped++;
+			vd.emit(d->session, frame, noErr, kVTDecodeInfo_FrameDropped, NULL);
+			opened = false;
+		} else {
+			if (!d->reopenAtSync) {
+				d->decodeOrder = !(flags & kVTDecodeFrame_EnableTemporalProcessing);
+			}
+			d->reopenAtSync = false;
+			if (!openHost(d)) {
+				if (startApple(d) != noErr) {
+					vd.emit(d->session, frame, kVTInvalidSessionErr, 0, NULL);
+					return noErr;
+				}
 			}
 		}
 	}
-	if (d->backend == BackendApple) {
+	if (!opened) {
+		/* Emitted dropped above. */
+	} else if (d->backend == BackendApple) {
 		if (d->inner) {
 			decodeApple(d, frame, sample);
 		} else {
 			vd.emit(d->session, frame, kVTInvalidSessionErr, 0, NULL);
 		}
 	} else {
-		void *copy = NULL;
-		size_t length = 0;
-		const void *bytes = sampleBytes(sample, &length, &copy);
-		if (!bytes) {
-			d->errors++;
-			vd.emit(d->session, frame, kVTVideoDecoderBadDataErr, 0, NULL);
-		} else {
-			StelaDecoderStatus refused = StelaDecoderOk;
-			bool decoded = false;
-			OSStatus status = decodeHost(d, frame, bytes, length, 0, &refused, &decoded);
-			if (status != noErr) {
-				/* This frame never shows. */
-				if (takeToken(d, d->nextNumber) == frame) {
-					d->errors++;
-					vd.emit(d->session, frame, status, 0, NULL);
-				}
-				if (refused == StelaDecoderDropped && ++d->drops < MOST_DROPS) {
-					os_log_error(logger(), "StelaVD: %{public}s session in %{public}s[%d]: NVDEC refused a "
-					    "sample: %{public}s", codecName(d->codec), getprogname(), getpid(), d->why);
-				} else {
-					dropHost(d, refused == StelaDecoderLost ? "the host lost the session"
-					    : refused == StelaDecoderDropped     ? "three samples refused in a row"
-					                                         : "the host refused a sample");
-				}
-			} else {
-				d->drops = 0;
-			}
-		}
-		free(copy);
+		decodeOnHost(d, frame, sample, sync, (flags & kVTDecodeFrame_DoNotOutputFrame) != 0);
 	}
 	uint64_t ns = nowNs() - start;
 	d->decodeNs += ns;
@@ -935,8 +1061,12 @@ static OSStatus finishDelayedFrames(VTVideoDecoderRef decoder)
 	}
 	StelaDecoderStatus refused = StelaDecoderOk;
 	bool decoded = false;
-	if (decodeHost(d, NULL, NULL, 0, StelaDecodeFlush, &refused, &decoded) != noErr) {
-		dropHost(d, "the host refused the end of the stream");
+	if (decodeHost(d, NULL, NULL, 0, StelaDecodeFlush, false, &refused, &decoded) != noErr) {
+		if (refused == StelaDecoderEvicted) {
+			leaveEvicted(d);
+		} else {
+			dropHost(d, "the host refused the end of the stream");
+		}
 		return noErr;
 	}
 	/* Pictures the stream never shows. */
