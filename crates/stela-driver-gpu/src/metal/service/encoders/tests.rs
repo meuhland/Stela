@@ -779,6 +779,7 @@ fn the_shared_service_hands_encoder_calls_to_its_encoders() {
         served: |_: Served| {},
         wake: || {},
         bundle: |_| {},
+        job_waiting: || {},
     };
     let shared = || {
         SharedService::<MockBackend, MockCompiler>::new(

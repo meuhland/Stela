@@ -1460,7 +1460,10 @@ fn open_gpu(
                 service.set_encoders(encoders);
             }
             // And its video decoder sessions, StelaVD's.
-            if let Some(decoders) = super::nvdec::attach(gpu.window, index, &bound.name, chipset) {
+            if core::ptr::eq(bound.stack, &stela_drivers::gpu::stack::NVIDIA)
+                && let Some(decoders) =
+                    super::nvdec::attach(gpu.window, index, &bound.name, chip as u16)
+            {
                 service.set_decoders(decoders);
             }
             // Without a second stack, every compilation stays in its turn.

@@ -105,9 +105,9 @@ pub(super) fn line(args: core::fmt::Arguments<'_>) {
     output::arguments(format_args!("{args}\n"));
 }
 
-/// The GPUs nouveau bound, by index, with their chipset and name. Every one
-/// is NVIDIA's, since this build gives GPUs to nouveau only, and bound GPU
-/// `index` has render node `RENDER_MINOR + index`.
+/// The GPUs nouveau bound, by index, with their chipset and name: the bound
+/// GPUs whose stack is NVIDIA's, whose chip query answers the chipset. A
+/// GPU another driver took is not one of them.
 pub(super) fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16, String)> {
     let Some(installed) = super::installed() else {
         line(format_args!("{prefix} skipped: no GPU answers"));
@@ -116,8 +116,11 @@ pub(super) fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16, String)> {
     let mut found = Vec::new();
     for (index, bound) in installed.start.bound.iter().enumerate() {
         let index = index as u32;
-        match client::chipset(index) {
-            Some(chipset) => found.push((index, chipset, bound.name.clone())),
+        if !core::ptr::eq(bound.stack, &stela_drivers::gpu::stack::NVIDIA) {
+            continue;
+        }
+        match client::query(index, bound.stack.kernel.chip) {
+            Some(chipset) => found.push((index, chipset as u16, bound.name.clone())),
             None => line(format_args!(
                 "{prefix} GPU {index} ({}): nouveau did not say its chipset",
                 bound.name
@@ -130,9 +133,11 @@ pub(super) fn nvidia_gpus(prefix: &str) -> Vec<(u32, u16, String)> {
     found
 }
 
-/// A render node file of GPU `index`.
+/// A render node file of GPU `index`, at the render minor DRM gave its
+/// device ([`client::minor`]).
 pub(super) fn open(prefix: &str, index: u32) -> Option<c_int> {
-    let fd = client::open_node(RENDER_MINOR + index);
+    let fd =
+        client::minor(index as usize).and_then(|minor| client::open_node(RENDER_MINOR + minor));
     if fd.is_none() {
         line(format_args!(
             "{prefix} GPU {index}: its render node did not open"
@@ -285,7 +290,6 @@ fn data(report: &selftest::Report) {
 pub(super) struct GateGpu {
     index: usize,
     chipset: u16,
-    minor: u32,
     stack: u64,
 }
 
@@ -296,8 +300,6 @@ impl GateGpu {
         Self {
             index,
             chipset,
-            // Bound GPU `index` has render node `RENDER_MINOR + index`.
-            minor: index as u32,
             stack,
         }
     }
@@ -315,7 +317,9 @@ impl EncoderPlatform for GateGpu {
     }
 
     fn open_node(&self) -> Result<RenderFile, &'static str> {
-        client::open_node(RENDER_MINOR + self.minor)
+        // The render minor DRM gave the device ([`client::minor`]).
+        client::minor(self.index)
+            .and_then(|minor| client::open_node(RENDER_MINOR + minor))
             .map(RenderFile)
             .ok_or("the GPU's render node did not open")
     }
@@ -401,8 +405,6 @@ pub(super) fn attach(
             "no sessions: its encoder failed the probe or the self-test"
         ));
     }
-    // Bound GPU `index` has render node `RENDER_MINOR + index`.
-    let minor = index as u32;
     let Some(stack) = Stack::map(window, ENCODER_STACK_BYTES) else {
         return refuse(format_args!("no sessions: no memory for their stack"));
     };
@@ -417,7 +419,6 @@ pub(super) fn attach(
     Some(Arc::new(Encoders::new(GateGpu {
         index,
         chipset,
-        minor,
         stack: top,
     })))
 }
