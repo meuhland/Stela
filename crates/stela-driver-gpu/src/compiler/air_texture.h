@@ -28,11 +28,29 @@ struct stela_air_texture_context {
    bool (*store_at)(void *translator, LLVMValueRef pointer, nir_def *offset, nir_def *value);
    /* A kernel's or tile function's explicit imageblock's dimensions, a
     * 32-bit uvec2, NULL without one, and the element at pixel
-    * y * width + x of the member a slice operand points to; NULL after
-    * reporting why. */
+    * y * width + x of the member a slice operand points to, or of the
+    * member at a 32-bit offset imageblock_member gave (NULL: the slice's
+    * own); NULL after reporting why. */
    nir_def *imageblock_extent;
-   nir_def *(*imageblock_load)(void *translator, LLVMValueRef slice, nir_def *pixel,
-                               unsigned components, unsigned bits);
+   nir_def *(*imageblock_load)(void *translator, LLVMValueRef slice, nir_def *member,
+                               nir_def *pixel, unsigned components, unsigned bits);
+   nir_def *(*imageblock_member)(void *translator, LLVMValueRef slice);
+   /* A slice write its thread makes as its last act before a threadgroup
+    * barrier or the function's end, which the threads that reach that
+    * point write together: deferred_slice gives the call's handle, or NULL
+    * where its thread writes the slice alone. slice_claim is true for the
+    * first thread of a round to claim the handle's record, and
+    * slice_record stores in it the pixel count, width, position's x and
+    * y, level and imageblock member, all 32 bits. slice_flush_begin moves
+    * the builder to the code those threads run, with the record's values
+    * (a count of 0 where no thread claimed it), the thread's rank among
+    * them and their number; slice_flush_end returns it to the call. */
+   void *(*deferred_slice)(void *translator, LLVMValueRef call);
+   nir_def *(*slice_claim)(void *translator, void *site);
+   void (*slice_record)(void *translator, void *site, nir_def *const values[6]);
+   void (*slice_flush_begin)(void *translator, void *site, nir_def *values[6], nir_def **rank,
+                             nir_def **threads);
+   void (*slice_flush_end)(void *translator, void *site);
    /* Emits body count times in a loop, with each iteration's 32-bit index
     * and the carried values: count values that start as values[] holds them,
     * which body reads and replaces, and which hold what the last iteration

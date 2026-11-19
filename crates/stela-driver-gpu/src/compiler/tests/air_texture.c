@@ -805,6 +805,10 @@ static const char *imageblock_body =
    " <2 x i16> <i16 1, i16 1>, i16 0, i1 false, i32 2)\n"
    "ret void\n}\n";
 
+/* A slice write's record (claim, count, width, x, y, level, member) and the
+ * count of threads at its barrier. */
+#define SLICE_RECORD_BYTES (7 * 4 + 4)
+
 /* The imageblock is threadgroup memory of the encoder's dimensions'
  * elements, and the slice write a loop of image stores. Without dimensions
  * it is 0 x 0, as on Apple GPUs, over an element for each thread of a
@@ -822,7 +826,7 @@ imageblocks_live_in_threadgroup_memory(void)
       fprintf(stderr, "imageblock: %u %s\n", error.kind, error.detail);
    assert(shader);
    nir_validate_shader(shader, "imageblock kernel");
-   assert(shader->info.shared_size == 8 * 2 * 8);
+   assert(shader->info.shared_size == 8 * 2 * 8 + SLICE_RECORD_BYTES);
    assert(count(shader).store);
    bool looped = false;
    nir_foreach_function_impl(impl, shader) {
@@ -842,7 +846,7 @@ imageblocks_live_in_threadgroup_memory(void)
    shader = kernel_with(imageblock_body, imageblock_metadata, &o, &error);
    assert(shader);
    nir_validate_shader(shader, "unsized imageblock");
-   assert(shader->info.shared_size == 4 * 8);
+   assert(shader->info.shared_size == 4 * 8 + SLICE_RECORD_BYTES);
    ralloc_free(shader);
    o.dynamic_shape = true;
    o.load_device_value = stela_metal_load_device_value;
@@ -851,7 +855,112 @@ imageblocks_live_in_threadgroup_memory(void)
    if (!shader)
       fprintf(stderr, "dynamic imageblock: %u %s\n", error.kind, error.detail);
    assert(shader);
-   assert(shader->info.shared_size == 64 * 8);
+   assert(shader->info.shared_size == 64 * 8 + SLICE_RECORD_BYTES);
+   ralloc_free(shader);
+}
+
+static unsigned
+intrinsics(nir_shader *shader, nir_intrinsic_op op)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            n += instr->type == nir_instr_type_intrinsic &&
+                 nir_instr_as_intrinsic(instr)->intrinsic == op;
+      }
+   }
+   return n;
+}
+
+/* As Core Animation's blur kernels do: one thread writes a slice before a
+ * barrier, the group rewrites the block, and one thread writes another
+ * slice before the kernel's end. */
+static const char *deferred_slice_body =
+   "%block_t = type { ptr addrspace(4) }\n"
+   "declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)\n"
+   "declare void @air.wg.barrier(i32, i32, i32) convergent\n"
+   "declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1),"
+   " ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)\n"
+   "define void @kernel(%block_t %block, ptr addrspace(1) %out, <2 x i16> %tid) {\n"
+   "entry:\n"
+   "%p = call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)\n"
+   "store <4 x half> <half 0xH3C00, half 0xH3C00, half 0xH3C00, half 0xH3C00>,"
+   " ptr addrspace(4) %p, align 8\n"
+   "call void @air.wg.barrier(i32 8, i32 5, i32 1) convergent\n"
+   "%x = extractelement <2 x i16> %tid, i64 0\n"
+   "%y = extractelement <2 x i16> %tid, i64 1\n"
+   "%xy = or i16 %x, %y\n"
+   "%first = icmp eq i16 %xy, 0\n"
+   "br i1 %first, label %write, label %wait\n"
+   "write:\n"
+   "%origin = call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)\n"
+   "call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %out,"
+   " ptr addrspace(4) %origin, i1 true, <2 x i16> zeroinitializer, <2 x i16> <i16 8, i16 1>,"
+   " <2 x i16> zeroinitializer, i16 0, i1 false, i32 2)\n"
+   "AFTER_FIRST"
+   "br label %wait\n"
+   "wait:\n"
+   "call void @air.wg.barrier(i32 8, i32 5, i32 1) convergent\n"
+   "store <4 x half> zeroinitializer, ptr addrspace(4) %p, align 8\n"
+   "call void @air.wg.barrier(i32 8, i32 5, i32 1) convergent\n"
+   "br i1 %first, label %again, label %done\n"
+   "again:\n"
+   "%origin2 = call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)\n"
+   "call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %out,"
+   " ptr addrspace(4) %origin2, i1 true, <2 x i16> zeroinitializer, <2 x i16> <i16 8, i16 1>,"
+   " <2 x i16> <i16 0, i16 1>, i16 0, i1 false, i32 2)\n"
+   "br label %done\n"
+   "done:\n"
+   "ret void\n}\n";
+
+/* A slice write its thread makes last before a threadgroup barrier or the
+ * kernel's end is written by every thread there: the caller claims a
+ * record, and each thread that arrives counts itself in and writes its
+ * share. Other slice writes, and kernels without threadgroup memory to
+ * spare for the records, stay with their callers. */
+static void
+deferred_slices_are_written_by_their_group(void)
+{
+   struct stela_air_error error = {0};
+   struct stela_air_options o = options(&primary, true);
+   o.workgroup_size[0] = 8, o.workgroup_size[1] = 2;
+   o.max_threadgroup_bytes = 32768;
+   o.imageblock_size[0] = 8, o.imageblock_size[1] = 2;
+   const char *deferred = replace(deferred_slice_body, "AFTER_FIRST", "");
+   nir_shader *shader = kernel_with(deferred, imageblock_metadata, &o, &error);
+   if (!shader)
+      fprintf(stderr, "deferred slices: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   nir_validate_shader(shader, "deferred slices");
+   /* Two records, each claimed once; one count of threads at the barrier
+    * and one at the end; a loop of the caller's own and one of the group's
+    * for each. */
+   assert(shader->info.shared_size == 8 * 2 * 8 + 2 * 7 * 4 + 4);
+   assert(intrinsics(shader, nir_intrinsic_shared_atomic_swap) == 2);
+   assert(intrinsics(shader, nir_intrinsic_shared_atomic) == 2);
+   assert(intrinsics(shader, nir_intrinsic_image_deref_store) == 4);
+   ralloc_free(shader);
+   /* The thread does more after the write: it writes the slice alone. */
+   const char *busy = replace(deferred_slice_body, "AFTER_FIRST",
+                              "store <4 x half> zeroinitializer, ptr addrspace(4) %p, align 8\n");
+   shader = kernel_with(busy, imageblock_metadata, &o, &error);
+   assert(shader);
+   assert(shader->info.shared_size == 8 * 2 * 8 + 7 * 4 + 4);
+   assert(intrinsics(shader, nir_intrinsic_shared_atomic_swap) == 1);
+   assert(intrinsics(shader, nir_intrinsic_image_deref_store) == 3);
+   ralloc_free(shader);
+   /* No room for the records: every slice is its caller's. */
+   o.max_threadgroup_bytes = 8 * 2 * 8;
+   /* replace's buffer holds one text at a time. */
+   deferred = replace(deferred_slice_body, "AFTER_FIRST", "");
+   shader = kernel_with(deferred, imageblock_metadata, &o, &error);
+   if (!shader)
+      fprintf(stderr, "slices without room: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   assert(shader->info.shared_size == 8 * 2 * 8);
+   assert(!intrinsics(shader, nir_intrinsic_shared_atomic_swap));
+   assert(intrinsics(shader, nir_intrinsic_image_deref_store) == 2);
    ralloc_free(shader);
 }
 
@@ -892,20 +1001,6 @@ static const char *tile_body =
    "%new = add i32 %old, 1\n"
    "store i32 %new, ptr addrspace(3) %shared, align 4\n"
    "ret void\n}\n";
-
-static unsigned
-intrinsics(nir_shader *shader, nir_intrinsic_op op)
-{
-   unsigned n = 0;
-   nir_foreach_function_impl(impl, shader) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block)
-            n += instr->type == nir_instr_type_intrinsic &&
-                 nir_instr_as_intrinsic(instr)->intrinsic == op;
-      }
-   }
-   return n;
-}
 
 /* A tile function's imageblock is its pass's attachments' texels at its
  * tile's pixels, and its threadgroup memory is copied in from the tile's
@@ -2274,6 +2369,7 @@ main(void)
    textures_choose_null_at_run_time();
    block_reads_fetch_each_texel();
    imageblocks_live_in_threadgroup_memory();
+   deferred_slices_are_written_by_their_group();
    tile_functions_access_their_attachments();
    tile_functions_access_imageblock_data();
    tile_functions_take_both_imageblocks();
@@ -2296,7 +2392,7 @@ main(void)
    glsl_type_singleton_decref();
    puts("AIR textures: sample/level/offset, write, read_write array read, size queries, "
         "implicit-derivative fragment sampling, depth compare, gather, storage levels, arrays, atomics, "
-        "constexpr samplers, cube reads, null textures, imageblocks, tile functions, joined samples, "
+        "constexpr samplers, cube reads, null textures, imageblocks, group-written slices, tile functions, joined samples, "
         "whole-quad derivatives in branches, derivatives kept in uniform branches and with guarded reads, gradients taken before early returns, tile functions of both imageblocks, and refusals passed");
    return 0;
 }

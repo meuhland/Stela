@@ -1635,9 +1635,14 @@ struct slice {
    nir_def *level, *position, *width;
    unsigned components, bits;
    bool floating;
+   /* A slice its group writes together: the member's offset, and the
+    * thread's first pixel and the stride to its next; NULL for one its
+    * caller writes alone. Its level is the same in every thread. */
+   nir_def *member_offset, *first, *stride;
 };
 
-/* Pixel index of a slice's region, row by row, to its texel. */
+/* Pixel index of a slice's region, row by row, to its texel; with a stride,
+ * the thread's index-th pixel. */
 static bool
 slice_pixel(void *data, nir_def *index, nir_def **values)
 {
@@ -1645,10 +1650,13 @@ slice_pixel(void *data, nir_def *index, nir_def **values)
    struct slice *slice = data;
    struct call *call = slice->call;
    nir_builder *b = call->b;
+   if (slice->stride)
+      index = nir_iadd(b, slice->first, nir_imul(b, index, slice->stride));
    nir_def *x = nir_umod(b, index, slice->width), *y = nir_udiv(b, index, slice->width);
    nir_def *pixel = nir_iadd(b, nir_imul(b, y, nir_channel(b, call->c->imageblock_extent, 0)), x);
-   nir_def *value = call->c->imageblock_load(call->c->translator, slice->member, pixel,
-                                             slice->components, slice->bits);
+   nir_def *value = call->c->imageblock_load(call->c->translator, slice->member,
+                                             slice->member_offset, pixel, slice->components,
+                                             slice->bits);
    /* Derefs stay in the block that uses them. */
    nir_deref_instr *deref = value ? texture_deref(call, slice->level) : NULL;
    if (!deref)
@@ -1666,9 +1674,50 @@ slice_pixel(void *data, nir_def *index, nir_def **values)
    nir_image_deref_store(b, &deref->def, image_coord(call, at, NULL, NULL), nir_undef(b, 1, 32),
                          texel, nir_imm_int(b, 0),
                          .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
-                         .access = image_access(call, slice->level),
+                         .access = slice->stride ? (call->coherent ? ACCESS_COHERENT : 0) :
+                                                   image_access(call, slice->level),
                          .src_type = nir_get_nir_type_for_glsl_base_type(base_type(call->texture)));
    return true;
+}
+
+/* A slice of count pixels the translator defers to its group
+ * (stela_air_texture_context::deferred_slice): the first caller of a round
+ * records it, a later one writes its own, and every thread that reaches the
+ * barrier or the function's end writes every threads-th pixel from its
+ * rank on. */
+static bool
+deferred_slice_write(struct call *call, void *site, struct slice *slice, nir_def *count)
+{
+   const struct stela_air_texture_context *c = call->c;
+   nir_builder *b = call->b;
+   nir_def *member = c->imageblock_member(c->translator, slice->member);
+   nir_def *claimed = member ? c->slice_claim(c->translator, site) : NULL;
+   nir_block *blocks[4];
+   if (!claimed || !c->branch(c->translator, claimed, blocks))
+      return false;
+   nir_def *recorded[6] = {count, slice->width, nir_channel(b, slice->position, 0),
+                           nir_channel(b, slice->position, 1),
+                           slice->level ? slice->level : nir_imm_int(b, 0), member};
+   c->slice_record(c->translator, site, recorded);
+   nir_def *then_value = nir_imm_int(b, 0);
+   c->branch_else(c->translator, blocks);
+   if (!c->repeat(c->translator, count, 0, NULL, slice_pixel, slice) ||
+       !c->branch_join(c->translator, blocks, then_value, nir_imm_int(b, 0)))
+      return false;
+   nir_def *values[6], *rank, *threads;
+   c->slice_flush_begin(c->translator, site, values, &rank, &threads);
+   struct slice shared = *slice;
+   shared.width = values[1];
+   shared.position = nir_vec2(b, values[2], values[3]);
+   shared.level = slice->level ? values[4] : NULL;
+   shared.member_offset = values[5];
+   shared.first = rank;
+   shared.stride = threads;
+   nir_def *left = nir_usub_sat(b, values[0], rank);
+   nir_def *pixels = nir_udiv(b, nir_iadd(b, left, nir_iadd_imm(b, threads, -1)), threads);
+   bool written = c->repeat(c->translator, pixels, 0, NULL, slice_pixel, &shared);
+   c->slice_flush_end(c->translator, site);
+   return written;
 }
 
 /* An imageblock slice into a texture, as texture2d::write(slice, position,
@@ -1740,8 +1789,18 @@ slice_write(struct call *call, const char *member_type, size_t member_type_bytes
                                           .access = image_access(call, slice.level));
    extent = nir_umin(b, extent, nir_usub_sat(b, texels, slice.position));
    slice.width = nir_channel(b, extent, 0);
-   return c->repeat(c->translator, nir_imul(b, slice.width, nir_channel(b, extent, 1)), 0, NULL,
-                    slice_pixel, &slice);
+   nir_def *count = nir_imul(b, slice.width, nir_channel(b, extent, 1));
+   void *site = c->deferred_slice ? c->deferred_slice(c->translator, call->inst) : NULL;
+   if (site && !call->texture_id)
+      return deferred_slice_write(call, site, &slice, count);
+   /* An argument buffer's texture is the caller's own: it writes alone,
+    * and its group has nothing to write. */
+   if (site) {
+      nir_def *values[6], *rank, *threads;
+      c->slice_flush_begin(c->translator, site, values, &rank, &threads);
+      c->slice_flush_end(c->translator, site);
+   }
+   return c->repeat(c->translator, count, 0, NULL, slice_pixel, &slice);
 }
 
 /* Texture atomics, as DXMT records them:

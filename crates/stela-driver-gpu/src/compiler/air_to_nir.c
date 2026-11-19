@@ -144,6 +144,13 @@ struct translator {
    LLVMValueRef mesh, mesh_grid;
    nir_variable *payload, *indices, *mesh_state;
    nir_block *exit;
+   /* The slice writes a kernel's group writes together (deferred_slice),
+    * the count of the threads at the current one's barrier and each
+    * thread's rank among them, and whether this translation may defer. */
+   struct deferred_slice *deferred;
+   unsigned deferred_count;
+   nir_variable *slice_threads, *slice_rank;
+   bool defer_slices;
    /* A kernel's explicit imageblock: threadgroup memory of width by height
     * elements of element bytes, row by row. */
    nir_variable *imageblock;
@@ -5381,12 +5388,12 @@ tile_imageblock_load(struct translator *t, const struct value *base, nir_def *pi
 /* Element `pixel` of the imageblock's member that slice points to, of
  * `components` lanes of `bits`. */
 static nir_def *
-imageblock_load(void *translator, LLVMValueRef slice, nir_def *pixel, unsigned components,
-                unsigned bits)
+imageblock_load(void *translator, LLVMValueRef slice, nir_def *member, nir_def *pixel,
+                unsigned components, unsigned bits)
 {
    struct translator *t = translator;
    const struct value *base = pointer_value(t, slice);
-   if (base && t->tile_explicit)
+   if (base && t->tile_explicit && !member)
       return tile_imageblock_load(t, base, pixel, components, bits);
    if (!base || !t->imageblock || base->storage != t->imageblock) {
       fail(t, STELA_AIR_MEMORY, "an imageblock slice that names no member of the imageblock");
@@ -5394,10 +5401,235 @@ imageblock_load(void *translator, LLVMValueRef slice, nir_def *pixel, unsigned c
    }
    nir_builder *b = &t->b;
    struct value address = *base;
-   nir_def *member = nir_umod_imm(b, base->def, t->imageblock_element);
+   member = member ? nir_u2u64(b, member) : nir_umod_imm(b, base->def, t->imageblock_element);
    address.def = nir_iadd(b, member, nir_u2u64(b, nir_imul_imm(b, pixel, t->imageblock_element)));
    address.offset_known = false;
    return memory_access(t, &address, NULL, NULL, 0, components, bits, bits / 8);
+}
+
+/* The 32-bit offset in its element of the kernel imageblock's member a
+ * slice operand points to, or NULL after reporting why. */
+static nir_def *
+imageblock_member(void *translator, LLVMValueRef slice)
+{
+   struct translator *t = translator;
+   const struct value *base = pointer_value(t, slice);
+   if (!base || t->tile_explicit || !t->imageblock || base->storage != t->imageblock) {
+      fail(t, STELA_AIR_MEMORY, "an imageblock slice that names no member of the imageblock");
+      return NULL;
+   }
+   return nir_u2u32(&t->b, nir_umod_imm(&t->b, base->def, t->imageblock_element));
+}
+
+/* A slice write (air.write_imageblock_slice_to_texture_2d) its thread makes
+ * as its last act before a threadgroup barrier or the kernel's end. Apple
+ * GPUs write the whole slice for the one thread that asks, and a loop of
+ * that thread's image stores keeps the rest of its group waiting. So the
+ * caller records the write in threadgroup memory instead, and every thread
+ * that reaches the barrier or the end writes its share of the pixels there,
+ * between two more barriers. A second caller in one round writes its own
+ * slice. */
+struct deferred_slice {
+   LLVMValueRef call;
+   /* The barrier, or NULL for the kernel's end. */
+   LLVMValueRef barrier;
+   /* SLICE_WORDS words: the claim, then slice_record's values. */
+   nir_variable *record;
+   /* The code the threads at the barrier or end run, and where the call's
+    * translation resumes. */
+   nir_block *entry, *exit;
+   nir_cursor resume;
+   bool emitted;
+};
+
+enum { SLICE_CLAIM, SLICE_VALUES, SLICE_WORDS = SLICE_VALUES + 6 };
+
+/* Whether inst directly calls the function named name, or one whose name
+ * starts with it. */
+static bool
+calls(LLVMValueRef inst, const char *name, bool prefix)
+{
+   LLVMValueRef callee = LLVMIsACallInst(inst) ? LLVMGetCalledValue(inst) : NULL;
+   if (!callee || !LLVMIsAFunction(callee))
+      return false;
+   size_t length, expected = strlen(name);
+   const char *called = LLVMGetValueName2(callee, &length);
+   return (prefix ? length >= expected : length == expected) && !memcmp(called, name, expected);
+}
+
+/* The slice writes of a kernel with an explicit imageblock that its group
+ * may write together. */
+static bool
+find_deferred_slices(struct translator *t)
+{
+   if (!t->defer_slices || t->stage_options || t->options->tile || !t->imageblock ||
+       t->mesh_state || t->tile_explicit)
+      return true;
+   for (unsigned i = 0; i < t->reachable_count; i++) {
+      for (LLVMValueRef inst = LLVMGetFirstInstruction(t->work[i]->llvm); inst;
+           inst = LLVMGetNextInstruction(inst)) {
+         if (!calls(inst, "air.write_imageblock_slice_to_texture_2d", true))
+            continue;
+         LLVMValueRef next = LLVMGetNextInstruction(inst);
+         if (next && LLVMGetInstructionOpcode(next) == LLVMUncondBr) {
+            next = LLVMGetFirstInstruction(LLVMGetSuccessor(next, 0));
+            while (next && LLVMGetInstructionOpcode(next) == LLVMPHI)
+               next = LLVMGetNextInstruction(next);
+         }
+         bool barrier = next && calls(next, "air.wg.barrier", false);
+         if (!barrier && (!next || LLVMGetInstructionOpcode(next) != LLVMRet))
+            continue;
+         struct deferred_slice *grown = reralloc(t->cfg_scratch, t->deferred, struct deferred_slice,
+                                                 t->deferred_count + 1);
+         nir_variable *record = nir_variable_create(t->b.shader, nir_var_mem_shared,
+            glsl_array_type(glsl_uint_type(), SLICE_WORDS, 0), "air.slice");
+         if (!grown || !record)
+            return fail(t, STELA_AIR_ALLOCATION, "deferred slice allocation failed");
+         t->deferred = grown;
+         t->deferred[t->deferred_count++] = (struct deferred_slice){
+            .call = inst, .barrier = barrier ? next : NULL, .record = record};
+      }
+   }
+   if (!t->deferred_count)
+      return true;
+   t->slice_threads = nir_variable_create(t->b.shader, nir_var_mem_shared, glsl_uint_type(),
+                                          "air.slice_threads");
+   t->slice_rank = nir_local_variable_create(t->b.impl, glsl_uint_type(), "air.slice_rank");
+   return (t->slice_threads && t->slice_rank) ||
+          fail(t, STELA_AIR_ALLOCATION, "deferred slice allocation failed");
+}
+
+static nir_deref_instr *
+slice_word(struct translator *t, const struct deferred_slice *site, unsigned word)
+{
+   return nir_build_deref_array_imm(&t->b, nir_build_deref_var(&t->b, site->record), word);
+}
+
+/* Clears the claims of the slices deferred to barrier, or of every slice,
+ * and the count of threads at it. */
+static void
+slice_clear(struct translator *t, LLVMValueRef barrier, bool every)
+{
+   nir_builder *b = &t->b;
+   for (unsigned i = 0; i < t->deferred_count; i++) {
+      if (every || t->deferred[i].barrier == barrier)
+         nir_store_deref(b, slice_word(t, &t->deferred[i], SLICE_CLAIM), nir_imm_int(b, 0), 1);
+   }
+   nir_store_deref(b, nir_build_deref_var(b, t->slice_threads), nir_imm_int(b, 0), 1);
+}
+
+static bool
+slice_blocks(struct translator *t, struct deferred_slice *site)
+{
+   if (!site->entry && (!(site->entry = new_block(t)) || !(site->exit = new_block(t))))
+      return false;
+   return true;
+}
+
+/* Before barrier (NULL: the kernel's end), whether slices are deferred to
+ * it; each thread then counts itself in among those reaching it. */
+static bool
+slice_arrive(struct translator *t, LLVMValueRef barrier)
+{
+   bool any = false;
+   for (unsigned i = 0; i < t->deferred_count; i++)
+      any |= t->deferred[i].barrier == barrier;
+   if (!any)
+      return false;
+   nir_builder *b = &t->b;
+   nir_def *rank = nir_deref_atomic(b, 32, &nir_build_deref_var(b, t->slice_threads)->def,
+                                    nir_imm_int(b, 1), .atomic_op = nir_atomic_op_iadd);
+   nir_store_deref(b, nir_build_deref_var(b, t->slice_rank), rank, 1);
+   return true;
+}
+
+/* After barrier (NULL: the kernel's end): the threads there write the
+ * slices deferred to it, wait for each other's, and clear their records
+ * for the next round before any thread can claim one again. */
+static bool
+slice_flush(struct translator *t, LLVMValueRef barrier)
+{
+   nir_builder *b = &t->b;
+   for (unsigned i = 0; i < t->deferred_count; i++) {
+      struct deferred_slice *site = &t->deferred[i];
+      if (site->barrier != barrier)
+         continue;
+      if (!slice_blocks(t, site))
+         return false;
+      nir_goto(b, site->entry);
+      b->cursor = nir_after_block(site->exit);
+   }
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared | nir_var_image);
+   if (!barrier)
+      return true;
+   struct memory_guard guard;
+   nir_def *first = nir_ieq_imm(b, nir_load_deref(b, nir_build_deref_var(b, t->slice_rank)), 0);
+   if (!memory_guard_begin(t, first, &guard))
+      return false;
+   slice_clear(t, barrier, false);
+   memory_guard_end(t, &guard, NULL);
+   workgroup_barrier(t);
+   return true;
+}
+
+static void *
+deferred_slice(void *translator, LLVMValueRef call)
+{
+   struct translator *t = translator;
+   for (unsigned i = 0; i < t->deferred_count; i++) {
+      struct deferred_slice *site = &t->deferred[i];
+      if (site->call == call)
+         return slice_blocks(t, site) ? site : NULL;
+   }
+   return NULL;
+}
+
+static nir_def *
+slice_claim(void *translator, void *data)
+{
+   struct translator *t = translator;
+   nir_builder *b = &t->b;
+   nir_def *before = nir_deref_atomic_swap(b, 32, &slice_word(t, data, SLICE_CLAIM)->def,
+                                           nir_imm_int(b, 0), nir_imm_int(b, 1),
+                                           .atomic_op = nir_atomic_op_cmpxchg);
+   return nir_ieq_imm(b, before, 0);
+}
+
+static void
+slice_record(void *translator, void *data, nir_def *const values[6])
+{
+   struct translator *t = translator;
+   for (unsigned i = 0; i < 6; i++)
+      nir_store_deref(&t->b, slice_word(t, data, SLICE_VALUES + i), values[i], 1);
+}
+
+static void
+slice_flush_begin(void *translator, void *data, nir_def *values[6], nir_def **rank,
+                  nir_def **threads)
+{
+   struct translator *t = translator;
+   struct deferred_slice *site = data;
+   nir_builder *b = &t->b;
+   site->resume = b->cursor;
+   b->cursor = nir_after_block(site->entry);
+   nir_def *claimed = nir_ine_imm(b, nir_load_deref(b, slice_word(t, site, SLICE_CLAIM)), 0);
+   for (unsigned i = 0; i < 6; i++)
+      values[i] = nir_load_deref(b, slice_word(t, site, SLICE_VALUES + i));
+   values[0] = nir_bcsel(b, claimed, values[0], nir_imm_int(b, 0));
+   *rank = nir_load_deref(b, nir_build_deref_var(b, t->slice_rank));
+   *threads = nir_load_deref(b, nir_build_deref_var(b, t->slice_threads));
+}
+
+static void
+slice_flush_end(void *translator, void *data)
+{
+   struct translator *t = translator;
+   struct deferred_slice *site = data;
+   nir_goto(&t->b, site->exit);
+   site->emitted = true;
+   t->b.cursor = site->resume;
 }
 
 /* Runs body count times, a loop of the flat CFG, with the 32-bit index of
@@ -5935,7 +6167,9 @@ texture_call(struct translator *t, LLVMValueRef inst, const char *name, size_t n
       .load_word = texture_load_word, .store_word = texture_store_word, .store_at = call_store,
       .imageblock_extent = t->imageblock ? t->imageblock_extent :
                            t->tile_explicit ? tile_extent(t) : NULL,
-      .imageblock_load = imageblock_load,
+      .imageblock_load = imageblock_load, .imageblock_member = imageblock_member,
+      .deferred_slice = deferred_slice, .slice_claim = slice_claim, .slice_record = slice_record,
+      .slice_flush_begin = slice_flush_begin, .slice_flush_end = slice_flush_end,
       .repeat = repeat, .branch = texture_branch, .branch_else = texture_branch_else,
       .branch_join = texture_branch_join,
    };
@@ -6789,6 +7023,10 @@ synchronization_call(struct translator *t, LLVMValueRef inst, LLVMValueRef calle
         kind == THREADGROUP_BARRIER ? scope != 1 : scope != 1 && scope != 4))
       return fail(t, STELA_AIR_INSTRUCTION, "unsupported barrier or fence memory flags/order/scope");
    nir_variable_mode modes = memory_flag_modes(t, flags);
+   /* The slices deferred to it are recorded in threadgroup memory. */
+   bool flush = kind == THREADGROUP_BARRIER && slice_arrive(t, inst);
+   if (flush)
+      modes |= nir_var_mem_shared;
    bool ordered = modes && order;
    mesa_scope execution = kind == THREADGROUP_BARRIER ? SCOPE_WORKGROUP :
                           kind == SIMDGROUP_BARRIER ? SCOPE_SUBGROUP : SCOPE_NONE;
@@ -6800,7 +7038,7 @@ synchronization_call(struct translator *t, LLVMValueRef inst, LLVMValueRef calle
                .memory_semantics = ordered ? order_semantics(order) : 0,
                .memory_modes = ordered ? modes : 0);
    t->shared_barriers++;
-   return true;
+   return !flush || slice_flush(t, inst);
 }
 
 enum { MEMORY_INTRINSIC_ACCESSES = 256 };
@@ -9216,6 +9454,17 @@ cfg_declare(struct translator *t)
       if (!(t->exit = new_block(t)))
          return false;
    }
+   /* Every thread clears the deferred slices' records before any claims
+    * one; the kernel's end gets a block of its own where it writes some. */
+   if (t->deferred_count) {
+      slice_clear(t, NULL, true);
+      workgroup_barrier(t);
+      bool at_end = false;
+      for (unsigned i = 0; i < t->deferred_count; i++)
+         at_end |= !t->deferred[i].barrier;
+      if (at_end && !(t->exit = new_block(t)))
+         return false;
+   }
    /* A tile function's threadgroup memory holds what its pass's earlier
     * dispatches left in the tile's. */
    if (t->tile && t->dynamic_threadgroup) {
@@ -9636,7 +9885,7 @@ hoist_derivatives(nir_shader *shader)
 static bool
 cfg_emit(struct translator *t)
 {
-   if (!pointer_provenance(t) || !cfg_declare(t))
+   if (!pointer_provenance(t) || !find_deferred_slices(t) || !cfg_declare(t))
       return false;
    for (unsigned i = 0; i < t->reachable_count; i++) {
       struct air_block *block = t->work[i];
@@ -9745,6 +9994,21 @@ cfg_emit(struct translator *t)
    }
    if (t->mesh_state)
       mesh_epilogue(t);
+   for (unsigned i = 0; i < t->deferred_count; i++) {
+      struct deferred_slice *site = &t->deferred[i];
+      if (site->entry && !site->emitted) {
+         t->b.cursor = nir_after_block(site->entry);
+         nir_goto(&t->b, site->exit);
+      }
+   }
+   if (t->exit != t->b.impl->end_block && t->deferred_count && !t->mesh_state && !t->tile_memory) {
+      t->b.cursor = nir_after_block(t->exit);
+      slice_arrive(t, NULL);
+      workgroup_barrier(t);
+      if (!slice_flush(t, NULL))
+         return false;
+      nir_goto(&t->b, t->b.impl->end_block);
+   }
    if (t->tile_memory) {
       t->b.cursor = nir_after_block(t->exit);
       if (!tile_memory_copy(t, false))
@@ -9828,13 +10092,14 @@ translate(const void *bitcode, size_t size, const char *entry,
                  const nir_shader_compiler_options *nir_options,
                  const struct stela_air_options *options,
                  struct stela_air_error *error, const struct stela_air_stage_options *stage,
-                 bool *folded_early)
+                 bool *folded_early, bool *deferred)
 {
    struct stela_air_error local_error = {0};
    if (!error)
       error = &local_error;
    *error = (struct stela_air_error){0};
-   struct translator t = {.options = options, .error = error, .stage_options = stage};
+   struct translator t = {.options = options, .error = error, .stage_options = stage,
+                          .defer_slices = deferred != NULL};
    bool compute = compute_like(&t);
    if (!bitcode || size < 4 || size > AIR_MAX_BITCODE_BYTES ||
        memcmp(bitcode, "BC\xc0\xde", 4) || !entry || !*entry || !nir_options ||
@@ -10040,7 +10305,7 @@ translate(const void *bitcode, size_t size, const char *entry,
    /* Each layout drops the variables it placed: a driver lays out what
     * variables remain after what the shader's size already holds, so
     * keeping them would place the same memory twice. */
-   if (t.shared_resources || t.mesh_state) {
+   if (t.shared_resources || t.mesh_state || t.deferred_count) {
       nir_lower_vars_to_explicit_types(t.b.shader, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
       if (t.b.shader->info.shared_size > options->max_threadgroup_bytes) {
          fail(&t, STELA_AIR_LIMIT, "aligned shared layout exceeds target/backend byte limit");
@@ -10098,6 +10363,8 @@ translate(const void *bitcode, size_t size, const char *entry,
    error->instruction = 0;
 
 done:
+   if (deferred)
+      *deferred = t.deferred_count != 0;
    ralloc_free(t.cfg_scratch);
    ralloc_free(t.b.shader);
    if (t.module)
@@ -10111,7 +10378,17 @@ stela_air_to_nir(const void *bitcode, size_t size, const char *entry,
                   const nir_shader_compiler_options *nir_options,
                   const struct stela_air_options *options, struct stela_air_error *error)
 {
-   return translate(bitcode, size, entry, nir_options, options, error, NULL, NULL);
+   struct stela_air_error local_error;
+   if (!error)
+      error = &local_error;
+   bool deferred = false;
+   nir_shader *shader = translate(bitcode, size, entry, nir_options, options, error, NULL, NULL,
+                                  &deferred);
+   /* Deferred slices take threadgroup memory of their own: a kernel without
+    * it to spare has each caller write its slice. */
+   if (!shader && deferred && error->kind == STELA_AIR_LIMIT)
+      shader = translate(bitcode, size, entry, nir_options, options, error, NULL, NULL, NULL);
+   return shader;
 }
 
 nir_shader *
@@ -10123,7 +10400,8 @@ stela_air_stage_to_nir(const void *bitcode, size_t size, const char *entry,
       if (error) *error = (struct stela_air_error){.kind = STELA_AIR_INPUT};
       return NULL;
    }
-   return translate(bitcode, size, entry, nir_options, &options->resources, error, options, NULL);
+   return translate(bitcode, size, entry, nir_options, &options->resources, error, options, NULL,
+                    NULL);
 }
 
 nir_shader *
@@ -10139,7 +10417,7 @@ stela_air_metal_stage_to_nir(const void *bitcode, size_t size, const char *entry
       error = &local_error;
    bool folded_early = false;
    nir_shader *shader = translate(bitcode, size, entry, nir_options, &options->resources, error,
-                                  options, &folded_early);
+                                  options, &folded_early, NULL);
    /* Only a fragment that attempted the early pass can retry. Its temporary
     * LLVM module and NIR are already gone, and the second call cannot fold
     * early again. Avoid extra work after an allocation refusal. */

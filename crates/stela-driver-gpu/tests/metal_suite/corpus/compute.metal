@@ -352,6 +352,29 @@ kernel void imageblock_unsized_slice(imageblock<ImageblockPixel, imageblock_layo
 }
 #endif
 
+#ifndef SKIP_imageblock_slice_rounds
+// Two slices, each one thread's last act before a barrier or the kernel's
+// end, as Core Animation's blur kernels write theirs; between them the
+// group rewrites the block, which the first slice must not see.
+kernel void imageblock_slice_rounds(imageblock<ImageblockPixel, imageblock_layout_explicit> block,
+                                    texture2d<half, access::write> out [[texture(0)]],
+                                    ushort2 tid [[thread_position_in_threadgroup]],
+                                    ushort2 group [[threadgroup_position_in_grid]])
+{
+    threadgroup_imageblock ImageblockPixel *p = block.data(tid);
+    p->color = half4(half(tid.x) / 8, half(tid.y) / 8, half(group.x) / 2, 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+    if (tid.x == 0 && tid.y == 0)
+        out.write(block.slice(block.data(ushort2(0))->color, ushort2(8, 4)), group * ushort2(8, 8));
+    threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+    p->color = half4(half(tid.y) / 8, half(tid.x) / 8, half(group.y) / 2, 0.5h);
+    threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+    if (tid.x == 0 && tid.y == 0)
+        out.write(block.slice(block.data(ushort2(0))->color, ushort2(8, 4)),
+                  group * ushort2(8, 8) + ushort2(0, 4));
+}
+#endif
+
 #ifndef SKIP_imageblock_dimensions
 // An explicit imageblock's dimensions: the encoder's, or 0 x 0 without them.
 struct ImageblockSample { half4 color; };

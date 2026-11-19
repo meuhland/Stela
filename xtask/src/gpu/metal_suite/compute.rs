@@ -890,6 +890,35 @@ fn imageblocks(plan: &mut Plan, library: &str) {
             ),
         );
     }
+    if plan.has(SOURCE, "imageblock_slice_rounds") {
+        // Each group's top four rows are the block before it was rewritten,
+        // and its bottom four the rewritten block's top rows.
+        let expected = texels(16, 16, true, |x, y| {
+            let (column, row) = (f64::from(x % 8), f64::from(y % 8));
+            let (group_x, group_y) = (f64::from(x / 8), f64::from(y / 8));
+            Some(if row < 4.0 {
+                [column / 8.0, row / 8.0, group_x / 2.0, 1.0]
+            } else {
+                [(row - 4.0) / 8.0, column / 8.0, group_y / 2.0, 0.5]
+            })
+        });
+        plan.add(
+            Case::compute(
+                "compute.imageblock.slice_rounds",
+                library,
+                "imageblock_slice_rounds",
+                [16, 16, 1],
+                [8, 8, 1],
+            )
+            .set("imageblock", json!([8, 8]))
+            .output(Output::new("t", Dtype::U8, Tolerance::exact()).expect_same(expected))
+            .texture(
+                Texture::d2("t", "rgba16float", 16, 16)
+                    .index(0)
+                    .usage(&["read", "write"]),
+            ),
+        );
+    }
     if plan.has(SOURCE, "imageblock_dimensions") {
         // Apple GPUs give a kernel's imageblock no dimensions of their own:
         // without the encoder's it is 0 x 0, not the threadgroup's size.
