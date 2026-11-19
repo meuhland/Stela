@@ -1871,6 +1871,7 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
                     | Status::Unsupported
                     | Status::Lost
                     | Status::Dropped
+                    | Status::Evicted
             ) {
                 (self.host.report)(&alloc::format!(
                     "video decoder operation {:#x} answered {status:?}",

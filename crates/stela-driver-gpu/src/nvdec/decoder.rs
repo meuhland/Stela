@@ -499,6 +499,12 @@ impl<N: Node> Decoder<N> {
         self.stream.events()
     }
 
+    /// Why the stream's parser refused its last refused sample
+    /// ([`Stream::refusal`]).
+    pub fn refusal(&self) -> Option<&str> {
+        self.stream.refusal()
+    }
+
     /// Asks nouveau's fence of the picture in flight, which lets Linux run.
     pub fn ask_fence(&mut self) -> bool {
         self.session.ask_fence()

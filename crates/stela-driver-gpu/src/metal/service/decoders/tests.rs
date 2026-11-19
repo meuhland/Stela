@@ -1010,6 +1010,229 @@ fn a_seek_to_a_cra_skips_its_rasl_pictures_through_the_gate() {
     assert!(platform.logged(" restarted=1 "));
 }
 
+/// A decode of no sample and no destination: a call that only says the
+/// session is in use.
+fn touch(
+    decoders: &Decoders<Platform>,
+    connection: NonZeroU64,
+    decoder: u64,
+    memory: &mut Memory,
+) -> Result<(), Fault> {
+    let request = decode_request(decoder, 1, 0, 0, 0);
+    call::<_, DecoderDecodeResponse>(
+        decoders,
+        connection,
+        Operation::DecoderDecode,
+        &request,
+        memory,
+    )
+    .0
+}
+
+fn close_session(
+    decoders: &Decoders<Platform>,
+    connection: NonZeroU64,
+    decoder: u64,
+    memory: &mut Memory,
+) -> Result<(), Fault> {
+    call::<_, wire::Empty>(
+        decoders,
+        connection,
+        Operation::DecoderClose,
+        &Handle { handle: decoder },
+        memory,
+    )
+    .0
+}
+
+/// An open past the session limit evicts the least recently called session
+/// idle at least EVICT_IDLE_NS (Aerial's loops leave one behind each): its
+/// calls then answer `Evicted`, its close `Ok`. Sessions not idle that long
+/// are never evicted, and the open is refused as before.
+#[test]
+fn an_open_past_the_limit_evicts_the_least_recently_used_idle_session() {
+    let (h264, _) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let decoders = Decoders::new(Platform::new(Engine::Decode(Tiling::NVDEC)));
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x1000);
+    let mut ids = Vec::new();
+    for token in 1..=MAX_SESSIONS as u64 {
+        let (outcome, opened) = open(&decoders, ONE, token, Codec::H264, &h264, &mut memory);
+        outcome.unwrap();
+        ids.push(opened.decoder);
+    }
+    let platform = decoders.platform();
+    platform
+        .clock
+        .fetch_add(EVICT_IDLE_NS / 2, Ordering::Relaxed);
+    let (refused, _) = open(&decoders, TWO, 100, Codec::H264, &h264, &mut memory);
+    assert_eq!(refused.unwrap_err().status, Status::Unsupported);
+    assert!(!platform.logged("evicted"));
+    // Idle long enough; the first is called again, so the second is the
+    // least recently called.
+    platform.clock.fetch_add(EVICT_IDLE_NS, Ordering::Relaxed);
+    touch(&decoders, ONE, ids[0], &mut memory).unwrap();
+    let (outcome, _) = open(&decoders, TWO, 101, Codec::H264, &h264, &mut memory);
+    outcome.unwrap();
+    assert!(platform.logged(&alloc::format!(
+        "NVDEC SESSION GPU 0 {} evicted (idle ",
+        ids[1]
+    )));
+    assert!(platform.logged(" ms) for a new session of connection 2"));
+    assert!(platform.logged(&alloc::format!("{} closed (evicted) after ", ids[1])));
+    assert_eq!(decoders.open_sessions(), MAX_SESSIONS);
+    // Only that one.
+    assert!(!platform.logged(&alloc::format!("{} evicted", ids[2])));
+    assert_eq!(
+        touch(&decoders, ONE, ids[1], &mut memory)
+            .unwrap_err()
+            .status,
+        Status::Evicted
+    );
+    assert_eq!(
+        touch(&decoders, TWO, ids[1], &mut memory)
+            .unwrap_err()
+            .status,
+        Status::StaleHandle
+    );
+    close_session(&decoders, ONE, ids[1], &mut memory).unwrap();
+    assert_eq!(
+        touch(&decoders, ONE, ids[1], &mut memory)
+            .unwrap_err()
+            .status,
+        Status::StaleHandle
+    );
+    touch(&decoders, ONE, ids[0], &mut memory).unwrap();
+}
+
+/// An open over the video memory budget evicts an idle session too, and a
+/// fresh session decodes the stream from its start.
+#[test]
+fn an_open_over_the_video_memory_evicts_an_idle_session() {
+    let (h264, samples) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let one = crate::nvdec::decoder::vram_bytes(Codec::H264, &h264).unwrap();
+    let decoders =
+        Decoders::with_vram_budget(Platform::new(Engine::Decode(Tiling::NVDEC)), one + one / 2);
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 2 * 0x40_0000);
+    let (first, a) = open(&decoders, ONE, 1, Codec::H264, &h264, &mut memory);
+    first.unwrap();
+    decoders
+        .platform()
+        .clock
+        .fetch_add(EVICT_IDLE_NS, Ordering::Relaxed);
+    let (second, b) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    second.unwrap();
+    assert!(decoders.platform().logged(&alloc::format!(
+        "{} evicted (idle 10000 ms) for a new session of connection 1",
+        a.decoder
+    )));
+    assert_eq!(
+        touch(&decoders, ONE, a.decoder, &mut memory)
+            .unwrap_err()
+            .status,
+        Status::Evicted
+    );
+    let shown = decode_all(
+        &decoders,
+        ONE,
+        &b,
+        &samples[..3],
+        (1920, 1088),
+        2,
+        &mut memory,
+    );
+    assert_eq!(shown.frames, [100, 101, 102]);
+}
+
+/// A session idle RELEASE_IDLE_NS gives its video memory back at the next
+/// decoder call, unless the call is its own.
+#[test]
+fn a_session_idle_a_minute_gives_its_video_memory_back() {
+    let (h264, _) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let decoders = Decoders::new(Platform::new(Engine::Decode(Tiling::NVDEC)));
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x1000);
+    let (_, a) = open(&decoders, ONE, 1, Codec::H264, &h264, &mut memory);
+    let (_, b) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    let platform = decoders.platform();
+    platform
+        .clock
+        .fetch_add(RELEASE_IDLE_NS / 2, Ordering::Relaxed);
+    touch(&decoders, ONE, a.decoder, &mut memory).unwrap();
+    assert_eq!(decoders.open_sessions(), 2);
+    platform
+        .clock
+        .fetch_add(RELEASE_IDLE_NS / 2 + 1, Ordering::Relaxed);
+    // Its own call keeps it; another's call lets it go.
+    touch(&decoders, ONE, b.decoder, &mut memory).unwrap();
+    assert_eq!(decoders.open_sessions(), 2);
+    platform
+        .clock
+        .fetch_add(RELEASE_IDLE_NS / 2, Ordering::Relaxed);
+    touch(&decoders, ONE, b.decoder, &mut memory).unwrap();
+    assert_eq!(decoders.open_sessions(), 1);
+    assert!(platform.logged(&alloc::format!(
+        "{} evicted (idle 60000 ms) to give its video memory back: no call in 60 s",
+        a.decoder
+    )));
+    assert_eq!(
+        touch(&decoders, ONE, a.decoder, &mut memory)
+            .unwrap_err()
+            .status,
+        Status::Evicted
+    );
+    decoders.disconnect(ONE);
+    assert_eq!(
+        touch(&decoders, ONE, a.decoder, &mut memory)
+            .unwrap_err()
+            .status,
+        Status::StaleHandle
+    );
+}
+
+/// A sample the parser refuses is logged with what it was: its NAL unit,
+/// order count, reference picture set and the buffer then.
+#[test]
+fn a_refused_sample_is_logged_with_what_it_was() {
+    let (record, samples) = stream::synthetic::hevc_with_cra();
+    let size = surface_size(Codec::Hevc, &record);
+    let platform = Platform::new(Engine::Decode(Tiling::NVDEC));
+    *platform.size.lock().unwrap() = size;
+    let decoders = Decoders::new(platform);
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x0100_0000);
+    let (outcome, opened) = open(&decoders, ONE, 1, Codec::Hevc, &record, &mut memory);
+    outcome.unwrap();
+    let pictures = Pictures::new(&opened, 64);
+    for (n, sample) in samples[..5].iter().enumerate() {
+        memory.put(SAMPLE, sample);
+        pictures.destinations(&mut memory, 3);
+        let request = decode_request(opened.decoder, 100 + n as u64, sample.len(), 3, 0);
+        let (outcome, _, _) = call_through::<_, DecoderDecodeResponse>(
+            &decoders,
+            ONE,
+            Operation::DecoderDecode,
+            &request,
+            &mut memory,
+        );
+        outcome.unwrap();
+    }
+    let bogus = stream::synthetic::hevc_p_without_references(9);
+    memory.put(SAMPLE, &bogus);
+    pictures.destinations(&mut memory, 3);
+    let request = decode_request(opened.decoder, 900, bogus.len(), 3, 0);
+    let (outcome, _, _) = call_through::<_, DecoderDecodeResponse>(
+        &decoders,
+        ONE,
+        Operation::DecoderDecode,
+        &request,
+        &mut memory,
+    );
+    assert_eq!(outcome.unwrap_err().status, Status::Dropped);
+    let platform = decoders.platform();
+    assert!(platform.logged(
+        "1 frame 900 dropped: an inter picture with no reference (invalid) [an inter picture"
+    ));
+    assert!(platform.logged("rps curr_before [] curr_after [] foll [5]"));
+}
+
 /// Sessions are admitted by video memory: a GPU whose budget holds one
 /// session refuses a second, and logs the session open.
 #[test]

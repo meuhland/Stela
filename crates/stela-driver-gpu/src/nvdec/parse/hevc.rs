@@ -24,7 +24,9 @@
 //! that slot to another surface: [`super::super::dpb::Surfaces`]).
 use super::super::dpb::{Output, Pool};
 use super::{Bits, Error, Nal, Result, ceil_log2};
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 pub const NAL_IDR_W_RADL: u8 = 19;
 pub const NAL_IDR_N_LP: u8 = 20;
@@ -826,11 +828,75 @@ pub struct Picture {
     /// one may be among them).
     pub outputs: Vec<Output>,
     /// References of its reference picture set that were not in the
-    /// buffer (never decoded: a seek, a splice, a dropped picture), each
-    /// stood in for by the reference nearest in order count, as FFmpeg
+    /// buffer (never decoded: a seek, a splice, a loop, a dropped picture),
+    /// each stood in for by the reference nearest in order count, as FFmpeg
     /// generates the missing ones: the picture is decoded, its errors
-    /// concealed.
+    /// concealed. Where the buffer holds no reference at all, an inter
+    /// picture's stand-in is the nearest picture still decoded there (kept
+    /// as a reference from then on), and an intra picture's missing
+    /// references are left out (it reads none).
     pub concealed: u8,
+}
+
+/// What a refused unit was, for the refusal's log line: its NAL unit, order
+/// count and reference picture set as far as they were read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Note {
+    nal_type: u8,
+    temporal_id: u8,
+    lsb: u32,
+    poc: Option<i32>,
+    pic_output: bool,
+    kind: char,
+    /// The order count as if the stream went on, and whether the IRAP
+    /// starts afresh.
+    going_on: Option<i32>,
+    restart_cra: bool,
+    no_rasl_output: bool,
+    before: Vec<i32>,
+    after: Vec<i32>,
+    follow: Vec<i32>,
+    /// Long-term: the order count (or its LSBs), used, whole.
+    long: Vec<(i32, bool, bool)>,
+}
+
+/// A reference picture set's entry to find in the buffer.
+#[derive(Clone, Copy, Debug)]
+enum Wanted {
+    Short(i32),
+    /// The order count, or its LSBs when not `full`.
+    Long {
+        target: i32,
+        full: bool,
+        max_lsb: i32,
+    },
+}
+
+impl Wanted {
+    fn poc(self) -> i32 {
+        match self {
+            Self::Short(poc) => poc,
+            Self::Long { target, .. } => target,
+        }
+    }
+
+    fn matches(self, frame: &Frame) -> bool {
+        match self {
+            Self::Short(poc) => frame.short && !frame.long && frame.poc == poc,
+            Self::Long {
+                target,
+                full,
+                max_lsb,
+            } => {
+                frame.long
+                    && if full {
+                        frame.poc == target
+                    } else {
+                        frame.poc & (max_lsb - 1) == target
+                    }
+            }
+        }
+    }
 }
 
 /// What a stream's parser did about pictures it could not decode as
@@ -900,6 +966,15 @@ pub struct Parser {
     active_sps: Option<Sps>,
     decoded: u32,
     events: Events,
+    /// The last IRAP taken: its NAL unit type, order count and decode.
+    last_irap: Option<(u8, i32, u32)>,
+    /// The decode count at the last flush, and the resets so far.
+    flushed_at: Option<u32>,
+    resets: u32,
+    /// What the unit being taken is, as far as read ([`Note`]).
+    note: Option<Note>,
+    /// Why the last unit refused was refused, with the stream's state.
+    refusal: Option<String>,
 }
 
 impl Default for Parser {
@@ -922,11 +997,142 @@ impl Parser {
             active_sps: None,
             decoded: 0,
             events: Events::default(),
+            last_irap: None,
+            flushed_at: None,
+            resets: 0,
+            note: None,
+            refusal: None,
         }
     }
 
     pub fn active_sps(&self) -> Option<&Sps> {
         self.active_sps.as_ref()
+    }
+
+    /// Why the last unit refused was refused: its NAL unit type, order
+    /// count, `pic_output_flag`, reference picture set (current before,
+    /// after, following, long-term), the buffer's pictures before it, the
+    /// last IRAP, and whether it came after a flush or a reset.
+    pub fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
+    /// The refusal of `error`, with the unit's `note` and this (the state
+    /// before the unit, restored).
+    fn describe_refusal(&self, error: &Error, note: Option<&Note>) -> String {
+        let mut line = String::new();
+        let _ = write!(line, "{} ({})", error.describe(), error.kind());
+        match note {
+            Some(note) => {
+                let _ = write!(
+                    line,
+                    "; nal {} tid {} lsb {} poc {} pic_output {} kind {} going_on {} restart_cra {} \
+                     no_rasl_output {}; rps curr_before {:?} curr_after {:?} foll {:?} long \
+                     (poc, used, msb) {:?}",
+                    note.nal_type,
+                    note.temporal_id,
+                    note.lsb,
+                    note.poc
+                        .map_or(String::from("?"), |poc| alloc::format!("{poc}")),
+                    note.pic_output,
+                    note.kind,
+                    note.going_on
+                        .map_or(String::from("?"), |poc| alloc::format!("{poc}")),
+                    note.restart_cra,
+                    note.no_rasl_output,
+                    note.before,
+                    note.after,
+                    note.follow,
+                    note.long,
+                );
+            }
+            None => line.push_str("; no slice header read"),
+        }
+        line.push_str("; dpb [");
+        let mut frames: Vec<&Frame> = self.frames.iter().collect();
+        frames.sort_by_key(|f| f.poc);
+        for (k, frame) in frames.iter().enumerate() {
+            let _ = write!(
+                line,
+                "{}{}@{}{}{}{}",
+                if k > 0 { " " } else { "" },
+                frame.poc,
+                frame.slot.map_or(-1, i32::from),
+                if frame.short { "S" } else { "" },
+                if frame.long { "L" } else { "" },
+                if frame.output { "O" } else { "" },
+            );
+        }
+        let _ = write!(
+            line,
+            "]; last irap {}; prev_tid0_poc {}; decoded {}; {}; {}; resets {}; skip_rasl {}",
+            self.last_irap
+                .map_or(String::from("none"), |(nal, poc, decoded)| alloc::format!(
+                    "nal {nal} poc {poc} decode {decoded}"
+                )),
+            self.prev_tid0_poc,
+            self.decoded,
+            if self.flushed {
+                "right after a flush"
+            } else {
+                "no flush before it"
+            },
+            match self.flushed_at {
+                Some(at) => alloc::format!("last flush at decode {at}"),
+                None => String::from("never flushed"),
+            },
+            self.resets,
+            self.skip_rasl,
+        );
+        if self.starting {
+            line.push_str("; the stream starts afresh (its start, a reset or an end of sequence)");
+        }
+        line
+    }
+
+    /// The slot of the reference `wanted` names. One not in the buffer is
+    /// stood in for (`concealed` counts it): by the reference nearest in
+    /// order count; with no reference at all, an intra picture leaves it
+    /// out (`None`), and an inter picture takes the nearest picture still
+    /// decoded in the buffer, which stays a reference from then on (as
+    /// FFmpeg's generated picture does). With no decoded picture at all, an
+    /// inter picture is refused with `what`.
+    fn reference_slot(
+        &mut self,
+        wanted: Wanted,
+        intra: bool,
+        concealed: &mut u8,
+        what: &'static str,
+    ) -> Result<Option<u8>> {
+        if let Some(slot) = self
+            .frames
+            .iter()
+            .find(|f| f.slot.is_some() && wanted.matches(f))
+            .and_then(|f| f.slot)
+        {
+            return Ok(Some(slot));
+        }
+        let poc = wanted.poc();
+        let nearest = |frames: &[Frame], any: bool| {
+            frames
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.slot.is_some() && (any || f.reference()))
+                .min_by_key(|(_, f)| (f.poc.abs_diff(poc), f.poc > poc))
+                .map(|(k, _)| k)
+        };
+        if let Some(k) = nearest(&self.frames, false) {
+            *concealed = concealed.saturating_add(1);
+            return Ok(self.frames[k].slot);
+        }
+        if intra {
+            *concealed = concealed.saturating_add(1);
+            return Ok(None);
+        }
+        let k = nearest(&self.frames, true).ok_or(Error::Missing(what))?;
+        *concealed = concealed.saturating_add(1);
+        self.frames[k].short = true;
+        Ok(self.frames[k].slot)
     }
 
     /// What the parser did about pictures it could not decode as coded.
@@ -1016,11 +1222,16 @@ impl Parser {
     /// stay), so the stream goes on with the next one.
     pub fn access_unit(&mut self, nals: &[Nal<'_>]) -> Result<Option<Picture>> {
         let saved = self.reference_state();
+        self.note = None;
         let result = self.unit(nals);
-        if result.is_err() {
+        let note = self.note.take();
+        if let Err(error) = &result {
             let sps = core::mem::take(&mut self.sps);
             let pps = core::mem::take(&mut self.pps);
             *self = Self { sps, pps, ..saved };
+            // The counts a refused unit made are rolled back with it: a
+            // refusal's log line says what it was instead.
+            self.refusal = Some(self.describe_refusal(error, note.as_ref()));
         }
         result
     }
@@ -1088,6 +1299,28 @@ impl Parser {
             return Err(Error::Missing("a picture without its first slice segment"));
         }
         let nal_type = first_nal.hevc_type();
+        // `I`, `P` or `B`, and the slice segments as NVDEC reads them.
+        let mut kind = 'I';
+        let mut bitstream = Vec::new();
+        for (nal, header) in &slices {
+            bitstream.extend_from_slice(&[0, 0, 1]);
+            bitstream.extend_from_slice(nal.bytes);
+            if !header.dependent {
+                kind = match (kind, header.slice_type) {
+                    (_, 0) | ('B', _) => 'B',
+                    (_, 1) | ('P', _) => 'P',
+                    _ => 'I',
+                };
+            }
+        }
+        self.note = Some(Note {
+            nal_type,
+            temporal_id: first_nal.hevc_temporal_id(),
+            lsb: first.pic_order_cnt_lsb,
+            pic_output: first.pic_output,
+            kind,
+            ..Note::default()
+        });
         for (nal, header) in &slices {
             if nal.hevc_type() != nal_type || header.pps_id != first.pps_id {
                 return Err(Error::Invalid("the slices of a picture disagree"));
@@ -1161,6 +1394,12 @@ impl Parser {
         let no_rasl_output =
             irap && (idr || (16..=18).contains(&nal_type) || self.starting || restart_cra);
         let poc = if no_rasl_output { lsb } else { going_on };
+        if let Some(note) = self.note.as_mut() {
+            note.poc = Some(poc);
+            note.going_on = Some(going_on);
+            note.restart_cra = restart_cra;
+            note.no_rasl_output = no_rasl_output;
+        }
         self.pool.widen(sps.slots());
         let mut outputs = Vec::new();
         // An IDR drops every reference as its header is read; an IRAP
@@ -1225,6 +1464,16 @@ impl Parser {
                 long_follow.push((target, msb_present));
             }
         }
+        if let Some(note) = self.note.as_mut() {
+            note.before = before.clone();
+            note.after = after.clone();
+            note.follow = follow.clone();
+            note.long = long_curr
+                .iter()
+                .map(|&(poc, full)| (poc, true, full))
+                .chain(long_follow.iter().map(|&(poc, full)| (poc, false, full)))
+                .collect();
+        }
         let matches_long = |frame_poc: i32, &(target, full): &(i32, bool)| {
             if full {
                 frame_poc == target
@@ -1254,6 +1503,52 @@ impl Parser {
                 frame.long = long;
                 frame.short = short;
             }
+        }
+        // 8.3.3's "no reference picture": a reference never decoded (a
+        // seek, a loop or a splice not seen as one, a picture dropped or
+        // refused). FFmpeg makes a grey picture in its place; the nearest
+        // reference in order count stands in here, and the engine decodes
+        // with it. A picture whose whole set names pictures the buffer does
+        // not hold (a jump in the stream with no IRAP at it) finds no
+        // reference left after the marking: an inter one then takes the
+        // nearest picture still decoded, before the unheld are let go.
+        let intra = kind == 'I';
+        let mut concealed = 0u8;
+        const SHORT_MISSING: &str =
+            "a short-term reference is not in the buffer, nor any decoded picture";
+        let mut st_curr_before = Vec::new();
+        for &p in &before {
+            if let Some(slot) =
+                self.reference_slot(Wanted::Short(p), intra, &mut concealed, SHORT_MISSING)?
+            {
+                st_curr_before.push(slot);
+            }
+        }
+        let mut st_curr_after = Vec::new();
+        for &p in &after {
+            if let Some(slot) =
+                self.reference_slot(Wanted::Short(p), intra, &mut concealed, SHORT_MISSING)?
+            {
+                st_curr_after.push(slot);
+            }
+        }
+        let mut lt_curr = Vec::new();
+        for &(target, full) in &long_curr {
+            let wanted = Wanted::Long {
+                target,
+                full,
+                max_lsb,
+            };
+            if let Some(slot) = self.reference_slot(
+                wanted,
+                intra,
+                &mut concealed,
+                "a long-term reference is not in the buffer, nor any decoded picture",
+            )? {
+                lt_curr.push(slot);
+            }
+        }
+        if !idr {
             self.release_unheld();
         }
         let references: Vec<Frame> = self
@@ -1262,69 +1557,6 @@ impl Parser {
             .filter(|f| f.slot.is_some() && f.reference())
             .copied()
             .collect();
-        let slot_of = |poc: i32, long: bool| {
-            references
-                .iter()
-                .find(|f| f.poc == poc && f.long == long)
-                .and_then(|f| f.slot)
-        };
-        // 8.3.3's "no reference picture": a reference never decoded (a seek
-        // or splice not seen as one, a picture refused). FFmpeg makes a grey
-        // picture in its place; the nearest reference in order count stands
-        // in here, and the engine decodes with it.
-        let mut concealed = 0u8;
-        let mut stand_in = |poc: i32, what: &'static str| -> Result<u8> {
-            let nearest = references
-                .iter()
-                .filter_map(|f| Some((f.slot?, f.poc)))
-                .min_by_key(|&(_, p)| (p.abs_diff(poc), p > poc))
-                .map(|(slot, _)| slot)
-                .ok_or(Error::Missing(what))?;
-            concealed = concealed.saturating_add(1);
-            Ok(nearest)
-        };
-        const SHORT_MISSING: &str = "a short-term reference is not in the buffer";
-        let mut st_curr_before = Vec::new();
-        for &p in &before {
-            let slot = match slot_of(p, false) {
-                Some(slot) => slot,
-                None => stand_in(p, SHORT_MISSING)?,
-            };
-            st_curr_before.push(slot);
-        }
-        let mut st_curr_after = Vec::new();
-        for &p in &after {
-            let slot = match slot_of(p, false) {
-                Some(slot) => slot,
-                None => stand_in(p, SHORT_MISSING)?,
-            };
-            st_curr_after.push(slot);
-        }
-        let mut lt_curr = Vec::new();
-        for lt in &long_curr {
-            let slot = match references
-                .iter()
-                .find(|f| f.long && matches_long(f.poc, lt))
-                .and_then(|f| f.slot)
-            {
-                Some(slot) => slot,
-                None => stand_in(lt.0, "a long-term reference is not in the buffer")?,
-            };
-            lt_curr.push(slot);
-        }
-        let mut kind = 'I';
-        let mut bitstream = Vec::new();
-        for (nal, header) in &slices {
-            bitstream.extend_from_slice(&[0, 0, 1]);
-            bitstream.extend_from_slice(nal.bytes);
-            if !header.dependent {
-                kind = match (kind, header.slice_type) {
-                    (_, 0) | ('B', _) => 'B',
-                    (_, 1) | ('P', _) => 'P',
-                    _ => 'I',
-                };
-            }
-        }
         if kind != 'I' && st_curr_before.len() + st_curr_after.len() + lt_curr.len() == 0 {
             return Err(Error::Invalid("an inter picture with no reference"));
         }
@@ -1396,6 +1628,7 @@ impl Parser {
         // As if decoded.
         if irap {
             self.skip_rasl = no_rasl_output;
+            self.last_irap = Some((nal_type, poc, current));
         }
         self.starting = false;
         self.flushed = false;
@@ -1418,6 +1651,7 @@ impl Parser {
         let mut outputs = Vec::new();
         self.bump(0, 0, &mut outputs, false);
         self.flushed = true;
+        self.flushed_at = Some(self.decoded);
         outputs
     }
 
@@ -1427,10 +1661,13 @@ impl Parser {
     pub fn reset(&mut self) {
         let sps = core::mem::take(&mut self.sps);
         let pps = core::mem::take(&mut self.pps);
+        let refusal = self.refusal.take();
         *self = Self {
             sps,
             pps,
             events: self.events,
+            resets: self.resets + 1,
+            refusal,
             ..Self::new()
         };
     }

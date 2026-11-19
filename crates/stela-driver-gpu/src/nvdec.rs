@@ -286,10 +286,10 @@ impl Picture {
     }
 
     /// References that were not in the buffer, stood in for by others
-    /// (HEVC's [`hevc::Picture::concealed`]; H.264 refuses those).
+    /// ([`hevc::Picture::concealed`], [`h264::Picture::concealed`]).
     pub fn concealed(&self) -> u8 {
         match &self.parsed {
-            Parsed::H264(_) => 0,
+            Parsed::H264(picture) => picture.concealed,
             Parsed::Hevc(picture) => picture.concealed,
         }
     }
