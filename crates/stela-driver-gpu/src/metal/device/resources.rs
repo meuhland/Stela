@@ -3072,8 +3072,9 @@ fn stored_len(description: &Description, metal_len: usize) -> usize {
 }
 
 /// Bytes of each subresource's decode arguments after a decoded format's
-/// blocks.
-const DECODE_ARGUMENTS_STRIDE: u64 = 64;
+/// blocks: all of a [`TexelArguments`], so none overlaps the next.
+const DECODE_ARGUMENTS_STRIDE: u64 =
+    (TexelArguments::BYTES as u64).next_multiple_of(TexelArguments::ALIGNMENT);
 
 /// Where a decoded format's decode arguments start in its blocks' buffer.
 fn decode_arguments_offset(descriptor: &TextureDescriptor) -> u64 {

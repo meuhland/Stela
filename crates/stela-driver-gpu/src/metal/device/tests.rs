@@ -2612,6 +2612,78 @@ fn decoded_textures_keep_their_blocks_and_decode_written_subresources() {
     );
 }
 
+/// Each subresource's decode arguments lie apart from every other's and
+/// inside the blocks' buffer: a slice written after the next one keeps the
+/// next one's arguments whole. Before, the 72-byte arguments lay 64 bytes
+/// apart, so a write of slice 0 after slice 1 zeroed the address slice 1's
+/// decode reads its blocks from, and the last slice's ran past the buffer.
+#[test]
+fn decode_arguments_of_each_subresource_stay_whole() {
+    use crate::metal::{
+        binding::TexelArguments,
+        vulkan::{backend::Backend as _, object::Memory},
+    };
+    let mut device = device();
+    let descriptor = TextureDescriptor {
+        width: 8,
+        height: 8,
+        array_length: 2,
+        texture_type: TextureType::D2Array,
+        options: options(StorageMode::Shared),
+        ..texture(PixelFormat::EacRgba8, TextureUsage::SHADER_READ)
+    };
+    let texture = device.new_texture(&descriptor).unwrap();
+    let blocks = device.texture_blocks(texture).unwrap().unwrap();
+    let strides = Strides {
+        bytes_per_row: 32,
+        bytes_per_image: 0,
+    };
+    let written: Vec<u8> = (0..32).collect();
+    for slice in [1, 0] {
+        let region = Region {
+            slice,
+            level: 0,
+            origin: [0, 4, 0],
+            size: [8, 4, 1],
+        };
+        device
+            .replace_region(texture, &region, &written, strides)
+            .unwrap();
+    }
+    submit(&mut device);
+    let arguments: Vec<u64> = device.backend().submissions.last().unwrap()[0]
+        .commands
+        .iter()
+        .filter_map(|command| match *command {
+            Command::DecodeBlocks { arguments, .. } => Some(arguments),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arguments.len(), 2);
+    let memory = Memory(blocks.address >> 32);
+    // Our mock backend keeps no memory sizes, so the arguments are held a
+    // whole TexelArguments apart instead of inside the buffer.
+    let offsets: Vec<u64> = arguments.iter().map(|a| a & 0xffff_ffff).collect();
+    assert!(
+        offsets[0].abs_diff(offsets[1]) >= u64::from(TexelArguments::BYTES),
+        "apart"
+    );
+    for (slice, address) in [1u64, 0].into_iter().zip(arguments) {
+        let offset = address & 0xffff_ffff;
+        let mut first = [0; 8];
+        device
+            .backend()
+            .read_memory(memory, offset, &mut first)
+            .unwrap();
+        // Each slice's blocks are 2 x 2 blocks of 16 bytes.
+        assert_eq!(
+            u64::from_le_bytes(first),
+            blocks.address + slice * 64,
+            "slice {slice}'s blocks"
+        );
+    }
+}
+
 #[test]
 fn texture_transfers_keep_strided_padding_and_coalesce_contiguous_rows() {
     let mut backend = MockBackend::new();
