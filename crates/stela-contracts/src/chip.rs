@@ -143,13 +143,18 @@ impl AdmitTable {
 
     /// [`Chip::admit`] of the table's chip, where the forms of the features
     /// its PE withholds are absent too.
+    #[inline]
     pub fn admit(&self, word: u32) -> u32 {
         let prefix = (word >> Self::SHIFT) as usize;
-        let span = match self.spans[prefix] {
-            0 => return word,
-            Self::UNALLOCATED => return UDF,
-            span => span,
-        };
+        match self.spans[prefix] {
+            0 => word,
+            Self::UNALLOCATED => UDF,
+            span => self.admit_span(word, span),
+        }
+    }
+
+    /// [`Self::admit`] of a word whose prefix holds absent forms.
+    fn admit_span(&self, word: u32, span: u32) -> u32 {
         let start = (span & u32::from(u16::MAX)) as usize;
         let end = (span >> u16::BITS) as usize;
         self.chip.admit_in(
