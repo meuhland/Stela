@@ -777,7 +777,10 @@ fn capabilities_limits_and_refusals() {
     assert_eq!(caps.codecs, 0b110);
     assert_eq!((caps.profiles_h264, caps.profiles_hevc), (0b111, 0b11));
     assert_eq!((caps.depths, caps.formats), (1 << 8 | 1 << 10, 0b11));
-    assert_eq!((caps.max_sessions, caps.open_sessions), (2, 0));
+    assert_eq!(
+        (caps.max_sessions, caps.open_sessions),
+        (MAX_SESSIONS as u32, 0)
+    );
     assert_eq!(
         (caps.max_width, caps.min_width, caps.max_destinations),
         (4096, 48, 16)
@@ -789,8 +792,32 @@ fn capabilities_limits_and_refusals() {
     first.unwrap();
     second.unwrap();
     assert_ne!(a.decoder, b.decoder);
-    let (third, _) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
-    assert_eq!(third.unwrap_err().status, Status::Unsupported);
+    // A client may hold several: up to MAX_SESSIONS, then refused, with
+    // the sessions open logged.
+    let mut more = Vec::new();
+    for token in 2..MAX_SESSIONS as u64 {
+        let (outcome, opened) = open(&decoders, ONE, token, Codec::H264, &h264, &mut memory);
+        outcome.unwrap();
+        more.push(opened.decoder);
+    }
+    let (one_more, _) = open(&decoders, ONE, 100, Codec::H264, &h264, &mut memory);
+    assert_eq!(one_more.unwrap_err().status, Status::Unsupported);
+    assert!(
+        decoders
+            .platform()
+            .logged("8 sessions open (1 for connection 1, ")
+    );
+    for decoder in more {
+        let (outcome, _) = call::<_, wire::Empty>(
+            &decoders,
+            ONE,
+            Operation::DecoderClose,
+            &Handle { handle: decoder },
+            &mut memory,
+        );
+        outcome.unwrap();
+    }
+    assert_eq!(decoders.open_sessions(), 2);
     // Another connection cannot use a session it does not hold.
     let request = decode_request(a.decoder, 1, 0, 0, 0);
     let (outcome, _) = call::<_, DecoderDecodeResponse>(
@@ -806,6 +833,7 @@ fn capabilities_limits_and_refusals() {
     // A record that is not one is a stream the host does not take; a
     // record of the other codec too. Neither leaves a file open.
     let opened_before = decoders.platform().opened.load(Ordering::Relaxed);
+    let closed_before = decoders.platform().closed.lock().unwrap().len() as u32;
     let (refused, _) = open(
         &decoders,
         TWO,
@@ -820,7 +848,7 @@ fn capabilities_limits_and_refusals() {
     let platform = decoders.platform();
     assert_eq!(
         platform.opened.load(Ordering::Relaxed) - opened_before,
-        platform.closed.lock().unwrap().len() as u32 - 1,
+        platform.closed.lock().unwrap().len() as u32 - closed_before,
         "every refused open gave its file back"
     );
     assert!(platform.logged("refused a h264 stream for connection 2"));
@@ -901,4 +929,111 @@ fn decode_order_shows_each_picture_with_its_own_sample() {
         assert!(decoders.platform().logged("order"));
         assert!(decoders.platform().logged(" decode order"), "{name}");
     }
+}
+
+/// A seek in a session, as Aerial's loop gives it: the frontend flushes
+/// (finishDelayedFrames), then feeds the stream from a CRA. The CRA's RASL
+/// pictures are answered taken with no picture (StelaVD emits them dropped,
+/// not as errors, and does not count them towards giving the session up),
+/// and pictures decoded with references stood in for are flagged.
+#[test]
+fn a_seek_to_a_cra_skips_its_rasl_pictures_through_the_gate() {
+    let (record, samples) = stream::synthetic::hevc_with_cra();
+    let size = surface_size(Codec::Hevc, &record);
+    let platform = Platform::new(Engine::Decode(Tiling::NVDEC));
+    *platform.size.lock().unwrap() = size;
+    let decoders = Decoders::new(platform);
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x0100_0000);
+    let (outcome, opened) = open(&decoders, ONE, 1, Codec::Hevc, &record, &mut memory);
+    outcome.unwrap();
+    let pictures = Pictures::new(&opened, 64);
+    let mut decoded = Vec::new();
+    let mut errors = 0;
+    let mut shown = 0;
+    // Samples 0 to 4, the flush, then from the CRA (sample 5) on, and the
+    // end's flush.
+    let order: Vec<Option<usize>> = (0..5)
+        .map(Some)
+        .chain([None])
+        .chain((5..samples.len()).map(Some))
+        .chain([None])
+        .collect();
+    for (n, which) in order.iter().enumerate() {
+        let frame = 100 + n as u64;
+        let (bytes, flags) = match which {
+            Some(k) => {
+                memory.put(SAMPLE, &samples[*k]);
+                (samples[*k].len(), 0)
+            }
+            None => (0, DECODE_FLUSH),
+        };
+        loop {
+            pictures.destinations(&mut memory, 3);
+            let request = decode_request(opened.decoder, frame, bytes, 3, flags);
+            let (outcome, response, _) = call_through::<_, DecoderDecodeResponse>(
+                &decoders,
+                ONE,
+                Operation::DecoderDecode,
+                &request,
+                &mut memory,
+            );
+            outcome.unwrap_or_else(|fault| panic!("frame {frame}: {fault}"));
+            for k in 0..response.outputs as usize {
+                let destination = pictures.destination(&memory, k);
+                shown += 1;
+                errors += usize::from(destination.flags & DESTINATION_ERRORS != 0);
+            }
+            if response.taken == 1 {
+                if bytes != 0 {
+                    decoded.push((which.unwrap(), response.decoded));
+                }
+                if response.queued == 0 || bytes != 0 {
+                    break;
+                }
+            }
+        }
+    }
+    let skipped: Vec<usize> = decoded
+        .iter()
+        .filter(|(_, d)| *d == 0)
+        .map(|(k, _)| *k)
+        .collect();
+    assert_eq!(skipped, [6, 7, 8]);
+    assert_eq!(shown, samples.len() - 3);
+    assert!(errors > 0, "no picture flagged");
+    let platform = decoders.platform();
+    assert!(platform.logged("a CRA starts afresh"));
+    assert!(platform.logged("skipped (shown dropped)"));
+    assert!(platform.logged("stood in for by the nearest"));
+    decoders.report();
+    assert!(platform.logged("skipped=3 concealed="));
+    assert!(platform.logged(" restarted=1 "));
+}
+
+/// Sessions are admitted by video memory: a GPU whose budget holds one
+/// session refuses a second, and logs the session open.
+#[test]
+fn sessions_are_admitted_by_video_memory() {
+    let (h264, _) = stream::samples(Codec::H264, H264_CLIP).unwrap();
+    let one = crate::nvdec::decoder::vram_bytes(Codec::H264, &h264).unwrap();
+    let decoders =
+        Decoders::with_vram_budget(Platform::new(Engine::Decode(Tiling::NVDEC)), one + one / 2);
+    let mut memory = Memory::new((PICTURES - BASE) as usize + 0x1000);
+    let (first, _) = open(&decoders, ONE, 1, Codec::H264, &h264, &mut memory);
+    first.unwrap();
+    let opened_before = decoders.platform().opened.load(Ordering::Relaxed);
+    let (second, _) = open(&decoders, ONE, 2, Codec::H264, &h264, &mut memory);
+    let fault = second.unwrap_err();
+    assert_eq!(fault.status, Status::Unsupported);
+    let platform = decoders.platform();
+    assert_eq!(platform.opened.load(Ordering::Relaxed), opened_before);
+    assert!(platform.logged(&alloc::format!(
+        "it takes {} MiB of video memory, {} MiB of {} MiB are taken (1 for connection 1, ",
+        one >> 20,
+        one >> 20,
+        (one + one / 2) >> 20
+    )));
+    decoders.close_all();
+    let (third, _) = open(&decoders, ONE, 3, Codec::H264, &h264, &mut memory);
+    third.unwrap();
 }

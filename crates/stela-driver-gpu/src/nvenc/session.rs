@@ -841,13 +841,16 @@ impl<N: Node> Session<N> {
         let Some(flight) = self.in_flight else {
             return Err(Error::Input("no frame is in flight"));
         };
+        // The clock before the semaphore: a release this look misses came
+        // after it (the timing model releases a job as its clock moves).
+        let now = self.node.now_ns();
         let value = self.semaphore();
         if value == flight.payload {
             fence(Ordering::Acquire);
             self.in_flight = None;
             return self.complete(flight).map(Some);
         }
-        if self.node.now_ns() >= flight.deadline {
+        if now >= flight.deadline {
             let job_done = if ask {
                 flight.job_done
             } else {

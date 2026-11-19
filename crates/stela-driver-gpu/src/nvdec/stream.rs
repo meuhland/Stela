@@ -54,8 +54,7 @@ pub struct Sequence {
     pub bit_depth: u8,
     /// The slots the stream may hold at once.
     pub slots: u8,
-    /// The surfaces those slots may be bound to: twice as many, since a
-    /// slot moves off a surface being shown ([`Surfaces`]), at most 32.
+    /// The surfaces those slots may be bound to: one more ([`surfaces`]).
     pub surfaces: u8,
     /// The SPS's `profile_idc` (H.264: 66, 77, 100...; HEVC's general
     /// profile: 1 Main, 2 Main 10).
@@ -90,9 +89,15 @@ fn h264_sequence(sps: &h264::Sps) -> Sequence {
     }
 }
 
-/// The surfaces `slots` may be bound to.
+/// The surfaces `slots` may be bound to: one more than the slots. A slot
+/// moves off its surface only when that surface is being shown
+/// ([`Surfaces::bind`]), and every surface shown is the surface of a slot
+/// that picture was decoded into: so the surfaces a bind must avoid are
+/// the other slots' (at most `slots - 1`) and at most its own, and one of
+/// `slots + 1` is always free. (It was twice the slots: 14 surfaces for a
+/// 4K Main 10 stream of 7 slots, 718 MiB of video memory where 8 do.)
 fn surfaces(slots: u8) -> u8 {
-    (2 * slots).min(32)
+    (slots + 1).min(32)
 }
 
 fn hevc_sequence(sps: &hevc::Sps) -> Sequence {
@@ -356,6 +361,16 @@ impl Stream {
         self.surfaces = Surfaces::new(self.surfaces.most());
     }
 
+    /// What the parser did about pictures it could not decode as coded:
+    /// RASL pictures skipped, references stood in for, CRAs that started
+    /// afresh (HEVC; H.264 refuses such pictures).
+    pub fn events(&self) -> hevc::Events {
+        match &self.parser {
+            Parser::H264(_) => hevc::Events::default(),
+            Parser::Hevc(parser) => parser.events(),
+        }
+    }
+
     /// The slots busy now: references and pictures waiting to be shown.
     pub fn held_slots(&self) -> Vec<u8> {
         match &self.parser {
@@ -446,6 +461,161 @@ pub fn samples(codec: Codec, clip: &[u8]) -> parse::Result<(Vec<u8>, Vec<Vec<u8>
     Ok((record(codec, &sets), samples))
 }
 
+/// Synthetic HEVC streams with a CRA and its RASL pictures, made from the
+/// captured hevc-main-bf clip (which has none): what a seek, a loop or a
+/// splice gives a session.
+#[cfg(test)]
+pub(crate) mod synthetic {
+    use super::*;
+    use crate::nvdec::captured;
+
+    /// A slice header's bits.
+    struct Writer {
+        bytes: Vec<u8>,
+        bits: u32,
+    }
+
+    impl Writer {
+        fn put(&mut self, value: u32, count: u32) {
+            for k in (0..count).rev() {
+                if self.bits.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                let bit = (value >> k) & 1;
+                *self.bytes.last_mut().unwrap() |= (bit as u8) << (7 - self.bits % 8);
+                self.bits += 1;
+            }
+        }
+
+        fn ue(&mut self, value: u32) {
+            let coded = value + 1;
+            let length = 32 - coded.leading_zeros();
+            self.put(0, length - 1);
+            self.put(coded, length);
+        }
+
+        /// The RBSP's stop bit, some bytes for the slice's data (which the
+        /// parser and the mock never read), and emulation prevention.
+        fn nal(mut self, kind: u8) -> Vec<u8> {
+            self.put(1, 1);
+            self.bytes.extend_from_slice(&[0xa5; 61]);
+            let mut nal = alloc::vec![kind << 1, 1];
+            let mut zeros = 0;
+            for byte in self.bytes {
+                if zeros >= 2 && byte <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                nal.push(byte);
+                zeros = if byte == 0 { zeros + 1 } else { 0 };
+            }
+            nal
+        }
+    }
+
+    /// The first slice of a picture of NAL type `kind` and `slice_type`,
+    /// order count LSBs `lsb`, its reference picture set in the slice: the
+    /// negative deltas `negative`, each used by it or not. Its header ends
+    /// where the parser stops reading.
+    fn slice(
+        sps: &hevc::Sps,
+        pps: &hevc::Pps,
+        kind: u8,
+        slice_type: u32,
+        lsb: u32,
+        negative: &[(i32, bool)],
+    ) -> Vec<u8> {
+        let mut w = Writer {
+            bytes: Vec::new(),
+            bits: 0,
+        };
+        w.put(1, 1);
+        if (16..=23).contains(&kind) {
+            w.put(0, 1);
+        }
+        w.ue(u32::from(pps.id));
+        w.put(0, u32::from(pps.num_extra_slice_header_bits));
+        w.ue(slice_type);
+        if pps.output_flag_present {
+            w.put(1, 1);
+        }
+        if sps.separate_colour_plane {
+            w.put(0, 2);
+        }
+        w.put(lsb, u32::from(sps.log2_max_poc_lsb));
+        w.put(0, 1);
+        if !sps.st_rps.is_empty() {
+            w.put(0, 1);
+        }
+        w.ue(negative.len() as u32);
+        w.ue(0);
+        let mut previous = 0;
+        for &(delta, used) in negative {
+            w.ue((previous - delta - 1) as u32);
+            w.put(u32::from(used), 1);
+            previous = delta;
+        }
+        if sps.long_term_ref_pics_present {
+            if !sps.lt_ref_pics.is_empty() {
+                w.ue(0);
+            }
+            w.ue(0);
+        }
+        if sps.temporal_mvp {
+            w.put(0, 1);
+        }
+        w.nal(kind)
+    }
+
+    /// The captured hevc-main-bf clip's record, samples and parameter sets.
+    fn bf() -> (Vec<u8>, Vec<Vec<u8>>, hevc::Sps, hevc::Pps) {
+        let (_, _, clip) = captured::clips()
+            .into_iter()
+            .find(|(name, ..)| *name == "hevc-main-bf-1080p")
+            .unwrap();
+        let (record, samples) = samples(Codec::Hevc, &clip).unwrap();
+        let nals = parse::nal_units(&clip);
+        let of = |kind| nals.iter().find(|n| n.hevc_type() == kind).unwrap();
+        let sps = hevc::sps(&of(hevc::NAL_SPS).bytes[2..]).unwrap();
+        let mut table = alloc::vec![None; 16];
+        table[usize::from(sps.id)] = Some(sps.clone());
+        let pps = hevc::pps(&of(hevc::NAL_PPS).bytes[2..], &table).unwrap();
+        (record, samples, sps, pps)
+    }
+
+    /// hevc-main-bf (IDR 0, P 4, B 2 1 3, P 8, B 6 5 7, P 12, …, display
+    /// order 0 to 29) with a CRA at order count 8 in place of its P picture
+    /// (sample 5), keeping 4, 2 and 0 for what follows, and the three
+    /// pictures after it (6, 5 and 7, which refer to 4, 2, 0 and 8) as its
+    /// RASL pictures (samples 6 to 8). Its record and samples.
+    pub(crate) fn hevc_with_cra() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (record, mut samples, sps, pps) = bf();
+        let cra = slice(
+            &sps,
+            &pps,
+            hevc::NAL_CRA,
+            2,
+            8,
+            &[(-4, false), (-6, false), (-8, false)],
+        );
+        samples[5] = sample(&[&cra]);
+        for (k, kind) in [(6, 9), (7, 8), (8, 8)] {
+            // The NAL header's first byte after the 4-byte length.
+            assert!(samples[k][4] >> 1 & 0x3f <= 1);
+            samples[k][4] = (samples[k][4] & 0x81) | kind << 1;
+        }
+        (record, samples)
+    }
+
+    /// A P picture of order count `lsb` whose reference picture set keeps
+    /// the picture 4 before it but uses none: an inter picture with no
+    /// reference, which the parser refuses after it marked the references.
+    pub(crate) fn hevc_p_without_references(lsb: u32) -> Vec<u8> {
+        let (_, _, sps, pps) = bf();
+        sample(&[&slice(&sps, &pps, 1, 1, lsb, &[(-4, false)])])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +678,124 @@ mod tests {
         let first = stream.decode(&samples[0]).unwrap().unwrap();
         assert!(first.idr);
         assert_eq!(first.slot, 0);
+    }
+
+    /// Decodes `samples` on `stream`: each sample's picture (None for one
+    /// skipped), and the order counts shown, in order.
+    fn run(stream: &mut Stream, samples: &[Vec<u8>]) -> (Vec<Option<Picture>>, Vec<i32>) {
+        let mut pictures = Vec::new();
+        let mut shown = Vec::new();
+        for (k, sample) in samples.iter().enumerate() {
+            let picture = stream
+                .decode(sample)
+                .unwrap_or_else(|error| panic!("sample {k}: {error:?}"));
+            if let Some(picture) = &picture {
+                shown.extend(picture.outputs.iter().map(|o| o.poc));
+            }
+            pictures.push(picture);
+        }
+        (pictures, shown)
+    }
+
+    fn flushed(stream: &mut Stream) -> Vec<i32> {
+        stream.flush().iter().map(|o| o.poc).collect()
+    }
+
+    #[test]
+    fn surfaces_are_one_more_than_the_slots_and_enough() {
+        for (name, codec, clip) in crate::nvdec::captured::clips() {
+            let (record, samples) = samples(codec, &clip);
+            let mut stream = Stream::open(codec, &record).unwrap();
+            let sequence = stream.sequence().unwrap();
+            assert_eq!(sequence.surfaces, sequence.slots + 1, "{name}");
+            for sample in &samples {
+                if let Some(picture) = stream.decode(sample).unwrap() {
+                    assert!(picture.surface < sequence.surfaces, "{name}");
+                    for output in &picture.outputs {
+                        assert!(output.surface < sequence.surfaces, "{name}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A CRA in the middle of a stream decoded from its start: its RASL
+    /// pictures have their references, and are decoded and shown.
+    #[test]
+    fn a_cra_mid_stream_decodes_its_rasl_pictures() {
+        let (record, samples) = synthetic::hevc_with_cra();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        let (pictures, mut shown) = run(&mut stream, &samples);
+        shown.extend(flushed(&mut stream));
+        assert!(pictures.iter().all(Option::is_some));
+        assert_eq!(shown, (0..30).collect::<Vec<i32>>());
+        assert_eq!(stream.events(), hevc::Events::default());
+        assert!(pictures.iter().flatten().all(|p| p.concealed() == 0));
+    }
+
+    /// A seek: the client flushes (finishDelayedFrames), then feeds the
+    /// stream from the CRA. The CRA starts afresh, its three RASL pictures
+    /// are skipped, and the pictures after it that refer to them (which a
+    /// real encoder never makes) are decoded with the CRA standing in.
+    #[test]
+    fn a_seek_to_a_cra_skips_its_rasl_pictures() {
+        let (record, samples) = synthetic::hevc_with_cra();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        let (_, mut shown) = run(&mut stream, &samples[..5]);
+        shown.extend(flushed(&mut stream));
+        assert_eq!(shown, [0, 1, 2, 3, 4]);
+        let (pictures, mut after) = run(&mut stream, &samples[5..]);
+        after.extend(flushed(&mut stream));
+        assert!(pictures[0].as_ref().is_some_and(|p| p.poc == 8));
+        assert!(pictures[1..4].iter().all(Option::is_none));
+        assert!(pictures[4..].iter().all(Option::is_some));
+        assert_eq!(after, (8..30).collect::<Vec<i32>>());
+        let events = stream.events();
+        assert_eq!((events.skipped, events.restarted), (3, 1));
+        assert!(events.concealed > 0);
+        // Order count 12 refers to 8, 6, 4 and 2: three stood in for.
+        assert_eq!(pictures[4].as_ref().unwrap().concealed(), 3);
+    }
+
+    /// A splice or a loop with no flush: the CRA's reference picture set
+    /// names pictures never decoded here, so it starts afresh too, and the
+    /// pictures still waiting are shown at its start.
+    #[test]
+    fn a_splice_at_a_cra_starts_afresh() {
+        let (record, samples) = synthetic::hevc_with_cra();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        let (_, shown) = run(&mut stream, &samples[..2]);
+        assert!(shown.is_empty());
+        let (pictures, mut after) = run(&mut stream, &samples[5..]);
+        let cra = pictures[0].as_ref().unwrap();
+        assert_eq!(
+            cra.outputs.iter().map(|o| o.poc).collect::<Vec<_>>(),
+            [0, 4]
+        );
+        assert!(pictures[1..4].iter().all(Option::is_none));
+        after.extend(flushed(&mut stream));
+        assert_eq!(&after[..2], [0, 4]);
+        assert_eq!(after[2..], (8..30).collect::<Vec<i32>>());
+        let events = stream.events();
+        assert_eq!((events.skipped, events.restarted), (3, 1));
+    }
+
+    /// A picture refused after it marked the references leaves them as they
+    /// were: the stream goes on as if it never came.
+    #[test]
+    fn a_refused_picture_leaves_the_references_as_they_were() {
+        let (record, samples) = synthetic::hevc_with_cra();
+        let mut whole = Stream::open(Codec::Hevc, &record).unwrap();
+        let (expected, _) = run(&mut whole, &samples);
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        let (mut pictures, _) = run(&mut stream, &samples[..5]);
+        let bogus = synthetic::hevc_p_without_references(9);
+        assert_eq!(
+            stream.decode(&bogus),
+            Err(Error::Invalid("an inter picture with no reference"))
+        );
+        pictures.extend(run(&mut stream, &samples[5..]).0);
+        assert_eq!(pictures, expected);
     }
 
     #[test]

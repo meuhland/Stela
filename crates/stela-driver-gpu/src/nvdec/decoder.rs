@@ -151,6 +151,9 @@ pub struct Shown {
     pub decoded: u32,
     /// What the engine reported for its decode.
     pub status: Status,
+    /// It was decoded with references stood in for missing ones
+    /// ([`Picture::concealed`]).
+    pub concealed: bool,
 }
 
 /// A picture decoded and not yet shown.
@@ -159,6 +162,7 @@ struct Token {
     decoded: u32,
     token: u64,
     status: Status,
+    concealed: bool,
 }
 
 /// The picture in flight.
@@ -166,6 +170,7 @@ struct Token {
 struct Flight {
     token: u64,
     decoded: u32,
+    concealed: bool,
     outputs: Vec<Output>,
 }
 
@@ -245,6 +250,39 @@ fn refusal(sequence: &Sequence) -> Option<&'static str> {
     None
 }
 
+/// What a session for the stream `record` describes is made of: the
+/// stream, its sequence, its pictures' geometry and its buffers.
+fn plan(codec: Codec, record: &[u8]) -> Result<(Stream, Sequence, Geometry, Layout), Error> {
+    let stream = Stream::open(codec, record).map_err(Error::Parse)?;
+    let sequence = stream
+        .sequence()
+        .ok_or(Error::Unsupported("the record has no sequence"))?;
+    if let Some(why) = refusal(&sequence) {
+        return Err(Error::Unsupported(why));
+    }
+    let geometry = Geometry::new(
+        sequence.coded.0.next_multiple_of(16),
+        sequence.coded.1.next_multiple_of(16),
+    )
+    .map_err(Error::Unsupported)?;
+    let slots = usize::from(sequence.surfaces.max(1));
+    let layout = Layout::with(codec, &geometry, sequence.bit_depth, slots, slots)
+        .map_err(Error::Unsupported)?
+        .without_cpu_surfaces();
+    if layout.vram_bytes() > VRAM_BUDGET {
+        return Err(Error::Unsupported(
+            "the stream's surfaces take more than a session's 1 GiB",
+        ));
+    }
+    Ok((stream, sequence, geometry, layout))
+}
+
+/// The video memory a session for the stream `record` describes takes,
+/// before anything is opened: what the gate admits sessions by.
+pub fn vram_bytes(codec: Codec, record: &[u8]) -> Result<u64, Error> {
+    plan(codec, record).map(|(_, _, _, layout)| layout.vram_bytes())
+}
+
 impl<N: Node> Decoder<N> {
     /// Opens a `codec` session for the stream `record` (`avcC`/`hvcC`)
     /// describes, on `node`, a fresh render node file of `chipset`'s GPU:
@@ -257,34 +295,10 @@ impl<N: Node> Decoder<N> {
         record: &[u8],
         timeout_ns: u64,
     ) -> Result<Self, (Error, N)> {
-        let stream = match Stream::open(codec, record) {
-            Ok(stream) => stream,
-            Err(error) => return Err((Error::Parse(error), node)),
+        let (stream, sequence, geometry, layout) = match plan(codec, record) {
+            Ok(plan) => plan,
+            Err(error) => return Err((error, node)),
         };
-        let Some(sequence) = stream.sequence() else {
-            return Err((Error::Unsupported("the record has no sequence"), node));
-        };
-        if let Some(why) = refusal(&sequence) {
-            return Err((Error::Unsupported(why), node));
-        }
-        let geometry = match Geometry::new(
-            sequence.coded.0.next_multiple_of(16),
-            sequence.coded.1.next_multiple_of(16),
-        ) {
-            Ok(geometry) => geometry,
-            Err(why) => return Err((Error::Unsupported(why), node)),
-        };
-        let slots = usize::from(sequence.surfaces.max(1));
-        let layout = match Layout::with(codec, &geometry, sequence.bit_depth, slots, slots) {
-            Ok(layout) => layout.without_cpu_surfaces(),
-            Err(why) => return Err((Error::Unsupported(why), node)),
-        };
-        if layout.vram_bytes() > VRAM_BUDGET {
-            return Err((
-                Error::Unsupported("the stream's surfaces take more than a session's 1 GiB"),
-                node,
-            ));
-        }
         let Some(ring) = copy::ring_after(layout.end()) else {
             return Err((
                 Error::Unsupported("no room for the copy engine past the surfaces"),
@@ -403,6 +417,7 @@ impl<N: Node> Decoder<N> {
         self.check(&picture)?;
         self.session.submit(&picture).map_err(Error::Session)?;
         self.crop = picture.crop;
+        let concealed = picture.concealed() > 0;
         let outputs = match self.order {
             Order::Display => picture.outputs,
             // Its own surface, which the next decode does not write: the
@@ -417,6 +432,7 @@ impl<N: Node> Decoder<N> {
         self.flight = Some(Flight {
             token,
             decoded: picture.decoded,
+            concealed,
             outputs,
         });
         Ok(true)
@@ -471,9 +487,16 @@ impl<N: Node> Decoder<N> {
             decoded: flight.decoded,
             token: flight.token,
             status: decoded.status,
+            concealed: flight.concealed,
         });
         self.queue.extend(flight.outputs);
         Ok(Some(decoded))
+    }
+
+    /// What the stream's parser did about pictures it could not decode
+    /// as coded ([`Stream::events`]).
+    pub fn events(&self) -> super::parse::hevc::Events {
+        self.stream.events()
     }
 
     /// Asks nouveau's fence of the picture in flight, which lets Linux run.
@@ -520,6 +543,7 @@ impl<N: Node> Decoder<N> {
             poc: output.poc,
             decoded: output.decoded,
             status: token.map(|token| token.status).unwrap_or_default(),
+            concealed: token.is_some_and(|token| token.concealed),
         })
     }
 

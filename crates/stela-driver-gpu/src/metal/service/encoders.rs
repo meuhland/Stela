@@ -51,6 +51,9 @@
 //! ([`EncoderPlatform::gpu_state`]): the engine's time follows the P-state's
 //! clocks, which GSP-RM's own policy picks.
 use super::gate::fault;
+#[cfg(test)]
+use super::pace::RETRY_LATE_US;
+use super::pace::{Pace, RETRY_AT_ONCE_US};
 use super::wire::{
     self, ENCODE_FORCE_IDR, ENCODER_OPEN_FULL_RANGE, EncoderCapabilitiesResponse, EncoderCodec,
     EncoderEncodeRequest, EncoderEncodeResponse, EncoderInput, EncoderOpenRequest,
@@ -98,20 +101,11 @@ pub const FRAME_BOUND_NS: u64 = 1_000_000_000;
 /// Past the engine's expected time by this much a frame is late, and each
 /// call asks nouveau's fence once, which also lets the host's Linux run.
 pub const LATE_NS: u64 = 2_000_000;
-/// A completion seen within this of the look before it measures the
-/// engine's time.
-const ACCURATE_NS: u64 = 100_000;
 /// The engine's time for a 1080p frame before any is measured: the boot
-/// self-test's (2026-11-17), H.264 and HEVC.
+/// self-test's (2026-11-17), H.264 and HEVC. HEVC's is the GPU's low
+/// P-state's (1.85 ms at P0): [`Pace`] measures the session's own.
 const H264_1080P_NS: u64 = 2_300_000;
 const HEVC_1080P_NS: u64 = 5_800_000;
-/// The `retry_us` of a `Pending` answer: at once, for a call that ran out
-/// of budget while storing; the bounds of a wait for the engine; and the
-/// wait for a late frame.
-const RETRY_AT_ONCE_US: u32 = 1;
-const RETRY_LEAST_US: u64 = 50;
-const RETRY_MOST_US: u64 = 8_000;
-const RETRY_LATE_US: u32 = 300;
 
 /// What the platform gives the encoders of one GPU.
 pub trait EncoderPlatform: Send + Sync + 'static {
@@ -302,7 +296,8 @@ struct Counts {
     total_max: u64,
     calls: u64,
     pending: u64,
-    /// The engine's time where a look saw it closely ([`ACCURATE_NS`]).
+    /// The engine's time where a look saw it closely
+    /// ([`super::pace::ACCURATE_NS`]).
     engine_ns: u64,
     engine_max: u64,
     engine_samples: u64,
@@ -395,9 +390,10 @@ struct Slot<N: Node> {
     luma_band: Vec<u8>,
     chroma_band: Vec<u8>,
     staging: Staging,
-    /// The engine's expected time for a frame: the self-test's at first,
-    /// then a running mean of what the session measures.
-    engine_ns: u64,
+    /// When the engine should be done with a frame, and when the frontend
+    /// should call again: the self-test's time at first, then what the
+    /// session's looks measure ([`Pace`]).
+    pace: Pace,
     lost: bool,
     opened_at: u64,
     period: Counts,
@@ -727,7 +723,7 @@ impl<P: EncoderPlatform> Encoders<P> {
             luma_band: Vec::new(),
             chroma_band: Vec::new(),
             staging: Staging::default(),
-            engine_ns: expected_engine_ns(codec, request.width, request.height),
+            pace: Pace::new(expected_engine_ns(codec, request.width, request.height)),
             lost: false,
             opened_at: self.platform.now_ns(),
             period: Counts::default(),
@@ -748,6 +744,7 @@ impl<P: EncoderPlatform> Encoders<P> {
         let started = self.platform.now_ns();
         let slot = &mut state.sessions[index];
         slot.period.calls += 1;
+        slot.pace.arrived(started);
         if slot.lost {
             return Err(lost());
         }
@@ -854,20 +851,17 @@ impl<P: EncoderPlatform> Encoders<P> {
     }
 
     /// `Pending` for a frame in flight, its response's `retry_us` saying
-    /// when the engine should have completed it.
-    fn goes_on(&self, slot: &Slot<P::Node>, response: &mut [u8]) -> Fault {
+    /// when the engine should have completed it, less the frontend's
+    /// wake-up ([`Pace::retry_us`]).
+    fn goes_on(&self, slot: &mut Slot<P::Node>, response: &mut [u8]) -> Fault {
         let calls = slot.picture.map_or(0, |picture| picture.calls);
+        let now = self.platform.now_ns();
         let retry_us = match slot.stage {
-            Stage::InFlight { submitted, .. } => {
-                let expected = submitted.saturating_add(slot.engine_ns);
-                let now = self.platform.now_ns();
-                if expected > now {
-                    ((expected - now) / 1000).clamp(RETRY_LEAST_US, RETRY_MOST_US) as u32
-                } else {
-                    RETRY_LATE_US
-                }
+            Stage::InFlight { submitted, .. } => slot.pace.retry_us(now, submitted),
+            _ => {
+                slot.pace.asked(now, RETRY_AT_ONCE_US);
+                RETRY_AT_ONCE_US
             }
-            _ => RETRY_AT_ONCE_US,
         };
         write_retry(response, retry_us, calls);
         GOES_ON
@@ -1069,11 +1063,10 @@ impl<P: EncoderPlatform> Encoders<P> {
                 Ok(Some(encoded)) => {
                     let seen = self.platform.now_ns();
                     // Seen right after a look that missed it: the engine's
-                    // own time, which the next frames' waits go by.
-                    if seen.saturating_sub(looked) <= ACCURATE_NS {
-                        let engine = seen.saturating_sub(submitted);
+                    // own time, which the next frames' waits go by; else
+                    // the looks bound it.
+                    if let Some(engine) = slot.pace.done(submitted, looked, seen) {
                         slot.period.engine(engine);
-                        slot.engine_ns = (3 * slot.engine_ns + engine) / 4;
                     }
                     let picture = slot.picture.expect("a frame in flight has its picture");
                     let total = seen.saturating_sub(picture.began);
@@ -1089,15 +1082,14 @@ impl<P: EncoderPlatform> Encoders<P> {
                         submitted,
                         looked,
                     };
-                    let expected = submitted.saturating_add(slot.engine_ns);
                     // A late frame: ask nouveau's fence once a call, which
                     // also lets the host's Linux run.
-                    if !asked && now > expected.saturating_add(LATE_NS) {
+                    if !asked && now > slot.pace.expected(submitted).saturating_add(LATE_NS) {
                         slot.session.ask_fence();
                         slot.period.asks += 1;
                         asked = true;
                     }
-                    if now >= budget_end || (expected > budget_end && now < expected) {
+                    if !slot.pace.keep_looking(now, submitted, budget_end) {
                         return Ok(());
                     }
                     self.platform.pause();

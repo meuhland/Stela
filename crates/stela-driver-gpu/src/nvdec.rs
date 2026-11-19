@@ -285,6 +285,15 @@ impl Picture {
         }
     }
 
+    /// References that were not in the buffer, stood in for by others
+    /// (HEVC's [`hevc::Picture::concealed`]; H.264 refuses those).
+    pub fn concealed(&self) -> u8 {
+        match &self.parsed {
+            Parsed::H264(_) => 0,
+            Parsed::Hevc(picture) => picture.concealed,
+        }
+    }
+
     /// Every picture of the Annex B `stream`, in decoding order, one
     /// access unit at a time through a [`stream::Stream`]. The last
     /// picture's [`Picture::outputs`] also lists what the end of the stream

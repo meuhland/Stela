@@ -53,6 +53,7 @@ pub mod identity;
 mod indirect;
 mod libraries;
 mod lifecycle;
+mod pace;
 mod pipelines;
 mod queue;
 mod reflection;

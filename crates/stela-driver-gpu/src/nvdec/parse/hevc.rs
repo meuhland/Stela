@@ -825,6 +825,27 @@ pub struct Picture {
     /// The pictures shown at this picture's start, in output order (this
     /// one may be among them).
     pub outputs: Vec<Output>,
+    /// References of its reference picture set that were not in the
+    /// buffer (never decoded: a seek, a splice, a dropped picture), each
+    /// stood in for by the reference nearest in order count, as FFmpeg
+    /// generates the missing ones: the picture is decoded, its errors
+    /// concealed.
+    pub concealed: u8,
+}
+
+/// What a stream's parser did about pictures it could not decode as
+/// coded, since it began.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Events {
+    /// RASL pictures of a CRA or BLA that started decoding afresh, skipped
+    /// (8.1.3): they may refer to pictures never decoded, and are not shown.
+    pub skipped: u32,
+    /// References stood in for ([`Picture::concealed`]).
+    pub concealed: u32,
+    /// CRA pictures that started afresh mid-stream (`HandleCraAsBlaFlag`):
+    /// after a flush, or whose reference picture set names pictures not in
+    /// the buffer, as at a splice or a seek with no flush.
+    pub restarted: u32,
 }
 
 impl Picture {
@@ -869,8 +890,16 @@ pub struct Parser {
     /// The next IRAP has `NoRaslOutputFlag` (the first, or after an end of
     /// sequence).
     starting: bool,
+    /// The stream was flushed (its end, `finishDelayedFrames`) since the
+    /// last picture: a CRA next starts afresh, as after an end of sequence,
+    /// but a picture of any other kind goes on with the references kept.
+    flushed: bool,
+    /// The last IRAP started afresh (`NoRaslOutputFlag`): its RASL pictures
+    /// are skipped.
+    skip_rasl: bool,
     active_sps: Option<Sps>,
     decoded: u32,
+    events: Events,
 }
 
 impl Default for Parser {
@@ -888,13 +917,21 @@ impl Parser {
             pool: Pool::new(MAX_SLOTS),
             prev_tid0_poc: 0,
             starting: true,
+            flushed: false,
+            skip_rasl: false,
             active_sps: None,
             decoded: 0,
+            events: Events::default(),
         }
     }
 
     pub fn active_sps(&self) -> Option<&Sps> {
         self.active_sps.as_ref()
+    }
+
+    /// What the parser did about pictures it could not decode as coded.
+    pub fn events(&self) -> Events {
+        self.events
     }
 
     /// Takes a parameter set NAL outside an access unit (from an `hvcC`):
@@ -973,8 +1010,57 @@ impl Parser {
 
     /// Takes one access unit's NAL units: the parameter sets it carries,
     /// and its picture, if it has slices. The reference state moves on as
-    /// if the picture was decoded.
+    /// if the picture was decoded. None for a unit without a picture, and
+    /// for a RASL picture skipped ([`Events::skipped`]). A unit refused
+    /// leaves the reference state as it was (the parameter sets it carried
+    /// stay), so the stream goes on with the next one.
     pub fn access_unit(&mut self, nals: &[Nal<'_>]) -> Result<Option<Picture>> {
+        let saved = self.reference_state();
+        let result = self.unit(nals);
+        if result.is_err() {
+            let sps = core::mem::take(&mut self.sps);
+            let pps = core::mem::take(&mut self.pps);
+            *self = Self { sps, pps, ..saved };
+        }
+        result
+    }
+
+    /// Everything but the parameter sets, which a refused unit keeps.
+    fn reference_state(&mut self) -> Self {
+        let sps = core::mem::take(&mut self.sps);
+        let pps = core::mem::take(&mut self.pps);
+        let saved = self.clone();
+        self.sps = sps;
+        self.pps = pps;
+        saved
+    }
+
+    /// Whether a reference picture set names a picture the buffer does not
+    /// hold, as a CRA's does where the stream was cut or spliced before it.
+    fn names_missing(&self, slice: &Slice, poc: i32, max_lsb: i32) -> bool {
+        let held = |found: &dyn Fn(&Frame) -> bool| {
+            self.frames
+                .iter()
+                .any(|f| f.slot.is_some() && f.reference() && found(f))
+        };
+        let short = slice
+            .st_rps
+            .negative
+            .iter()
+            .chain(&slice.st_rps.positive)
+            .any(|&(delta, _)| !held(&|f| f.poc == poc + delta));
+        let long = slice.long_term.iter().any(|&(value, _, msb_present)| {
+            if msb_present {
+                let target = (poc - (poc & (max_lsb - 1))) + value;
+                !held(&|f| f.poc == target)
+            } else {
+                !held(&|f| f.poc & (max_lsb - 1) == value)
+            }
+        });
+        short || long
+    }
+
+    fn unit(&mut self, nals: &[Nal<'_>]) -> Result<Option<Picture>> {
         let mut slices: Vec<(Nal<'_>, Slice)> = Vec::new();
         for nal in nals {
             let kind = nal.hevc_type();
@@ -1042,27 +1128,39 @@ impl Parser {
                 "the stream does not start with an IRAP picture",
             ));
         }
-        let no_rasl_output = irap && (idr || (16..=18).contains(&nal_type) || self.starting);
-        if matches!(nal_type, 8 | 9) && self.starting {
-            return Err(Error::Unsupported("RASL pictures after a starting CRA"));
+        // 8.1.3: the RASL pictures of an IRAP that started afresh are not
+        // decoded (they may refer to pictures before it, never decoded
+        // here) nor shown. FFmpeg skips them the same way.
+        if matches!(nal_type, 8 | 9) && self.skip_rasl {
+            self.events.skipped += 1;
+            return Ok(None);
         }
-        // 8.3.1: the picture order count.
+        // 8.3.1: the picture order count, as if the picture went on from
+        // the one before.
         let max_lsb = 1i32 << sps.log2_max_poc_lsb;
         let lsb = first.pic_order_cnt_lsb as i32;
-        let msb = if no_rasl_output {
-            0
+        let prev_lsb = self.prev_tid0_poc & (max_lsb - 1);
+        let prev_msb = self.prev_tid0_poc - prev_lsb;
+        let going_on = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
+            prev_msb + max_lsb
+        } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
+            prev_msb - max_lsb
         } else {
-            let prev_lsb = self.prev_tid0_poc & (max_lsb - 1);
-            let prev_msb = self.prev_tid0_poc - prev_lsb;
-            if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
-                prev_msb + max_lsb
-            } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
-                prev_msb - max_lsb
-            } else {
-                prev_msb
-            }
-        };
-        let poc = msb + lsb;
+            prev_msb
+        } + lsb;
+        // A CRA starts afresh (`HandleCraAsBlaFlag`) after a flush, and
+        // where its reference picture set names pictures the buffer does not
+        // hold: a stream cut or spliced before it (a loop, a seek with no
+        // flush), whose RASL pictures would refer to pictures never decoded.
+        let restart_cra = nal_type == NAL_CRA
+            && !self.starting
+            && (self.flushed || self.names_missing(&first, going_on, max_lsb));
+        if restart_cra {
+            self.events.restarted += 1;
+        }
+        let no_rasl_output =
+            irap && (idr || (16..=18).contains(&nal_type) || self.starting || restart_cra);
+        let poc = if no_rasl_output { lsb } else { going_on };
         self.pool.widen(sps.slots());
         let mut outputs = Vec::new();
         // An IDR drops every reference as its header is read; an IRAP
@@ -1083,14 +1181,13 @@ impl Parser {
         let place = (0..PICTURE_PLACES)
             .find(|p| !self.frames.iter().any(|f| f.place == *p))
             .ok_or(Error::Invalid("every picture place is held"))?;
-        let rasl_skipped = matches!(nal_type, 8 | 9) && no_rasl_output;
         self.frames.push(Frame {
             place,
             slot: None,
             poc,
             short: true,
             long: false,
-            output: first.pic_output && !rasl_skipped,
+            output: first.pic_output,
             decoded: self.decoded,
         });
         // 8.3.2: the reference picture set, and what the buffer keeps.
@@ -1171,25 +1268,48 @@ impl Parser {
                 .find(|f| f.poc == poc && f.long == long)
                 .and_then(|f| f.slot)
         };
+        // 8.3.3's "no reference picture": a reference never decoded (a seek
+        // or splice not seen as one, a picture refused). FFmpeg makes a grey
+        // picture in its place; the nearest reference in order count stands
+        // in here, and the engine decodes with it.
+        let mut concealed = 0u8;
+        let mut stand_in = |poc: i32, what: &'static str| -> Result<u8> {
+            let nearest = references
+                .iter()
+                .filter_map(|f| Some((f.slot?, f.poc)))
+                .min_by_key(|&(_, p)| (p.abs_diff(poc), p > poc))
+                .map(|(slot, _)| slot)
+                .ok_or(Error::Missing(what))?;
+            concealed = concealed.saturating_add(1);
+            Ok(nearest)
+        };
+        const SHORT_MISSING: &str = "a short-term reference is not in the buffer";
         let mut st_curr_before = Vec::new();
         for &p in &before {
-            st_curr_before.push(slot_of(p, false).ok_or(Error::Missing(
-                "a short-term reference is not in the buffer",
-            ))?);
+            let slot = match slot_of(p, false) {
+                Some(slot) => slot,
+                None => stand_in(p, SHORT_MISSING)?,
+            };
+            st_curr_before.push(slot);
         }
         let mut st_curr_after = Vec::new();
         for &p in &after {
-            st_curr_after.push(slot_of(p, false).ok_or(Error::Missing(
-                "a short-term reference is not in the buffer",
-            ))?);
+            let slot = match slot_of(p, false) {
+                Some(slot) => slot,
+                None => stand_in(p, SHORT_MISSING)?,
+            };
+            st_curr_after.push(slot);
         }
         let mut lt_curr = Vec::new();
         for lt in &long_curr {
-            let slot = references
+            let slot = match references
                 .iter()
                 .find(|f| f.long && matches_long(f.poc, lt))
                 .and_then(|f| f.slot)
-                .ok_or(Error::Missing("a long-term reference is not in the buffer"))?;
+            {
+                Some(slot) => slot,
+                None => stand_in(lt.0, "a long-term reference is not in the buffer")?,
+            };
             lt_curr.push(slot);
         }
         let mut kind = 'I';
@@ -1271,9 +1391,15 @@ impl Parser {
             scaling,
             decoded: current,
             outputs,
+            concealed,
         };
         // As if decoded.
+        if irap {
+            self.skip_rasl = no_rasl_output;
+        }
         self.starting = false;
+        self.flushed = false;
+        self.events.concealed += u32::from(concealed);
         self.decoded += 1;
         let sub_layer_non_reference = nal_type <= 14 && nal_type % 2 == 0;
         if first_nal.hevc_temporal_id() == 0
@@ -1286,22 +1412,25 @@ impl Parser {
     }
 
     /// The pictures still waiting to be shown, in output order, as at the
-    /// end of the stream.
+    /// end of the stream. The references stay; a CRA next starts afresh, as
+    /// after an end of sequence (a client flushes before it seeks).
     pub fn flush(&mut self) -> Vec<Output> {
         let mut outputs = Vec::new();
         self.bump(0, 0, &mut outputs, false);
+        self.flushed = true;
         outputs
     }
 
     /// Forgets every picture (a seek): no reference, nothing to show, every
-    /// slot free; the parameter sets stay, and the next picture must be an
-    /// IRAP.
+    /// slot free; the parameter sets and the events stay, and the next
+    /// picture must be an IRAP.
     pub fn reset(&mut self) {
         let sps = core::mem::take(&mut self.sps);
         let pps = core::mem::take(&mut self.pps);
         *self = Self {
             sps,
             pps,
+            events: self.events,
             ..Self::new()
         };
     }
