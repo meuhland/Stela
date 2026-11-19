@@ -3314,6 +3314,9 @@ fn start_devices(
                 // sessions, which open with them.
                 #[cfg(feature = "nvk")]
                 gpu::nvenc::set_serving(options.nvenc);
+                // And with which profile (`--no-nvenc-realtime-profile`).
+                #[cfg(feature = "nvk")]
+                gpu::nvenc::set_realtime_profile(options.nvenc_realtime_profile);
                 // And the guest's NVDEC sessions (`--no-nvdec`).
                 #[cfg(feature = "nvk")]
                 gpu::nvdec::set_serving(options.nvdec);

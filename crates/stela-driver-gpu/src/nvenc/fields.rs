@@ -84,6 +84,21 @@ pub mod h264 {
     pub const RATE_CONTROL_VCL_CPB_SIZE: Field = Field::new(152, 4, 0, 32);
     pub const RATE_CONTROL_VCL_BITRATE: Field = Field::new(156, 4, 0, 32);
     pub const RATE_CONTROL_GOP_LENGTH: Field = Field::new(160, 4, 0, 32);
+    pub const RATE_CONTROL_HRD_TYPE: Field = Field::new(112, 1, 0, 8);
+    pub const RATE_CONTROL_NP: Field = Field::new(164, 4, 0, 32);
+    pub const RATE_CONTROL_BMIN: Field = Field::new(168, 4, 0, 32);
+    pub const RATE_CONTROL_RAVG: Field = Field::new(172, 4, 0, 32);
+    pub const RATE_CONTROL_R: Field = Field::new(176, 4, 0, 32);
+    pub const RATE_CONTROL_AB_BETA: Field = Field::new(181, 1, 0, 8);
+    pub const RATE_CONTROL_PREV_ACT: Field = Field::new(182, 2, 0, 16);
+    pub const RATE_CONTROL_SINGLE_FRAME_VBV: Field = Field::new(185, 1, 0, 8);
+    pub const RATE_CONTROL_TWO_PASS_RC: Field = Field::new(186, 1, 0, 8);
+    pub const RATE_CONTROL_I_SIZE_RATIO_X: Field = Field::new(189, 1, 0, 8);
+    pub const RATE_CONTROL_I_SIZE_RATIO_Y: Field = Field::new(190, 1, 0, 8);
+    pub const PIC_CONTROL_MAX_SLICE_SIZE: Field = Field::new(368, 4, 0, 32);
+    pub const PIC_CONTROL_SLICE_MODE: Field = Field::new(424, 1, 5, 1);
+    pub const PIC_CONTROL_INTRA_REFRESH_COUNT: Field = Field::new(431, 1, 0, 8);
+    pub const MD_INTRA_REFRESH_CNT: Field = Field::new(1024, 2, 0, 16);
     pub const PIC_CONTROL_L0: [Field; 8] = [
         Field::new(200, 1, 0, 8),
         Field::new(201, 1, 0, 8),
@@ -293,6 +308,20 @@ pub mod hevc {
     pub const RATE_CONTROL_VCL_CPB_SIZE: Field = Field::new(156, 4, 0, 32);
     pub const RATE_CONTROL_VCL_BITRATE: Field = Field::new(160, 4, 0, 32);
     pub const RATE_CONTROL_GOP_LENGTH: Field = Field::new(164, 4, 0, 32);
+    pub const RATE_CONTROL_HRD_TYPE: Field = Field::new(116, 1, 0, 8);
+    pub const RATE_CONTROL_NP: Field = Field::new(168, 4, 0, 32);
+    pub const RATE_CONTROL_BMIN: Field = Field::new(172, 4, 0, 32);
+    pub const RATE_CONTROL_RAVG: Field = Field::new(176, 4, 0, 32);
+    pub const RATE_CONTROL_R: Field = Field::new(180, 4, 0, 32);
+    pub const RATE_CONTROL_AB_BETA: Field = Field::new(185, 1, 0, 8);
+    pub const RATE_CONTROL_PREV_ACT: Field = Field::new(186, 2, 0, 16);
+    pub const RATE_CONTROL_SINGLE_FRAME_VBV: Field = Field::new(189, 1, 0, 8);
+    pub const RATE_CONTROL_TWO_PASS_RC: Field = Field::new(190, 1, 0, 8);
+    pub const RATE_CONTROL_I_SIZE_RATIO_X: Field = Field::new(193, 1, 0, 8);
+    pub const RATE_CONTROL_I_SIZE_RATIO_Y: Field = Field::new(194, 1, 0, 8);
+    pub const PIC_CONTROL_MAX_SLICE_SIZE: Field = Field::new(380, 4, 0, 32);
+    pub const PIC_CONTROL_SLICE_MODE: Field = Field::new(424, 1, 3, 1);
+    pub const MD_INTRA_REFRESH_CNT: Field = Field::new(13312, 2, 0, 16);
     pub const PIC_CONTROL_L0: [Field; 8] = [
         Field::new(212, 1, 0, 8),
         Field::new(213, 1, 0, 8),

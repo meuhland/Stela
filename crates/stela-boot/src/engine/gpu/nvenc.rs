@@ -48,6 +48,9 @@ const DATA_CAP: usize = 256 * 1024;
 /// Whether the Metal services serve the guest's encoder sessions: off with
 /// `--no-nvenc`.
 static SERVING: AtomicBool = AtomicBool::new(true);
+/// Whether the guest's sessions open with the real-time profile: off with
+/// `--no-nvenc-realtime-profile`.
+static REALTIME_PROFILE: AtomicBool = AtomicBool::new(true);
 /// The bound GPUs, by index, whose encoder the probe or the self-test found
 /// failing: they serve no sessions.
 static FAILED: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +66,13 @@ const ENCODER_STACK_BYTES: usize = 1 << 20;
 /// encodes H.264 with x264 as before.
 pub(in crate::engine) fn set_serving(serving: bool) {
     SERVING.store(serving, Ordering::Relaxed);
+}
+
+/// `--no-nvenc-realtime-profile`: the guest's sessions open with NVIDIA's
+/// captured rate control (a CPB of two seconds, three H.264 references)
+/// instead of the real-time profile (`nvenc::Config::realtime`).
+pub(in crate::engine) fn set_realtime_profile(on: bool) {
+    REALTIME_PROFILE.store(on, Ordering::Relaxed);
 }
 
 /// Notes that GPU `index`'s encoder failed before macOS.
@@ -356,6 +366,10 @@ impl EncoderPlatform for GateGpu {
         Some(super::perf_now())
     }
 
+    fn realtime_profile(&self) -> bool {
+        REALTIME_PROFILE.load(Ordering::Relaxed)
+    }
+
     fn heap(&self) -> Option<stela_drivers::gpu::metal::service::encoders::HostHeap> {
         // The engine's heap, which also backs Linux's pages (nouveau's GART
         // buffers among them): one look under its lock.
@@ -413,8 +427,13 @@ pub(super) fn attach(
     core::mem::forget(stack);
     line(format_args!(
         "NVENC SESSION GPU {index} ({name}): serves H.264 and HEVC sessions on chipset \
-         {chipset:#x}, at most {} at once",
-        stela_drivers::gpu::metal::service::encoders::MAX_SESSIONS
+         {chipset:#x}, at most {} at once, {}",
+        stela_drivers::gpu::metal::service::encoders::MAX_SESSIONS,
+        if REALTIME_PROFILE.load(Ordering::Relaxed) {
+            "with the real-time profile (a one-frame CPB, one reference)"
+        } else {
+            "with NVIDIA's captured rate control (--no-nvenc-realtime-profile)"
+        }
     ));
     Some(Arc::new(Encoders::new(GateGpu {
         index,

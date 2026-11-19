@@ -45,6 +45,8 @@ struct Platform {
     kicks: bool,
     /// The GPU's state the platform reports, if any.
     state: Option<&'static str>,
+    /// Whether sessions open with the real-time profile.
+    realtime: bool,
 }
 
 impl Platform {
@@ -61,6 +63,7 @@ impl Platform {
             timing: None,
             kicks: false,
             state: None,
+            realtime: true,
         }
     }
 
@@ -150,6 +153,10 @@ impl EncoderPlatform for Platform {
 
     fn run(&self, body: &mut dyn FnMut()) {
         body();
+    }
+
+    fn realtime_profile(&self) -> bool {
+        self.realtime
     }
 
     fn log(&self, line: fmt::Arguments<'_>) {
@@ -560,31 +567,130 @@ fn a_short_output_span_gets_the_length_then_the_frame() {
     assert!(bytes.starts_with(&[0, 0, 0, 1]));
 }
 
-/// A frame's bitrate re-templates a CBR session from that frame on.
+/// A frame's bitrate re-templates a CBR session from that frame on, and
+/// the real-time profile's CPB follows it: one frame's bits. Without the
+/// profile it is two seconds', as before.
 #[test]
 fn a_bitrate_change_takes_effect_at_the_next_frame() {
+    for (realtime, cpb) in [(true, "cpb 133 kbit"), (false, "cpb 16000 kbit")] {
+        let mut platform = Platform::new(Engine::Encode);
+        platform.realtime = realtime;
+        let encoders = Encoders::new(platform);
+        let mut memory = caller_with(0);
+        let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+        encode(
+            &encoders,
+            &encode_request(opened.encoder, 1, 0),
+            &mut memory,
+        )
+        .0
+        .unwrap();
+        let mut request = encode_request(opened.encoder, 2, 0);
+        request.bitrate = 8_000_000;
+        let (outcome, response, _) = encode(&encoders, &request, &mut memory);
+        outcome.unwrap();
+        assert_eq!(response.idr, 0);
+        assert!(
+            encoders
+                .platform()
+                .logged(&alloc::format!("bitrate 8000 kb/s from frame 2, {cpb}"))
+        );
+        encoders.report();
+        assert!(
+            encoders
+                .platform()
+                .logged("h264 1920x1080 60 fps cbr 8000 kb/s: frames=2")
+        );
+    }
+}
+
+/// Sessions open with the real-time profile, which the open line spells
+/// out; the platform's no gives NVIDIA's captured rate control, and says
+/// why.
+#[test]
+fn the_open_line_gives_the_profile() {
+    let encoders = Encoders::new(Platform::new(Engine::Encode));
+    let mut memory = caller_with(0);
+    let h264 = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    let hevc = open(&encoders, ONE, 2, EncoderCodec::Hevc, &mut memory).unwrap();
+    let realtime = "bytes of parameter sets, profile realtime: cpb 333 kbit (1.0 frames), \
+                    bmin 4, 1 ref, P frames only, no lookahead, an IDR only when asked \
+                    (gop_length 999999)";
+    let lines = encoders.platform().lines.lock().unwrap().clone();
+    for codec in ["h264", "hevc"] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(codec) && line.ends_with(realtime)),
+            "{lines:?}"
+        );
+    }
+    close(&encoders, ONE, h264.encoder, &mut memory);
+    close(&encoders, ONE, hevc.encoder, &mut memory);
+
+    let mut platform = Platform::new(Engine::Encode);
+    platform.realtime = false;
+    let encoders = Encoders::new(platform);
+    open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    assert!(encoders.platform().logged(
+        "profile captured: cpb 40000 kbit (120.0 frames), bmin 490, 3 refs, P frames only, no \
+         lookahead, an IDR only when asked (gop_length 999999) (--no-nvenc-realtime-profile)"
+    ));
+}
+
+/// The heartbeat and the close line give the frames' sizes, P frames and
+/// IDRs apart, the engine's QP, and the frames past twice a frame's share.
+#[test]
+fn the_heartbeat_gives_frame_sizes() {
     let encoders = Encoders::new(Platform::new(Engine::Encode));
     let mut memory = caller_with(0);
     let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
-    encode(
-        &encoders,
-        &encode_request(opened.encoder, 1, 0),
-        &mut memory,
-    )
-    .0
-    .unwrap();
-    let mut request = encode_request(opened.encoder, 2, 0);
-    request.bitrate = 8_000_000;
-    let (outcome, response, _) = encode(&encoders, &request, &mut memory);
-    outcome.unwrap();
-    assert_eq!(response.idr, 0);
-    assert!(encoders.platform().logged("bitrate 8000 kb/s from frame 2"));
+    let mut sizes = Vec::new();
+    for (frame, flags) in [(1, 0), (2, 0), (3, 0), (4, ENCODE_FORCE_IDR), (5, 0)] {
+        put_picture(&mut memory, frame as u32);
+        let (outcome, response, _) = encode(
+            &encoders,
+            &encode_request(opened.encoder, frame, flags),
+            &mut memory,
+        );
+        outcome.unwrap();
+        // The mock engine's status says QP 25 for every frame.
+        assert_eq!(response.average_qp, 25);
+        sizes.push((response.idr == 1, response.bytes));
+    }
     encoders.report();
-    assert!(
-        encoders
-            .platform()
-            .logged("h264 1920x1080 60 fps cbr 8000 kb/s: frames=2")
+    let total: u64 = sizes.iter().map(|(_, bytes)| bytes).sum();
+    let largest = sizes.iter().map(|(_, bytes)| *bytes).max().unwrap();
+    let of = |idr: bool| -> (u64, u64) {
+        let picked: Vec<u64> = sizes
+            .iter()
+            .filter(|(is_idr, _)| *is_idr == idr)
+            .map(|(_, bytes)| *bytes)
+            .collect();
+        (
+            picked.iter().sum::<u64>() / picked.len() as u64,
+            *picked.iter().max().unwrap(),
+        )
+    };
+    let (p, idr) = (of(false), of(true));
+    // A frame's share at 20 Mb/s and 60 fps.
+    let over = sizes
+        .iter()
+        .filter(|(_, bytes)| *bytes > 2 * (20_000_000 / 8 / 60))
+        .count();
+    let stats = alloc::format!(
+        "frame_bytes={}/{largest} p_bytes={}/{} idr_bytes={}/{} qp=25/25 over_2x={over}",
+        total / 5,
+        p.0,
+        p.1,
+        idr.0,
+        idr.1
     );
+    assert!(encoders.platform().logged(&stats), "{stats}");
+    close(&encoders, ONE, opened.encoder, &mut memory);
+    let lines = encoders.platform().lines.lock().unwrap().clone();
+    let closed = lines.iter().find(|line| line.contains("closed")).unwrap();
+    assert!(closed.ends_with(&stats), "{closed}");
 }
 
 /// No encoder for the chipset, a refused channel, full range and a third
@@ -721,6 +827,11 @@ fn a_refused_output_drops_the_frame() {
         &mut memory,
     );
     assert_eq!(outcome.unwrap_err().status, Status::Dropped);
+    // The real-time profile goes with the refused frame.
+    assert!(encoders.platform().logged(
+        "1 real-time profile off from frame 3: the engine refused frame 2; profile captured: \
+         cpb 40000 kbit (120.0 frames), bmin 490, 3 refs"
+    ));
     let (outcome, response, _) = encode(
         &encoders,
         &encode_request(opened.encoder, 3, 0),
@@ -729,6 +840,40 @@ fn a_refused_output_drops_the_frame() {
     outcome.unwrap();
     assert_eq!(response.idr, 1);
     assert!(encoders.platform().logged("frame 2 dropped"));
+}
+
+/// A session lost with the real-time profile, its channel idle, leaves
+/// later sessions to open with NVIDIA's captured rate control.
+#[test]
+fn a_session_lost_with_the_profile_turns_it_off_for_later_ones() {
+    let encoders = Encoders::new(Platform::new(Engine::Silent));
+    let mut memory = caller_with(0);
+    let opened = open(&encoders, ONE, 1, EncoderCodec::H264, &mut memory).unwrap();
+    let (outcome, _, _) = call_through::<_, EncoderEncodeResponse>(
+        &encoders,
+        ONE,
+        Operation::EncoderEncode,
+        &encode_request(opened.encoder, 1, 0),
+        &mut memory,
+    );
+    assert_eq!(outcome.unwrap_err().status, Status::Lost);
+    assert!(
+        encoders
+            .platform()
+            .logged("1 lost with the real-time profile: later sessions open without it")
+    );
+    close(&encoders, ONE, opened.encoder, &mut memory);
+    open(&encoders, TWO, 2, EncoderCodec::Hevc, &mut memory).unwrap();
+    assert!(
+        encoders.platform().logged(
+            "(gop_length 999999) (a session was lost with the real-time profile this boot)"
+        )
+    );
+    assert!(
+        encoders
+            .platform()
+            .logged("profile captured: cpb 40000 kbit")
+    );
 }
 
 /// A connection's close closes its sessions alone.
@@ -1006,7 +1151,7 @@ fn session_lines_end_with_the_gpus_state() {
     assert!(
         encoders
             .platform()
-            .logged("bytes of parameter sets | gpu pstate=P8 pcie=gen1x16")
+            .logged("(gop_length 999999) | gpu pstate=P8 pcie=gen1x16")
     );
     let request = encode_request(opened.encoder, 1, 0);
     timed_frame(&encoders, &request, &mut memory);
@@ -1016,8 +1161,9 @@ fn session_lines_end_with_the_gpus_state() {
         .iter()
         .find(|line| line.contains("frames=1"))
         .expect("a heartbeat line");
+    assert!(beat.contains(" kicks=1 frame_bytes="), "{beat}");
     assert!(
-        beat.ends_with(" kicks=1 | gpu pstate=P8 pcie=gen1x16"),
+        beat.ends_with(" over_2x=0 | gpu pstate=P8 pcie=gen1x16"),
         "{beat}"
     );
     encoders.report();

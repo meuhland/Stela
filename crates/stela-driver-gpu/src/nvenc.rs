@@ -206,7 +206,8 @@ pub enum Rate {
     /// Every picture at this QP (0..=51), RC mode 0.
     ConstQp(u8),
     /// Low-latency CBR at this many bits per second, NVIDIA's captured
-    /// rate control (`hrd_type 0x22`, a CPB of two seconds).
+    /// rate control (`hrd_type 0x22`): a CPB of two seconds, or of one
+    /// frame in the real-time profile ([`Config::realtime`]).
     Cbr { bitrate: u32 },
 }
 
@@ -228,6 +229,16 @@ pub struct Config {
     /// Map the reconstructed pictures for the CPU ([`session::Session::recon`]),
     /// as the self-test does to compare them with the input.
     pub map_recon: bool,
+    /// The real-time profile, for a streaming client such as Parsec. NVIDIA's
+    /// captured setups already are its ultra-low-latency tuning
+    /// (`nvenc-capture.md`: `-preset p1 -tune ull -rc cbr -g 999999 -bf 0
+    /// -delay 0 -zerolatency 1`): no B-frames, no lookahead, one picture in
+    /// and one out. What ffmpeg chose for it is not: a CPB of two seconds
+    /// (its default `-bufsize`) and H.264 P frames on up to three
+    /// references. The profile makes the CPB one frame's bits (bitrate /
+    /// fps) with `Bmin` scaled to it, and gives every P frame one reference,
+    /// the previous picture ([`setup`]).
+    pub realtime: bool,
 }
 
 impl Config {
@@ -240,6 +251,7 @@ impl Config {
             fps: 60,
             rate,
             map_recon: false,
+            realtime: false,
         }
     }
 }

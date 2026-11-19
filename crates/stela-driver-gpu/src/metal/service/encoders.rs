@@ -44,12 +44,24 @@
 //! closes its sessions ([`GateEncoders::disconnect`]), as the PC's stop
 //! closes every one ([`GateEncoders::close_all`]).
 //!
-//! **Report.** Each session logs `NVENC SESSION` lines: when it opens, at
-//! each platform report while it encodes ([`GateEncoders::report`]), when it
-//! is lost and when it closes. The open and report lines end with the GPU's
-//! P-state and PCIe link when the platform knows them
-//! ([`EncoderPlatform::gpu_state`]): the engine's time follows the P-state's
-//! clocks, which GSP-RM's own policy picks.
+//! **The real-time profile** ([`Config::realtime`]): every session opens
+//! with it unless the platform says not ([`EncoderPlatform::realtime_profile`],
+//! `--no-nvenc-realtime-profile`). StelaVT is the only frontend, and it is a
+//! real-time encoder to every client: it reports `RealTime` true and
+//! `AllowFrameReordering` false whatever the client set, codes one frame in
+//! and one out, and passes neither property to the host. Parsec, the client
+//! this serves, sets both that way. A frame the engine refuses turns the
+//! session's profile off from its next frame (an IDR anyway), and a session
+//! lost with it on keeps later sessions of the GPU from opening with it.
+//!
+//! **Report.** Each session logs `NVENC SESSION` lines: when it opens (with
+//! its profile and rate control), at each platform report while it encodes
+//! ([`GateEncoders::report`]), when it is lost and when it closes. The
+//! report and close lines carry the frames' sizes, P and IDR apart, and the
+//! engine's QP. The open and report lines end with the GPU's P-state and
+//! PCIe link when the platform knows them ([`EncoderPlatform::gpu_state`]):
+//! the engine's time follows the P-state's clocks, which GSP-RM's own policy
+//! picks.
 use super::gate::fault;
 #[cfg(test)]
 use super::pace::RETRY_LATE_US;
@@ -63,6 +75,7 @@ use crate::nvenc::{
     Codec, Config, Node, Rate,
     layout::MAX_SIDE,
     session::{self, Encoded, Frame, Options, Session},
+    setup::RateControl,
     surface::{self, Order, Rgb, Staging},
 };
 use alloc::vec::Vec;
@@ -160,6 +173,11 @@ pub trait EncoderPlatform: Send + Sync + 'static {
     /// admit sessions by it. `None` when the platform does not say.
     fn heap(&self) -> Option<HostHeap> {
         None
+    }
+    /// Whether sessions open with the real-time profile
+    /// ([`Config::realtime`]): yes unless `--no-nvenc-realtime-profile`.
+    fn realtime_profile(&self) -> bool {
+        true
     }
     /// Waits a moment for another holder of the encoders, in a wait with
     /// no bound: it may do the platform's work the holder waits for.
@@ -329,6 +347,18 @@ struct Counts {
     /// push a job ([`EncoderPlatform::kick`]).
     asks: u64,
     kicks: u64,
+    /// The largest frame, the P frames' bytes and largest, the IDRs' bytes
+    /// (parameter sets included) and largest.
+    frame_max: u64,
+    p_bytes: u64,
+    p_max: u64,
+    idr_bytes: u64,
+    idr_max: u64,
+    /// The engine's average QP of each frame, summed, and the highest.
+    qp_sum: u64,
+    qp_max: u64,
+    /// Frames of more than twice a CBR frame's share of the bitrate.
+    over: u64,
 }
 
 impl Counts {
@@ -338,10 +368,25 @@ impl Counts {
         self.engine_samples += 1;
     }
 
-    fn frame(&mut self, encoded: &Encoded, convert_ns: u64, total_ns: u64) {
+    /// A coded frame; `share` is a CBR frame's share of the bitrate, in
+    /// bytes.
+    fn frame(&mut self, encoded: &Encoded, convert_ns: u64, total_ns: u64, share: Option<u64>) {
+        let bytes = encoded.bytes.len() as u64;
         self.frames += 1;
-        self.bytes += encoded.bytes.len() as u64;
+        self.bytes += bytes;
         self.idrs += u64::from(encoded.idr);
+        self.frame_max = self.frame_max.max(bytes);
+        if encoded.idr {
+            self.idr_bytes += bytes;
+            self.idr_max = self.idr_max.max(bytes);
+        } else {
+            self.p_bytes += bytes;
+            self.p_max = self.p_max.max(bytes);
+        }
+        let qp = u64::from(encoded.status.average_qp);
+        self.qp_sum += qp;
+        self.qp_max = self.qp_max.max(qp);
+        self.over += u64::from(share.is_some_and(|share| bytes > 2 * share));
         self.gpu_ns += encoded.timing.wait_ns;
         self.gpu_max = self.gpu_max.max(encoded.timing.wait_ns);
         self.convert_ns += convert_ns;
@@ -368,19 +413,32 @@ impl Counts {
         self.engine_samples += other.engine_samples;
         self.asks += other.asks;
         self.kicks += other.kicks;
+        self.frame_max = self.frame_max.max(other.frame_max);
+        self.p_bytes += other.p_bytes;
+        self.p_max = self.p_max.max(other.p_max);
+        self.idr_bytes += other.idr_bytes;
+        self.idr_max = self.idr_max.max(other.idr_max);
+        self.qp_sum += other.qp_sum;
+        self.qp_max = self.qp_max.max(other.qp_max);
+        self.over += other.over;
     }
 }
 
 /// `frames=… bytes=… idr=… errors=… gpu_us=avg/max convert_us=avg/max
 /// total_us=avg/max calls=… pending=… engine_us=avg/max/samples asks=…
-/// kicks=…`.
+/// kicks=… frame_bytes=avg/max p_bytes=avg/max idr_bytes=avg/max
+/// qp=avg/max over_2x=…`: the sizes in bytes, the QP the engine's statuses
+/// averaged, and frames past twice a CBR frame's share of the bitrate.
 impl fmt::Display for Counts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let average = |total: u64| total.checked_div(self.frames).unwrap_or(0) / 1000;
+        let idrs = self.idrs;
+        let p_frames = self.frames - idrs.min(self.frames);
         write!(
             formatter,
             "frames={} bytes={} idr={} errors={} gpu_us={}/{} convert_us={}/{} total_us={}/{} \
-             calls={} pending={} engine_us={}/{}/{} asks={} kicks={}",
+             calls={} pending={} engine_us={}/{}/{} asks={} kicks={} frame_bytes={}/{} \
+             p_bytes={}/{} idr_bytes={}/{} qp={}/{} over_2x={}",
             self.frames,
             self.bytes,
             self.idrs,
@@ -398,7 +456,62 @@ impl fmt::Display for Counts {
             self.engine_samples,
             self.asks,
             self.kicks,
+            self.bytes.checked_div(self.frames).unwrap_or(0),
+            self.frame_max,
+            self.p_bytes.checked_div(p_frames).unwrap_or(0),
+            self.p_max,
+            self.idr_bytes.checked_div(idrs).unwrap_or(0),
+            self.idr_max,
+            self.qp_sum.checked_div(self.frames).unwrap_or(0),
+            self.qp_max,
+            self.over,
         )
+    }
+}
+
+/// The open line's profile: `profile realtime: cpb 167 kbit (1.0 frame),
+/// bmin 2, 1 ref, …`, or `profile captured: …`.
+fn profile(config: &Config, rc: &RateControl) -> alloc::string::String {
+    let name = if config.realtime {
+        "realtime"
+    } else {
+        "captured"
+    };
+    let rate = match config.rate {
+        Rate::Cbr { .. } => {
+            let tenths = rc.cpb_tenth_frames();
+            alloc::format!(
+                "cpb {} kbit ({}.{} frames), bmin {}",
+                rc.cpb_bits / 1000,
+                tenths / 10,
+                tenths % 10,
+                rc.bmin
+            )
+        }
+        Rate::ConstQp(_) => alloc::string::String::from("constant QP"),
+    };
+    // The host picks every picture's type: an IDR first, when asked and
+    // after an engine error, else P. `gop_length` only informs the rate
+    // control.
+    alloc::format!(
+        "profile {name}: {rate}, {} ref{}, P frames only, {}, an IDR only when asked \
+         (gop_length {})",
+        rc.refs,
+        if rc.refs == 1 { "" } else { "s" },
+        if rc.lookahead {
+            "lookahead"
+        } else {
+            "no lookahead"
+        },
+        rc.gop
+    )
+}
+
+/// A CBR frame's share of the bitrate, in bytes.
+fn share(config: &Config) -> Option<u64> {
+    match config.rate {
+        Rate::Cbr { bitrate } => Some(u64::from(bitrate) / 8 / u64::from(config.fps.max(1))),
+        Rate::ConstQp(_) => None,
     }
 }
 
@@ -449,6 +562,9 @@ struct State<N: Node> {
     /// Why no session opens on this GPU any more: one hung with its channel
     /// busy, or nouveau refused the encoder's channel.
     refused: Option<&'static str>,
+    /// Why sessions no longer open with the real-time profile: one was lost
+    /// with it.
+    realtime_off: Option<&'static str>,
 }
 
 /// A GPU's encoders, over its platform.
@@ -496,6 +612,7 @@ impl<P: EncoderPlatform> Encoders<P> {
                 sessions: Vec::new(),
                 next_id: 1,
                 refused: None,
+                realtime_off: None,
             }),
         }
     }
@@ -606,9 +723,17 @@ impl<P: EncoderPlatform> Encoders<P> {
                     slot.stage = Stage::Idle;
                     let (buffers, _) = slot.session.made();
                     let took = self.platform.now_ns().saturating_sub(slot.opened_at);
+                    let profile = profile(slot.session.config(), &slot.session.rate_control());
+                    let why_not = match (slot.session.config().realtime, state.realtime_off) {
+                        (false, Some(why)) => alloc::format!(" ({why})"),
+                        (false, None) if !self.platform.realtime_profile() => {
+                            alloc::string::String::from(" (--no-nvenc-realtime-profile)")
+                        }
+                        _ => alloc::string::String::new(),
+                    };
                     let line = alloc::format!(
                         "{} open for connection {connection}: {}, coded {}x{}, {buffers} \
-                         buffers in {} ms, {} bytes of parameter sets{}",
+                         buffers in {} ms, {} bytes of parameter sets, {profile}{why_not}{}",
                         slot.id,
                         slot.describe(),
                         slot.session.geometry().coded_width,
@@ -723,6 +848,7 @@ impl<P: EncoderPlatform> Encoders<P> {
             fps,
             rate,
             map_recon: false,
+            realtime: self.platform.realtime_profile() && state.realtime_off.is_none(),
         };
         let node = self
             .platform
@@ -937,10 +1063,11 @@ impl<P: EncoderPlatform> Encoders<P> {
                 })
                 .map_err(refusal)?;
             self.log(format_args!(
-                "{} bitrate {} kb/s from frame {}",
+                "{} bitrate {} kb/s from frame {}, cpb {} kbit",
                 slot.id,
                 request.bitrate / 1000,
-                request.frame
+                request.frame,
+                slot.session.rate_control().cpb_bits / 1000
             ));
         }
         Ok(Picture {
@@ -1094,7 +1221,9 @@ impl<P: EncoderPlatform> Encoders<P> {
                     }
                     let picture = slot.picture.expect("a frame in flight has its picture");
                     let total = seen.saturating_sub(picture.began);
-                    slot.period.frame(&encoded, picture.convert_ns, total);
+                    let share = share(slot.session.config());
+                    slot.period
+                        .frame(&encoded, picture.convert_ns, total, share);
                     slot.stage = Stage::Done { frame, encoded };
                     return Ok(());
                 }
@@ -1129,6 +1258,17 @@ impl<P: EncoderPlatform> Encoders<P> {
                     }
                     let fault = Fault::new(Status::Dropped, why);
                     slot.stage = Stage::Refused { frame, fault };
+                    // The profile's rate control is the suspect: the next
+                    // frame, an IDR, goes back to NVIDIA's captured one.
+                    if slot.session.config().realtime && slot.session.set_realtime(false).is_ok() {
+                        self.log(format_args!(
+                            "{} real-time profile off from frame {}: the engine refused frame \
+                             {frame}; {}",
+                            slot.id,
+                            frame + 1,
+                            profile(slot.session.config(), &slot.session.rate_control())
+                        ));
+                    }
                     return Ok(());
                 }
                 Err(session::Error::Timeout { value, job_done }) => {
@@ -1158,6 +1298,13 @@ impl<P: EncoderPlatform> Encoders<P> {
         slot.lost = true;
         if slot.session.dead() == Some(true) {
             state.refused = Some("an encoder session hung this boot");
+        }
+        if slot.session.config().realtime && state.realtime_off.is_none() {
+            state.realtime_off = Some("a session was lost with the real-time profile this boot");
+            self.log(format_args!(
+                "{} lost with the real-time profile: later sessions open without it",
+                slot.id
+            ));
         }
         lost()
     }

@@ -58,6 +58,7 @@ impl ParseState<'_> {
             PROBE_NVDEC => options.probe_nvdec = true,
             NVDEC_SELFTEST => options.nvdec_selftest = true,
             NO_NVENC => options.nvenc = false,
+            NO_NVENC_REALTIME_PROFILE => options.nvenc_realtime_profile = false,
             NO_NVDEC => options.nvdec = false,
             GPU_BOOST => options.gpu_boost = true,
             "--native-shared-check" => flag(
