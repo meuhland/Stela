@@ -3163,6 +3163,9 @@ fn start_devices(
                 // sessions, which open with them.
                 #[cfg(feature = "nvk")]
                 gpu::nvenc::set_serving(options.nvenc);
+                // And the guest's NVDEC sessions (`--no-nvdec`).
+                #[cfg(feature = "nvk")]
+                gpu::nvdec::set_serving(options.nvdec);
                 let firmware = handoff
                     .screen
                     .and_then(|screen| screen.pci_source)

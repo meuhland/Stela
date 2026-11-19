@@ -188,6 +188,29 @@ impl<N: Node> Session<N> {
         layout: Layout,
         timeout_ns: u64,
     ) -> Result<Self, (Error, N)> {
+        let mut session = Self::begin_layout(node, chipset, geometry, layout, timeout_ns)?;
+        loop {
+            match session.bring_up_step() {
+                Ok(true) => return Ok(session),
+                Ok(false) => {}
+                Err(error) => {
+                    session.give_back();
+                    return Err((error, session.node));
+                }
+            }
+        }
+    }
+
+    /// [`Session::open_layout`] a piece at a time, for a caller with a
+    /// budget (the gate's `DecoderOpen`): the channel, the class and the
+    /// syncobj now, then one buffer per [`Session::bring_up_step`].
+    pub fn begin_layout(
+        node: N,
+        chipset: u16,
+        geometry: Geometry,
+        layout: Layout,
+        timeout_ns: u64,
+    ) -> Result<Self, (Error, N)> {
         if decoder_class(chipset).is_none() {
             return Err((Error::NoDecoder, node));
         }
@@ -208,20 +231,30 @@ impl<N: Node> Session<N> {
             in_flight: None,
             held: false,
         };
-        let made = session.start_channel().and_then(|()| {
-            for index in 0..session.layout.plans.len() {
-                let buffer = session.make(index)?;
-                session.buffers.push(buffer);
-            }
-            Ok(())
-        });
-        match made {
+        match session.start_channel() {
             Ok(()) => Ok(session),
             Err(error) => {
                 session.give_back();
                 Err((error, session.node))
             }
         }
+    }
+
+    /// Makes the layout's next buffer; whether every one is made. A
+    /// refusal leaves the session to [`Session::close`], which gives back
+    /// what was made: nothing was submitted.
+    pub fn bring_up_step(&mut self) -> Result<bool, Error> {
+        let index = self.buffers.len();
+        if index < self.layout.plans.len() {
+            let buffer = self.make(index)?;
+            self.buffers.push(buffer);
+        }
+        Ok(self.buffers.len() == self.layout.plans.len())
+    }
+
+    /// The buffers made, and the layout's.
+    pub fn made(&self) -> (usize, usize) {
+        (self.buffers.len(), self.layout.plans.len())
     }
 
     fn control<T>(
@@ -472,6 +505,9 @@ impl<N: Node> Session<N> {
         }
         if self.in_flight.is_some() {
             return Err(Error::Config("a picture is in flight"));
+        }
+        if self.buffers.len() != self.layout.plans.len() {
+            return Err(Error::Config("the session is still being made"));
         }
         if picture.codec != self.codec {
             return Err(Error::Config("the picture is another codec's"));

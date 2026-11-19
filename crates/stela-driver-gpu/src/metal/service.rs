@@ -46,6 +46,7 @@ use stela_contracts::gate::MemoryRange;
 use wire::{Fault, Handle, NegotiateRequest, NegotiateResponse, Operation, Record, Span, Status};
 
 mod commands;
+pub mod decoders;
 pub mod encoders;
 mod gate;
 pub mod identity;
@@ -804,6 +805,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             | Operation::EncoderOpen
             | Operation::EncoderEncode
             | Operation::EncoderClose => Err(encoders::NONE),
+            // The same for its decoders.
+            Operation::DecoderCapabilities
+            | Operation::DecoderOpen
+            | Operation::DecoderDecode
+            | Operation::DecoderClose => Err(decoders::NONE),
         }
     }
 

@@ -796,6 +796,11 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         .iter()
         .filter_map(|service| service.encoders())
         .for_each(|encoders| encoders.report());
+    // `NVDEC SESSION` lines of the sessions that decoded since.
+    shared()
+        .iter()
+        .filter_map(|service| service.decoders())
+        .for_each(|decoders| decoders.report());
     let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
     // How long submitted work took to be seen complete: the GPU's time plus
     // the wait for its interrupt and a look at the device.
@@ -1263,6 +1268,10 @@ fn open_gpu(
             if let Some(encoders) = super::nvenc::attach(gpu.window, index, &bound.name, chipset) {
                 service.set_encoders(encoders);
             }
+            // And its video decoder sessions, StelaVD's.
+            if let Some(decoders) = super::nvdec::attach(gpu.window, index, &bound.name, chipset) {
+                service.set_decoders(decoders);
+            }
             // Without a second stack, every compilation stays in its turn.
             service.set_wait_bound(gpu.tsc_hz / 1000 * WAIT_BOUND_MILLIS);
             service.set_look_budget(gpu.tsc_hz / 1_000_000 * LOOK_MICROS);
@@ -1387,6 +1396,10 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
         .iter()
         .filter_map(|service| service.encoders())
         .for_each(|encoders| encoders.close_all());
+    services
+        .iter()
+        .filter_map(|service| service.decoders())
+        .for_each(|decoders| decoders.close_all());
     let close_ms = ms(closing);
     let quarantine = dma_quarantine_status();
     output::arguments(format_args!(

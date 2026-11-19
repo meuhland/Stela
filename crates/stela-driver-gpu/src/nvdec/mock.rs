@@ -117,6 +117,13 @@ pub struct Gpu {
     /// Each copy-engine submission's words, and its (method, data) pairs.
     pub ce_words: Vec<Vec<u32>>,
     pub ce_submissions: Vec<Vec<(u32, u32)>>,
+    /// The surfaces' pitch in bytes and luma rows the engine writes:
+    /// 1920x1088 unless [`Gpu::with_size`] says otherwise.
+    pub size: (u32, u32),
+    /// Whether `ERROR_FRM_IDX` must be the previous submission's slot, as
+    /// in the P-only clips (pictures with B-frames conceal from a
+    /// reference, not the last picture).
+    pub check_conceal: bool,
 }
 
 impl Gpu {
@@ -142,7 +149,19 @@ impl Gpu {
             submissions: Vec::new(),
             frames: 0,
             last_slot: None,
+            size: (1920, 1088),
+            check_conceal: true,
         }
+    }
+
+    /// Writes pictures of `pitch` bytes by `rows` rows, for any clip, and
+    /// takes any `ERROR_FRM_IDX`.
+    /// The gate's tests use it, built with the `metal` feature.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    pub fn with_size(mut self, pitch: u32, rows: u32) -> Self {
+        self.size = (pitch, rows);
+        self.check_conceal = false;
+        self
     }
 
     /// The buffer holding GPU address `address`, and the offset in it.
@@ -243,7 +262,9 @@ impl Gpu {
         };
         // ERROR_FRM_IDX: the previous picture's slot.
         let conceal = get(m::SET_CONTROL_PARAMS) >> 7 & 0x3f;
-        if frame == 0 {
+        if !self.check_conceal {
+            assert!(conceal < 32, "ERROR_FRM_IDX");
+        } else if frame == 0 {
             assert_eq!(conceal, 0);
         } else {
             assert_eq!(Some(conceal), self.last_slot, "ERROR_FRM_IDX");
@@ -265,7 +286,7 @@ impl Gpu {
         let chroma_method =
             luma_method - m::SET_PICTURE_LUMA_OFFSET0 + m::SET_PICTURE_CHROMA_OFFSET0;
         let (luma_at, chroma_at) = (shifted(luma_method), shifted(chroma_method));
-        let (pitch, rows) = (1920u32, 1088u32);
+        let (pitch, rows) = self.size;
         let (luma, chroma) = picture(index, pitch, rows);
         for (address, plane, height) in [(luma_at, &luma, rows), (chroma_at, &chroma, rows / 2)] {
             let (buffer, offset) = self.at(address);

@@ -681,6 +681,26 @@ fn nvenc_sessions_are_on_unless_no_nvenc() {
     assert!(usual.to_string().contains(" --nvenc-selftest --no-nvenc"));
 }
 
+/// The guest's NVDEC sessions are on unless `--no-nvdec`, which round-trips
+/// alone and beside `--no-nvenc` and the self-test, and changes nothing
+/// else.
+#[test]
+fn nvdec_sessions_are_on_unless_no_nvdec() {
+    assert!(System::default().nvdec);
+    assert!(!round_trip("--system").to_string().contains("no-nvdec"));
+    let off = round_trip(&format!("--system {NO_NVDEC}"));
+    assert!(!off.nvdec && off.nvenc);
+    assert_eq!(off.to_string(), "--system --no-nvdec");
+    assert_eq!(System { nvdec: true, ..off }, System::default());
+    let both = round_trip(&format!("--system {NVDEC_SELFTEST} {NO_NVDEC} {NO_NVENC}"));
+    assert!(!both.nvdec && !both.nvenc && both.nvdec_selftest);
+    assert!(
+        both.to_string()
+            .contains(" --nvdec-selftest --no-nvenc --no-nvdec"),
+        "{both}"
+    );
+}
+
 /// `--gpu-boost`, the GPU held at its highest performance level, is off
 /// unless asked for, round-trips alone and beside the self-test and the
 /// boot's usual flags, and changes nothing else.

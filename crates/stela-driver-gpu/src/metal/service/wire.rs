@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 /// The protocol version a connection negotiates. A major version changes
 /// records; a minor version only adds operations.
 pub const MAJOR: u32 = 5;
-pub const MINOR: u32 = 0;
+pub const MINOR: u32 = 1;
 
 /// A fixed-width wire record.
 ///
@@ -1083,6 +1083,156 @@ raw_enum! {
     }
 }
 
+records! {
+    /// `DecoderCapabilities`: what the GPU's video decoder takes, which
+    /// answers `Unsupported`, with the reason, when the host serves none.
+    /// `codecs` holds `1 << EncoderCodec` for each codec; `profiles_h264`
+    /// and `profiles_hevc` hold `DECODER_PROFILE_*` bits; `depths` holds
+    /// `1 << bits` for each bit depth (8, 10); `formats` holds
+    /// `1 << DecoderFormat` for each output format.
+    pub struct DecoderCapabilitiesResponse {
+        pub codecs: u32,
+        pub profiles_h264: u32,
+        pub profiles_hevc: u32,
+        pub depths: u32,
+        pub formats: u32,
+        pub max_sessions: u32,
+        pub open_sessions: u32,
+        pub max_width: u32,
+        pub max_height: u32,
+        pub min_width: u32,
+        pub min_height: u32,
+        pub max_destinations: u32,
+    }
+
+    /// `DecoderOpen`: a session of `EncoderCodec` `codec` for the stream
+    /// `config` describes, its `avcC` (H.264) or `hvcC` (HEVC) record, whose
+    /// samples carry length-prefixed NAL units, with `DECODER_OPEN_*` flags.
+    /// `token`, nonzero, names the open across the calls answered `Pending`
+    /// while the host makes it.
+    /// `Unsupported` for a stream the host does not decode (its reason
+    /// says why): the frontend decodes it another way.
+    pub struct DecoderOpenRequest {
+        pub token: u64,
+        pub codec: u32,
+        pub flags: u32,
+        pub config: Span,
+    }
+
+    /// A new session: its handle, the stream's coded and displayed size
+    /// (every picture shown is the displayed size), its bit depth, the
+    /// `DecoderFormat` pictures are shown in, the reference slots the
+    /// stream holds at most and the surfaces the host made for them.
+    pub struct DecoderOpenResponse {
+        pub decoder: u64,
+        pub coded_width: u32,
+        pub coded_height: u32,
+        pub display_width: u32,
+        pub display_height: u32,
+        pub bit_depth: u32,
+        pub format: u32,
+        pub slots: u32,
+        pub surfaces: u32,
+        pub reserved: u64,
+    }
+
+    /// One picture the decoder may show: its planes in the caller's
+    /// memory, `luma` and `chroma` (interleaved CbCr) of `luma_pitch` and
+    /// `chroma_pitch` bytes a row, each holding the displayed size's rows
+    /// in the session's format. The host fills the rest of a destination it
+    /// shows a picture in: `frame`, the `DecoderDecodeRequest::frame` of
+    /// the sample that decoded it, its picture order count, and
+    /// `DESTINATION_*` flags.
+    pub struct DecoderPlanes {
+        pub luma: Span,
+        pub chroma: Span,
+        pub luma_pitch: u32,
+        pub chroma_pitch: u32,
+        pub frame: u64,
+        pub poc: i32,
+        pub flags: u32,
+    }
+
+    /// `DecoderDecode`: the sample at `sample` (length-prefixed NAL units,
+    /// one access unit; empty to only show or flush), decoded as frame
+    /// `frame`, a number each new sample changes; a call made again for
+    /// the same frame, after `Pending` or `Unmapped`, goes on with it; one
+    /// made again after an `Ok` answer that left pictures `queued` brings
+    /// fresh destinations for them (and, when the sample was not `taken`,
+    /// the same sample). `destinations` holds `count` `DecoderPlanes`
+    /// records, which the pictures shown fill in display order, those of
+    /// earlier samples first. `flags` are `DECODE_*`.
+    pub struct DecoderDecodeRequest {
+        pub decoder: u64,
+        pub frame: u64,
+        pub sample: Span,
+        pub destinations: Span,
+        pub count: u32,
+        pub flags: u32,
+    }
+
+    /// What the call did: `taken` 1 once the sample is decoded (0 when the
+    /// destinations ran out first: pictures still wait, `queued` of them,
+    /// and the frontend calls again with more, the same sample and frame),
+    /// `decoded` 1 when the sample held a picture, `outputs` the
+    /// destinations filled, the engine's report of the sample's picture
+    /// (`mbs_in_error`, `error_status`), and microseconds of the engine's
+    /// decode, the copy engine's readback and the host's copy into the
+    /// destinations. A decode answered `Pending` answers this record too,
+    /// with only `retry_us` and `calls`.
+    pub struct DecoderDecodeResponse {
+        pub frame: u64,
+        pub taken: u32,
+        pub decoded: u32,
+        pub outputs: u32,
+        pub queued: u32,
+        pub mbs_in_error: u32,
+        pub error_status: u32,
+        pub gpu_us: u32,
+        pub ce_us: u32,
+        pub copy_us: u32,
+        pub retry_us: u32,
+        pub calls: u32,
+        pub reserved: u32,
+    }
+}
+
+raw_enum! {
+    /// The pixel formats a decoder shows pictures in.
+    pub enum DecoderFormat: u32 {
+        /// `420v`: 8-bit luma, then interleaved CbCr, video range.
+        Nv12 = 0,
+        /// `x420`: 16-bit samples, the 10 bits high, then interleaved CbCr.
+        P010 = 1,
+    }
+}
+
+/// `DecoderCapabilitiesResponse::profiles_h264`: Baseline (constrained),
+/// Main and High.
+pub const DECODER_PROFILE_H264_BASELINE: u32 = 1;
+pub const DECODER_PROFILE_H264_MAIN: u32 = 2;
+pub const DECODER_PROFILE_H264_HIGH: u32 = 4;
+/// `DecoderCapabilitiesResponse::profiles_hevc`: Main and Main 10.
+pub const DECODER_PROFILE_HEVC_MAIN: u32 = 1;
+pub const DECODER_PROFILE_HEVC_MAIN10: u32 = 2;
+/// `DecoderOpenRequest::flags`: show each picture right after its decode,
+/// in decode order (VideoToolbox without temporal processing), rather than
+/// in display order.
+pub const DECODER_OPEN_DECODE_ORDER: u32 = 1;
+/// `DecoderDecodeRequest::flags`: the end of the stream (or VideoToolbox's
+/// `finishDelayedFrames`): once the sample (if any) is decoded, every
+/// picture still waiting is shown.
+pub const DECODE_FLUSH: u32 = 1;
+/// `DecoderDecodeRequest::flags`: forget every picture before this sample,
+/// shown or not, as for a seek; the sample must start afresh (an IDR or an
+/// IRAP).
+pub const DECODE_RESET: u32 = 2;
+/// `DecoderPlanes::flags`: the host showed a picture in it.
+pub const DESTINATION_WRITTEN: u32 = 1;
+/// `DecoderPlanes::flags`: the engine reported errors in the
+/// picture's decode, which it concealed.
+pub const DESTINATION_ERRORS: u32 = 2;
+
 /// `EncoderOpenRequest::flags`: the pictures are full range (`420f`), which
 /// the parameter sets do not signal yet: refused.
 pub const ENCODER_OPEN_FULL_RANGE: u32 = 1;
@@ -1420,6 +1570,18 @@ operations! {
     EncoderEncode = 0x0a02 => EncoderEncodeRequest, EncoderEncodeResponse;
     /// Closes a session; closing the connection closes its sessions.
     EncoderClose = 0x0a03 => Handle, Empty;
+    /// The GPU's video decoder (NVDEC), which these calls reach outside the
+    /// device's turn (`decoders`): `Unsupported` when the host serves none.
+    DecoderCapabilities = 0x0a10 => Empty, DecoderCapabilitiesResponse;
+    /// Opens a session for a stream's configuration record, answered
+    /// `Pending` while the host makes it.
+    DecoderOpen = 0x0a11 => DecoderOpenRequest, DecoderOpenResponse;
+    /// Decodes a sample and shows the pictures ready, answered `Pending`
+    /// while the engines work; `Lost` once the session timed out, `Dropped`
+    /// for a sample the host's parser or the engine refused.
+    DecoderDecode = 0x0a12 => DecoderDecodeRequest, DecoderDecodeResponse;
+    /// Closes a session; closing the connection closes its sessions.
+    DecoderClose = 0x0a13 => Handle, Empty;
 }
 
 pub mod commands;

@@ -65,6 +65,7 @@
 //! and command pools stay the turn's.
 use super::{
     Service, StagedLibrary,
+    decoders::{self, GateDecoders},
     encoders::{self, GateEncoders},
     wire::{self, GateCall, NewLibraryRequest, Operation, Span, Status},
 };
@@ -175,6 +176,9 @@ pub struct SharedService<B: Backend, C: Compiler> {
     /// The GPU's video encoders ([`SharedService::set_encoders`]), as a
     /// leaked box, or null: their calls never take a turn.
     encoders: AtomicPtr<Arc<dyn GateEncoders>>,
+    /// The GPU's video decoders ([`SharedService::set_decoders`]), as
+    /// the encoders.
+    decoders: AtomicPtr<Arc<dyn GateDecoders>>,
     host: ServiceHost,
 }
 
@@ -701,6 +705,11 @@ impl<B: Backend, C: Compiler> Drop for SharedService<B, C> {
             // frees, and which no call reaches once the service drops.
             drop(unsafe { Box::from_raw(encoders) });
         }
+        let decoders = *self.decoders.get_mut();
+        if !decoders.is_null() {
+            // SAFETY: the box `set_decoders` leaked, as the encoders'.
+            drop(unsafe { Box::from_raw(decoders) });
+        }
     }
 }
 
@@ -792,6 +801,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             refusals,
             read_backs,
             encoders: AtomicPtr::new(core::ptr::null_mut()),
+            decoders: AtomicPtr::new(core::ptr::null_mut()),
             host,
         }
     }
@@ -820,6 +830,32 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
     pub fn encoders(&self) -> Option<&Arc<dyn GateEncoders>> {
         // SAFETY: published once and never freed while the service lives.
         unsafe { self.encoders.load(Ordering::Acquire).as_ref() }
+    }
+
+    /// Serves the GPU's video decoder calls with `decoders`, before any
+    /// turn, once for the boot: without them the device answers them
+    /// `Unsupported`.
+    pub fn set_decoders(&self, decoders: Arc<dyn GateDecoders>) {
+        let boxed = Box::into_raw(Box::new(decoders));
+        if self
+            .decoders
+            .compare_exchange(
+                core::ptr::null_mut(),
+                boxed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: never published.
+            drop(unsafe { Box::from_raw(boxed) });
+        }
+    }
+
+    /// The GPU's video decoders, when it has them.
+    pub fn decoders(&self) -> Option<&Arc<dyn GateDecoders>> {
+        // SAFETY: published once and never freed while the service lives.
+        unsafe { self.decoders.load(Ordering::Acquire).as_ref() }
     }
 
     /// Defers the compilations no cache holds to jobs, which the platform
@@ -1714,6 +1750,9 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         if let Some(encoders) = self.encoders() {
             encoders.disconnect(connection);
         }
+        if let Some(decoders) = self.decoders() {
+            decoders.disconnect(connection);
+        }
         self.jobs.with(|jobs| {
             jobs.parked
                 .retain(|parked| parked.connection != connection.get());
@@ -1755,6 +1794,29 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
                 gave_up: false,
             });
         };
+        // A video decoder's call is the decoders', which hold no turn.
+        if let Some(decoders) = self.decoders()
+            && let Some(call) = read_call(record, caller)
+            && decoders::is_decoder_operation(call.operation)
+        {
+            let status = decoders::serve_gate(&**decoders, connection, record, call, caller)?;
+            if !matches!(
+                status,
+                Status::Ok
+                    | Status::Pending
+                    | Status::Unmapped
+                    | Status::Unsupported
+                    | Status::Lost
+                    | Status::Dropped
+            ) {
+                (self.host.report)(&alloc::format!(
+                    "video decoder operation {:#x} answered {status:?}",
+                    call.operation
+                ));
+            }
+            served_at_once(call.operation, status);
+            return Ok(());
+        }
         // A video encoder's call is the encoders', which hold no turn.
         if let Some(encoders) = self.encoders()
             && let Some(call) = read_call(record, caller)
