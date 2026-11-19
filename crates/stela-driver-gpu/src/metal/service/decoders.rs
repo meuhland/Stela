@@ -39,10 +39,20 @@
 //!
 //! **Limits and cleanup.** A GPU serves at most [`MAX_SESSIONS`] sessions at
 //! once, admitted while their video memory together stays within
-//! [`VRAM_BUDGET`] (each at most `decoder::VRAM_BUDGET`); a refusal lists
-//! the sessions open and how long each has been idle. A connection's
+//! [`VRAM_BUDGET`] (each at most `decoder::VRAM_BUDGET`). A connection's
 //! close closes its sessions ([`GateDecoders::disconnect`]), as the PC's
 //! stop closes every one.
+//!
+//! **Eviction.** VideoToolbox may leave a session open and never call it
+//! again (the Aerial wallpaper's AVPlayerLooper leaves one behind each loop,
+//! 0.43 GiB of video memory each). An open that does not fit closes the
+//! sessions idle at least [`EVICT_IDLE_NS`], least recently called first,
+//! when that makes room (else nothing is closed and the open is refused,
+//! listing the sessions open and how long each has been idle); and a
+//! session idle [`RELEASE_IDLE_NS`] is closed at the next decoder call
+//! (of another session) to give its video memory back. An evicted
+//! session's calls answer `Evicted`, which StelaVD takes as "open a new
+//! session at the next sync sample", and its close answers `Ok`.
 //!
 //! **Report.** Each session logs `NVDEC SESSION` lines when it opens, at
 //! each platform report while it decodes, when it is lost and when it
@@ -90,6 +100,24 @@ pub const MAX_SESSIONS: usize = 8;
 /// the RTX 3050's 8 GiB, the rest left to macOS (NVK) and the encoders. A
 /// 4K Main 10 session takes about 0.45 GiB ([`decoder::vram_bytes`]).
 pub const VRAM_BUDGET: u64 = 4 << 30;
+/// How long a session must have gone without a call before an open that
+/// does not fit may evict it: 10 s. A playing session calls at least once a
+/// frame (every 42 ms at 24 fps, 1 s even at 1 fps), and AVFoundation's
+/// preroll of the next item calls within a second or two of opening, so
+/// anything idle this long is paused or abandoned (Aerial's left-behind
+/// sessions were idle 85-170 s). An evicted session that comes back only
+/// loses the frames until its next sync sample.
+pub const EVICT_IDLE_NS: u64 = 10_000_000_000;
+/// How long a session may go without a call before it is evicted anyway,
+/// to give its video memory back to macOS (NVK): 60 s, a paused movie's
+/// price being frames dropped until the next sync sample when it resumes.
+pub const RELEASE_IDLE_NS: u64 = 60_000_000_000;
+/// The least time between two looks for sessions idle past
+/// [`RELEASE_IDLE_NS`].
+const SWEEP_NS: u64 = 1_000_000_000;
+/// Evicted sessions remembered, so their calls answer `Evicted` rather than
+/// a stale handle; the oldest is forgotten past this.
+const MOST_EVICTED: usize = 64;
 /// Destinations one decode call may give.
 pub const MAX_DESTINATIONS: u32 = 16;
 /// About how long one call works before it answers `Pending`, as the
@@ -409,6 +437,18 @@ struct State<N: Node> {
     /// Why no session opens on this GPU any more: one hung with its channel
     /// busy, or nouveau refused the decoder's channel.
     refused: Option<&'static str>,
+    /// Sessions evicted and not yet closed by their frontend: id and
+    /// connection, oldest first.
+    evicted: Vec<(u64, NonZeroU64)>,
+    /// When idle sessions were last looked for.
+    swept: u64,
+}
+
+fn evicted() -> Fault {
+    Fault::new(
+        Status::Evicted,
+        "the decoder session was evicted, idle, for another: open a new one at a sync sample",
+    )
 }
 
 /// A GPU's decoders, over its platform.
@@ -523,6 +563,8 @@ impl<P: EncoderPlatform> Decoders<P> {
                 sessions: Vec::new(),
                 next_id: 1,
                 refused: None,
+                evicted: Vec::new(),
+                swept: 0,
             }),
         }
     }
@@ -591,6 +633,109 @@ impl<P: EncoderPlatform> Decoders<P> {
         self.platform.close_node(closed.node, closed.keeps_file);
     }
 
+    /// Evicts the session of slot `index`, idle `idle_ns`: it is closed
+    /// (its video memory and channels freed), and its calls answer
+    /// `Evicted` until its frontend closes it.
+    fn evict(
+        &self,
+        state: &mut State<P::Node>,
+        index: usize,
+        idle_ns: u64,
+        why: fmt::Arguments<'_>,
+    ) {
+        let (id, connection) = (state.sessions[index].id, state.sessions[index].connection);
+        self.log(format_args!(
+            "{id} evicted (idle {} ms) {why}",
+            idle_ns / 1_000_000
+        ));
+        self.close_slot(state, index, "evicted");
+        if state.evicted.len() >= MOST_EVICTED {
+            state.evicted.remove(0);
+        }
+        state.evicted.push((id, connection));
+    }
+
+    /// Whether a session of `needed` bytes of video memory fits, after
+    /// evicting the sessions idle at least [`EVICT_IDLE_NS`], least
+    /// recently called first, that make it fit. Nothing is evicted when
+    /// evicting every such session would not make it fit.
+    fn make_room(&self, state: &mut State<P::Node>, connection: NonZeroU64, needed: u64) -> bool {
+        let fits =
+            |count: usize, taken: u64| count < MAX_SESSIONS && taken + needed <= self.vram_budget;
+        let mut count = state.sessions.len();
+        let mut taken: u64 = state
+            .sessions
+            .iter()
+            .map(|slot| slot.decoder.layout().vram_bytes())
+            .sum();
+        if fits(count, taken) {
+            return true;
+        }
+        let now = self.platform.now_ns();
+        let mut idle: Vec<(u64, u64, u64)> = state
+            .sessions
+            .iter()
+            .filter(|slot| now.saturating_sub(slot.last_call) >= EVICT_IDLE_NS)
+            .map(|slot| (slot.last_call, slot.id, slot.decoder.layout().vram_bytes()))
+            .collect();
+        idle.sort_unstable();
+        let mut chosen = Vec::new();
+        for (last_call, id, bytes) in idle {
+            if fits(count, taken) {
+                break;
+            }
+            count -= 1;
+            taken -= bytes;
+            chosen.push((id, last_call));
+        }
+        if !fits(count, taken) {
+            return false;
+        }
+        for (id, last_call) in chosen {
+            if let Some(index) = state.sessions.iter().position(|slot| slot.id == id) {
+                self.evict(
+                    state,
+                    index,
+                    now.saturating_sub(last_call),
+                    format_args!("for a new session of connection {connection}"),
+                );
+            }
+        }
+        true
+    }
+
+    /// Evicts the sessions but `keep` idle at least [`RELEASE_IDLE_NS`],
+    /// looking at most once every [`SWEEP_NS`].
+    fn sweep(&self, state: &mut State<P::Node>, keep: Option<u64>) {
+        let now = self.platform.now_ns();
+        if now.saturating_sub(state.swept) < SWEEP_NS {
+            return;
+        }
+        state.swept = now;
+        while let Some(index) = state.sessions.iter().position(|slot| {
+            Some(slot.id) != keep && now.saturating_sub(slot.last_call) >= RELEASE_IDLE_NS
+        }) {
+            let idle_ns = now.saturating_sub(state.sessions[index].last_call);
+            self.evict(
+                state,
+                index,
+                idle_ns,
+                format_args!(
+                    "to give its video memory back: no call in {} s",
+                    RELEASE_IDLE_NS / 1_000_000_000
+                ),
+            );
+        }
+    }
+
+    /// Whether `connection`'s session `decoder` was evicted.
+    fn was_evicted(state: &State<P::Node>, connection: NonZeroU64, decoder: u64) -> bool {
+        state
+            .evicted
+            .iter()
+            .any(|&(id, holder)| id == decoder && holder == connection)
+    }
+
     fn capabilities(state: &State<P::Node>, response: &mut [u8]) -> Result<(), Fault> {
         if let Some(why) = state.refused {
             return Err(Fault::new(Status::Unsupported, why));
@@ -635,6 +780,7 @@ impl<P: EncoderPlatform> Decoders<P> {
         };
         let started = self.platform.now_ns();
         let slot = &mut state.sessions[index];
+        slot.last_call = started;
         while slot.opening {
             match slot.decoder.bring_up_step() {
                 Ok(true) => {
@@ -732,19 +878,6 @@ impl<P: EncoderPlatform> Decoders<P> {
             )
             .value(request.config.length));
         }
-        if state.sessions.len() >= MAX_SESSIONS {
-            self.log(format_args!(
-                "refused a {} stream for connection {connection}: {MAX_SESSIONS} sessions open \
-                 ({})",
-                codec.name(),
-                self.idle_list(state)
-            ));
-            return Err(Fault::new(
-                Status::Unsupported,
-                "every video decoder session of the GPU is in use",
-            )
-            .value(MAX_SESSIONS as u64));
-        }
         let mut record = alloc::vec![0; request.config.length as usize];
         caller
             .read(request.config.address, &mut record)
@@ -765,12 +898,27 @@ impl<P: EncoderPlatform> Decoders<P> {
                 });
             }
         };
+        // Sessions idle long enough make room, least recently called first.
+        let room = self.make_room(state, connection, needed);
+        if !room && state.sessions.len() >= MAX_SESSIONS {
+            self.log(format_args!(
+                "refused a {} stream for connection {connection}: {MAX_SESSIONS} sessions open \
+                 ({})",
+                codec.name(),
+                self.idle_list(state)
+            ));
+            return Err(Fault::new(
+                Status::Unsupported,
+                "every video decoder session of the GPU is in use",
+            )
+            .value(MAX_SESSIONS as u64));
+        }
         let taken: u64 = state
             .sessions
             .iter()
             .map(|slot| slot.decoder.layout().vram_bytes())
             .sum();
-        if taken + needed > self.vram_budget {
+        if !room {
             self.log(format_args!(
                 "refused a {} stream for connection {connection}: it takes {} MiB of video \
                  memory, {} MiB of {} MiB are taken ({})",
@@ -877,7 +1025,13 @@ impl<P: EncoderPlatform> Decoders<P> {
         response: &mut [u8],
         caller: &mut dyn CallerMemory,
     ) -> Result<(), Fault> {
-        let index = slot_of(state, connection, request.decoder)?;
+        let index = match slot_of(state, connection, request.decoder) {
+            Ok(index) => index,
+            Err(_) if Self::was_evicted(state, connection, request.decoder) => {
+                return Err(evicted());
+            }
+            Err(fault) => return Err(fault),
+        };
         let started = self.platform.now_ns();
         let slot = &mut state.sessions[index];
         slot.period.calls += 1;
@@ -1045,8 +1199,11 @@ impl<P: EncoderPlatform> Decoders<P> {
             Err(Error::Parse(error)) => {
                 slot.period.errors += 1;
                 if slot.total.errors + slot.period.errors <= 4 {
+                    // What the sample was and the references then: its NAL
+                    // unit, order count, reference picture set, the buffer.
+                    let refusal = slot.decoder.refusal().unwrap_or("");
                     self.log(format_args!(
-                        "{} frame {} dropped: {} ({})",
+                        "{} frame {} dropped: {} ({}) [{refusal}]",
                         slot.id,
                         request.frame,
                         error.describe(),
@@ -1375,9 +1532,19 @@ impl<P: EncoderPlatform> Decoders<P> {
         connection: NonZeroU64,
         decoder: u64,
     ) -> Result<(), Fault> {
-        let index = slot_of(state, connection, decoder)?;
-        self.close_slot(state, index, "the frontend closed it");
-        Ok(())
+        match slot_of(state, connection, decoder) {
+            Ok(index) => {
+                self.close_slot(state, index, "the frontend closed it");
+                Ok(())
+            }
+            Err(_) if Self::was_evicted(state, connection, decoder) => {
+                state
+                    .evicted
+                    .retain(|&(id, holder)| !(id == decoder && holder == connection));
+                Ok(())
+            }
+            Err(fault) => Err(fault),
+        }
     }
 
     fn call(
@@ -1389,6 +1556,16 @@ impl<P: EncoderPlatform> Decoders<P> {
         response: &mut [u8],
         caller: &mut dyn CallerMemory,
     ) -> Result<(), Fault> {
+        // Sessions long idle give their video memory back, but never the
+        // one this call is for.
+        let keep = match operation {
+            Operation::DecoderDecode => wire::read::<DecoderDecodeRequest>(request)
+                .ok()
+                .map(|request| request.decoder),
+            Operation::DecoderClose => wire::read::<Handle>(request).ok().map(|h| h.handle),
+            _ => None,
+        };
+        self.sweep(state, keep);
         match operation {
             Operation::DecoderCapabilities => Self::capabilities(state, response),
             Operation::DecoderOpen => {
@@ -1492,6 +1669,7 @@ impl<P: EncoderPlatform> GateDecoders for Decoders<P> {
             {
                 self.close_slot(state, index, "its connection closed");
             }
+            state.evicted.retain(|&(_, holder)| holder != connection);
         });
     }
 

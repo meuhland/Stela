@@ -1277,6 +1277,11 @@ raw_enum! {
         /// The video encoder refused the frame's output: nothing was coded
         /// for it, and the session's next frame is an IDR.
         Dropped = 13,
+        /// A video decoder session left idle was closed to make room for
+        /// another (or to give its video memory back): nothing of the call
+        /// took effect. The frontend closes it and opens a new one at its
+        /// stream's next sync sample.
+        Evicted = 14,
     }
 }
 
@@ -1578,9 +1583,11 @@ operations! {
     DecoderOpen = 0x0a11 => DecoderOpenRequest, DecoderOpenResponse;
     /// Decodes a sample and shows the pictures ready, answered `Pending`
     /// while the engines work; `Lost` once the session timed out, `Dropped`
-    /// for a sample the host's parser or the engine refused.
+    /// for a sample the host's parser or the engine refused, `Evicted` once
+    /// the host closed the idle session for another.
     DecoderDecode = 0x0a12 => DecoderDecodeRequest, DecoderDecodeResponse;
-    /// Closes a session; closing the connection closes its sessions.
+    /// Closes a session (an evicted one too); closing the connection closes
+    /// its sessions.
     DecoderClose = 0x0a13 => Handle, Empty;
 }
 

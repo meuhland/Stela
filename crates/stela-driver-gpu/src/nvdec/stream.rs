@@ -363,11 +363,21 @@ impl Stream {
 
     /// What the parser did about pictures it could not decode as coded:
     /// RASL pictures skipped, references stood in for, CRAs that started
-    /// afresh (HEVC; H.264 refuses such pictures).
+    /// afresh (H.264: pictures after a gap in `frame_num`, and streams
+    /// taken from an intra picture that is no IDR).
     pub fn events(&self) -> hevc::Events {
         match &self.parser {
-            Parser::H264(_) => hevc::Events::default(),
+            Parser::H264(parser) => parser.events(),
             Parser::Hevc(parser) => parser.events(),
+        }
+    }
+
+    /// Why the parser refused the last unit it refused, with what the
+    /// unit was and the references then (for the session's log).
+    pub fn refusal(&self) -> Option<&str> {
+        match &self.parser {
+            Parser::H264(parser) => parser.refusal(),
+            Parser::Hevc(parser) => parser.refusal(),
         }
     }
 
@@ -614,6 +624,26 @@ pub(crate) mod synthetic {
         let (_, _, sps, pps) = bf();
         sample(&[&slice(&sps, &pps, 1, 1, lsb, &[(-4, false)])])
     }
+
+    /// A sample of one picture of hevc-main-bf's parameter sets: NAL type
+    /// `kind`, `slice_type` (0 B, 1 P, 2 I), order count LSBs `lsb`, the
+    /// negative deltas `negative` of its reference picture set, each used
+    /// or not.
+    pub(crate) fn hevc_picture(
+        kind: u8,
+        slice_type: u32,
+        lsb: u32,
+        negative: &[(i32, bool)],
+    ) -> Vec<u8> {
+        let (_, _, sps, pps) = bf();
+        sample(&[&slice(&sps, &pps, kind, slice_type, lsb, negative)])
+    }
+
+    /// hevc-main-bf's record and samples.
+    pub(crate) fn hevc_bf() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (record, samples, ..) = bf();
+        (record, samples)
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +826,149 @@ mod tests {
         );
         pictures.extend(run(&mut stream, &samples[5..]).0);
         assert_eq!(pictures, expected);
+    }
+
+    /// What nvdec7 showed at Aerial's frame 1800: a picture whose whole
+    /// reference picture set names pictures the buffer does not hold, with
+    /// no IRAP before it (the stream jumped: a loop fed with no sync sample
+    /// at the jump, or samples never fed). The marking drops every reference,
+    /// so no reference is left to stand in, and the picture was refused
+    /// ("a short-term reference is not in the buffer", with the restart and
+    /// conceal counts rolled back with it). It is now decoded from the
+    /// nearest picture still decoded, which stays a reference, and flagged.
+    #[test]
+    fn a_jump_to_a_picture_whose_references_are_all_missing_is_concealed() {
+        let (record, samples) = synthetic::hevc_bf();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        run(&mut stream, &samples[..13]);
+        // hevc-main-bf's P picture of order count 4, which refers to 0.
+        let picture = stream
+            .decode(&samples[1])
+            .unwrap_or_else(|error| panic!("{error:?}: {:?}", stream.refusal()))
+            .unwrap();
+        assert_eq!(picture.concealed(), 1);
+        let crate::nvdec::Parsed::Hevc(hevc) = &picture.parsed else {
+            unreachable!()
+        };
+        assert_eq!(hevc.st_curr_before.len(), 1);
+        assert!(
+            hevc.dpb
+                .iter()
+                .any(|kept| kept.slot == hevc.st_curr_before[0])
+        );
+        assert!(stream.events().concealed >= 1);
+        // The stream goes on, and an IDR starts it afresh.
+        assert!(stream.decode(&samples[0]).unwrap().unwrap().idr);
+        run(&mut stream, &samples[1..]);
+    }
+
+    /// An IRAP picture (intra) whose reference picture set marks pictures
+    /// it would use, at the start and after a flush: it reads none, so the
+    /// missing ones are left out rather than refused.
+    #[test]
+    fn an_irap_naming_used_pictures_never_decoded_decodes() {
+        let (record, samples) = synthetic::hevc_bf();
+        let cra = synthetic::hevc_picture(hevc::NAL_CRA, 2, 8, &[(-4, true), (-8, false)]);
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        let first = stream.decode(&cra).unwrap().unwrap();
+        assert_eq!((first.kind, first.poc, first.concealed()), ('I', 8, 1));
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        run(&mut stream, &samples[..5]);
+        stream.flush();
+        let after = stream.decode(&cra).unwrap().unwrap();
+        assert_eq!((after.kind, after.concealed()), ('I', 1));
+        assert_eq!(stream.events().restarted, 1);
+    }
+
+    /// Samples never fed (a trimmed tail, pictures dropped): the pictures
+    /// that refer to them are decoded with the nearest reference standing
+    /// in, never refused.
+    #[test]
+    fn references_never_fed_are_stood_in_for() {
+        let (record, samples) = synthetic::hevc_bf();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        // Without sample 5 (order count 8), which 6, 5 and 7 refer to, and
+        // sample 9 (12).
+        let fed: Vec<Vec<u8>> = samples
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| *k != 5 && *k != 9)
+            .map(|(_, sample)| sample.clone())
+            .collect();
+        let (pictures, _) = run(&mut stream, &fed);
+        assert!(pictures.iter().all(Option::is_some));
+        assert!(pictures.iter().flatten().any(|p| p.concealed() > 0));
+        assert!(stream.events().concealed > 0);
+        assert_eq!(stream.events().restarted, 0);
+    }
+
+    /// Entries the picture does not use (`foll`) may name pictures never
+    /// decoded: nothing is stood in for, nothing refused.
+    #[test]
+    fn missing_following_entries_are_not_required() {
+        let (record, samples) = synthetic::hevc_bf();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        run(&mut stream, &samples[..2]);
+        // Order count 5 uses 4 and keeps -3 (never decoded) for later.
+        let p = synthetic::hevc_picture(1, 1, 5, &[(-1, true), (-8, false)]);
+        let picture = stream.decode(&p).unwrap().unwrap();
+        assert_eq!((picture.kind, picture.concealed()), ('P', 0));
+        assert_eq!(stream.events(), hevc::Events::default());
+    }
+
+    /// A refusal says what the unit was and what the buffer held.
+    #[test]
+    fn a_refusal_names_the_unit_and_the_buffer() {
+        let (record, samples) = synthetic::hevc_bf();
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        run(&mut stream, &samples[..5]);
+        let bogus = synthetic::hevc_p_without_references(9);
+        assert!(stream.decode(&bogus).is_err());
+        let refusal = stream.refusal().unwrap();
+        for part in [
+            "an inter picture with no reference (invalid)",
+            "nal 1 tid 0 lsb 9 poc 9 pic_output ",
+            " kind P ",
+            "rps curr_before [] curr_after [] foll [5]",
+            "; dpb [",
+            "last irap nal ",
+            " poc 0 decode 0",
+            "no flush before it",
+        ] {
+            assert!(refusal.contains(part), "{part:?} not in {refusal}");
+        }
+        // A P picture first: no reference at all, still refused.
+        let mut stream = Stream::open(Codec::Hevc, &record).unwrap();
+        assert!(stream.decode(&samples[1]).is_err());
+        assert!(stream.refusal().unwrap().contains("starts afresh"));
+    }
+
+    /// H.264: a gap in `frame_num` (a reference never fed) is decoded with
+    /// the references there are and flagged; a stream taken from a P
+    /// picture, with no reference at all, is still refused.
+    #[test]
+    fn an_h264_gap_in_frame_num_is_concealed() {
+        let (record, samples) = samples(Codec::H264, H264_CLIP);
+        let mut stream = Stream::open(Codec::H264, &record).unwrap();
+        let fed: Vec<Vec<u8>> = samples
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| *k != 3)
+            .map(|(_, sample)| sample.clone())
+            .collect();
+        let (pictures, _) = run(&mut stream, &fed);
+        assert!(pictures.iter().all(Option::is_some));
+        let concealed: Vec<u8> = pictures.iter().flatten().map(Picture::concealed).collect();
+        assert_eq!(
+            concealed.iter().filter(|&&c| c > 0).count(),
+            1,
+            "{concealed:?}"
+        );
+        assert_eq!(concealed[3], 1);
+        assert_eq!(stream.events().concealed, 1);
+        stream.reset();
+        assert!(stream.decode(&samples[5]).is_err());
+        assert!(stream.refusal().unwrap().contains("kind P"));
     }
 
     #[test]

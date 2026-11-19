@@ -26,7 +26,9 @@
 //!   an IDR or a `memory_management_control_operation` 5.
 use super::super::dpb::{Output, Pool};
 use super::{Bits, Error, Nal, Result};
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 /// `nal_unit_type`s.
 pub const NAL_SLICE: u8 = 1;
@@ -786,6 +788,21 @@ pub struct Picture {
     /// The pictures shown as this one starts, in output order, maybe
     /// itself.
     pub outputs: Vec<Output>,
+    /// Pictures never decoded that it may refer to: a gap in `frame_num`
+    /// (a picture dropped or never fed: a seek, a loop, a splice), or a
+    /// stream taken from an intra picture that is no IDR. The engine
+    /// decodes it with the references there are, and conceals.
+    pub concealed: u8,
+}
+
+/// What a refused unit was, for the refusal's log line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Note {
+    idr: bool,
+    nal_ref_idc: u8,
+    kind: char,
+    frame_num: u32,
+    poc_lsb: u32,
 }
 
 /// A picture FFmpeg's picture array holds: its place there and its slot.
@@ -829,6 +846,15 @@ pub struct Parser {
     next_outputed_poc: i32,
     last_pocs: [i32; MAX_DELAYED],
     decoded: u32,
+    /// Pictures decoded with references never decoded
+    /// ([`Picture::concealed`]), and streams taken from an intra picture
+    /// that is no IDR (`restarted`).
+    events: super::hevc::Events,
+    /// The unit being taken, as far as read, and why the last unit refused
+    /// was refused.
+    note: Option<Note>,
+    refusal: Option<String>,
+    resets: u32,
 }
 
 impl Default for Parser {
@@ -859,7 +885,62 @@ impl Parser {
             next_outputed_poc: i32::MIN,
             last_pocs: [i32::MIN; MAX_DELAYED],
             decoded: 0,
+            events: super::hevc::Events::default(),
+            note: None,
+            refusal: None,
+            resets: 0,
         }
+    }
+
+    /// What the parser did about pictures it could not decode as coded.
+    pub fn events(&self) -> super::hevc::Events {
+        self.events
+    }
+
+    /// Why the last unit refused was refused, with the references then.
+    pub fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
+    fn describe_refusal(&self, error: &Error, note: Option<&Note>) -> String {
+        let mut line = String::new();
+        let _ = write!(line, "{} ({})", error.describe(), error.kind());
+        match note {
+            Some(note) => {
+                let _ = write!(
+                    line,
+                    "; idr {} nal_ref_idc {} kind {} frame_num {} poc_lsb {}",
+                    note.idr, note.nal_ref_idc, note.kind, note.frame_num, note.poc_lsb
+                );
+            }
+            None => line.push_str("; no slice header read"),
+        }
+        line.push_str("; refs [");
+        for (k, reference) in self.refs.iter().flatten().enumerate() {
+            let _ = write!(
+                line,
+                "{}frame_num {} poc {}@{}{}",
+                if k > 0 { ", " } else { "" },
+                reference.frame_num,
+                reference.poc[0],
+                reference.slot,
+                if reference.long_term.is_some() {
+                    " long"
+                } else {
+                    ""
+                },
+            );
+        }
+        let _ = write!(
+            line,
+            "]; prev_ref_frame_num {}; waiting {}; decoded {}; seen_idr {}; resets {}",
+            self.prev_ref_frame_num,
+            self.waiting.len(),
+            self.decoded,
+            self.seen_idr,
+            self.resets
+        );
+        line
     }
 
     /// The sequence of the stream's first picture.
@@ -901,11 +982,14 @@ impl Parser {
         let saved = self.clone();
         self.sps = sps;
         self.pps = pps;
+        self.note = None;
         let result = self.unit(nals);
-        if result.is_err() {
+        let note = self.note.take();
+        if let Err(error) = &result {
             let sps = core::mem::take(&mut self.sps);
             let pps = core::mem::take(&mut self.pps);
             *self = Self { sps, pps, ..saved };
+            self.refusal = Some(self.describe_refusal(error, note.as_ref()));
         }
         result
     }
@@ -941,14 +1025,45 @@ impl Parser {
                 return Err(Error::Invalid("the slices of a picture disagree"));
             }
         }
+        let mut kind = 'I';
+        for (_, header) in &slices {
+            kind = match (kind, header.slice_type) {
+                (_, B) | ('B', _) => 'B',
+                (_, P | SP) | ('P', _) => 'P',
+                _ => 'I',
+            };
+        }
+        self.note = Some(Note {
+            idr,
+            nal_ref_idc,
+            kind,
+            frame_num: first.frame_num,
+            poc_lsb: first.pic_order_cnt_lsb,
+        });
         let pps = self.pps[usize::from(first.pps_id)]
             .clone()
             .ok_or(Error::Missing("pps"))?;
         let sps = self.sps[usize::from(pps.sps_id)]
             .clone()
             .ok_or(Error::Missing("sps"))?;
+        let mut concealed = 0u8;
         if !self.seen_idr && !idr {
-            return Err(Error::Missing("the stream does not start with an IDR"));
+            // An intra picture starts the stream as a recovery point does
+            // (FFmpeg takes it too); an inter one has no reference at all.
+            if kind != 'I' {
+                return Err(Error::Missing("the stream does not start with an IDR"));
+            }
+            self.seen_idr = true;
+            self.refs = [None; 16];
+            self.max_long_term_frame_idx = None;
+            self.prev_poc_msb = 0;
+            self.prev_poc_lsb = first.pic_order_cnt_lsb as i32;
+            self.prev_frame_num_offset = 0;
+            self.prev_frame_num = first.frame_num;
+            self.prev_ref_frame_num = first.frame_num;
+            self.last_pocs = [i32::MIN; MAX_DELAYED];
+            self.events.restarted += 1;
+            concealed = 1;
         }
         match &self.active_sps {
             Some(active)
@@ -985,7 +1100,17 @@ impl Parser {
         } else if first.frame_num != self.prev_ref_frame_num
             && first.frame_num != (self.prev_ref_frame_num + 1) % max_frame_num
         {
-            return Err(Error::Unsupported("a gap in frame_num"));
+            // Pictures never decoded (dropped, or never fed: a seek, a loop
+            // or a splice with no IDR at it). FFmpeg fills the gap with
+            // copies of the last reference; the engine here decodes with
+            // the references there are, and conceals what they lack. With
+            // none at all an inter picture has nothing to decode from.
+            if kind != 'I' && self.refs.iter().all(Option::is_none) {
+                return Err(Error::Missing(
+                    "a gap in frame_num, and no reference picture at all",
+                ));
+            }
+            concealed = concealed.saturating_add(1);
         }
         // 8.2.1: the picture order count.
         let reference = nal_ref_idc != 0;
@@ -1074,16 +1199,10 @@ impl Parser {
         let high_water = self.pool.high_water().unwrap_or(slot);
         let mut bitstream = Vec::new();
         let mut slice_offsets = Vec::with_capacity(slices.len());
-        let mut kind = 'I';
-        for (nal, header) in &slices {
+        for (nal, _) in &slices {
             slice_offsets.push(bitstream.len() as u32);
             bitstream.extend_from_slice(&[0, 0, 1]);
             bitstream.extend_from_slice(nal.bytes);
-            kind = match (kind, header.slice_type) {
-                (_, B) | ('B', _) => 'B',
-                (_, P | SP) | ('P', _) => 'P',
-                _ => 'I',
-            };
         }
         let mut picture = Picture {
             sps: sps.clone(),
@@ -1103,6 +1222,7 @@ impl Parser {
             dpb: self.refs,
             decoded: self.decoded,
             outputs: Vec::new(),
+            concealed,
         };
         // As if decoded: the marking (8.2.5) and the order count's state.
         let mut forget_all = false;
@@ -1138,6 +1258,7 @@ impl Parser {
         if let Some(output) = self.select_output(&sps, kind, slot, shown_poc, idr || forget_all) {
             picture.outputs.push(output);
         }
+        self.events.concealed += u32::from(concealed);
         self.decoded += 1;
         Ok(Some(picture))
     }
@@ -1259,9 +1380,13 @@ impl Parser {
     pub fn reset(&mut self) {
         let sps = core::mem::take(&mut self.sps);
         let pps = core::mem::take(&mut self.pps);
+        let refusal = self.refusal.take();
         *self = Self {
             sps,
             pps,
+            events: self.events,
+            refusal,
+            resets: self.resets + 1,
             ..Self::new()
         };
     }
