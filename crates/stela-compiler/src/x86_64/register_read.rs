@@ -1577,12 +1577,26 @@ const READ_SEEN: i8 = core::mem::offset_of!(DeviceRead, seen) as i8;
 const READ_VALUE: i8 = core::mem::offset_of!(DeviceRead, value) as i8;
 const READ_UNTIL: i8 = core::mem::offset_of!(DeviceRead, until) as i8;
 
-/// The [`DeviceRead`]s a PE keeps, a slot per site ([`device_read_slot`]).
+/// The [`DeviceRead`]s a PE keeps, a slot per site and address
+/// ([`device_read_slot`]).
 pub const DEVICE_READS: usize = 64;
 
-/// The slot of the device site at physical address `site`.
-pub const fn device_read_slot(site: u64) -> usize {
-    ((site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - DEVICE_READS.ilog2())) as usize
+/// The multiplier mixing a read's address into its slot, as native code's
+/// `imul r64, r/m64, imm32` sign-extends it, and the bit of the product
+/// where the slot's bits start: bits 26-31 of the product take every
+/// address bit from 2 to 33, where a 32-bit multiplier leaves the top bits
+/// to the address's high bits alone.
+const ADDRESS_MIX: i32 = 0x9e37_79b1_u32 as i32;
+const ADDRESS_MIX_SHIFT: u8 = 26;
+
+/// The slot of the read at virtual `address` by the device site at
+/// physical `site`: one site that reads several addresses in turn (a
+/// sampler walking per-cluster counters) keeps a slot for each.
+pub const fn device_read_slot(site: u64, address: u64) -> usize {
+    let bits = 64 - DEVICE_READS.ilog2();
+    let site = (site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> bits;
+    let address = (address >> 2).wrapping_mul(ADDRESS_MIX as i64 as u64) >> ADDRESS_MIX_SHIFT;
+    (site ^ address) as usize & (DEVICE_READS - 1)
 }
 
 /// The key a [`DeviceRead`] made in mirror state `state` with PSTATE.PAN
@@ -1594,13 +1608,34 @@ pub const fn device_read_key(generation: u64, state: usize, pan: bool) -> u64 {
 
 /// A load a [`device_read_thunk`] completes: `LDR` or `LDUR` of a B, H, W or X
 /// register, zero-extending, without writeback, from a base other than SP
-/// (`rn`) plus `offset`, into `rt`.
+/// (`rn`) plus `offset` or plus an `index` register, into `rt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceLoad {
     pub rn: u8,
     pub offset: i32,
+    pub index: Option<DeviceIndex>,
     pub rt: u8,
     pub bytes: u8,
+}
+
+/// The index of `LDR (register)`: Xm, or Wm zero- or sign-extended, shifted
+/// left by `shift`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIndex {
+    pub rm: u8,
+    pub extend: IndexExtend,
+    pub shift: u8,
+}
+
+/// How `LDR (register)` widens its index ([`DeviceIndex`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexExtend {
+    /// UXTW: Wm zero-extended.
+    Unsigned,
+    /// SXTW: Wm sign-extended.
+    Signed,
+    /// LSL or SXTX: Xm as it is.
+    Whole,
 }
 
 impl DeviceLoad {
@@ -1609,21 +1644,94 @@ impl DeviceLoad {
         let size = word >> 30;
         let rn = (word >> 5 & 31) as u8;
         let rt = (word & 31) as u8;
+        let mut index = None;
         let offset = if word & 0x3fc0_0000 == 0x3940_0000 {
             // LDR (immediate, unsigned offset).
             ((word >> 10 & 0xfff) << size) as i32
         } else if word & 0x3fe0_0c00 == 0x3840_0000 {
             // LDUR.
             ((word << 11) as i32) >> 23
+        } else if word & 0x3fe0_0c00 == 0x3860_0800 {
+            // LDR (register); Rm 31 is XZR, which no device load names.
+            let rm = (word >> 16 & 31) as u8;
+            let extend = match word >> 13 & 7 {
+                0b010 => IndexExtend::Unsigned,
+                0b110 => IndexExtend::Signed,
+                0b011 | 0b111 => IndexExtend::Whole,
+                _ => return None,
+            };
+            let shift = if word >> 12 & 1 != 0 { size as u8 } else { 0 };
+            index = (rm != 31).then_some(DeviceIndex { rm, extend, shift });
+            index?;
+            0
         } else {
             return None;
         };
         (rn != 31).then_some(Self {
             rn,
             offset,
+            index,
             rt,
             bytes: 1 << size,
         })
+    }
+
+    /// The virtual address the load reads with `x` its X registers' values.
+    pub fn address(&self, x: impl Fn(u8) -> u64) -> u64 {
+        let index = self.index.map_or(0, |index| {
+            let value = x(index.rm);
+            let value = match index.extend {
+                IndexExtend::Unsigned => value & 0xffff_ffff,
+                IndexExtend::Signed => value as u32 as i32 as i64 as u64,
+                IndexExtend::Whole => value,
+            };
+            value << index.shift
+        });
+        x(self.rn)
+            .wrapping_add_signed(i64::from(self.offset))
+            .wrapping_add(index)
+    }
+
+    /// Its address into RAX, as [`Self::address`]. Clobbers RCX.
+    fn address_into_rax(&self, asm: &mut Asm<'_>) {
+        use Gpr::{Rax, Rcx};
+        use Size::{Dword, Qword};
+        asm.mov_load(Qword, Rax, register(self.rn));
+        if self.offset != 0 {
+            asm.alu_imm32(Alu::Add, Qword, Rax, self.offset);
+        }
+        if let Some(index) = self.index {
+            match index.extend {
+                IndexExtend::Unsigned => asm.mov_load(Dword, Rcx, register(index.rm)),
+                IndexExtend::Signed => asm.movsxd(Rcx, register(index.rm)),
+                IndexExtend::Whole => asm.mov_load(Qword, Rcx, register(index.rm)),
+            }
+            if index.shift != 0 {
+                asm.shift_imm(ShiftOp::Shl, Qword, Rcx, index.shift);
+            }
+            asm.alu(Alu::Add, Qword, Rax, Rcx);
+        }
+    }
+}
+
+/// The address of the [`DeviceRead`] slot of `site` and the address in RAX
+/// ([`device_read_slot`]) among `reads` into RCX.
+fn device_read_slot_into_rcx(asm: &mut Asm<'_>, reads: Place, site: u64) {
+    use Gpr::{Rax, Rcx};
+    use Size::{Dword, Qword};
+    let bits = 64 - DEVICE_READS.ilog2() as u8;
+    let site = (site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> bits;
+    asm.mov(Qword, Rcx, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rcx, 2);
+    asm.imul_imm32(Qword, Rcx, Rcx, ADDRESS_MIX);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rcx, ADDRESS_MIX_SHIFT);
+    asm.alu_imm8(Alu::And, Dword, Rcx, (DEVICE_READS - 1) as i8);
+    asm.alu_imm8(Alu::Xor, Dword, Rcx, site as i8);
+    asm.imul_imm32(Dword, Rcx, Rcx, core::mem::size_of::<DeviceRead>() as i32);
+    let anchor = core::mem::offset_of!(crate::GuestState, anchors) + reads.anchor as usize * 8;
+    asm.alu_load(Alu::Add, Qword, Rcx, Mem::base(Gpr::Rdi, anchor as i32));
+    if reads.offset != 0 {
+        asm.alu_imm32(Alu::Add, Qword, Rcx, reads.offset as i32);
     }
 }
 
@@ -1638,12 +1746,12 @@ pub struct DeviceReadPlaces {
 }
 
 /// The thunk completing the plain device load `load` of the site at `pc`
-/// and physical `site` natively, while the [`DeviceRead`] of its slot holds
-/// that site, the address the load reads now, the key of the PE's state
-/// and PSTATE.PAN, a model epoch that still holds the count it held, and a
-/// count below `until`: it writes the read's value to Xt and leaves through
-/// a direct exit to the next instruction. Else it exits at `pc`. It also
-/// clobbers RCX and RDX.
+/// and physical `site` natively, while the [`DeviceRead`] of the slot of
+/// that site and the address the load reads now ([`device_read_slot`])
+/// holds both, the key of the PE's state and PSTATE.PAN, a model epoch that
+/// still holds the count it held, and a count below `until`: it writes the
+/// read's value to Xt and leaves through a direct exit to the next
+/// instruction. Else it exits at `pc`. It also clobbers RCX and RDX.
 pub fn device_read_thunk(
     pc: impl Into<ThunkPc>,
     site: u64,
@@ -1652,10 +1760,6 @@ pub fn device_read_thunk(
 ) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
-    let slot = Place::new(
-        places.reads.anchor,
-        places.reads.offset + device_read_slot(site) * core::mem::size_of::<DeviceRead>(),
-    );
     let read = |offset| Mem::base_disp8(Rcx, offset);
     let (mut code, closed) = open(places.key);
     let mut asm = Asm::new(&mut code);
@@ -1666,18 +1770,15 @@ pub fn device_read_thunk(
         Rdx,
         frame_field(core::mem::offset_of!(GuestState, pan)),
     );
-    asm.place(Rcx, slot);
+    load.address_into_rax(&mut asm);
+    device_read_slot_into_rcx(&mut asm, places.reads, site);
     asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_KEY));
     let other_key = asm.jcc(Cond::Ne);
-    asm.mov_imm64(Rax, site);
-    asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_SITE));
-    let other_site = asm.jcc(Cond::Ne);
-    asm.mov_load(Qword, Rax, register(load.rn));
-    if load.offset != 0 {
-        asm.alu_imm32(Alu::Add, Qword, Rax, load.offset);
-    }
     asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_ADDRESS));
     let other_address = asm.jcc(Cond::Ne);
+    asm.mov_imm64(Rdx, site);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_SITE));
+    let other_site = asm.jcc(Cond::Ne);
     asm.mov_load(Qword, Rax, read(READ_EPOCH));
     asm.mov_load(Qword, Rax, Mem::base(Rax, 0));
     asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_SEEN));
@@ -1685,7 +1786,9 @@ pub fn device_read_thunk(
     asm.alu_imm8(Alu::Cmp, Qword, read(READ_UNTIL), -1);
     let timeless = asm.jcc(Cond::E);
     read_count(&mut asm, places.count);
-    asm.place(Rcx, slot);
+    // The count clobbered the slot's address: find it again.
+    load.address_into_rax(&mut asm);
+    device_read_slot_into_rcx(&mut asm, places.reads, site);
     asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_UNTIL));
     let due = asm.jcc(Cond::Ae);
     asm.bind(timeless);
@@ -2407,6 +2510,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 9,
                 offset: 0x14,
+                index: None,
                 rt: 8,
                 bytes: 4
             })
@@ -2416,6 +2520,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 1,
                 offset: 0,
+                index: None,
                 rt: 0,
                 bytes: 8
             })
@@ -2425,6 +2530,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 3,
                 offset: 1,
+                index: None,
                 rt: 2,
                 bytes: 1
             })
@@ -2434,6 +2540,7 @@ mod tests {
             Some(DeviceLoad {
                 rn: 5,
                 offset: 6,
+                index: None,
                 rt: 4,
                 bytes: 2
             })
@@ -2444,18 +2551,53 @@ mod tests {
             Some(DeviceLoad {
                 rn: 1,
                 offset: -4,
+                index: None,
                 rt: 0,
                 bytes: 4
             })
         );
+        // ldr x13, [x11, w13, uxtw]; ldr w0, [x1, x2]; ldr x0, [x1, w2, sxtw #3]
+        let indexed = |rn, rm, extend, shift, rt, bytes| DeviceLoad {
+            rn,
+            offset: 0,
+            index: Some(DeviceIndex { rm, extend, shift }),
+            rt,
+            bytes,
+        };
+        assert_eq!(
+            DeviceLoad::of(0xf86d_496d),
+            Some(indexed(11, 13, IndexExtend::Unsigned, 0, 13, 8))
+        );
+        assert_eq!(
+            DeviceLoad::of(0xb862_6820),
+            Some(indexed(1, 2, IndexExtend::Whole, 0, 0, 4))
+        );
+        assert_eq!(
+            DeviceLoad::of(0xf862_d820),
+            Some(indexed(1, 2, IndexExtend::Signed, 3, 0, 8))
+        );
+        let x = |r: u8| match r {
+            1 => 0x1000,
+            2 => 0xffff_ffff_ffff_fff0,
+            11 => 0x2000,
+            13 => 0xffff_ffff_0000_0040,
+            _ => 0,
+        };
+        assert_eq!(DeviceLoad::of(0xf86d_496d).unwrap().address(x), 0x2040);
+        assert_eq!(
+            DeviceLoad::of(0xf862_d820).unwrap().address(x),
+            0x1000 - 0x80
+        );
+        assert_eq!(DeviceLoad::of(0xb85f_c020).unwrap().address(x), 0xffc);
         // ldr x0, [sp]; ldrsw x0, [x1]; str w0, [x1]; ldr w0, [x1], #4;
-        // ldr w0, [x1, x2]
+        // ldr w0, [x1, xzr]; ldr w0, [x1, w2, uxth] (unallocated)
         for other in [
             0xf940_03e0_u32,
             0xb980_0020,
             0xb900_0020,
             0xb840_4420,
-            0xb862_6820,
+            0xb87f_6820,
+            0xb862_2820,
         ] {
             assert_eq!(DeviceLoad::of(other), None, "{other:#x}");
         }
@@ -2478,6 +2620,7 @@ mod tests {
         let load = DeviceLoad {
             rn: 1,
             offset: 0x10,
+            index: None,
             rt: 2,
             bytes: 4,
         };
@@ -2505,7 +2648,7 @@ mod tests {
         state.anchors[Anchor::Count] = &mut *count as *mut Count as u64;
         state.x[1] = 0xffff_fe00_1000_0000;
         let key = device_read_key(3, 1, false);
-        let slot = device_read_slot(SITE);
+        let slot = device_read_slot(SITE, 0xffff_fe00_1000_0010);
         // SAFETY: `base` points into the live box; written between runs.
         let data = |f: &mut dyn FnMut(&mut Data)| unsafe { f(&mut *base) };
         assert_eq!(run(&thunk.code, &mut state), MISS);
@@ -2551,6 +2694,88 @@ mod tests {
         data(&mut |d| d.key.readable = 0);
         assert_eq!(run(&thunk.code, &mut state), MISS);
         assert_eq!(state.x[2], 0xabcd);
+    }
+
+    /// One indexed load site reading a counter of each cluster in turn
+    /// (`ldr x13, [x11, w13, uxtw]`) completes each from the slot of its
+    /// own address, the timed one past its deadline exiting.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn indexed_device_reads_keep_a_slot_per_address() {
+        use crate::GuestState;
+        use core::mem::offset_of;
+        use core::sync::atomic::Ordering::Relaxed;
+        #[repr(C)]
+        struct Data {
+            key: Cell,
+            reads: [DeviceRead; DEVICE_READS],
+        }
+        const SITE: u64 = 0x8_0000_2144;
+        const CLUSTERS: [u64; 2] = [0xffff_fe00_2000_4100, 0xffff_fe00_2004_4100];
+        let load = DeviceLoad::of(0xf86d_496d).expect("an indexed load");
+        let slots = CLUSTERS.map(|address| device_read_slot(SITE, address + 0x20));
+        assert_ne!(slots[0], slots[1]);
+        let mut data = alloc::boxed::Box::new(Data {
+            key: Cell::default(),
+            reads: [DeviceRead::default(); DEVICE_READS],
+        });
+        let base = &mut *data as *mut Data;
+        let epoch = alloc::boxed::Box::new(AtomicU64::new(7));
+        let published = alloc::boxed::Box::new(CountState::default());
+        published.offset.store(100, Relaxed);
+        published.ceiling.store(u64::MAX, Relaxed);
+        let mut count = alloc::boxed::Box::new(Count {
+            state: &*published as *const CountState as u64,
+            ..Count::default()
+        });
+        let places = DeviceReadPlaces {
+            reads: Place::new(Anchor::Mirrors, offset_of!(Data, reads)),
+            key: Place::new(Anchor::Mirrors, offset_of!(Data, key)),
+            count: READER,
+        };
+        let thunk = device_read_thunk(PC, SITE, load, places);
+        let mut state = GuestState::default();
+        state.anchors[Anchor::Mirrors] = base as u64;
+        state.anchors[Anchor::Count] = &mut *count as *mut Count as u64;
+        let key = device_read_key(3, 1, false);
+        // SAFETY: `base` points into the live box; written between runs.
+        let data = |f: &mut dyn FnMut(&mut Data)| unsafe { f(&mut *base) };
+        data(&mut |d| {
+            d.key = Cell {
+                readable: 1,
+                value: key,
+            };
+            for (cluster, (&slot, &address)) in slots.iter().zip(&CLUSTERS).enumerate() {
+                d.reads[slot] = DeviceRead {
+                    site: SITE,
+                    address: address + 0x20,
+                    key,
+                    epoch: &*epoch as *const AtomicU64 as u64,
+                    seen: 7,
+                    value: 0x100 + cluster as u64,
+                    until: if cluster == 0 { u64::MAX } else { 1000 },
+                };
+            }
+        });
+        for _ in 0..2 {
+            for (cluster, &address) in CLUSTERS.iter().enumerate() {
+                state.x[11] = address;
+                state.x[13] = 0xdead_0000_0000_0020;
+                assert_eq!(run(&thunk.code, &mut state), NEXT);
+                assert_eq!(state.x[13], 0x100 + cluster as u64);
+            }
+        }
+        // Another index, or the timed cluster past its deadline, exits.
+        state.x[11] = CLUSTERS[0];
+        state.x[13] = 0x28;
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        data(&mut |d| d.reads[slots[1]].until = 50);
+        state.x[11] = CLUSTERS[1];
+        state.x[13] = 0x20;
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        state.x[11] = CLUSTERS[0];
+        assert_eq!(run(&thunk.code, &mut state), NEXT);
+        assert_eq!(state.x[13], 0x100);
     }
 
     /// What the event thunks of these tests find at [`Anchor::Mirrors`].

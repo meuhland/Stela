@@ -249,7 +249,7 @@ fn a_plain_read_at_a_device_site_is_kept_for_native_code_until_translation_may_c
         .push(device_fault(offset, DEVICE + 8, false));
     machine.step().unwrap();
     assert!(machine.device_site(BASE + 4));
-    let slot = device_read_slot(BASE + 4);
+    let slot = device_read_slot(BASE + 4, DEVICE + 8);
     // The fault path keeps nothing: only a site's stub is completed again.
     assert_eq!(machine.mirrors.device_reads[slot].site, 0);
     machine.cpu.pc = BASE + 4;
@@ -294,6 +294,45 @@ fn a_plain_read_at_a_device_site_is_kept_for_native_code_until_translation_may_c
     machine.host.exits.push(exit(BASE + 4, ExitKind::System));
     machine.step().unwrap();
     assert_eq!(machine.mirrors.device_reads[slot].site, BASE + 4);
+}
+
+/// An indexed load site reading one register of each of two blocks in turn
+/// keeps each read in the slot of its own address, for native code to
+/// complete both again.
+#[test]
+fn an_indexed_device_site_keeps_a_read_per_address() {
+    use register_read::device_read_slot;
+    // add x3, x3, #1; ldr w0, [x1, w2, uxtw]; add x2, x2, #1; ret
+    let words = [0x9100_0463, 0xb862_4820, 0x9100_0442, 0xd65f_03c0];
+    let mut machine = board(&words, PlainRegisters::default(), Vec::new());
+    machine.cpu.state.x[1] = DEVICE;
+    machine.cpu.state.x[2] = 8;
+    let (_, offset) =
+        native_fault_site_in_entry(&mut machine, BASE, BASE + 4, RecoverySiteKind::GuestAccess);
+    machine
+        .host
+        .exits
+        .push(device_fault(offset, DEVICE + 8, false));
+    machine.step().unwrap();
+    assert!(machine.device_site(BASE + 4));
+    let mut values = Vec::new();
+    for index in [8, 0x10] {
+        machine.cpu.state.x[2] = 0xffff_ffff_0000_0000 | index;
+        machine.cpu.pc = BASE + 4;
+        machine.devices.served = None;
+        machine.host.exits.push(exit(BASE + 4, ExitKind::System));
+        machine.step().unwrap();
+        values.push(machine.cpu.state.x[0]);
+    }
+    let slots = [8, 0x10].map(|index| device_read_slot(BASE + 4, DEVICE + index));
+    assert_ne!(slots[0], slots[1]);
+    for ((slot, index), value) in slots.into_iter().zip([8, 0x10]).zip(values) {
+        let read = machine.mirrors.device_reads[slot];
+        assert_eq!(
+            (read.site, read.address, read.value),
+            (BASE + 4, DEVICE + index, value)
+        );
+    }
 }
 
 /// A device site keeps the translation its last access made, as a TLB

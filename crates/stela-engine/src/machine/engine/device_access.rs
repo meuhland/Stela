@@ -286,9 +286,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let site = self.device_sites.entry(physical).or_default();
         site.device = site.device.saturating_add(1);
         let load = register_read::DeviceLoad::of(word).filter(|_| !access.write);
-        let address = load.map(|load| {
-            self.cpu.state.x[usize::from(load.rn)].wrapping_add_signed(i64::from(load.offset))
-        });
+        let address = load.map(|load| load.address(|r| self.cpu.state.x[usize::from(r)]));
         self.devices.take_plain_read();
         let step = self.outside_run(|machine| {
             machine.completing(pc, |machine| {
@@ -336,7 +334,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     fn keep_device_read(&mut self, site: u64, address: u64, plain: PlainRead) {
         use register_read::{DeviceRead, device_read_slot};
         let key = self.open_device_read_key();
-        let slot = device_read_slot(site);
+        let slot = device_read_slot(site, address);
         self.mirrors.device_reads[slot] = DeviceRead {
             site,
             address,
