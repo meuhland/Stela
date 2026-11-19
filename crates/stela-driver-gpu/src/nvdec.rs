@@ -1,7 +1,7 @@
 //! NVDEC, GA10x's video decoder (`NVC7B0_VIDEO_DECODER`), driven through
 //! nouveau from Stela's host.
 //!
-//! Two users so far:
+//! Three users:
 //!
 //! - **The "alive" probe** ([`probe`], `--probe-nvdec`): does GSP-RM run the
 //!   decoder for nouveau on this GPU? It is NVENC's probe
@@ -23,8 +23,14 @@
 //!   engine, blitted block-linear to pitch-linear NV12 in system memory
 //!   ([`copy`]), or, when it fails, over BAR1 and de-tiled on the CPU
 //!   ([`surface`]).
+//! - **The guest's decode sessions** ([`decoder`], the Metal gate's
+//!   `DecoderOpen`/`DecoderDecode`, `metal::service::decoders`): a
+//!   [`stream::Stream`] fed StelaVD's samples, a [`session::Session`]
+//!   decoding each picture, and a [`copy::Copier`] reading each picture
+//!   shown into the staging buffer the host copies into the guest's pixel
+//!   buffers.
 //!
-//! Neither ever stops the boot: every refusal is a line and a value, waits
+//! None ever stops the boot: every refusal is a line and a value, waits
 //! are bounded by the caller's clock, and a channel whose push never
 //! finished is left open with its file.
 use crate::nouveau_chip::{Architecture, Chip};
