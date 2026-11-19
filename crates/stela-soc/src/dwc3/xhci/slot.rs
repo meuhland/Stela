@@ -280,6 +280,12 @@ pub(super) struct Slot {
     output: u64,
     context: [u32; 8],
     endpoints: [Endpoint; ENDPOINTS],
+    /// Bit `dci - 1` for each endpoint that is not Disabled: what the
+    /// schedule's looks visit ([`Self::live`]), so a look costs the
+    /// endpoints a device configured, not all 31 contexts. Only
+    /// [`Self::start`] and [`Self::disable`] change it, as only they take
+    /// an endpoint out of or into Disabled.
+    enabled: u32,
 }
 
 impl Slot {
@@ -289,7 +295,51 @@ impl Slot {
             output: 0,
             context: [0; 8],
             endpoints: [const { Endpoint::disabled() }; ENDPOINTS],
+            enabled: 0,
         })
+    }
+
+    /// Endpoint `dci` Running on the ring `context` names, as Address
+    /// Device starts EP0 and Configure Endpoint an added endpoint.
+    fn start(&mut self, dci: usize, context: [u32; 8]) {
+        let endpoint = &mut self.endpoints[dci - 1];
+        *endpoint = Endpoint::disabled();
+        endpoint.context = context;
+        endpoint.state = EpState::Running;
+        endpoint.ring = Ring {
+            dequeue: u64::from(context[2] & !0xf) | u64::from(context[3]) << 32,
+            cycle: context[2] & 1 != 0,
+        };
+        self.enabled |= 1 << (dci - 1);
+    }
+
+    /// Endpoint `dci` Disabled, as a drop, a deconfiguration or Reset
+    /// Device leaves it.
+    fn disable(&mut self, dci: usize) {
+        self.endpoints[dci - 1] = Endpoint::disabled();
+        self.enabled &= !(1 << (dci - 1));
+    }
+
+    /// The DCIs of the endpoints that are not Disabled, in order.
+    fn live(&self) -> impl Iterator<Item = usize> + use<> {
+        let mut mask = self.enabled;
+        core::iter::from_fn(move || {
+            let bit = mask.trailing_zeros();
+            (bit < 32).then(|| {
+                mask &= mask - 1;
+                bit as usize + 1
+            })
+        })
+    }
+
+    /// Whether [`Self::enabled`] names exactly the endpoints that are not
+    /// Disabled.
+    #[cfg(test)]
+    pub(super) fn live_matches(&self) -> bool {
+        self.endpoints
+            .iter()
+            .enumerate()
+            .all(|(n, e)| (e.state != EpState::Disabled) == (self.enabled & 1 << n != 0))
     }
 
     fn port(&self) -> usize {
@@ -449,14 +499,7 @@ impl Xhci {
         slot.output = output;
         slot.context = context;
         slot.context[3] = if bsr { 0 } else { id as u32 };
-        let endpoint = &mut slot.endpoints[0];
-        *endpoint = Endpoint::disabled();
-        endpoint.context = ep0;
-        endpoint.state = EpState::Running;
-        endpoint.ring = Ring {
-            dequeue: u64::from(ep0[2] & !0xf) | u64::from(ep0[3]) << 32,
-            cycle: ep0[2] & 1 != 0,
-        };
+        slot.start(1, ep0);
         Self::write_slot_context(port, slot)?;
         Self::write_endpoint_context(port, slot, 1)?;
         Ok(SUCCESS)
@@ -498,7 +541,7 @@ impl Xhci {
         }
         if deconfigure {
             for dci in 2..=ENDPOINTS {
-                slot.endpoints[dci - 1] = Endpoint::disabled();
+                slot.disable(dci);
                 Self::write_endpoint_context(port, slot, dci)?;
             }
             slot.state = SlotState::Addressed;
@@ -540,19 +583,12 @@ impl Xhci {
         let slot = self.enabled_slot(id);
         for dci in 2..=ENDPOINTS {
             if drop & 1 << dci != 0 {
-                slot.endpoints[dci - 1] = Endpoint::disabled();
+                slot.disable(dci);
                 Self::write_endpoint_context(port, slot, dci)?;
             }
         }
         for (dci, context) in added {
-            let endpoint = &mut slot.endpoints[dci - 1];
-            *endpoint = Endpoint::disabled();
-            endpoint.context = context;
-            endpoint.state = EpState::Running;
-            endpoint.ring = Ring {
-                dequeue: u64::from(context[2] & !0xf) | u64::from(context[3]) << 32,
-                cycle: context[2] & 1 != 0,
-            };
+            slot.start(dci, context);
             Self::write_endpoint_context(port, slot, dci)?;
         }
         if let Some(context) = slot_context {
@@ -563,9 +599,8 @@ impl Xhci {
             slot.context[1] = slot.context[1] & 0x00ff_ffff | context[1] & 0xff00_0000;
             slot.context[2] = slot.context[2] & !(3 << 16) | context[2] & 3 << 16;
         }
-        let configured = slot.endpoints[1..]
-            .iter()
-            .any(|e| e.state != EpState::Disabled);
+        // Any endpoint beyond EP0.
+        let configured = slot.enabled & !1 != 0;
         slot.state = if configured {
             SlotState::Configured
         } else {
@@ -717,7 +752,7 @@ impl Xhci {
             return Ok(CONTEXT_STATE_ERROR);
         }
         for dci in 2..=ENDPOINTS {
-            slot.endpoints[dci - 1] = Endpoint::disabled();
+            slot.disable(dci);
             Self::write_endpoint_context(port, slot, dci)?;
         }
         slot.endpoints[0].td = None;
@@ -775,31 +810,37 @@ impl Xhci {
             let Some(slot) = slot else { continue };
             let (state, route) = (slot.state, slot.route());
             let _ = write!(line, " slot{}=[{state:?} route={route:#x}", n + 1);
-            for (e, endpoint) in slot.endpoints.iter().enumerate() {
-                if endpoint.state != EpState::Disabled {
-                    let _ = write!(
-                        line,
-                        " dci{}={:?}@{:#x}/{}{}{}{}",
-                        e + 1,
-                        endpoint.state,
-                        endpoint.ring.dequeue,
-                        u8::from(endpoint.ring.cycle),
-                        if endpoint.td.is_some() { " td" } else { "" },
-                        if endpoint.rung { " rung" } else { "" },
-                        if endpoint.waiting { " waiting" } else { "" },
-                    );
-                }
+            for dci in slot.live() {
+                let endpoint = &slot.endpoints[dci - 1];
+                let _ = write!(
+                    line,
+                    " dci{dci}={:?}@{:#x}/{}{}{}{}",
+                    endpoint.state,
+                    endpoint.ring.dequeue,
+                    u8::from(endpoint.ring.cycle),
+                    if endpoint.td.is_some() { " td" } else { "" },
+                    if endpoint.rung { " rung" } else { "" },
+                    if endpoint.waiting { " waiting" } else { "" },
+                );
             }
             line.push(']');
         }
     }
 
+    /// Whether every slot's set of live endpoints is the endpoints that are
+    /// not Disabled ([`Slot::live`]).
+    #[cfg(test)]
+    pub(crate) fn live_endpoints_match(&self) -> bool {
+        self.slots.iter().flatten().all(|slot| slot.live_matches())
+    }
+
     /// Endpoints with work to try now.
     pub(super) fn transfers_pending(&self) -> bool {
         self.slots.iter().flatten().any(|slot| {
-            slot.endpoints
-                .iter()
-                .any(|e| e.state == EpState::Running && e.rung && !e.waiting)
+            slot.live().any(|dci| {
+                let e = &slot.endpoints[dci - 1];
+                e.state == EpState::Running && e.rung && !e.waiting
+            })
         })
     }
 
@@ -808,13 +849,18 @@ impl Xhci {
     pub(super) fn transfer_deadline(&self, function: Option<&(dyn Function + '_)>) -> Option<u64> {
         let mut deadline: Option<u64> = None;
         for slot in self.slots.iter().flatten() {
-            let device = function.and_then(|f| usb::route_ref(f, slot.route()));
-            for (n, endpoint) in slot.endpoints.iter().enumerate() {
+            // Found once per slot, and only for a slot with an IN endpoint
+            // to ask about.
+            let mut device: Option<Option<&dyn Function>> = None;
+            for dci in slot.live() {
+                let endpoint = &slot.endpoints[dci - 1];
                 if endpoint.state != EpState::Running || !endpoint.waiting {
                     continue;
                 }
-                let dci = n + 1;
                 let ready = if dci % 2 == 1 && dci > 1 && !endpoint.isoch() {
+                    let device = *device.get_or_insert_with(|| {
+                        function.and_then(|f| usb::route_ref(f, slot.route()))
+                    });
                     device.and_then(|f| f.ready_at(address(dci)))
                 } else {
                     Some(0)
@@ -840,7 +886,12 @@ impl Xhci {
         }
         let mut budget = PACKETS_PER_SERVICE;
         for id in 1..=MAX_SLOTS {
-            for dci in 1..=ENDPOINTS {
+            // The endpoints that are not Disabled: a transfer changes no
+            // endpoint's Disabled state, so the slot's set holds for its loop.
+            let Some(live) = self.slot_mut(id).map(|slot| slot.live()) else {
+                continue;
+            };
+            for dci in live {
                 let Some(slot) = self.slot_mut(id) else {
                     break;
                 };
@@ -1484,5 +1535,118 @@ mod tests {
         };
         assert_eq!(e.output()[0] & 7, 2);
         assert_eq!(e.output()[2], 0x1234_5671);
+    }
+
+    /// The guest's schedule on the native hub: the hub, the input
+    /// peripheral, the network adapter and the Bluetooth controller, each
+    /// interrupt or bulk IN endpoint rung and NAKing.
+    fn guest_schedule() -> Xhci {
+        let mut x = Xhci::new();
+        x.usbsts &= !super::super::HCH;
+        x.started = Some(0);
+        let layout: [&[(usize, bool)]; 4] = [
+            &[(1, false), (3, true)],
+            &[(1, false), (3, true), (5, true), (7, true)],
+            &[(1, false), (3, true), (4, false), (5, true)],
+            &[(1, false), (3, true), (4, false), (7, true)],
+        ];
+        for (n, endpoints) in layout.iter().enumerate() {
+            let mut slot = Slot::new();
+            slot.state = SlotState::Configured;
+            for &(dci, waiting) in *endpoints {
+                slot.start(dci, [0; 8]);
+                let e = &mut slot.endpoints[dci - 1];
+                e.rung = waiting;
+                e.waiting = waiting;
+                e.next = 1000;
+            }
+            x.slots[n] = Some(slot);
+        }
+        x
+    }
+
+    /// What the looks answered when they read all 31 contexts of a slot.
+    fn full_scan(x: &Xhci) -> (bool, Option<u64>) {
+        let mut pending = false;
+        let mut deadline: Option<u64> = None;
+        for slot in x.slots.iter().flatten() {
+            for (n, e) in slot.endpoints.iter().enumerate() {
+                pending |= e.state == EpState::Running && e.rung && !e.waiting;
+                // No function is cabled: an IN endpoint's device says nothing.
+                let dci = n + 1;
+                if e.state == EpState::Running
+                    && e.waiting
+                    && !(dci % 2 == 1 && dci > 1 && !e.isoch())
+                {
+                    deadline = Some(deadline.map_or(e.next, |d| d.min(e.next)));
+                }
+            }
+        }
+        (pending, deadline)
+    }
+
+    #[test]
+    fn looks_at_live_endpoints_answer_as_a_full_scan_does() {
+        let mut x = guest_schedule();
+        assert!(x.live_endpoints_match());
+        assert_eq!((x.pending(), x.deadline(None)), (false, None));
+        assert_eq!(full_scan(&x), (false, None));
+        // An OUT endpoint that NAKed is due at its next try.
+        let slot = x.slots[2].as_mut().unwrap();
+        slot.endpoints[3].waiting = true;
+        slot.endpoints[3].next = 4000;
+        assert_eq!(x.transfer_deadline(None), Some(4000));
+        // A stopped one is not, nor is one dropped since.
+        let slot = x.slots[2].as_mut().unwrap();
+        slot.endpoints[3].state = EpState::Stopped;
+        assert_eq!(x.transfer_deadline(None), full_scan(&x).1);
+        let slot = x.slots[3].as_mut().unwrap();
+        slot.endpoints[0].waiting = true;
+        slot.endpoints[0].next = 9000;
+        assert_eq!(x.transfer_deadline(None), Some(9000));
+        let slot = x.slots[3].as_mut().unwrap();
+        slot.disable(1);
+        assert!(x.live_endpoints_match());
+        assert_eq!(x.transfer_deadline(None), None);
+        // A rung endpoint that has not NAKed is work now.
+        let slot = x.slots[1].as_mut().unwrap();
+        slot.endpoints[6].waiting = false;
+        assert!(x.transfers_pending());
+        assert!(full_scan(&x).0);
+        // The highest index too.
+        let slot = x.slots[1].as_mut().unwrap();
+        slot.endpoints[6].rung = false;
+        slot.start(ENDPOINTS, [0; 8]);
+        slot.endpoints[ENDPOINTS - 1].rung = true;
+        assert!(x.live_endpoints_match());
+        assert!(x.transfers_pending());
+        assert_eq!(x.slots[1].as_ref().unwrap().live().last(), Some(ENDPOINTS));
+    }
+
+    #[test]
+    #[ignore = "timing"]
+    fn schedule_scan_cost() {
+        extern crate std;
+        let x = guest_schedule();
+        let rounds = 1_000_000u32;
+        let mut found = 0u64;
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                let x = core::hint::black_box(&x);
+                found += u64::from(x.pending());
+                found += x.deadline(None).unwrap_or(0);
+            }
+            best = best.min(start.elapsed().as_nanos() as f64 / f64::from(rounds));
+        }
+        std::println!("pending+deadline: {best:.1} ns per look, best of 7 ({found})");
+        // What a look reads cold: each endpoint it visits, twice per look.
+        let endpoint = core::mem::size_of::<Endpoint>();
+        let visited: usize = x.slots.iter().flatten().map(|s| s.live().count()).sum();
+        std::println!(
+            "endpoint {endpoint} bytes; {visited} endpoints visited per scan, {} KiB",
+            visited * endpoint / 1024
+        );
     }
 }

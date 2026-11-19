@@ -38,6 +38,7 @@ fn service_with(x: &mut Xhci, ram: &mut Ram, now: u64, function: Option<&mut (dy
         access: &mut access,
     };
     x.service(&mut port, function).unwrap();
+    assert!(x.live_endpoints_match());
 }
 fn trb(ram: &mut Ram, at: u64, words: [u32; 4]) {
     ram.put_u64(at, u64::from(words[0]) | u64::from(words[1]) << 32);
@@ -1034,6 +1035,7 @@ pub(crate) mod host {
             self.xhci
                 .service(&mut port, Some(&mut self.function))
                 .unwrap();
+            assert!(self.xhci.live_endpoints_match());
         }
     }
 
