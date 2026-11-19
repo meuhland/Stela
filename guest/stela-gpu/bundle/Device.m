@@ -210,6 +210,8 @@ static void report_open(io_service_t accelerator, NSString *step)
 	IONotificationPortSetDispatchQueue(_notifications, _completions);
 	/* Its gate may serve StelaVT's video encoder sessions. */
 	stela_encoder_note_device(self);
+	/* And StelaVD's video decoder sessions. */
+	stela_decoder_note_device(self);
 	/* Armed once something waits: nothing does yet. */
 	return self;
 }
