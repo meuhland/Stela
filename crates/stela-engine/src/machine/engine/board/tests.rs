@@ -52,7 +52,10 @@ fn grace_waits_for_readers_and_not_for_outside_pes() {
 }
 
 /// Readers hold one of a few buffers inside a section; a writer replaces
-/// it, waits the grace period, then poisons and reuses the old one.
+/// it, waits the grace period, then poisons and reuses the old one. The
+/// writer starts once every reader has run a section and stops only once
+/// every reader has run a whole section while it wrote, so a loaded host
+/// that starts or runs a reader late still tests every reader.
 #[test]
 fn grace_keeps_buffers_until_readers_left() {
     const READERS: usize = 4;
@@ -66,13 +69,16 @@ fn grace_keeps_buffers_until_readers_left() {
     );
     let current = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
+    // Each reader's sections run to their end.
+    let sections: Arc<[AtomicU64; READERS]> = Arc::new(core::array::from_fn(|_| AtomicU64::new(0)));
     let readers: Vec<_> = (0..READERS)
         .map(|pe| {
-            let (grace, buffers, current, done) = (
+            let (grace, buffers, current, done, sections) = (
                 grace.clone(),
                 buffers.clone(),
                 current.clone(),
                 done.clone(),
+                sections.clone(),
             );
             thread::spawn(move || {
                 let mut reads = 0u64;
@@ -98,16 +104,43 @@ fn grace_keeps_buffers_until_readers_left() {
                         grace.pass(pe);
                     }
                     grace.leave(pe);
+                    sections[pe].fetch_add(1, Ordering::Release);
+                    // On a loaded host the writer runs between sections.
+                    thread::yield_now();
                 }
                 reads
             })
         })
         .collect();
+    let counts = || {
+        sections
+            .each_ref()
+            .map(|count| count.load(Ordering::Acquire))
+    };
+    let mut started = give_up();
+    while counts().contains(&0) {
+        assert!(!started(), "a reader never ran a section");
+    }
+    // A reader two sections past these counts ran a whole section after
+    // the writer began.
+    let before = counts();
     // The last PE is parked throughout: it never holds anything up.
     let writer = READERS;
     grace.enter(writer);
     let mut value = 1;
-    for _ in 0..20_000 {
+    let mut overlapped = None;
+    for round in 0u32.. {
+        if round >= 20_000 {
+            if counts()
+                .iter()
+                .zip(before)
+                .all(|(&now, then)| now >= then + 2)
+            {
+                break;
+            }
+            let overlapped = overlapped.get_or_insert_with(give_up);
+            assert!(!overlapped(), "a reader never ran while the writer did");
+        }
         let old = current.load(Ordering::Relaxed);
         let new = (old + 1) % BUFFERS;
         value += 1;
