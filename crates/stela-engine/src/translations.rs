@@ -933,41 +933,40 @@ impl Entry {
             input: input.to_vec(),
             code: stored,
             relocations,
-            source_map: block
-                .native
-                .source_map
-                .iter()
-                .map(|&(guest, native)| Some((page_offset(guest.0)?, u32::try_from(native).ok()?)))
-                .collect::<Option<_>>()?,
-            exits: block
-                .direct_exits
-                .iter()
-                .map(|exit| {
-                    Some(Exit {
-                        offset: u32::try_from(exit.offset).ok()?,
-                        target: exit.target.0.wrapping_sub(page),
-                        kind: exit.kind as u8,
-                        skipped: exit.skipped,
-                    })
+            source_map: exact(block.native.source_map.iter().map(|&(guest, native)| {
+                Some((page_offset(guest.0)?, u32::try_from(native).ok()?))
+            }))?,
+            exits: exact(block.direct_exits.iter().map(|exit| {
+                Some(Exit {
+                    offset: u32::try_from(exit.offset).ok()?,
+                    target: exit.target.0.wrapping_sub(page),
+                    kind: exit.kind as u8,
+                    skipped: exit.skipped,
                 })
-                .collect::<Option<_>>()?,
-            recovery: block
-                .fault_recovery
-                .iter()
-                .map(|row| {
-                    let mut row = UnqualifiedFaultRecovery::from(row);
-                    row.retirement = row
-                        .retirement
-                        .relocated(GuestAddress(
-                            row.retirement.instruction_pc().0.checked_sub(page)?,
-                        ))
-                        .ok()?;
-                    Some(row)
-                })
-                .collect::<Option<_>>()?,
+            }))?,
+            recovery: exact(block.fault_recovery.iter().map(|row| {
+                let mut row = UnqualifiedFaultRecovery::from(row);
+                row.retirement = row
+                    .retirement
+                    .relocated(GuestAddress(
+                        row.retirement.instruction_pc().0.checked_sub(page)?,
+                    ))
+                    .ok()?;
+                Some(row)
+            }))?,
         };
         entry.consistent().then_some(entry)
     }
+}
+
+/// The items of `rows`, unless one is `None`, in one allocation of their
+/// exact count, where collecting into an `Option` grew the list from empty.
+fn exact<T>(rows: impl ExactSizeIterator<Item = Option<T>>) -> Option<Vec<T>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(row?);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
