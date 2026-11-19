@@ -136,6 +136,64 @@ u8 pci_find_capability(struct pci_dev *dev, int cap)
     return found;
 }
 
+/* PCI Express capability reads, after drivers/pci/access.c: the
+ * registers every function with the capability has, and the link registers
+ * of a function with a link (the version 2 ones only from version 2). Any
+ * other register reads as zero, as Linux answers for one the function does
+ * not have; nothing here reads a slot's or a root port's registers. A failed
+ * read is zero, as Linux's callers do not check. */
+static bool stela_linux_pcie_has_link(u16 flags)
+{
+    switch ((flags & PCI_EXP_FLAGS_TYPE) >> 4) {
+    case PCI_EXP_TYPE_ENDPOINT:
+    case PCI_EXP_TYPE_LEG_END:
+    case PCI_EXP_TYPE_ROOT_PORT:
+    case PCI_EXP_TYPE_UPSTREAM:
+    case PCI_EXP_TYPE_DOWNSTREAM:
+    case PCI_EXP_TYPE_PCI_BRIDGE:
+    case PCI_EXP_TYPE_PCIE_BRIDGE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
+{
+    u16 flags;
+    int error;
+    *val = 0;
+    if (pos & 1)
+        return PCIBIOS_BAD_REGISTER_NUMBER;
+    if (!pci_is_pcie(dev))
+        return PCIBIOS_SUCCESSFUL;
+    switch (pos) {
+    case PCI_EXP_FLAGS:
+    case PCI_EXP_DEVCTL:
+    case PCI_EXP_DEVSTA:
+        break;
+    case PCI_EXP_LNKCTL:
+    case PCI_EXP_LNKSTA:
+    case PCI_EXP_LNKCTL2:
+    case PCI_EXP_LNKSTA2:
+        error = pci_read_config_word(dev, pci_pcie_cap(dev) + PCI_EXP_FLAGS, &flags);
+        if (error)
+            return error;
+        if (!stela_linux_pcie_has_link(flags))
+            return PCIBIOS_SUCCESSFUL;
+        if ((pos == PCI_EXP_LNKCTL2 || pos == PCI_EXP_LNKSTA2) &&
+            (flags & PCI_EXP_FLAGS_VERS) < 2)
+            return PCIBIOS_SUCCESSFUL;
+        break;
+    default:
+        return PCIBIOS_SUCCESSFUL;
+    }
+    error = pci_read_config_word(dev, pci_pcie_cap(dev) + pos, val);
+    if (error)
+        *val = 0;
+    return error;
+}
+
 const struct bus_type pci_bus_type = {.name = "pci"};
 
 /* The devices their owners registered and the drivers bound to them, as
@@ -585,6 +643,26 @@ int main(void)
 	assert(!pci_find_capability(&dev, PCI_CAP_ID_AGP));
 	config[0x61] = 0x50;
 	assert(!pci_find_capability(&dev, PCI_CAP_ID_AGP));
+
+	/* PCI Express capability reads: an endpoint's link status; zero for a
+	 * register it does not have, and for a function without the capability. */
+	u16 word = 0xffff;
+	config[0x60 + PCI_EXP_LNKSTA] = 0x41;
+	config[0x60 + PCI_EXP_LNKSTA + 1] = 0x10;
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_LNKSTA, &word) && !word);
+	dev.pcie_cap = 0x60;
+	config[0x60 + PCI_EXP_FLAGS] = 0x02;
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_LNKSTA, &word) && word == 0x1041);
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_LNKSTA2, &word) && !word);
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_SLTCTL, &word) && !word);
+	assert(pcie_capability_read_word(&dev, PCI_EXP_LNKSTA + 1, &word) ==
+	       PCIBIOS_BAD_REGISTER_NUMBER && !word);
+	config[0x60 + PCI_EXP_FLAGS] = (PCI_EXP_TYPE_RC_END << 4) | 0x02;
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_LNKSTA, &word) && !word);
+	config[0x60 + PCI_EXP_FLAGS] = 0;
+	config[0x60 + PCI_EXP_LNKSTA] = 0;
+	config[0x60 + PCI_EXP_LNKSTA + 1] = 0;
+	dev.pcie_cap = 0;
 
 	dev.resource[0].flags = IORESOURCE_MEM;
 	assert(!pci_enable_device(&dev) && !pci_enable_device(&dev));
