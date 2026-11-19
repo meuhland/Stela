@@ -965,24 +965,31 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         ));
     }
     // Pipeline work in turns: the jobs turns left, with what making them
-    // (each stage's NIR copied for its job) took, and the pipelines turns
-    // created themselves.
+    // (each stage's NIR copied for its job) took, the pipelines turns
+    // created themselves, and the store lookups turns made, found or missed.
     let [
         [left, copied, copy_longest],
         [created, create, create_longest],
         [looked, look, look_longest],
+        [found, find, find_longest],
+        [missed, miss, miss_longest],
     ] = native::take_pipeline_turn_work();
-    if left != 0 || created != 0 || looked != 0 {
+    if left != 0 || created != 0 || looked != 0 || found != 0 || missed != 0 {
         output::arguments(format_args!(
             "GPU PIPELINE TURNS jobs_left={left} copy_us={} copy_longest_us={} created={created} \
              create_us={} create_longest_us={} archive_looks={looked} look_us={} \
-             look_longest_us={}\n",
+             look_longest_us={} store_found={found} found_us={} found_longest_us={} \
+             store_missed={missed} missed_us={} missed_longest_us={}\n",
             micros(copied),
             micros(copy_longest),
             micros(create),
             micros(create_longest),
             micros(look),
             micros(look_longest),
+            micros(find),
+            micros(find_longest),
+            micros(miss),
+            micros(miss_longest),
         ));
     }
     // Where the time of the slowest operations went, phase by phase.

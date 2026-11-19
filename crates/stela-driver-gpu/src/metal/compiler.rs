@@ -2097,8 +2097,9 @@ unsafe fn free_nir(shader: *mut c_void) {
     unsafe { ralloc_free(shader) }
 }
 
-/// The bytes `shader`'s NIR takes, for the cache's budget.
-fn nir_bytes(shader: *mut c_void) -> usize {
+/// The bytes `shader`'s NIR takes, for the cache's budget and for what a
+/// pipeline creation's hashing of it costs.
+pub(crate) fn nir_bytes(shader: *mut c_void) -> usize {
     #[cfg(all(feature = "metal-linked", target_os = "uefi"))]
     {
         unsafe extern "C" {

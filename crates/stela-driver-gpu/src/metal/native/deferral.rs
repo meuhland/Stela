@@ -20,6 +20,15 @@
 //! The job keeps the pipeline, and the call's next run takes it with no
 //! driver work.
 //!
+//! A creation whose stages' NIR is small ([`IN_TURN_NIR_BYTES`]) is
+//! looked up in the turn, in the pipeline store's cache or its archive's:
+//! hashing that NIR costs a fraction of a millisecond, under what a job and
+//! the calling thread's sleep until the call runs again cost. Found, the
+//! call takes the pipeline in its turn. Missed, an archive lookup has its
+//! answer, and a creation leaves its job, which compiles into a scratch
+//! cache for the store with no second lookup, or through the archive's
+//! cache.
+//!
 //! The job shares the compiler's NIR rather than copying it in the turn
 //! (copies took 15-35 ms): it pins each stage ([`pin_nir`]), which the
 //! driver only reads, until the call takes the pipeline. So a creation's
@@ -87,6 +96,13 @@ static CREATED: Counted = Counted::new();
 /// Binary archives a turn looked in for a pipeline, failing on a miss: the
 /// creation's next source depends on the answer, so it stays in the turn.
 static LOOKED: Counted = Counted::new();
+/// Pipelines a turn found in the store's or an archive's cache
+/// ([`IN_TURN_NIR_BYTES`]).
+static FOUND: Counted = Counted::new();
+/// Lookups in the store's or an archive's cache a turn made that missed:
+/// an archive lookup's answer, or a creation then left as a job that
+/// compiles.
+static MISSED: Counted = Counted::new();
 
 /// Counts a creation of `source` a turn made itself, which took `ticks`.
 pub(super) fn note_created(source: PipelineSource, ticks: u64) {
@@ -97,10 +113,48 @@ pub(super) fn note_created(source: PipelineSource, ticks: u64) {
 }
 
 /// Since the last call, cleared: the pipeline jobs turns left, the
-/// pipelines turns created, and the archive lookups turns made, each as
+/// pipelines turns created, the archive lookups turns made, and the store
+/// lookups turns made that found the pipeline and that missed, each as
 /// count, ticks in all and longest ticks.
-pub fn take_turn_work() -> [[u64; 3]; 3] {
-    [LEFT.take(), CREATED.take(), LOOKED.take()]
+pub fn take_turn_work() -> [[u64; 3]; 5] {
+    [
+        LEFT.take(),
+        CREATED.take(),
+        LOOKED.take(),
+        FOUND.take(),
+        MISSED.take(),
+    ]
+}
+
+/// The most NIR, in bytes as the compiler's cache counts it, a creation's
+/// stages hold for its lookup in the store's cache to run in the turn. The
+/// driver serializes and hashes each stage's NIR for the lookup: a shader
+/// that took 45-55 ms held megabytes, and the compositor's hold tens of
+/// kilobytes, which take a few hundred microseconds or less.
+pub(super) const IN_TURN_NIR_BYTES: usize = 256 << 10;
+
+/// The most NIR one call's lookups in its turn hash in all: a commit that
+/// meets many new pipelines looks up the first few and leaves jobs for the
+/// rest.
+pub(super) const IN_TURN_CALL_NIR_BYTES: usize = 4 * IN_TURN_NIR_BYTES;
+
+/// The cache a creation of `source`, whose stages hold `nir_bytes`, is
+/// looked up in during its turn, after lookups of `looked` bytes in the
+/// same call: an archive's own, or for a compiled one the `store`'s; none
+/// past [`IN_TURN_NIR_BYTES`] or [`IN_TURN_CALL_NIR_BYTES`].
+pub(super) fn lookup_in_turn(
+    source: PipelineSource,
+    store: Option<PipelineCache>,
+    nir_bytes: usize,
+    looked: usize,
+) -> Option<PipelineCache> {
+    if nir_bytes > IN_TURN_NIR_BYTES || looked + nir_bytes > IN_TURN_CALL_NIR_BYTES {
+        return None;
+    }
+    match source {
+        PipelineSource::Compiled => store,
+        PipelineSource::Cached(cache) | PipelineSource::Archived(cache) => Some(cache),
+    }
 }
 
 /// Keys a backend remembers as failed; past this it forgets them all, which
@@ -123,6 +177,8 @@ pub(super) struct Deferral {
     jobs: Option<JobLock>,
     /// The jobs the call served now left, at most [`LEFT_PER_CALL`].
     left: Vec<Job>,
+    /// The NIR bytes the call served now looked up in its turn.
+    looked: usize,
     /// Set once the device is destroyed.
     gone: Arc<AtomicBool>,
     /// The cache jobs fill while the store's does not grow.
@@ -254,6 +310,17 @@ impl Wanted<'_> {
         }
     }
 
+    /// The bytes its stages' NIR holds ([`IN_TURN_NIR_BYTES`]).
+    fn nir_bytes(self) -> usize {
+        let bytes = |code: crate::metal::vulkan::object::ShaderCode| {
+            crate::metal::compiler::nir_bytes(code.0 as usize as *mut core::ffi::c_void)
+        };
+        match self {
+            Self::Compute(info) => bytes(info.code),
+            Self::Graphics(info) => info.stages.iter().map(|&(_, code)| bytes(code)).sum(),
+        }
+    }
+
     /// The digest of everything the creation reads: its state and its
     /// stages' NIR, by the compiler's handles, which stay while its cache
     /// keeps them.
@@ -273,6 +340,7 @@ impl Deferral {
         }
         self.deferring = deferring.cloned();
         self.left.clear();
+        self.looked = 0;
     }
 
     pub(super) fn stop(&mut self) {
@@ -373,16 +441,54 @@ impl NativeBackend {
         if self.deferral.failed.contains(&key) {
             return None;
         }
+        if self.deferral.left.iter().any(|left| left.key == key) {
+            return Some(Err(DEFERRED));
+        }
+        let source = wanted.source();
+        let store = self.store.cache().map(|store| PipelineCache(raw(store)));
+        let bytes = wanted.nir_bytes();
+        let looked = match lookup_in_turn(source, store, bytes, self.deferral.looked) {
+            Some(cache) => {
+                self.deferral.looked += bytes;
+                let started = (self.ticks)();
+                let mut feedback = vk::PipelineCreationFeedback::default();
+                let archived = PipelineSource::Archived(cache);
+                let created = create(&self.device, self.layout, wanted, archived, &mut feedback);
+                let ticks = (self.ticks)().wrapping_sub(started);
+                let compiled = matches!(source, PipelineSource::Compiled);
+                match created {
+                    Ok(pipeline) => {
+                        if compiled {
+                            super::pipeline_store::note_lookup(true, feedback.duration);
+                        }
+                        FOUND.note(ticks);
+                        return Some(Ok(pipeline));
+                    }
+                    Err(Error::NotArchived) => {
+                        MISSED.note(ticks);
+                        // A lookup's miss is its answer.
+                        if let PipelineSource::Archived(_) = source {
+                            return Some(Err(Error::NotArchived));
+                        }
+                        // The job compiles a store's miss into a scratch
+                        // cache, counted there as the store's miss.
+                        compiled
+                    }
+                    // Another failure is the job's to meet again and
+                    // answer.
+                    Err(_) => false,
+                }
+            }
+            None => false,
+        };
         // A call that goes on past a deferral, as a commit does to find
         // every pipeline it misses, leaves a job for each up to a bound; it
         // runs again, so past the bound nothing it makes would stay.
-        if self.deferral.left.len() >= LEFT_PER_CALL
-            || self.deferral.left.iter().any(|left| left.key == key)
-        {
+        if self.deferral.left.len() >= LEFT_PER_CALL {
             return Some(Err(DEFERRED));
         }
         let started = (self.ticks)();
-        let job = self.pipeline_job(wanted, key);
+        let job = self.pipeline_job(wanted, key, looked);
         LEFT.note((self.ticks)().wrapping_sub(started));
         self.deferral.left.push(job?);
         lock.lock.set_deferred(true);
@@ -472,8 +578,9 @@ impl NativeBackend {
     }
 
     /// A job that creates `wanted` from its stages' NIR, pinned, and keeps
-    /// the pipeline, or `None` when no cache can be made.
-    fn pipeline_job(&mut self, wanted: Wanted<'_>, key: [u8; 32]) -> Option<Job> {
+    /// the pipeline, or `None` when no cache can be made. `looked` when the
+    /// turn found the store's cache lacks it: the job compiles at once.
+    fn pipeline_job(&mut self, wanted: Wanted<'_>, key: [u8; 32], looked: bool) -> Option<Job> {
         // The store's cache is looked in, and what it lacks compiles into a
         // scratch cache the store keeps from; without a store, the backend's
         // own cache takes it. An archive's creation or lookup goes through
@@ -519,7 +626,11 @@ impl NativeBackend {
             let mut compiled = None;
             let pipeline = (!gone.load(Ordering::Acquire))
                 .then(|| {
-                    let created = create(&device, layout, wanted, source, &mut feedback);
+                    let created = if looked && into_store {
+                        Err(Error::NotArchived)
+                    } else {
+                        create(&device, layout, wanted, source, &mut feedback)
+                    };
                     let scratch = || {
                         let info = vk::PipelineCacheCreateInfo::default();
                         // SAFETY: the create info outlives the call.
@@ -647,8 +758,44 @@ fn create(
 
 #[cfg(test)]
 mod tests {
-    use super::{Counted, still_held};
+    use super::{Counted, IN_TURN_CALL_NIR_BYTES, IN_TURN_NIR_BYTES, lookup_in_turn, still_held};
+    use crate::metal::vulkan::object::{PipelineCache, PipelineSource};
     use alloc::{sync::Arc, vec};
+
+    /// A creation of NIR up to the bound is looked up in its turn: a
+    /// compiled one in the store's cache when there is a store, an
+    /// archive's in the archive's own.
+    #[test]
+    fn a_small_creation_is_looked_up_in_its_turn() {
+        let (store, archive) = (PipelineCache(3), PipelineCache(7));
+        let small = 40 << 10;
+        let large = IN_TURN_NIR_BYTES + 1;
+        let compiled = PipelineSource::Compiled;
+        assert_eq!(lookup_in_turn(compiled, Some(store), small, 0), Some(store));
+        let bound = IN_TURN_NIR_BYTES;
+        assert_eq!(lookup_in_turn(compiled, Some(store), bound, 0), Some(store));
+        assert_eq!(lookup_in_turn(compiled, Some(store), large, 0), None);
+        assert_eq!(lookup_in_turn(compiled, None, small, 0), None);
+        for source in [
+            PipelineSource::Archived(archive),
+            PipelineSource::Cached(archive),
+        ] {
+            assert_eq!(lookup_in_turn(source, Some(store), small, 0), Some(archive));
+            assert_eq!(lookup_in_turn(source, None, small, 0), Some(archive));
+            assert_eq!(lookup_in_turn(source, None, large, 0), None);
+        }
+        // A call's lookups stop at their bound, after which its creations
+        // leave jobs.
+        let spent = IN_TURN_CALL_NIR_BYTES - small;
+        assert_eq!(
+            lookup_in_turn(compiled, Some(store), small, spent),
+            Some(store)
+        );
+        assert_eq!(
+            lookup_in_turn(compiled, Some(store), small, spent + 1),
+            None
+        );
+    }
 
     #[test]
     fn counted_work_is_taken_once_with_its_longest() {
