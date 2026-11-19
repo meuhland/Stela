@@ -1,6 +1,34 @@
 //! Operand-derived legacy, REX2, VEX and vector EVEX prefixes.
 use super::{Asm, Disp, Evex, Gpr, Map, Mem, Rm, Size, Vex};
 
+/// The bytes of one instruction, built on the stack and appended to the
+/// code at once: each push to the code checks its room, and an
+/// instruction's prefixes, opcode and operand bytes were a dozen pushes.
+struct Encoding {
+    bytes: [u8; 15],
+    len: usize,
+}
+
+impl Encoding {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 15],
+            len: 0,
+        }
+    }
+    fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+    fn extend(&mut self, bytes: &[u8]) {
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 impl Asm<'_> {
     pub(super) fn modrm(&mut self, reg: u8, rm: Rm) {
         self.modrm_scaled(reg, rm, 1);
@@ -9,10 +37,17 @@ impl Asm<'_> {
     /// ModRM, SIB and displacement, with an 8-bit displacement counted in
     /// units of `scale` bytes (EVEX disp8*N; 1 elsewhere).
     fn modrm_scaled(&mut self, reg: u8, rm: Rm, scale: u8) {
+        let mut encoding = Encoding::new();
+        self.modrm_into(&mut encoding, reg, rm, scale);
+        self.code.extend_from_slice(encoding.as_slice());
+    }
+
+    /// [`Self::modrm_scaled`] into `out`.
+    fn modrm_into(&self, out: &mut Encoding, reg: u8, rm: Rm, scale: u8) {
         let reg = (reg & 7) << 3;
         match rm {
-            Rm::Reg(register) => self.code.push(0xc0 | reg | register.low()),
-            Rm::Xmm(register) => self.code.push(0xc0 | reg | (register & 7)),
+            Rm::Reg(register) => out.push(0xc0 | reg | register.low()),
+            Rm::Xmm(register) => out.push(0xc0 | reg | (register & 7)),
             Rm::Mem(Mem {
                 base: None,
                 index,
@@ -20,8 +55,8 @@ impl Asm<'_> {
                 ..
             }) => {
                 debug_assert!(index.is_none(), "RIP-relative addressing has no index");
-                self.code.push(reg | 5);
-                self.code.extend(displacement.to_le_bytes());
+                out.push(reg | 5);
+                out.extend(&displacement.to_le_bytes());
             }
             Rm::Mem(Mem {
                 base: Some(base),
@@ -51,8 +86,8 @@ impl Asm<'_> {
                     Disp::Auto => 2,
                 };
                 match index {
-                    None if base.low() != 4 => self.code.push(mode << 6 | reg | base.low()),
-                    None => self.code.extend([mode << 6 | reg | 4, 0x24]),
+                    None if base.low() != 4 => out.push(mode << 6 | reg | base.low()),
+                    None => out.extend(&[mode << 6 | reg | 4, 0x24]),
                     Some((index, scale)) => {
                         debug_assert!(index != Gpr::Rsp, "RSP cannot be an index");
                         let scale = match scale {
@@ -62,15 +97,15 @@ impl Asm<'_> {
                             8 => 3,
                             _ => unreachable!("scale of 1, 2, 4 or 8"),
                         };
-                        self.code.extend([
+                        out.extend(&[
                             mode << 6 | reg | 4,
                             scale << 6 | index.low() << 3 | base.low(),
                         ]);
                     }
                 }
                 match mode {
-                    1 => self.code.push((displacement / scale) as u8),
-                    2 => self.code.extend(displacement.to_le_bytes()),
+                    1 => out.push((displacement / scale) as u8),
+                    2 => out.extend(&displacement.to_le_bytes()),
                     _ => {}
                 }
             }
@@ -102,15 +137,17 @@ impl Asm<'_> {
         byte_rex: bool,
         rm: Rm,
     ) {
+        let mut encoding = Encoding::new();
         if size == Size::Word {
-            self.code.push(0x66);
+            encoding.push(0x66);
         }
         if let Some(prefix) = prefix {
-            self.code.push(prefix);
+            encoding.push(prefix);
         }
-        let skip = self.opcode_prefix(size, byte_rex, opcode, reg, rm);
-        self.code.extend(&opcode[skip..]);
-        self.modrm(reg, rm);
+        let skip = opcode_prefix_into(&mut encoding, size, byte_rex, opcode, reg, rm);
+        encoding.extend(&opcode[skip..]);
+        self.modrm_into(&mut encoding, reg, rm, 1);
+        self.code.extend_from_slice(encoding.as_slice());
         self.count();
     }
 
@@ -123,40 +160,55 @@ impl Asm<'_> {
         reg: u8,
         rm: Rm,
     ) -> usize {
-        assert!(reg < 32, "integer register encoding is at most five bits");
-        let (x, b) = rm.extensions();
-        let (x4, b4) = rm.extended_extensions();
-        let w = size == Size::Qword;
-        let r = reg & 8 != 0;
-        let r4 = reg & 16 != 0;
-        if r4 || x4 || b4 {
-            let map1 = opcode.first() == Some(&0x0f);
-            assert!(
-                (!map1 && opcode.len() == 1) || (map1 && opcode.len() == 2),
-                "REX2 supports only legacy maps zero and one"
-            );
-            self.code.extend([
-                0xd5,
-                u8::from(map1) << 7
-                    | u8::from(r4) << 6
-                    | u8::from(x4) << 5
-                    | u8::from(b4) << 4
-                    | u8::from(w) << 3
-                    | u8::from(r) << 2
-                    | u8::from(x) << 1
-                    | u8::from(b),
-            ]);
-            usize::from(map1)
-        } else {
-            if w || r || x || b || force {
-                self.code.push(
-                    0x40 | u8::from(w) << 3 | u8::from(r) << 2 | u8::from(x) << 1 | u8::from(b),
-                );
-            }
-            0
-        }
+        let mut encoding = Encoding::new();
+        let skip = opcode_prefix_into(&mut encoding, size, force, opcode, reg, rm);
+        self.code.extend_from_slice(encoding.as_slice());
+        skip
     }
+}
 
+/// [`Asm::opcode_prefix`] into `out`.
+fn opcode_prefix_into(
+    out: &mut Encoding,
+    size: Size,
+    force: bool,
+    opcode: &[u8],
+    reg: u8,
+    rm: Rm,
+) -> usize {
+    assert!(reg < 32, "integer register encoding is at most five bits");
+    let (x, b) = rm.extensions();
+    let (x4, b4) = rm.extended_extensions();
+    let w = size == Size::Qword;
+    let r = reg & 8 != 0;
+    let r4 = reg & 16 != 0;
+    if r4 || x4 || b4 {
+        let map1 = opcode.first() == Some(&0x0f);
+        assert!(
+            (!map1 && opcode.len() == 1) || (map1 && opcode.len() == 2),
+            "REX2 supports only legacy maps zero and one"
+        );
+        out.extend(&[
+            0xd5,
+            u8::from(map1) << 7
+                | u8::from(r4) << 6
+                | u8::from(x4) << 5
+                | u8::from(b4) << 4
+                | u8::from(w) << 3
+                | u8::from(r) << 2
+                | u8::from(x) << 1
+                | u8::from(b),
+        ]);
+        usize::from(map1)
+    } else {
+        if w || r || x || b || force {
+            out.push(0x40 | u8::from(w) << 3 | u8::from(r) << 2 | u8::from(x) << 1 | u8::from(b));
+        }
+        0
+    }
+}
+
+impl Asm<'_> {
     /// A VEX-encoded instruction: two-byte C5 when the fields allow it,
     /// otherwise three-byte C4.
     pub(crate) fn vex(&mut self, prefix: Vex, opcode: u8, reg: u8, vvvv: u8, rm: Rm) {

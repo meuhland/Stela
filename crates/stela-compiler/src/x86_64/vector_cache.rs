@@ -130,6 +130,10 @@ impl VectorCache {
     /// The dirty homes, for a fault site here.
     pub(crate) fn dirty_homes(&self) -> DirtyHomes {
         let mut homes = [None; HOSTS];
+        // Most code holds no dirty vector: every instruction it emits asks.
+        if self.dirty == 0 {
+            return homes;
+        }
         for (index, owner) in self.owner.iter().enumerate() {
             if *owner != NONE && self.is_dirty(*owner) {
                 homes[index] = Some((*owner, FIRST_HOST + index as u8));
@@ -140,6 +144,11 @@ impl VectorCache {
     /// The pool registers that hold a guest vector: no recipe may write one,
     /// except the destination home it is writing.
     pub(crate) fn occupied(&self) -> u32 {
+        // Most code keeps no vector in the pool: every instruction it emits
+        // asks.
+        if self.owner == [NONE; HOSTS] && self.derived == [None; DERIVED_HOSTS] {
+            return 0;
+        }
         let occupied = self
             .owner
             .iter()

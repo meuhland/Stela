@@ -44,12 +44,13 @@ pub(crate) struct Asm<'a> {
     /// The locals a fault recovers from their hosts ([`super::pinned::Span`]).
     dirty: super::pinned::Dirty,
     linked_block: Option<u64>,
-    /// Host XMM registers that hold guest vectors
-    /// ([`super::vector_cache`]): no instruction emitted here writes one.
-    guarded: u32,
-    /// The guest vectors whose only current value is a home: a fault site
-    /// here records them for recovery.
-    homes: super::vector_cache::DirtyHomes,
+    /// The [`Code`]'s guest vectors in host XMM registers
+    /// ([`super::vector_cache`]), which no instruction emitted here writes
+    /// unless `unguarded`, and whose homes holding the only current value
+    /// a fault site here records for recovery. Asked only where an
+    /// instruction needs them: every instruction builds an encoder.
+    vectors: Option<&'a super::vector_cache::VectorCache>,
+    unguarded: bool,
 }
 
 impl<'a> Asm<'a> {
@@ -82,9 +83,23 @@ impl<'a> Asm<'a> {
             locals: None,
             dirty: Default::default(),
             linked_block: None,
-            guarded: 0,
-            homes: Default::default(),
+            vectors: None,
+            unguarded: false,
         }
+    }
+    /// Host XMM registers that hold guest vectors, which no instruction
+    /// emitted here writes.
+    fn guarded(&self) -> u32 {
+        match self.vectors {
+            Some(vectors) if !self.unguarded => vectors.occupied(),
+            _ => 0,
+        }
+    }
+    /// The guest vectors whose only current value is a home.
+    fn homes(&self) -> super::vector_cache::DirtyHomes {
+        self.vectors
+            .map(super::vector_cache::VectorCache::dirty_homes)
+            .unwrap_or_default()
     }
     /// [`Self::new`] for code that keeps guest registers in host registers
     /// ([`super::pinned`]).
@@ -139,6 +154,7 @@ impl<'a> Asm<'a> {
         self.refuse_dirty_homes("a helper call");
         let start = self.len();
         self.data(&[bytes, flags]);
+        let homes = self.homes();
         if let Some(sites) = self.sites.as_deref_mut() {
             assert!(
                 sites.last().is_none_or(|previous| previous.end <= start),
@@ -151,7 +167,7 @@ impl<'a> Asm<'a> {
                 stack: None,
                 source: None,
                 locals: self.dirty,
-                homes: self.homes,
+                homes,
             });
         }
     }
@@ -159,7 +175,7 @@ impl<'a> Asm<'a> {
     /// a home ([`super::vector_cache`]).
     pub(crate) fn refuse_dirty_homes(&self, what: &str) {
         assert!(
-            self.homes.iter().all(Option::is_none),
+            self.homes().iter().all(Option::is_none),
             "{what} with V registers only in XMM"
         );
     }
@@ -167,7 +183,7 @@ impl<'a> Asm<'a> {
     /// ([`super::vector_cache`]): a recipe names it only as a source.
     pub(crate) fn guard_vector(&self, xmm: u8) {
         assert!(
-            self.guarded & 1 << xmm == 0,
+            self.guarded() & 1 << xmm == 0,
             "xmm{xmm} holds a guest vector of the block"
         );
     }
@@ -186,6 +202,7 @@ impl<'a> Asm<'a> {
             "one exact faulting instruction"
         );
         let end = self.len();
+        let homes = self.homes();
         if let Some(sites) = self.sites.as_deref_mut() {
             assert!(
                 sites.last().is_none_or(|previous| previous.end <= start),
@@ -198,7 +215,7 @@ impl<'a> Asm<'a> {
                 stack,
                 source: None,
                 locals: self.dirty,
-                homes: self.homes,
+                homes,
             });
         }
     }
@@ -249,9 +266,9 @@ impl<'a> Asm<'a> {
         xmm: u8,
         rm: impl Into<Rm>,
     ) {
-        let guarded = core::mem::replace(&mut self.guarded, 0);
+        let unguarded = core::mem::replace(&mut self.unguarded, true);
         self.sse(prefix, opcode, xmm, rm);
-        self.guarded = guarded;
+        self.unguarded = unguarded;
     }
     /// [`Self::sse`] with an 8-bit immediate.
     pub(crate) fn sse_imm(
@@ -416,6 +433,11 @@ impl<'a> Asm<'a> {
         }
         self.data(&address.0.to_le_bytes());
         if let Some(relocations) = self.relocations.as_deref_mut() {
+            // Room for a block's exits and constants at once, where the
+            // list grew through three sizes.
+            if relocations.capacity() == 0 {
+                relocations.reserve(16);
+            }
             relocations.push(u32::try_from(at).expect("code under 4 GiB"));
         }
     }

@@ -251,8 +251,12 @@ impl Code {
     }
     /// An encoder that appends here and adds to this count.
     pub(crate) fn asm(&mut self) -> Asm<'_> {
-        let guarded = self.vectors.occupied();
-        let homes = self.vectors.dirty_homes();
+        // A buffer made empty (`Default`, as a block's own is) takes room
+        // for most blocks at its first instruction, where it grew through
+        // seven sizes to that.
+        if self.bytes.capacity() == 0 {
+            self.bytes.reserve(INITIAL_BYTES);
+        }
         Asm {
             code: &mut self.bytes,
             instructions: 0,
@@ -265,15 +269,15 @@ impl Code {
             locals: self.locals,
             dirty: self.dirty,
             linked_block: self.linked_block,
-            guarded,
-            homes,
+            vectors: Some(&self.vectors),
+            unguarded: false,
         }
     }
     /// [`Self::asm`] for the vector cache's own moves, which may write the
     /// pool registers that hold guest vectors.
     pub(in crate::x86_64) fn asm_unguarded(&mut self) -> Asm<'_> {
         let mut asm = self.asm();
-        asm.guarded = 0;
+        asm.unguarded = true;
         asm
     }
     /// A typed recipe that emits exactly one guest memory instruction.
