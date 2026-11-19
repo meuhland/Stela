@@ -6,7 +6,12 @@
 use super::PTD_BYTES;
 use super::{MAX_ENTRIES, Range, UPDATE_OFFSET};
 use crate::Result;
-use alloc::{collections::BTreeSet, rc::Rc, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeSet, VecDeque},
+    rc::Rc,
+    vec,
+    vec::Vec,
+};
 use core::cell::RefCell;
 use stela_contracts::Refusal;
 use stela_contracts::interrupt::Wire;
@@ -32,6 +37,11 @@ const NEW_DATA: u64 = 1 << 1;
 const DROPPED: u64 = 1;
 const FLAGS: u64 = NEW_DATA | DROPPED;
 const TIMESTAMP: u64 = u64::MAX << 10;
+/// The committed updates a bank keeps, the most recent: nothing in the
+/// boot consumes them (they are its tests' record), and every update
+/// macOS writes added one for good. stela-main-nvdec7 stopped when the
+/// log, doubling, found no extent of the host's heap.
+pub const MOST_REQUESTS: usize = 1024;
 
 /// Timestamp provenance is explicit: a native observation is not the
 /// Stela system counter. A capture-only bank refuses new timestamped updates.
@@ -104,7 +114,8 @@ struct State {
     notification_owner: NotificationOwner,
     pmp_recipient_admitted: bool,
     asserted: [bool; ROUTES],
-    requests: Vec<Request>,
+    /// The last [`MOST_REQUESTS`] committed updates.
+    requests: VecDeque<Request>,
     serial: u64,
 }
 
@@ -313,7 +324,7 @@ impl Ptd {
             notification_owner: NotificationOwner::External,
             pmp_recipient_admitted: false,
             asserted: [false; ROUTES],
-            requests: Vec::new(),
+            requests: VecDeque::new(),
             serial: 0,
         }))))
     }
@@ -321,8 +332,9 @@ impl Ptd {
     pub fn ranges(&self) -> Vec<Range> {
         self.0.borrow().ranges.clone()
     }
+    /// The last [`MOST_REQUESTS`] committed updates, oldest first.
     pub fn requests(&self) -> Vec<Request> {
-        self.0.borrow().requests.clone()
+        self.0.borrow().requests.iter().copied().collect()
     }
     pub fn lifecycle_state(&self) -> LifecycleState {
         self.0.borrow().lifecycle
@@ -557,7 +569,10 @@ impl MmioDevice for Ptd {
                 }
             };
             state.serial = serial;
-            state.requests.push(Request {
+            if state.requests.len() >= MOST_REQUESTS {
+                state.requests.pop_front();
+            }
+            state.requests.push_back(Request {
                 serial,
                 entry: index as u32,
                 value,

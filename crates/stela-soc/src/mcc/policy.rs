@@ -259,7 +259,7 @@ pub(super) fn apply(
         }
     }
     state.serial = serial;
-    state.requests.push(Request {
+    state.record(Request {
         serial,
         aperture,
         offset,

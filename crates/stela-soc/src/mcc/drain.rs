@@ -54,7 +54,7 @@ impl Controller {
             .checked_add(1)
             .ok_or(refuse!("MCC request serial exhausted"))?;
         let previous = state.words[&(aperture, offset)];
-        state.requests.push(Request {
+        state.record(Request {
             serial,
             aperture,
             offset,
