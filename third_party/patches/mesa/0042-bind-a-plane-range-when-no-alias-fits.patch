@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:20:00 +0000
+Subject: [PATCH] nvk: bind a plane's own range when a whole-memory kind alias
+ finds no address range
+
+nvk_device_memory_kind_addr maps a memory object whole with an image's PTE
+kind, which needs an address range the size of the memory. When the address
+space or the allocator has no such range, the image's plane now takes a
+range of its own, as it does once the memory maps no more kinds, rather than
+failing the bind. A failure to bind the alias still fails it.
+
+---
+ src/nouveau/vulkan/nvk_device_memory.c | 7 ++++++-
+ src/nouveau/vulkan/nvk_device_memory.h | 3 ++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/nouveau/vulkan/nvk_device_memory.c b/src/nouveau/vulkan/nvk_device_memory.c
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -377,8 +377,13 @@ nvk_device_memory_kind_addr(struct nvk_device *dev,
+                                        NVK_MEM_KIND_VA_ALIGN_B),
+                                NVK_MEM_KIND_VA_ALIGN_B,
+                                0 /* fixed_addr */, &va);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      /* A plane's own smaller range can fit where the whole alias cannot. */
++      if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
++          result == VK_ERROR_OUT_OF_HOST_MEMORY)
++         result = VK_SUCCESS;
+       goto out;
++   }
+
+    result = nvkmd_va_bind_mem(va, &mem->vk.base, 0, mem->mem, 0,
+                               mem->mem->size_B);
+diff --git a/src/nouveau/vulkan/nvk_device_memory.h b/src/nouveau/vulkan/nvk_device_memory.h
+--- a/src/nouveau/vulkan/nvk_device_memory.h
++++ b/src/nouveau/vulkan/nvk_device_memory.h
+@@ -45,7 +45,8 @@ struct nvk_device_memory {
+ };
+
+ /* The address of mem mapped whole with pte_kind, or 0 when mem maps no more
+- * kinds and the image needs a range of its own.
++ * kinds or no address range fits the whole of it, and the image needs a
++ * range of its own.
+  */
+ VkResult nvk_device_memory_kind_addr(struct nvk_device *dev,
+                                      struct nvk_device_memory *mem,
+--
+2.43.0
+
