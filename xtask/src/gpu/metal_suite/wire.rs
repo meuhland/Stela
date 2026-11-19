@@ -174,6 +174,22 @@ const OPERATIONS: &[(&str, Reach)] = &[
         "EncoderClose",
         Reach::Without("the video encoder's, not Metal's: StelaVT's, tested in `encoders`"),
     ),
+    (
+        "DecoderCapabilities",
+        Reach::Without("the video decoder's, not Metal's: StelaVD's, tested in `decoders`"),
+    ),
+    (
+        "DecoderOpen",
+        Reach::Without("the video decoder's, not Metal's: StelaVD's, tested in `decoders`"),
+    ),
+    (
+        "DecoderDecode",
+        Reach::Without("the video decoder's, not Metal's: StelaVD's, tested in `decoders`"),
+    ),
+    (
+        "DecoderClose",
+        Reach::Without("the video decoder's, not Metal's: StelaVD's, tested in `decoders`"),
+    ),
     ("CommandBufferCode::EndEncoding", Reach::Call("endEncoding")),
     (
         "CommandBufferCode::SignalEvent",

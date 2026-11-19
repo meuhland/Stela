@@ -28,11 +28,11 @@
 //! ([`surface::Tiling::ALL`]), so a wrong guess of the surface layout shows
 //! apart from a wrong decode.
 use super::copy::{self, Copier};
+use super::dpb::Output;
 use super::layout::Layout;
 use super::session::{Error, Session};
 use super::stream::{self, Stream};
 use super::surface::{self, Crop, Tiling};
-use super::dpb::Output;
 use super::{Codec, H264_CLIP, HEVC_CLIP, golden, md5};
 use crate::nvenc::selftest::hex;
 use crate::nvenc::session::Closed;
@@ -254,6 +254,7 @@ struct Reader {
 impl Reader {
     /// Reads, hashes, checks and logs the shown picture `output` (with
     /// `crop`); an error ends the run.
+    #[allow(clippy::too_many_arguments)]
     fn show<N: Node>(
         &mut self,
         session: &mut Session<N>,

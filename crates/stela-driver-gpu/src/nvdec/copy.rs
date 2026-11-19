@@ -157,6 +157,8 @@ pub fn ring_after(end: u64) -> Option<u64> {
     (ring + STAGING_FROM_RING + MOST_STAGING <= crate::nvenc::layout::KERNEL_VA_START)
         .then_some(ring)
 }
+/// How long [`Copier::close`] lets a copy in flight land.
+const CLOSE_WAIT_NS: u64 = 50_000_000;
 /// The most planes in one copy.
 pub const MOST_BLITS: usize = 4;
 /// The words of one plane's copy.
@@ -232,29 +234,60 @@ pub fn nv12_bytes(crop: &Crop) -> u64 {
 /// the chroma rows. That is the layout of the golden checksums
 /// ([`super::surface::picture`]).
 pub fn nv12(luma: u64, chroma: u64, geometry: &Geometry, crop: &Crop, dst: u64) -> [Blit; 2] {
+    planes(
+        luma,
+        chroma,
+        geometry.pitch,
+        geometry.coded_height,
+        1,
+        crop,
+        dst,
+    )
+}
+
+/// The bytes the displayed picture `crop` takes at `sample_bytes` bytes a
+/// sample: NV12 at 1, P010 (16-bit samples) at 2.
+pub fn picture_bytes(crop: &Crop, sample_bytes: u32) -> u64 {
+    nv12_bytes(crop) * u64::from(sample_bytes)
+}
+
+/// [`nv12`] for samples of `sample_bytes` bytes (2: NVDEC's 10-bit
+/// surfaces, 16-bit containers as P010), from planes `pitch` bytes a row
+/// of `coded_height` luma rows: `crop.width * sample_bytes` bytes a row,
+/// packed at `dst`, the luma rows then the chroma rows.
+pub fn planes(
+    luma: u64,
+    chroma: u64,
+    pitch: u32,
+    coded_height: u32,
+    sample_bytes: u32,
+    crop: &Crop,
+    dst: u64,
+) -> [Blit; 2] {
     let gobs = match Tiling::NVDEC {
         Tiling::Blocks(gobs) => gobs,
         Tiling::Pitch => 1,
     };
+    let row_bytes = crop.width * sample_bytes;
     let luma = Blit {
         src: luma,
-        src_pitch: geometry.pitch,
-        src_rows: Tiling::NVDEC.padded_rows(geometry.coded_height),
+        src_pitch: pitch,
+        src_rows: Tiling::NVDEC.padded_rows(coded_height),
         gobs,
-        x: crop.left,
+        x: crop.left * sample_bytes,
         y: crop.top,
-        width: crop.width,
+        width: row_bytes,
         rows: crop.height,
         dst,
-        dst_pitch: crop.width,
+        dst_pitch: row_bytes,
     };
     let chroma = Blit {
         src: chroma,
-        src_rows: Tiling::NVDEC.padded_rows(geometry.coded_height / 2),
-        // The chroma's samples are byte pairs: its bytes are the luma's.
+        src_rows: Tiling::NVDEC.padded_rows(coded_height / 2),
+        // The chroma's samples are pairs: its bytes are the luma's.
         y: crop.top / 2,
         rows: crop.height / 2,
-        dst: dst + u64::from(crop.width) * u64::from(crop.height),
+        dst: dst + u64::from(row_bytes) * u64::from(crop.height),
         ..luma
     };
     [luma, chroma]
@@ -411,6 +444,16 @@ pub struct Copier {
     copies: u32,
     timeout_ns: u64,
     state: State,
+    in_flight: Option<Flight>,
+}
+
+/// A copy submitted and not yet seen released.
+#[derive(Clone, Copy, Debug)]
+struct Flight {
+    payload: u32,
+    started: u64,
+    deadline: u64,
+    job_done: bool,
 }
 
 const RING: usize = 0;
@@ -453,6 +496,7 @@ impl Copier {
             copies: 0,
             timeout_ns,
             state: State::Open,
+            in_flight: None,
         };
         match copier.start(node) {
             Ok(()) => Ok(copier),
@@ -571,16 +615,31 @@ impl Copier {
     /// Copies `blits` (each writing inside the staging buffer) and waits
     /// for the engine, at most the copier's bound.
     pub fn copy<N: Node>(&mut self, node: &mut N, blits: &[Blit]) -> Result<Copied, Error> {
+        self.submit(node, blits)?;
+        loop {
+            if let Some(copied) = self.poll(node, true)? {
+                return Ok(copied);
+            }
+            node.pause();
+        }
+    }
+
+    /// Writes `blits`' methods (each writing inside the staging buffer) and
+    /// submits them, without waiting: [`Copier::poll`] then looks for the
+    /// release.
+    pub fn submit<N: Node>(&mut self, node: &mut N, blits: &[Blit]) -> Result<(), Error> {
         if self.state != State::Open {
             return Err(Error::Dead);
+        }
+        if self.in_flight.is_some() {
+            return Err(Error::Config("a copy is in flight"));
         }
         if blits.is_empty() || blits.len() > MOST_BLITS {
             return Err(Error::Config("1 to 4 planes a copy"));
         }
         let start = self.staging_address();
         let end = start + self.staging;
-        if let Some(why) = blits.iter().find_map(|blit| blit.refusal(start, end))
-        {
+        if let Some(why) = blits.iter().find_map(|blit| blit.refusal(start, end)) {
             return Err(Error::Config(why));
         }
         let started = node.now_ns();
@@ -636,34 +695,57 @@ impl Copier {
             return Err(error);
         }
         self.push_at += bytes.next_multiple_of(256);
-        let deadline = node.now_ns().saturating_add(self.timeout_ns);
-        let mut job_done = false;
-        loop {
-            let value = self.semaphore();
-            if value == payload {
-                fence(Ordering::Acquire);
-                self.copies += 1;
-                return Ok(Copied {
-                    ce_ns: node.now_ns().saturating_sub(started),
-                });
-            }
-            if node.now_ns() >= deadline {
-                let job_done = job_done || self.ask_fence(node);
-                self.state = State::Dead {
-                    keeps_channel: !job_done,
-                };
-                return Err(Error::Timeout { value, job_done });
-            }
-            if !job_done {
-                job_done = self.ask_fence(node);
-            }
-            node.pause();
+        self.in_flight = Some(Flight {
+            payload,
+            started,
+            deadline: node.now_ns().saturating_add(self.timeout_ns),
+            job_done: false,
+        });
+        Ok(())
+    }
+
+    /// Whether a copy is in flight.
+    pub fn busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// One look at the copy in flight: its time once the semaphore holds
+    /// its payload, `None` while it does not and the bound has not passed
+    /// (asking nouveau's fence when `ask`, which lets the host's Linux run).
+    /// Past the bound the copy timed out and the copier is dead.
+    pub fn poll<N: Node>(&mut self, node: &mut N, ask: bool) -> Result<Option<Copied>, Error> {
+        let Some(flight) = self.in_flight else {
+            return Err(Error::Config("no copy is in flight"));
+        };
+        let value = self.semaphore();
+        if value == flight.payload {
+            fence(Ordering::Acquire);
+            self.in_flight = None;
+            self.copies += 1;
+            return Ok(Some(Copied {
+                ce_ns: node.now_ns().saturating_sub(flight.started),
+            }));
         }
+        if node.now_ns() >= flight.deadline {
+            let job_done = flight.job_done || self.ask_fence(node);
+            self.in_flight = None;
+            self.state = State::Dead {
+                keeps_channel: !job_done,
+            };
+            return Err(Error::Timeout { value, job_done });
+        }
+        if ask && !flight.job_done {
+            let done = self.ask_fence(node);
+            if let Some(flight) = self.in_flight.as_mut() {
+                flight.job_done = done;
+            }
+        }
+        Ok(None)
     }
 
     /// The first `bytes` of the staging buffer, as the last copy left them.
     pub fn output(&self, bytes: usize) -> Option<&[u8]> {
-        if bytes as u64 > self.staging || self.state != State::Open {
+        if bytes as u64 > self.staging || self.state != State::Open || self.in_flight.is_some() {
             return None;
         }
         let cpu = self.buffers.get(STAGING)?.cpu?;
@@ -676,6 +758,21 @@ impl Copier {
     /// still busy, which keeps the channel and its buffers (unmapped);
     /// whether it did, so the file must stay open.
     pub fn close<N: Node>(mut self, node: &mut N) -> bool {
+        // A copy still in flight gets a moment to land; one that does not,
+        // with its job pending, keeps the channel.
+        if let Some(flight) = self.in_flight {
+            let deadline = node.now_ns().saturating_add(CLOSE_WAIT_NS);
+            self.in_flight = Some(Flight {
+                deadline: deadline.min(flight.deadline),
+                ..flight
+            });
+            while self.in_flight.is_some() {
+                if self.poll(node, true).is_err() {
+                    break;
+                }
+                node.pause();
+            }
+        }
         self.give_back(node);
         self.keeps_channel()
     }

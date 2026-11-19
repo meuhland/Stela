@@ -33,8 +33,9 @@ use crate::nvenc::{self, Log, Node, Outcome, PUSH_WORDS, Target};
 use alloc::vec::Vec;
 
 #[cfg(test)]
-mod captured;
+pub(crate) mod captured;
 pub mod copy;
+pub mod decoder;
 pub mod dpb;
 mod fields;
 pub mod layout;

@@ -14,7 +14,7 @@
 //!   slice headers only, so the cut clip drives it as the whole one does:
 //!   138 KB for 174 frames, where the clips are 2.7 MB. Made by
 //!   `nvdec-tools/mkcapture.py --excerpt`.
-//! - **`$NVDEC_CAPTURE`**, the whole clips and truths staged by
+//! - **`$STELA_NVDEC_CAPTURE`**, the whole clips and truths staged by
 //!   `nvdec-tools/mkcapture.py` without `--excerpt`, for the ignored test.
 //!
 //! Each clip is driven as phase 2 drives a guest's stream: its parameter
@@ -279,13 +279,13 @@ fn every_captured_frame_is_nvidias() {
     assert!(report(&clips), "a captured frame differs (see above)");
 }
 
-/// The same over the whole clips: `NVDEC_CAPTURE=<dir> cargo test -p
+/// The same over the whole clips: `STELA_NVDEC_CAPTURE=<dir> cargo test -p
 /// stela-driver-gpu --lib every_whole_captured_clip -- --ignored
 /// --nocapture`, the directory from `nvdec-tools/mkcapture.py`.
 #[test]
-#[ignore]
+#[ignore = "oracle: STELA_NVDEC_CAPTURE"]
 fn every_whole_captured_clip() {
-    let Ok(dir) = std::env::var("NVDEC_CAPTURE") else {
+    let Ok(dir) = std::env::var("STELA_NVDEC_CAPTURE") else {
         return;
     };
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -421,4 +421,34 @@ fn the_golden_checksums_are_thirty_md5s_each() {
             0x6a, 0x33
         ]
     );
+}
+
+macro_rules! clip {
+    ($name:literal, $ext:literal, $codec:expr) => {
+        (
+            $name,
+            $codec,
+            inflate(
+                $codec,
+                include_bytes!(concat!("fixtures/capture/", $name, ".", $ext)),
+                include_bytes!(concat!("fixtures/capture/", $name, ".lens")),
+            ),
+        )
+    };
+}
+
+/// The eight captured clips as Annex B streams, each slice padded back to
+/// its whole length: what the decoder's and the gate's tests feed the mock
+/// GPU (which never reads the slices' bytes past their start).
+pub(crate) fn clips() -> Vec<(&'static str, Codec, Vec<u8>)> {
+    vec![
+        clip!("h264-cavlc-slices-720p", "h264", Codec::H264),
+        clip!("h264-high-bf-1080p", "h264", Codec::H264),
+        clip!("h264-high-cqm-720p", "h264", Codec::H264),
+        clip!("h264-qp25", "h264", Codec::H264),
+        clip!("hevc-main-bf-1080p", "hevc", Codec::Hevc),
+        clip!("hevc-main-slices-1080p", "hevc", Codec::Hevc),
+        clip!("hevc-main10-4k", "hevc", Codec::Hevc),
+        clip!("hevc-qp25", "hevc", Codec::Hevc),
+    ]
 }

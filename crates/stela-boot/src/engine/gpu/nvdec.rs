@@ -21,6 +21,12 @@
 //!   `NVDEC SELFTEST GPU 0 summary: h264 PASS (30/30, read ce), hevc PASS
 //!   (30/30, read ce) in N ms`. A copy that never completed keeps its file
 //!   open, and the GPU's next clips read over BAR1.
+//! - **The guest's decode sessions** ([`attach`]): each NVIDIA GPU whose
+//!   decoder this port drives serves the sessions StelaVD opens through its
+//!   Metal service's gate (`metal::service::decoders`, ops 0x0a10-0x0a13),
+//!   unless `--no-nvdec` says not to, or the probe or the self-test found
+//!   its decoder failing. Each session is a render node file of its own, as
+//!   the self-test's, and logs `NVDEC SESSION` lines.
 //!
 //! Nothing either finds stops the boot or changes NVENC: its sessions are
 //! served as before. Waits are bounded, and a push that never finished
@@ -28,13 +34,40 @@
 //! the channel, a busy wait of up to 15 s; a GPU whose decoder timed out
 //! is not asked again.
 use super::client;
-use super::nvenc::{RenderFile, line, nvidia_gpus, open};
-use crate::output;
-use alloc::{format, string::String, vec::Vec};
+use super::nvenc::{GateGpu, RenderFile, line, nvidia_gpus, open};
+use super::stack::Stack;
+use crate::{native_mmio::Window, output};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
+use core::{
+    fmt,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use stela_drivers::gpu::metal::service::decoders::{self, Decoders, GateDecoders};
 use stela_drivers::gpu::nvdec::{self, selftest};
 
 /// How long the probe's decoder gets to release its semaphore.
 const BOUND_NS: u64 = 500_000_000;
+/// The stack each GPU's decoder calls run on, one at a time under the
+/// decoders' lock.
+const DECODER_STACK_BYTES: usize = 1 << 20;
+
+/// Whether the Metal services serve the guest's decode sessions: off with
+/// `--no-nvdec`.
+static SERVING: AtomicBool = AtomicBool::new(true);
+/// The bound GPUs, by index, whose decoder the probe or the self-test found
+/// failing: they serve no sessions.
+static FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// `--no-nvdec`: the Metal services serve no decode sessions, and StelaVD
+/// decodes with Apple's software decoder as before.
+pub(in crate::engine) fn set_serving(serving: bool) {
+    SERVING.store(serving, Ordering::Relaxed);
+}
+
+/// Notes that GPU `index`'s decoder failed before macOS.
+fn failed(index: u32) {
+    FAILED.fetch_or(1 << index.min(63), Ordering::Relaxed);
+}
 
 /// Probes the decoder of every NVIDIA GPU nouveau bound, in order.
 pub(in crate::engine) fn probe() {
@@ -52,6 +85,13 @@ pub(in crate::engine) fn probe() {
             "NVDEC PROBE GPU {index} ({name}): {}",
             outcome.verdict(&nvdec::PROBE, chipset, BOUND_NS)
         ));
+        if matches!(
+            outcome,
+            stela_drivers::gpu::nvenc::Outcome::Timeout { .. }
+                | stela_drivers::gpu::nvenc::Outcome::Failed { .. }
+        ) {
+            failed(index);
+        }
         if outcome.keeps_channel() {
             line(format_args!(
                 "NVDEC PROBE GPU {index} ({name}): its file stays open with the unfinished channel"
@@ -119,6 +159,11 @@ pub(in crate::engine) fn selftest() {
             } else {
                 client::close_descriptor(fd);
             }
+            // A decoder that failed, or a copy engine that hung, serves no
+            // sessions: they read every picture back by the copy engine.
+            if !report.passed || report.ce_hung {
+                failed(index);
+            }
             wedged |= report.timed_out;
             summary.push(format!(
                 "{codec} {} ({}/{}, read {})",
@@ -143,4 +188,46 @@ pub(in crate::engine) fn selftest() {
         output::flush_log();
     }
     output::flush_log();
+}
+
+/// The decoders bound GPU `index` serves the guest's sessions with, or why
+/// it serves none, which is logged: it must have a decoder this port drives
+/// (GA102 to GA107), and neither `--no-nvdec` nor a failed probe or
+/// self-test may say no.
+pub(super) fn attach(
+    window: &'static Window,
+    index: usize,
+    name: &str,
+    chipset: u16,
+) -> Option<Arc<dyn GateDecoders>> {
+    let refuse = |why: fmt::Arguments<'_>| {
+        line(format_args!("NVDEC SESSION GPU {index} ({name}): {why}"));
+        None
+    };
+    if !SERVING.load(Ordering::Relaxed) {
+        return refuse(format_args!("no sessions: --no-nvdec"));
+    }
+    if nvdec::decoder_class(chipset).is_none() {
+        return refuse(format_args!(
+            "no sessions: chipset {chipset:#x} has no decoder this port drives (GA102-GA107 only)"
+        ));
+    }
+    if FAILED.load(Ordering::Relaxed) & (1 << index.min(63)) != 0 {
+        return refuse(format_args!(
+            "no sessions: its decoder failed the probe or the self-test"
+        ));
+    }
+    let Some(stack) = Stack::map(window, DECODER_STACK_BYTES) else {
+        return refuse(format_args!("no sessions: no memory for their stack"));
+    };
+    let top = stack.top();
+    // It serves for the boot.
+    core::mem::forget(stack);
+    line(format_args!(
+        "NVDEC SESSION GPU {index} ({name}): serves H.264 (8-bit) and HEVC (Main, Main 10) \
+         decode sessions on chipset {chipset:#x}, at most {} at once, pictures read back by the \
+         copy engine and copied into the guest's pixel buffers",
+        decoders::MAX_SESSIONS
+    ));
+    Some(Arc::new(Decoders::new(GateGpu::new(index, chipset, top))))
 }

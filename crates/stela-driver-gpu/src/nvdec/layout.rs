@@ -351,6 +351,25 @@ impl Layout {
         self.bitstream_bytes
     }
 
+    /// The layout with its surfaces left unmapped for the CPU: a session
+    /// whose pictures leave by the copy engine alone (the gate's) keeps
+    /// BAR1's room, which a 4K Main 10 surface (52 MiB) would exhaust.
+    pub fn without_cpu_surfaces(mut self) -> Self {
+        for &index in &self.surfaces {
+            self.plans[index].mappable = false;
+        }
+        self
+    }
+
+    /// The video memory the layout's buffers take.
+    pub fn vram_bytes(&self) -> u64 {
+        self.plans
+            .iter()
+            .filter(|plan| plan.domain == Domain::Vram)
+            .map(|plan| plan.bytes)
+            .sum()
+    }
+
     /// Where the session's addresses end: past every buffer and every
     /// surface of the pool, bound or not.
     pub fn end(&self) -> u64 {

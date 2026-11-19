@@ -280,12 +280,27 @@ fn data(report: &selftest::Report) {
     }
 }
 
-/// The encoders of one bound GPU, on render node files of its own.
-struct GateGpu {
+/// The encoders of one bound GPU, on render node files of its own; its
+/// decoders too (`super::nvdec::attach`), on a stack of their own.
+pub(super) struct GateGpu {
     index: usize,
     chipset: u16,
     minor: u32,
     stack: u64,
+}
+
+impl GateGpu {
+    /// Bound GPU `index` of `chipset`, whose calls run on the stack whose
+    /// top is `stack`.
+    pub(super) fn new(index: usize, chipset: u16, stack: u64) -> Self {
+        Self {
+            index,
+            chipset,
+            // Bound GPU `index` has render node `RENDER_MINOR + index`.
+            minor: index as u32,
+            stack,
+        }
+    }
 }
 
 impl EncoderPlatform for GateGpu {

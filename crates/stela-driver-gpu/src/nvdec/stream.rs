@@ -57,6 +57,13 @@ pub struct Sequence {
     /// The surfaces those slots may be bound to: twice as many, since a
     /// slot moves off a surface being shown ([`Surfaces`]), at most 32.
     pub surfaces: u8,
+    /// The SPS's `profile_idc` (H.264: 66, 77, 100...; HEVC's general
+    /// profile: 1 Main, 2 Main 10).
+    pub profile: u8,
+    /// 4:2:0 with luma and chroma of one bit depth.
+    pub chroma_420: bool,
+    /// Frames only: H.264 without field pictures or MBAFF (HEVC always).
+    pub frames_only: bool,
 }
 
 /// A stream of samples of one codec.
@@ -77,6 +84,9 @@ fn h264_sequence(sps: &h264::Sps) -> Sequence {
         bit_depth: sps.bit_depth_luma,
         slots: sps.slots(),
         surfaces: surfaces(sps.slots()),
+        profile: sps.profile_idc,
+        chroma_420: sps.chroma_format_idc == 1 && sps.bit_depth_chroma == sps.bit_depth_luma,
+        frames_only: sps.frame_mbs_only,
     }
 }
 
@@ -93,6 +103,9 @@ fn hevc_sequence(sps: &hevc::Sps) -> Sequence {
         bit_depth: sps.bit_depth_luma,
         slots: sps.slots(),
         surfaces: surfaces(sps.slots()),
+        profile: sps.profile_idc,
+        chroma_420: sps.chroma_format_idc == 1 && sps.bit_depth_chroma == sps.bit_depth_luma,
+        frames_only: true,
     }
 }
 

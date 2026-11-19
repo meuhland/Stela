@@ -175,7 +175,7 @@ pub trait GateEncoders: Send + Sync {
 
 /// Whether `operation` is an encoder's, which never reaches the device.
 pub fn is_encoder_operation(operation: u32) -> bool {
-    operation & 0xff00 == 0x0a00
+    operation & 0xfff0 == 0x0a00
 }
 
 /// Serves the encoder call `call` at `record` as [`super::Service::serve`]

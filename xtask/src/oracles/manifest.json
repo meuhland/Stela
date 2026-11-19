@@ -5073,5 +5073,15 @@
       "STELA_KEXT"
     ],
     "reason": "requires a boot kernel collection (STELA_BOOT_KC) and a kext built by cargo xtask guest (STELA_KEXT); links it as a boot would"
+  },
+  {
+    "package": "stela-driver-gpu",
+    "test": "every_whole_captured_clip",
+    "source": "crates/stela-driver-gpu/src/nvdec/captured.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_NVDEC_CAPTURE"
+    ],
+    "reason": "requires the whole nvdec-cap-1118 clips and truths staged by nvdec-tools/mkcapture.py in STELA_NVDEC_CAPTURE"
   }
 ]

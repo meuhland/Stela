@@ -73,6 +73,9 @@ pub const NVDEC_SELFTEST: &str = "--nvdec-selftest";
 /// Serves no video encoder sessions to the guest: StelaVT encodes H.264
 /// with x264, as before NVENC ([`System::nvenc`]).
 pub const NO_NVENC: &str = "--no-nvenc";
+/// Serves no video decoder sessions to the guest: StelaVD decodes H.264 and
+/// HEVC with Apple's software decoder, as before NVDEC ([`System::nvdec`]).
+pub const NO_NVDEC: &str = "--no-nvdec";
 /// Read the host's keyboards and pointers at every host service turn
 /// ([`System::input_every_turn`]).
 pub const INPUT_EVERY_TURN: &str = "--input-every-turn";
@@ -494,6 +497,10 @@ pub struct System {
     /// `--no-nvenc`, which leaves StelaVT on x264 for H.264 and without
     /// HEVC.
     pub nvenc: bool,
+    /// Each NVIDIA GPU whose decoder Stela drives (GA102-GA107) serves
+    /// StelaVD's H.264 and HEVC decode sessions through its Metal gate; off
+    /// with `--no-nvdec`, which leaves StelaVD on Apple's software decoder.
+    pub nvdec: bool,
     /// From the start of its GSP-RM, before the NVENC probe and self-test,
     /// nouveau asks RM every 30 s to hold each NVIDIA GPU at its highest
     /// performance level (`NV2080_CTRL_CMD_PERF_BOOST`), where by default
@@ -588,6 +595,7 @@ impl Default for System {
             probe_nvdec: false,
             nvdec_selftest: false,
             nvenc: true,
+            nvdec: true,
             gpu_boost: false,
             watches: Vec::new(),
             dumps: Vec::new(),
@@ -1058,6 +1066,7 @@ impl fmt::Display for System {
         line.flag(PROBE_NVDEC, self.probe_nvdec)?;
         line.flag(NVDEC_SELFTEST, self.nvdec_selftest)?;
         line.flag(NO_NVENC, !self.nvenc)?;
+        line.flag(NO_NVDEC, !self.nvdec)?;
         line.flag(GPU_BOOST, self.gpu_boost)?;
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
