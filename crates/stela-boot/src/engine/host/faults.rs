@@ -451,7 +451,9 @@ fn map_around(state: &mut State, table: *mut u64, half: usize, address: u64) {
     }
 }
 
-/// #GP or #UD inside native code ends the block; elsewhere it is fatal.
+/// #SS, #GP or #UD inside native code ends the block; elsewhere it is
+/// fatal. #SS and #GP name a non-canonical address: #SS where RSP or RBP
+/// is the access's base.
 pub(crate) fn native_exception(
     frame: &mut Frame,
     saved: &super::super::interrupts::SavedState<'_>,
@@ -460,7 +462,7 @@ pub(crate) fn native_exception(
     if !in_code(state, frame.rip) {
         super::super::interrupts::fatal(frame);
     }
-    let cause = if frame.vector == 13 {
+    let cause = if matches!(frame.vector, 12 | 13) {
         FaultCause::NonCanonical
     } else {
         FaultCause::InvalidOpcode
