@@ -311,6 +311,30 @@ typedef struct {
 /* `NSDataReadingMappedIfSafe`: a system library runs to hundreds of megabytes. */
 #define STELA_DATA_MAPPED 1
 
+/* A file a client names by URL. Apple's Metal opens the URL's path, so a URL made
+ * from a bare path (`URLWithString:@"/System/..."`, no scheme), as Espresso passes
+ * its default.metallib, opens too; NSData reads only URLs with a scheme. */
+static NSData *stela_read_url(NSURL *url, NSUInteger options, NSError **error)
+{
+	NSData *data = [NSData dataWithContentsOfURL:url options:options error:error];
+	if (!data && url && !url.scheme && url.path.length) {
+		NSError *again = nil;
+		data = [NSData dataWithContentsOfFile:url.path options:options error:&again];
+		if (error) {
+			*error = data ? nil : again;
+		}
+	}
+	return data;
+}
+
+/* The path a library read by URL keeps: a file URL's file-system form, else the
+ * bare path a scheme-less URL holds (whose file-system form can be NULL). */
+static NSString *stela_url_path(NSURL *url)
+{
+	const char *path = url.isFileURL ? url.fileSystemRepresentation : NULL;
+	return path ? [NSString stringWithUTF8String:path] : url.path;
+}
+
 /* A universal library's header, big endian: magic, then `count` slices of cpu
  * type, subtype, offset, size and alignment. Its AIR slice is the one a device
  * other than Apple's own compiles; the rest are code for Apple's GPUs. */
@@ -1121,7 +1145,7 @@ static BOOL add_failed(NSError **error, NSInteger code, NSError *failure)
 	NSData *data = nil;
 	if (url) {
 		NSError *failure = nil;
-		data = [NSData dataWithContentsOfURL:url options:0 error:&failure];
+		data = stela_read_url(url, 0, &failure);
 		if (!data) {
 			add_failed(error, MTLBinaryArchiveErrorInvalidFile, failure);
 			return nil;
@@ -1168,7 +1192,7 @@ static BOOL add_failed(NSError **error, NSInteger code, NSError *failure)
 
 - (id)newLibraryWithURL:(NSURL *)url error:(NSError **)error
 {
-	NSData *data = [NSData dataWithContentsOfURL:url options:STELA_DATA_MAPPED error:error];
+	NSData *data = stela_read_url(url, STELA_DATA_MAPPED, error);
 	if (!data) {
 		StelaFailure failure = {.reason = "the file did not read"};
 		stela_report([[NSString stringWithFormat:@"a library at %@", url] UTF8String], &failure);
@@ -1176,7 +1200,7 @@ static BOOL add_failed(NSError **error, NSInteger code, NSError *failure)
 	}
 	StelaGPULibrary *library = [self libraryWithBytes:data.bytes length:data.length error:error];
 	if (library) {
-		library->_path = [NSString stringWithUTF8String:url.fileSystemRepresentation];
+		library->_path = stela_url_path(url);
 	}
 	return library;
 }
@@ -1236,10 +1260,10 @@ static BOOL add_failed(NSError **error, NSInteger code, NSError *failure)
 
 - (id)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
 {
-	NSData *data = [NSData dataWithContentsOfURL:url options:0 error:error];
+	NSData *data = stela_read_url(url, 0, error);
 	StelaGPULibrary *library = data ? [self libraryWithBytes:data.bytes length:data.length error:error] : nil;
 	if (library) {
-		library->_path = [NSString stringWithUTF8String:url.fileSystemRepresentation];
+		library->_path = stela_url_path(url);
 	}
 	return library ? [self dynamicLibrary:library error:error] : nil;
 }

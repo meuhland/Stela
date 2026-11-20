@@ -179,6 +179,9 @@ enum {
 
 @interface NSURL : NSObject
 @property(readonly) const char *fileSystemRepresentation;
+@property(readonly) NSString *scheme;
+@property(readonly) NSString *path;
+@property(readonly) BOOL isFileURL;
 @end
 
 extern NSString *const NSLocalizedDescriptionKey;
