@@ -246,7 +246,8 @@ StelaSandboxClient::replaceCache(OSObject *, void *, IOExternalMethodArguments *
 			result = kIOReturnNotPermitted;
 			goto done;
 		}
-		error = stelaWriteFile(path, bytes, length, 0644, context);
+		unsigned step = 0;
+		error = stelaWriteFile(path, bytes, length, 0644, context, &step);
 		bool same = false;
 		unsigned char digest[SHA256_DIGEST_LENGTH];
 		SHA256_CTX hash;
@@ -349,7 +350,8 @@ stage(const char *path, const unsigned char *bytes, unsigned long length, const 
 	if (error && error != ENOENT) {
 		return error;
 	}
-	error = stelaWriteFile(path, bytes, length, mode, context);
+	unsigned step = 0;
+	error = stelaWriteFile(path, bytes, length, mode, context, &step);
 	if (!error) {
 		error = stelaMatches(path, sha256, length, context, buffer, &same);
 	}

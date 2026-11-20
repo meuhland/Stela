@@ -573,7 +573,7 @@ fn bundle(report: BundleReport) {
         BundleReport::Current => Report::Current,
         BundleReport::Updated => Report::Updated,
         BundleReport::Missing => Report::Missing,
-        BundleReport::Failed => Report::Failed,
+        BundleReport::Failed(_) => Report::Failed,
     });
     match (decided, report) {
         (Decision::Continue(_), BundleReport::Updated) => {
@@ -589,7 +589,7 @@ fn bundle(report: BundleReport) {
                 "GPU StelaGPU.bundle is not installed ({report:?}); this single-user boot may install it\n"
             ));
         }
-        (Decision::Repair, BundleReport::Failed) => {
+        (Decision::Repair, BundleReport::Failed(_)) => {
             output::arguments(format_args!(
                 "GPU StelaGPU.bundle could not be read or written (its StelaGPU lines say \
                  why); restarting once into a single-user boot that removes its files for \
@@ -605,6 +605,10 @@ fn bundle(report: BundleReport) {
             super::super::service::request_restart();
         }
         (Decision::StopMissing { attempted }, _) => stop(&bundle_repair::missing(attempted)),
+        (Decision::StopFailed, BundleReport::Failed(failure)) => stop(&format!(
+            "the StelaGPU kext could not install StelaGPU.bundle: {failure}; \
+             its StelaGPU lines above name the file"
+        )),
         (Decision::StopFailed, _) => stop(
             "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say \
              why. The automatic single-user repair already ran or cannot be recorded: run stela \

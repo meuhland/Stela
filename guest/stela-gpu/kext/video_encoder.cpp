@@ -27,7 +27,8 @@ stage(const char *path, const unsigned char *bytes, unsigned long length, const 
 	if (error && error != ENOENT) {
 		return error;
 	}
-	error = stelaWriteFile(path, bytes, length, mode, context);
+	unsigned step = 0;
+	error = stelaWriteFile(path, bytes, length, mode, context, &step);
 	if (!error) {
 		error = stelaMatches(path, sha256, length, context, buffer, &same);
 	}
