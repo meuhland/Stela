@@ -57,6 +57,18 @@ fn put_signed(setup: &mut [u8], field: Field, value: i32) {
     field.put(setup, i64::from(value) as u64);
 }
 
+/// `RefDiffPicOrderCnts[slot]`: the current picture's order count less a
+/// kept picture's, clipped to [-128, 127] as `nvdec_drv.h` documents the
+/// field. The standard clips every order count difference the decoding
+/// uses the same way (`td` and `tb` of H.265 8.5.3.2.7 and 8.5.3.2.8), so a
+/// reference further away decodes as coded, and one the picture only keeps
+/// for later uses none. The setup refused such a picture before, which made
+/// the session lost and left the stream to Apple's software decoder (the 4K
+/// Aerial wallpaper's, 29 s in).
+fn ref_diff_poc(current: i32, kept: i32) -> i32 {
+    current.saturating_sub(kept).clamp(-128, 127)
+}
+
 /// The H.264 surfaces' bottom-field offsets, in units of 256 bytes: half a
 /// plane whose rows round up to 32 (NVIDIA's driver gave 1088 rows 4080 and
 /// 720 rows, coded 720 of 736, 1840).
@@ -580,14 +592,10 @@ pub fn hevc(picture: &hevc::Picture, geometry: &Geometry) -> Result<Vec<u8>, Ref
     );
     let mut long_terms = 0u64;
     for kept in &picture.dpb {
-        let difference = picture.poc - kept.poc;
-        if !(-128..=127).contains(&difference) {
-            return Err(Refused("a reference more than 128 POCs away"));
-        }
         put_signed(
             &mut s,
             f5::REF_DIFF_PIC_ORDER_CNTS[usize::from(kept.slot)],
-            difference,
+            ref_diff_poc(picture.poc, kept.poc),
         );
         if kept.long_term {
             long_terms |= 1 << (15 - kept.slot);
@@ -737,6 +745,18 @@ pub fn hevc_page(picture: &hevc::Picture, geometry: &Geometry) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_far_reference_is_clipped_as_the_standard_clips_it() {
+        assert_eq!(ref_diff_poc(10, 4), 6);
+        assert_eq!(ref_diff_poc(4, 10), -6);
+        assert_eq!(ref_diff_poc(127, 0), 127);
+        assert_eq!(ref_diff_poc(0, 128), -128);
+        assert_eq!(ref_diff_poc(1730, 1000), 127);
+        assert_eq!(ref_diff_poc(0, 300), -128);
+        assert_eq!(ref_diff_poc(i32::MIN, i32::MAX), -128);
+        assert_eq!(ref_diff_poc(i32::MAX, i32::MIN), 127);
+    }
 
     #[test]
     fn the_filter_formula_gives_both_captured_layouts() {
