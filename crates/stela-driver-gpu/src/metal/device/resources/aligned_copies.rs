@@ -31,15 +31,31 @@
 //! in place, every texel cache miss is a bus read of guest RAM with no L2
 //! caching, so one 3840x2160 surface cost a Mission Control frame 10-19 ms of
 //! GPU time on the 5080. Its copy is refreshed only in a command buffer that
-//! uses it, and only when the surface changed since it was last copied:
-//! the guest reports each IOSurface object a command buffer uses with the
-//! surface's ID and seed as committed (`SurfaceUse`); the CPU's writes
-//! change the seed, and a command buffer that writes a surface (a pass
-//! attachment, a blit destination, a texture shaders may write, any buffer
-//! over it) marks its copies stale for later command buffers. A texture
-//! reached only through an argument buffer and a residency set, which the
-//! guest does not report, is not refreshed: its copy keeps what its last
-//! reported use copied.
+//! uses it ([`Watch`]): the guest reports each IOSurface object a command
+//! buffer uses with the surface's ID and seed as committed (`SurfaceUse`).
+//!
+//! - A command buffer of any connection that writes a surface (a pass
+//!   attachment, a blit destination, a texture shaders may write, any buffer
+//!   over it), and the host's CPU copy into a texture the guest reported over
+//!   it, leave every copy of that surface stale for later command buffers:
+//!   the device, and so this state, is the whole host's.
+//! - The seed changes only when a process unlocks the surface after locking
+//!   it for writing. Writers that skip the lock change the rows and not the
+//!   seed: a capture surface ScreenCaptureKit's service fills, or a buffer
+//!   the CPU writes through `contents`. So an unchanged seed proves unchanged
+//!   rows only for a surface whose writers showed they change it: a copy is
+//!   refreshed at every use until it has seen its surface's seed change
+//!   twice between its uses ([`TRUSTED_CHANGES`]), as a video decoder's
+//!   pool surfaces do with every frame, and from then on only when the seed
+//!   changed or the surface was written. A copy that trusted the seed never
+//!   learns of a lockless writer that came later.
+//! - What a commit changes of these states applies once its recording
+//!   reaches the queue ([`SurfaceUses`]): a commit refused after it planned
+//!   its copies copies nothing, and the next use copies again.
+//!
+//! A texture reached only through an argument buffer and a residency set,
+//! which the guest does not report, is not refreshed: its copy keeps what its
+//! last reported use copied.
 use super::{Device, TextureId};
 use crate::metal::{
     abi::TextureUsage,
@@ -78,14 +94,85 @@ pub(in crate::metal::device) struct AlignedCopy {
 enum Refresh {
     /// By every command buffer: rows the GPU cannot address in place.
     Always,
-    /// By a command buffer that uses it whose surface's seed differs from
-    /// `filled`, the seed it was last copied at (`None`: never copied, or
-    /// written by the GPU since); `surface` is the surface's ID once the
-    /// guest reported it.
-    Changed {
-        surface: Option<u32>,
-        filled: Option<u32>,
-    },
+    /// By a command buffer that uses it, when its rows may have changed
+    /// since it was last copied ([`Watch::used`]).
+    Changed(Watch),
+}
+
+/// How often a copy must see its surface's seed change between two of its
+/// uses before an unchanged seed spares it a copy: a pool surface a video
+/// decoder fills changes it every frame; one bumped once (by a lock taken to
+/// map the surface, say) proves nothing of its writers.
+pub(in crate::metal::device) const TRUSTED_CHANGES: u8 = 2;
+
+/// What a [`Refresh::Changed`] copy knows of its surface's rows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::metal::device) struct Watch {
+    /// The surface's ID, as the guest reported its last use.
+    surface: Option<u32>,
+    /// The surface's seed at that use.
+    seed: Option<u32>,
+    /// The copy holds the rows as they were then: false before its first
+    /// copy, and once a command buffer of any connection or the host's CPU
+    /// copy wrote the surface.
+    current: bool,
+    /// How often the seed changed between two of its uses, up to
+    /// [`TRUSTED_CHANGES`].
+    changes: u8,
+}
+
+impl Watch {
+    /// A use of the copy at the surface's `seed`: whether the command
+    /// buffer copies the rows into it first, and what the copy knows after.
+    /// It copies when it does not hold the rows, when the seed changed, and
+    /// at every use while the surface has not shown that its writers change
+    /// its seed.
+    pub(in crate::metal::device) fn used(self, surface: u32, seed: u32) -> (bool, Self) {
+        // Another surface under the same texture knows nothing of this one.
+        let known = if self.surface.is_none_or(|known| known == surface) {
+            self
+        } else {
+            Self::default()
+        };
+        let changed = known.seed.is_some_and(|last| last != seed);
+        let changes = if changed {
+            known.changes.saturating_add(1).min(TRUSTED_CHANGES)
+        } else {
+            known.changes
+        };
+        let after = Self {
+            surface: Some(surface),
+            seed: Some(seed),
+            current: true,
+            changes,
+        };
+        (!known.current || changed || !after.trusts_seed(), after)
+    }
+
+    /// The surface was written where its seed does not tell: the next use
+    /// copies.
+    pub(in crate::metal::device) fn written(&mut self) {
+        self.current = false;
+    }
+
+    /// Whether an unchanged seed spares the copy at its next use.
+    pub(in crate::metal::device) fn trusts_seed(&self) -> bool {
+        self.changes >= TRUSTED_CHANGES
+    }
+}
+
+/// What a command buffer's surface uses change of the copies' [`Watch`]es,
+/// applied once its recording reaches the queue
+/// ([`Device::apply_surface_uses`]).
+#[derive(Debug, Default)]
+pub(in crate::metal::device) struct SurfaceUses {
+    /// Each used copy's watch after the use: its texture and its place
+    /// among the texture's copies.
+    watches: Vec<(TextureId, usize, Watch)>,
+    /// The surfaces the command buffer may write.
+    written: Vec<u32>,
+    /// The textures it used and their surfaces, for the host's CPU copies.
+    textures: Vec<(TextureId, u32)>,
 }
 
 /// An IOSurface object a command buffer uses, as the guest reported it:
@@ -176,10 +263,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             return Ok((image, None));
         }
         let refresh = if fits {
-            Refresh::Changed {
-                surface: None,
-                filled: None,
-            }
+            Refresh::Changed(Watch::default())
         } else {
             Refresh::Always
         };
@@ -322,16 +406,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// back into the rows of the textures it wrote (`written`); each
     /// followed by a full barrier, and empty when there are none. It begins
     /// with every [`Refresh::Always`] copy, and each [`Refresh::Changed`]
-    /// copy of a texture it uses (`surfaces`) whose surface's seed differs
-    /// from the one last copied, which it then records. The surfaces it may
-    /// write (`writes`: the textures it writes; any buffer over a surface)
-    /// leave their copies stale for later command buffers.
+    /// copy of a texture it uses (`surfaces`) that [`Watch::used`] says
+    /// to copy, once whatever objects over the texture it reports. The
+    /// surfaces it may write (`writes`: the textures it writes; any buffer
+    /// over a surface) leave their copies stale for later command buffers.
+    /// The watches change only when the caller applies the returned
+    /// [`SurfaceUses`] ([`Self::apply_surface_uses`]), once the recording
+    /// reached the queue.
     pub(in crate::metal::device) fn aligned_copy_commands(
-        &mut self,
+        &self,
         written: &[TextureId],
         surfaces: &[SurfaceNote],
         writes: &[TextureId],
-    ) -> (Vec<Command>, Vec<Command>) {
+    ) -> (Vec<Command>, Vec<Command>, SurfaceUses) {
         let mut lead: Vec<Command> = self
             .resources
             .aligned_copies
@@ -340,39 +427,41 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .filter(|copy| copy.refresh == Refresh::Always)
             .map(|copy| copy.rows.refresh())
             .collect();
-        let used: Vec<(TextureId, SurfaceNote)> = surfaces
-            .iter()
-            .filter_map(|note| Some((self.aligned_root(note.texture?)?, *note)))
-            .collect();
-        for (root, note) in used {
-            let Some(copies) = self.resources.aligned_copies.get_mut(&root.0) else {
+        let mut uses = SurfaceUses::default();
+        let mut roots: Vec<TextureId> = Vec::new();
+        for note in surfaces {
+            let Some(texture) = note.texture else {
                 continue;
             };
-            for copy in copies {
-                if let Refresh::Changed { surface, filled } = &mut copy.refresh {
-                    *surface = Some(note.surface);
-                    if *filled != Some(note.seed) {
-                        *filled = Some(note.seed);
+            if !uses.textures.contains(&(texture, note.surface)) {
+                uses.textures.push((texture, note.surface));
+            }
+            let Some(root) = self.aligned_root(texture) else {
+                continue;
+            };
+            // A texture and its views are one use.
+            if roots.contains(&root) {
+                continue;
+            }
+            roots.push(root);
+            let Some(copies) = self.resources.aligned_copies.get(&root.0) else {
+                continue;
+            };
+            for (index, copy) in copies.iter().enumerate() {
+                if let Refresh::Changed(watch) = copy.refresh {
+                    let (copies_rows, after) = watch.used(note.surface, note.seed);
+                    if copies_rows {
                         lead.push(copy.rows.refresh());
                     }
+                    uses.watches.push((root, index, after));
                 }
             }
         }
-        let dirty: Vec<u32> = surfaces
-            .iter()
-            .filter(|note| note.texture.is_none_or(|texture| writes.contains(&texture)))
-            .map(|note| note.surface)
-            .collect();
-        if !dirty.is_empty() {
-            for copy in self.resources.aligned_copies.values_mut().flatten() {
-                if let Refresh::Changed {
-                    surface: Some(surface),
-                    filled,
-                } = &mut copy.refresh
-                    && dirty.contains(surface)
-                {
-                    *filled = None;
-                }
+        for note in surfaces {
+            if note.texture.is_none_or(|texture| writes.contains(&texture))
+                && !uses.written.contains(&note.surface)
+            {
+                uses.written.push(note.surface);
             }
         }
         let copies = &self.resources.aligned_copies;
@@ -387,7 +476,89 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 commands.push(Command::Barrier(FULL));
             }
         }
-        (lead, tail)
+        (lead, tail, uses)
+    }
+
+    /// Applies what a command buffer's uses change of the copies' watches
+    /// ([`Self::aligned_copy_commands`]) once its recording reached the
+    /// queue: each used copy's watch, then the surfaces it may write, whose
+    /// copies its later command buffers refresh.
+    pub(in crate::metal::device) fn apply_surface_uses(&mut self, uses: SurfaceUses) {
+        let SurfaceUses {
+            watches,
+            written,
+            textures,
+        } = uses;
+        for (root, index, watch) in watches {
+            if let Some(copy) = self
+                .resources
+                .aligned_copies
+                .get_mut(&root.0)
+                .and_then(|copies| copies.get_mut(index))
+                && matches!(copy.refresh, Refresh::Changed(_))
+            {
+                copy.refresh = Refresh::Changed(watch);
+            }
+        }
+        for (texture, surface) in textures {
+            if self.resources.textures.get(texture.0).is_ok() {
+                self.resources.surface_textures.insert(texture.0, surface);
+            }
+        }
+        for surface in written {
+            self.surface_written(surface);
+        }
+    }
+
+    /// Every connection's copies of `surface` are refreshed at their next
+    /// use.
+    fn surface_written(&mut self, surface: u32) {
+        for copy in self.resources.aligned_copies.values_mut().flatten() {
+            if let Refresh::Changed(watch) = &mut copy.refresh
+                && watch.surface == Some(surface)
+            {
+                watch.written();
+            }
+        }
+    }
+
+    /// The host's CPU copy wrote texture `id` (`replaceRegion:`), which
+    /// changes no seed: the copies of the surface the guest reported it, or
+    /// the texture it views, over are refreshed at their next use.
+    pub(in crate::metal::device) fn note_cpu_write(&mut self, id: TextureId) {
+        let mut texture = Some(id);
+        while let Some(id) = texture {
+            if let Some(&surface) = self.resources.surface_textures.get(&id.0) {
+                self.surface_written(surface);
+                return;
+            }
+            texture = self
+                .resources
+                .textures
+                .get(id.0)
+                .ok()
+                .and_then(|texture| texture.parent);
+        }
+    }
+
+    /// Forgets the surface texture `id` was reported over, as it is
+    /// destroyed.
+    pub(in crate::metal::device) fn forget_surface_texture(&mut self, id: TextureId) {
+        self.resources.surface_textures.remove(&id.0);
+    }
+
+    /// The watch of texture `id`'s first copy refreshed only where used and
+    /// changed.
+    #[cfg(test)]
+    pub(in crate::metal::device) fn surface_watch(&self, id: TextureId) -> Option<Watch> {
+        self.resources
+            .aligned_copies
+            .get(&id.0)?
+            .iter()
+            .find_map(|copy| match copy.refresh {
+                Refresh::Changed(watch) => Some(watch),
+                Refresh::Always => None,
+            })
     }
 
     /// The copies that refresh an extended-range IOSurface texture's
@@ -434,8 +605,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .into_iter()
             .flatten()
         {
-            if let Refresh::Changed { filled, .. } = &mut copy.refresh {
-                *filled = None;
+            if let Refresh::Changed(watch) = &mut copy.refresh {
+                watch.written();
             }
         }
         Ok(true)

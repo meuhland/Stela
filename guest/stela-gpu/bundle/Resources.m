@@ -1169,13 +1169,15 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 
 /* A buffer over the surface's own pages, all of its allocation, shared with
  * the CPU as any imported buffer is. It keeps the surface; wiring the pages
- * outlasts the lock that maps them. */
+ * outlasts the lock that maps them. The lock only maps: read-only, so its
+ * unlock leaves the seed, which tells the service a CPU write changed the
+ * surface, alone. */
 - (id)newBufferWithIOSurface:(IOSurfaceRef)surface
 {
 	if (!surface) {
 		return nil;
 	}
-	if (IOSurfaceLock(surface, 0, NULL) != 0) {
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
 		StelaFailure failure = {.reason = "the surface does not lock"};
 		stela_report("newBufferWithIOSurface:", &failure);
 		return nil;
@@ -1187,7 +1189,7 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 						    deallocator:^(void *contents, NSUInteger length) {
 							    CFRelease(surface);
 						    }];
-	IOSurfaceUnlock(surface, 0, NULL);
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	if (!buffer) {
 		CFRelease(surface);
 		return nil;
@@ -1198,10 +1200,11 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 
 /* The texture reads the surface's own pages, through a buffer over them that
  * keeps the surface. Wiring them outlasts the lock that maps them. A surface
- * counts rows of its elements, which can be taller than the format's blocks. */
+ * counts rows of its elements, which can be taller than the format's blocks.
+ * Its lock is read-only, as the buffer's is. */
 - (id)newTextureWithDescriptor:(id)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
-	if (IOSurfaceLock(surface, 0, NULL) != 0) {
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
 		StelaFailure failure = {.reason = "the surface does not lock"};
 		stela_report("newTextureWithDescriptor:iosurface:plane:", &failure);
 		return nil;
@@ -1224,7 +1227,7 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 						    deallocator:^(void *contents, NSUInteger length) {
 							    CFRelease(surface);
 						    }];
-	IOSurfaceUnlock(surface, 0, NULL);
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
 	if (!buffer) {
 		CFRelease(surface);
 		return nil;

@@ -259,6 +259,10 @@ pub(super) struct Resources {
     /// Linear textures' planes whose rows the GPU cannot address in place,
     /// by texture: their aligned copies ([`aligned_copies`]).
     aligned_copies: BTreeMap<u32, Vec<aligned_copies::AlignedCopy>>,
+    /// The IOSurface ID each texture lies over, by texture, as a command
+    /// buffer of any connection reported it: the host's CPU copies into the
+    /// texture then refresh the surface's aligned copies.
+    surface_textures: BTreeMap<u32, u32>,
     /// Destroyed private textures kept for reuse, oldest first, and their
     /// bytes.
     recycled: VecDeque<Recycled>,
@@ -1690,14 +1694,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let (region, strides) = self.block_run(id, region, strides)?;
         let region = &region;
         let (copy, rows) = self.cpu_region(id, region, strides, bytes.len())?;
-        if rows.tight() {
-            return self.write_region(id, &copy, &bytes[..rows.packed_bytes]);
+        let written = if rows.tight() {
+            self.write_region(id, &copy, &bytes[..rows.packed_bytes])
+        } else {
+            let mut packed = Vec::with_capacity(rows.packed_bytes);
+            for row in rows.ranges() {
+                packed.extend_from_slice(&bytes[row]);
+            }
+            self.write_region(id, &copy, &packed)
+        };
+        // The surface's seed does not change: other textures' device copies
+        // of it learn of the write here (`aligned_copies`).
+        if written.is_ok() {
+            self.note_cpu_write(id);
         }
-        let mut packed = Vec::with_capacity(rows.packed_bytes);
-        for row in rows.ranges() {
-            packed.extend_from_slice(&bytes[row]);
-        }
-        self.write_region(id, &copy, &packed)
+        written
     }
 
     /// `getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:`.
@@ -2066,6 +2077,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let texture = self.resources.textures.remove(id.0)?;
         let readers = self.resources.texture_readers.remove(&id.0);
         self.forget_extended_planes(id);
+        self.forget_surface_texture(id);
         // Every commit refreshes an aligned copy, whatever its connection.
         let copies = self.take_aligned_copies(id);
         // Its decodes would write a view destroyed with it, and its uploads

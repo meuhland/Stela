@@ -232,6 +232,8 @@ extern const mach_port_t kIOMainPortDefault;
 
 CFTypeRef CFRetain(CFTypeRef object);
 void CFRelease(CFTypeRef object);
+/* IOSurfaceLock's option for a lock whose unlock leaves the seed alone. */
+enum { kIOSurfaceLockReadOnly = 0x00000001 };
 kern_return_t IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 kern_return_t IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);

@@ -340,62 +340,48 @@ fn rows_another_connections_work_refreshes_from_outlive_it() {
     assert!(device.backend().destroyed.contains(&Object::Memory(memory)));
 }
 
-/// A video wallpaper's 10-bit 4:2:0 surface, whose rows the GPU could
-/// address in place, is sampled from device memory: both planes' copies are
-/// refreshed only by a command buffer that uses the texture, only when the
-/// surface's seed changed since the last copy, and again after a command
-/// buffer wrote the surface through another object. Before, it was sampled
-/// from guest RAM: 10.6 ms for one 1280x896 quad over a 3840x2160 surface.
-#[test]
-fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
-    let mut device = device();
-    let buffer = buffer(&mut device, 8 << 20);
+/// The planes of a 1920x1080 10-bit 4:2:0 surface, whose rows the GPU
+/// could address in place, in a buffer.
+const SURFACE_PLANES: [PlaneLayout; 2] = [
+    PlaneLayout {
+        offset: 0,
+        bytes_per_row: 3840,
+    },
+    PlaneLayout {
+        offset: 4 << 20,
+        bytes_per_row: 3840,
+    },
+];
+
+/// Both planes' copies refreshed from their rows.
+const BOTH: [(bool, u64, u32, [u32; 3]); 2] = [
+    (true, 0, 1920, [1920, 1080, 1]),
+    (true, 4 << 20, 960, [960, 540, 1]),
+];
+
+/// The surface's ID in these tests.
+const SURFACE: u32 = 42;
+
+/// A buffer over a video frame's surface and the sampled texture over it,
+/// kept in device memory.
+fn video_frame(device: &mut TestDevice) -> (BufferId, TextureId) {
+    let buffer = buffer(device, 8 << 20);
     let surface = descriptor(
         PixelFormat::Ycbcr10_420_2p,
         1920,
         1080,
         TextureUsage::SHADER_READ,
     );
-    let planes = [
-        PlaneLayout {
-            offset: 0,
-            bytes_per_row: 3840,
-        },
-        PlaneLayout {
-            offset: 4 << 20,
-            bytes_per_row: 3840,
-        },
-    ];
     let texture = device
-        .new_two_plane_texture(buffer, &surface, planes, 0)
+        .new_two_plane_texture(buffer, &surface, SURFACE_PLANES, 0)
         .unwrap();
     assert!(device.has_aligned_copy(texture));
-    let both = [
-        (true, 0, 1920, [1920, 1080, 1]),
-        (true, 4 << 20, 960, [960, 540, 1]),
-    ];
-    let note = |texture, seed| SurfaceNote {
-        texture,
-        surface: 42,
-        seed,
-    };
-    let commit = |device: &mut TestDevice, notes: &[SurfaceNote], written: &[TextureId]| {
-        let mut commands = device.new_command_buffer();
-        commands.surfaces.extend_from_slice(notes);
-        commands.written.extend_from_slice(written);
-        device.commit(commands).unwrap();
-        row_copies(device)
-    };
-    // Not used: nothing is copied.
-    assert_eq!(commit(&mut device, &[], &[]), []);
-    // Used at seed 7: copied once, then not again while the seed holds.
-    assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), both);
-    assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), []);
-    // The CPU wrote it: a new seed.
-    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
-    // Another texture over the same surface (another connection's, as the
-    // surface's ID says) written by a command buffer: the next use copies.
-    let other = device
+    (buffer, texture)
+}
+
+/// Another texture over the same surface's first plane, one passes write.
+fn plane_texture(device: &mut TestDevice, buffer: BufferId) -> TextureId {
+    device
         .new_texture_from_buffer(
             buffer,
             &descriptor(
@@ -407,17 +393,312 @@ fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
             0,
             3840,
         )
-        .unwrap();
-    assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[other]), []);
-    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+        .unwrap()
+}
+
+fn note(texture: Option<TextureId>, seed: u32) -> SurfaceNote {
+    SurfaceNote {
+        texture,
+        surface: SURFACE,
+        seed,
+    }
+}
+
+/// Commits, for connection `key`, a command buffer that uses `notes` and
+/// writes `written`, and answers the copies between rows and copies it
+/// made.
+fn commit_uses(
+    device: &mut TestDevice,
+    key: u64,
+    notes: &[SurfaceNote],
+    written: &[TextureId],
+) -> Vec<(bool, u64, u32, [u32; 3])> {
+    let mut commands = device.new_command_buffer();
+    commands.surfaces.extend_from_slice(notes);
+    commands.written.extend_from_slice(written);
+    device.commit_for(key, commands).unwrap();
+    row_copies(device)
+}
+
+/// Uses `texture` at seeds 1, 2 and 3: its copy has then seen the seed
+/// change twice, and trusts it.
+fn trust_seed(device: &mut TestDevice, texture: TextureId) {
+    for seed in 1..=3 {
+        assert_eq!(
+            commit_uses(device, 1, &[note(Some(texture), seed)], &[]),
+            BOTH
+        );
+    }
+    assert!(device.surface_watch(texture).unwrap().trusts_seed());
+    assert_eq!(commit_uses(device, 1, &[note(Some(texture), 3)], &[]), []);
+}
+
+/// A video wallpaper's 10-bit 4:2:0 surface is sampled from device memory:
+/// both planes' copies are refreshed only by a command buffer that uses the
+/// texture; at each use until the surface's seed changed twice between uses,
+/// as a decoder's pool surfaces' seeds do each time it fills them; from then
+/// on only when the seed changed, or after a command buffer wrote the surface
+/// through another object. Before, it was sampled from guest RAM: 10.6 ms
+/// for one 1280x896 quad over a 3840x2160 surface.
+#[test]
+fn a_large_sampled_surface_is_copied_only_where_used_and_changed() {
+    let mut device = device();
+    let (buffer, texture) = video_frame(&mut device);
+    let commit = |device: &mut TestDevice, notes: &[SurfaceNote], written: &[TextureId]| {
+        commit_uses(device, 0, notes, written)
+    };
+    // Not used: nothing is copied.
+    assert_eq!(commit(&mut device, &[], &[]), []);
+    // Used at seed 7: copied at every use while the seed has not shown it
+    // changes with the surface's writes.
+    assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), BOTH);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 7)], &[]), BOTH);
+    // The decoder filled it: a new seed, once and then again.
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), BOTH);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), BOTH);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 9)], &[]), BOTH);
+    // From then on, not again while the seed holds.
+    assert_eq!(commit(&mut device, &[note(Some(texture), 9)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 9)], &[]), []);
+    // A view and the texture in one command buffer copy once.
+    assert_eq!(
+        commit(
+            &mut device,
+            &[note(Some(texture), 10), note(Some(texture), 10)],
+            &[]
+        ),
+        BOTH
+    );
+    // Another texture over the same surface written by a command buffer:
+    // the next use copies.
+    let other = plane_texture(&mut device, buffer);
+    assert_eq!(commit(&mut device, &[note(Some(other), 10)], &[other]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 10)], &[]), BOTH);
     // Read, not written, it changes nothing.
-    assert_eq!(commit(&mut device, &[note(Some(other), 8)], &[]), []);
-    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(other), 10)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 10)], &[]), []);
     // A buffer over the surface may be written by any shader.
-    assert_eq!(commit(&mut device, &[note(None, 8)], &[]), []);
-    assert_eq!(commit(&mut device, &[note(Some(texture), 8)], &[]), both);
+    assert_eq!(commit(&mut device, &[note(None, 10)], &[]), []);
+    assert_eq!(commit(&mut device, &[note(Some(texture), 10)], &[]), BOTH);
+    // One command buffer that reads it and writes it through another
+    // object copies before its work and leaves it stale for the next.
+    assert_eq!(
+        commit(
+            &mut device,
+            &[note(Some(texture), 10), note(Some(other), 10)],
+            &[other]
+        ),
+        []
+    );
+    assert_eq!(commit(&mut device, &[note(Some(texture), 10)], &[]), BOTH);
     device.destroy_texture(other).unwrap();
     device.destroy_texture(texture).unwrap();
+}
+
+/// Parsec's capture surfaces: ScreenCaptureKit's service fills them again
+/// for every frame without a write lock, so their seed holds while their
+/// rows change, and no command buffer reports writing them. Their copies
+/// are refreshed at every use, however long the seed holds. With the seed
+/// trusted at its first value, VideoToolbox's conversion in parsecd read
+/// the first frame forever and the encoder sent 418-byte P-frames.
+#[test]
+fn a_surface_whose_seed_never_changes_is_copied_at_every_use() {
+    let mut device = device();
+    let (_, texture) = video_frame(&mut device);
+    for _ in 0..16 {
+        assert_eq!(
+            commit_uses(&mut device, 1, &[note(Some(texture), 5)], &[]),
+            BOTH
+        );
+    }
+    assert!(!device.surface_watch(texture).unwrap().trusts_seed());
+    device.destroy_texture(texture).unwrap();
+}
+
+/// A command buffer of another connection that writes the surface through
+/// its own texture leaves connection 1's copy stale, though the seed holds:
+/// the device's state is the whole host's, by surface ID. Connection 2's
+/// reads change nothing.
+#[test]
+fn another_connections_write_refreshes_every_connections_copy() {
+    let mut device = device();
+    let (buffer, texture) = video_frame(&mut device);
+    trust_seed(&mut device, texture);
+    let theirs = plane_texture(&mut device, buffer);
+    assert_eq!(
+        commit_uses(&mut device, 2, &[note(Some(theirs), 3)], &[]),
+        []
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 3)], &[]),
+        []
+    );
+    assert_eq!(
+        commit_uses(&mut device, 2, &[note(Some(theirs), 3)], &[theirs]),
+        []
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 3)], &[]),
+        BOTH
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 3)], &[]),
+        []
+    );
+    // Through a buffer over the surface, which shaders may write.
+    assert_eq!(commit_uses(&mut device, 3, &[note(None, 3)], &[]), []);
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 3)], &[]),
+        BOTH
+    );
+    device.destroy_texture(theirs).unwrap();
+    device.destroy_texture(texture).unwrap();
+}
+
+/// A pool surface comes back with the same ID and a new frame: the decoder
+/// that filled it changed its seed, so its copy is refreshed. A texture made
+/// later over a surface of the same ID, in the slot of a destroyed one, knows
+/// nothing of the old copy's seeds and copies at its uses.
+#[test]
+fn a_recycled_surface_is_copied_again() {
+    let mut device = device();
+    let (buffer, texture) = video_frame(&mut device);
+    trust_seed(&mut device, texture);
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 4)], &[]),
+        BOTH
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 4)], &[]),
+        []
+    );
+    device.destroy_texture(texture).unwrap();
+    let surface = descriptor(
+        PixelFormat::Ycbcr10_420_2p,
+        1920,
+        1080,
+        TextureUsage::SHADER_READ,
+    );
+    let again = device
+        .new_two_plane_texture(buffer, &surface, SURFACE_PLANES, 0)
+        .unwrap();
+    assert_eq!(device.surface_watch(again), Some(Watch::default()));
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(again), 4)], &[]),
+        BOTH
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(again), 4)], &[]),
+        BOTH
+    );
+    device.destroy_texture(again).unwrap();
+}
+
+/// The CPU writes the surface. With a write lock its seed changes, and the
+/// next use copies. Through `replaceRegion:` on another texture the guest
+/// reported over the surface, the host's CPU copy changes no seed: it
+/// leaves the surface's copies stale itself.
+#[test]
+fn cpu_writes_refresh_the_copies() {
+    let mut device = device();
+    let (buffer, texture) = video_frame(&mut device);
+    trust_seed(&mut device, texture);
+    // A write lock's unlock.
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 4)], &[]),
+        BOTH
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 4)], &[]),
+        []
+    );
+    // The host's CPU copy into another connection's texture over it.
+    let theirs = plane_texture(&mut device, buffer);
+    assert_eq!(
+        commit_uses(&mut device, 2, &[note(Some(theirs), 4)], &[]),
+        []
+    );
+    let region = Region {
+        slice: 0,
+        level: 0,
+        origin: [0, 0, 0],
+        size: [2, 1, 1],
+    };
+    let tight = Strides {
+        bytes_per_row: 4,
+        bytes_per_image: 0,
+    };
+    device
+        .replace_region(theirs, &region, &[1, 2, 3, 4], tight)
+        .unwrap();
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 4)], &[]),
+        BOTH
+    );
+    assert_eq!(
+        commit_uses(&mut device, 1, &[note(Some(texture), 4)], &[]),
+        []
+    );
+    // Once destroyed, the texture's surface is forgotten.
+    device.destroy_texture(theirs).unwrap();
+    assert!(!device.resources.surface_textures.contains_key(&theirs.0));
+    device.destroy_texture(texture).unwrap();
+    assert!(device.resources.surface_textures.is_empty());
+}
+
+/// A commit refused after it planned its copies (its mappings fail, or its
+/// submission) copies nothing: the copies' watches are left as they were,
+/// and the next use copies again. Before, the refused use recorded the seed
+/// as copied, and later uses at that seed read whatever the copy held.
+#[test]
+fn a_refused_commit_leaves_the_copies_to_copy_again() {
+    let mut device = device();
+    let (_, texture) = video_frame(&mut device);
+    trust_seed(&mut device, texture);
+    let before = device.surface_watch(texture);
+    let notes = [note(Some(texture), 4)];
+    let refreshes = |lead: &[Command]| {
+        lead.iter()
+            .filter(|command| matches!(command, Command::CopyBufferToImage { .. }))
+            .count()
+    };
+    let (lead, _, _refused) = device.aligned_copy_commands(&[], &notes, &[]);
+    assert_eq!(refreshes(&lead), 2);
+    assert_eq!(device.surface_watch(texture), before);
+    let (lead, _, uses) = device.aligned_copy_commands(&[], &notes, &[]);
+    assert_eq!(refreshes(&lead), 2);
+    device.apply_surface_uses(uses);
+    let (lead, _, _) = device.aligned_copy_commands(&[], &notes, &[]);
+    assert_eq!(refreshes(&lead), 0);
+    device.destroy_texture(texture).unwrap();
+}
+
+/// A copy's watch: what each use copies, and when the seed is trusted.
+#[test]
+fn a_watch_trusts_a_seed_that_changed_twice() {
+    let watch = Watch::default();
+    // The first use copies, and so does each use at an unproven seed.
+    let (copies, watch) = watch.used(SURFACE, 1);
+    assert!(copies);
+    let (copies, watch) = watch.used(SURFACE, 1);
+    assert!(copies);
+    let (copies, watch) = watch.used(SURFACE, 2);
+    assert!(copies && !watch.trusts_seed());
+    let (copies, watch) = watch.used(SURFACE, 2);
+    assert!(copies);
+    let (copies, watch) = watch.used(SURFACE, 3);
+    assert!(copies && watch.trusts_seed());
+    // Trusted: only a new seed or a write copies.
+    let (copies, mut watch) = watch.used(SURFACE, 3);
+    assert!(!copies);
+    watch.written();
+    let (copies, watch) = watch.used(SURFACE, 3);
+    assert!(copies && watch.trusts_seed());
+    let (copies, watch) = watch.used(SURFACE, 4);
+    assert!(copies);
+    // Another surface under the texture starts over.
+    let (copies, watch) = watch.used(SURFACE + 1, 4);
+    assert!(copies && !watch.trusts_seed());
 }
 
 /// A surface below a 1920x1080 frame keeps sampling its rows in

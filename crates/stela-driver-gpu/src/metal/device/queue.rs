@@ -872,14 +872,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .and_then(|()| commands.finish(&mut self.resolver(), completion));
         // Aligned copies are refreshed from their rows first, and those it
         // wrote copied back into them last.
+        let mut surface_uses = None;
         if finished.is_ok() {
             let written = core::mem::take(&mut commands.aligned_writes);
             let surfaces = core::mem::take(&mut commands.surfaces);
             let writes = core::mem::take(&mut commands.written);
-            let (lead, tail) = self.aligned_copy_commands(&written, &surfaces, &writes);
+            let (lead, tail, uses) = self.aligned_copy_commands(&written, &surfaces, &writes);
             commands.surround(lead, tail);
+            surface_uses = Some(uses);
         }
-        // Applied once the recording reaches the queue.
+        // Applied once the recording reaches the queue: a refused commit
+        // copied nothing, so its uses must leave the copies' state alone.
         let planes = core::mem::take(&mut commands.planes);
         let recording = commands.into_recording();
         if let Err(error) = finished.and_then(|()| self.check_mappings(&recording.mappings)) {
@@ -963,6 +966,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let start = self.timing.since(Phase::CommitUpload, start);
         self.submitted = serial;
         self.apply_plane_changes(planes);
+        if let Some(uses) = surface_uses {
+            self.apply_surface_uses(uses);
+        }
         self.queue.in_flight.push_back(InFlight {
             serial,
             key,

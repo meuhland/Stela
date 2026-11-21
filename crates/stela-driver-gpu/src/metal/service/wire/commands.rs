@@ -45,8 +45,10 @@ records! {
     /// the surface's ID and its seed as the command buffer was committed
     /// (`IOSurfaceGetID`, `IOSurfaceGetSeed`). Sent once for each such
     /// object, after the encoders: the service refreshes its device-memory
-    /// copies of sampled surfaces only when their seed changed, and takes a
-    /// surface written by the command buffer as changed for later ones.
+    /// copies of sampled surfaces only when their seed changed, once their
+    /// seeds showed they change with their writes (at every use before), and
+    /// takes a surface written by the command buffer as changed for later
+    /// ones, whichever connection's copies they are.
     pub struct SurfaceUse {
         pub object: u64,
         pub surface: u32,
