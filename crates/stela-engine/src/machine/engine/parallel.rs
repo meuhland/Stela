@@ -832,10 +832,19 @@ impl Hub {
         (self.clock.lag(), self.clock.take_repaid())
     }
 
-    /// The PE holding the count below a ceiling, if any
+    /// The times holds went off since the last call, having left as much
+    /// lag as they may owe ([`SharedClock::take_capped`]).
+    pub fn clock_capped(&self) -> u64 {
+        self.clock.take_capped()
+    }
+
+    /// The PE holding the count below a ceiling, if any, why
+    /// (`host-work`, `no-progress` or `wake`) and the count it showed
     /// ([`SharedClock::holder`]).
-    pub fn clock_holder(&self) -> Option<(usize, bool, u64)> {
-        self.clock.holder()
+    pub fn clock_holder(&self) -> Option<(usize, &'static str, u64)> {
+        self.clock
+            .holder()
+            .map(|(pe, hold, count)| (pe, hold.name(), count))
     }
 
     /// PE `pe` stopped for good: it holds the count no more, at the host's
@@ -847,13 +856,16 @@ impl Hub {
     /// Each PE's longest gap with guest work and no instruction retired
     /// since the last call, in counts, and the phase that took most of it
     /// ([`SharedClock::take_stalls`]): a step loop phase's name, `host` for
-    /// host work outside the step loop, `?` without step timing.
+    /// host work outside the step loop, `?` without step timing, and `-`
+    /// for a PE with no gap worth reporting (whose packed zero would read
+    /// as the first phase).
     pub fn clock_stalls(&self) -> Vec<(u64, &'static str)> {
         self.clock
             .take_stalls()
             .into_iter()
             .map(|(ticks, phase)| {
                 let name = match step_timing::Phase::ALL.get(usize::from(phase)) {
+                    _ if ticks == 0 => "-",
                     Some(phase) => phase.name(),
                     None if phase == super::clock::STALL_HOST => "host",
                     None => "?",

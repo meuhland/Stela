@@ -620,7 +620,7 @@ fn a_pe_released_for_good_holds_the_count_no_more() {
         second.mark(|| host, retired, None);
     }
     assert_eq!(second.read(|| 1000 + LONG_STALL), limit);
-    assert_eq!(shared.holder(), Some((0, false, 1000)));
+    assert_eq!(shared.holder(), Some((0, Hold::NoProgress, 1000)));
     // Released, it holds the count no more: it goes on from the limit at
     // once, before any other PE looks.
     shared.release(0, || 1000 + LONG_STALL);
@@ -644,11 +644,181 @@ fn a_pe_stopped_in_the_kernel_and_released_lifts_its_ceiling_at_once() {
     assert!(first.leave(|| 2000, 0, false));
     // Held at the stop's limit, 1200 counts past it.
     assert_eq!(second.read(|| 6000), 3200);
-    assert_eq!(shared.holder(), Some((0, true, 2000)));
+    assert_eq!(shared.holder(), Some((0, Hold::HostWork, 2000)));
     shared.release(0, || 6000);
     assert_eq!(second.read(|| 6100), 3300);
     assert_eq!(shared.holder(), None);
     // A resume after the release publishes nothing either.
     first.resume(|| 6200, 0);
     assert_eq!(shared.slot(0), IDLE);
+}
+
+/// A PE whose guest waits holds nothing, however its wait came: native code
+/// completes no WFI or WFE that waits (a WFE spins 2 us at most), so every
+/// wait reaches the engine's, and the scheduler marks the PE idle before
+/// it waits. Its own timer coming due while it then serves the host for a
+/// second holds nothing either: the running PE's count stays the host's,
+/// and nothing writes the state native reads share.
+#[test]
+fn an_idle_pe_s_own_timer_holds_nothing_while_it_serves_the_host() {
+    let (shared, mut first, mut second) = pair();
+    first.idle(|| 1000, 0, None);
+    first.busy(|| 1000, 0, None);
+    // The second runs, waits in WFI and leaves its loop to serve the host
+    // with its timer due at 1500.
+    second.idle(|| 1000, 0, None);
+    second.busy(|| 1000, 0, None);
+    second.idle(|| 1200, 2000, None);
+    second.serving(Some(1500));
+    assert_eq!(shared.slot(1), IDLE);
+    let sequence = shared.state.sequence.load(Ordering::Relaxed);
+    let end = 1200 + FREQUENCY;
+    let mut retired = 0;
+    for host in (1210..end).step_by(10) {
+        retired += 100;
+        first.mark(|| host, retired, None);
+        assert_eq!(first.read(|| host), host, "at {host}");
+    }
+    assert_eq!(shared.slot(1), IDLE);
+    assert_eq!(shared.holder(), None);
+    assert_eq!((shared.take_stalled(), shared.lag()), (0, 0));
+    assert_eq!(shared.state.sequence.load(Ordering::Relaxed), sequence);
+    // Back in its loop, its timer wakes it: it has guest work from now.
+    second.look(|| end);
+    second.busy(|| end, 2000, None);
+    assert_eq!(shared.slot(1), end);
+}
+
+/// The protection stays for PEs the host keeps from guest work they have:
+/// one that runs and shows no progress, one stopped in the kernel, and one
+/// whose wait a wake ended while it serves the host each hold the count a
+/// stall limit past their last count, and the report names why.
+#[test]
+fn pes_kept_from_their_guest_work_still_hold_the_count() {
+    let stall = FREQUENCY * STALL_MILLIS / 1000;
+    for kind in [Hold::NoProgress, Hold::HostWork, Hold::Wake] {
+        let (shared, mut first, mut second) = pair();
+        first.idle(|| 1000, 0, None);
+        first.busy(|| 1000, 0, None);
+        second.idle(|| 1000, 0, None);
+        match kind {
+            Hold::NoProgress => second.busy(|| 1000, 0, None),
+            Hold::HostWork => {
+                second.busy(|| 1000, 0, None);
+                assert!(second.leave(|| 1000, 0, false));
+            }
+            // Another core's IPI for it, while it serves.
+            Hold::Wake => shared.pending(1, 1000),
+        }
+        let mut retired = 0;
+        for host in (1010..1000 + LONG_STALL).step_by(10) {
+            retired += 100;
+            first.mark(|| host, retired, None);
+            assert_eq!(
+                first.read(|| host),
+                host.min(1000 + stall),
+                "{kind:?} at {host}"
+            );
+        }
+        assert_eq!(shared.holder(), Some((1, kind, 1000)), "{kind:?}");
+        assert_eq!(Hold::Wake.name(), "wake");
+    }
+}
+
+/// The safety net. PE 0 looks stalled for a minute (a PE that does not come
+/// back, or a misfire): the count it holds never owes more than
+/// [`HOLD_LAG_PARTS`] stall limits (5 s). Holds then stay off until the
+/// slew, at 10% above [`FAST_LAG_PARTS`] stall limits, has repaid half of
+/// it, and come back on. Once PE 0 runs again the lag is repaid at 10% and
+/// then 1%, in steps of at most a tenth of a step's time; every reader
+/// stays monotonic, a PE sure a deadline is ahead is right, and a waiting
+/// PE's timers come on their count.
+#[test]
+fn holds_owe_at_most_five_seconds_and_large_lag_is_repaid_at_ten_percent() {
+    let (shared, mut clocks) = busy_clocks(3, FREQUENCY);
+    let stall = FREQUENCY * STALL_MILLIS / 1000;
+    let most = stall * HOLD_LAG_PARTS;
+    let fast = stall * FAST_LAG_PARTS;
+    let step = shared.slew_step();
+    let largest = step / FAST_SLEW_PARTS;
+    // PE 2 waits, for a timer re-armed 1000 counts after each one fires.
+    clocks[2].idle(|| 1000, 0, None);
+    let (mut deadline, mut armed) = (1500, 1000);
+    let mut wake = clocks[2].wake_at(deadline, 1000);
+    let resumed = 1000 + 60 * FREQUENCY;
+    let end = resumed + (most - fast) * FAST_SLEW_PARTS + fast * SLEW_PARTS + 100_000;
+    let (mut retired, mut seen) = ([0u64; 2], [0u64; 3]);
+    let (mut capped, mut stalled, mut repaid, mut fired) = (0, 0, 0, 0);
+    let mut owed_at_resume = 0;
+    let mut previous = 1000;
+    for host in (1010..end).step_by(10) {
+        for pe in 0..2 {
+            if pe == 0 && host < resumed {
+                continue;
+            }
+            retired[pe] += 100;
+            clocks[pe].mark(|| host, retired[pe], None);
+        }
+        if clocks[1].below(deadline, || host) {
+            assert!(shared.count(|| host) < deadline, "at {host}");
+        }
+        if host >= wake {
+            clocks[2].look(|| host);
+            let count = clocks[2].read(|| host);
+            if count >= deadline {
+                if armed > resumed {
+                    assert!(
+                        count - deadline <= largest + 2,
+                        "at {host}: {count} for {deadline}"
+                    );
+                }
+                fired += 1;
+                deadline = count + 1000;
+                armed = host;
+            }
+            wake = clocks[2].wake_at(deadline, host);
+            assert!(wake > host, "at {host}: waits again at once");
+        }
+        for (pe, clock) in clocks.iter_mut().enumerate() {
+            let count = clock.read(|| host);
+            assert!(count >= seen[pe], "at {host}: {count} after {}", seen[pe]);
+            assert!(count <= host, "at {host}: overshoot to {count}");
+            seen[pe] = count;
+        }
+        let count = shared.count(|| host);
+        // Never more owed than holds may leave, held or not, and the count
+        // moves on in small steps.
+        assert!(host - count <= most + 20, "at {host}: {count}");
+        assert!(shared.lag() <= most + 20, "at {host}: {}", shared.lag());
+        assert!(count - previous <= 10 + 2 * largest, "at {host}: {count} after {previous}");
+        previous = count;
+        if host == resumed {
+            owed_at_resume = shared.lag();
+        }
+        if host > resumed && owed_at_resume > 0 {
+            // At 10% while more than a second is owed.
+            let expected = owed_at_resume.saturating_sub((host - resumed) / FAST_SLEW_PARTS);
+            if expected > fast + 1000 {
+                let owed = shared.lag();
+                assert!(
+                    owed.abs_diff(expected) <= largest + 20,
+                    "at {host}: {owed} owed, {expected} expected"
+                );
+            }
+        }
+        if host % 10_000 == 0 {
+            capped += shared.take_capped();
+            stalled += shared.take_stalled();
+            repaid += shared.take_repaid();
+        }
+    }
+    capped += shared.take_capped();
+    stalled += shared.take_stalled();
+    repaid += shared.take_repaid();
+    // A minute stalled went off and on again a few times.
+    assert!((2..=4).contains(&capped), "holds went off {capped} times");
+    assert!(owed_at_resume > most / 2, "{owed_at_resume} owed at the resume");
+    assert_eq!((shared.lag(), repaid), (0, stalled));
+    assert_eq!(clocks[1].read(|| end), end, "back on the host's count");
+    assert!(fired > (end - 1000) / 1100, "{fired} timers fired");
 }

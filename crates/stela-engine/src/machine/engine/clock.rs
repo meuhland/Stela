@@ -33,21 +33,31 @@
 //!   returns, until it marks progress: short stops with a few blocks
 //!   between them add up as one long stop.
 //!   Normal host work takes a few milliseconds and never reaches it.
-//! - A PE whose guest waits holds nothing, unless guest work comes for it
-//!   while it is out of its run loop serving the host (`Machine::serve_host`):
-//!   an interrupt or fast IPI another PE sends it, or its own timer coming
-//!   due, while that PE accepts the line: it ends the PE's wait, or it
-//!   runs and takes it at its PSTATE (`Machine::accepted_lines`). A timer
-//!   that is disabled, masked by its IMASK or masked at the PE holds
-//!   nothing, and neither does a deadline from before the PE left its run
-//!   loop, which then counts from the moment it left. Another core's XNU
-//!   times that PE's answer (a cross-call's
-//!   acknowledgement, a timer call queued on its CPU), so from that moment
-//!   (the wake, or the timer's deadline) it counts as a PE with guest work
-//!   that ran nothing: the count holds a stall limit later if it is still
-//!   out (`SharedClock::pending`), and its host work ends at its next part
-//!   (`GuestWatch`). As with every hold, the held time is lag the slew
-//!   repays, so guest time comes back to wall time.
+//! - A PE whose guest waits (WFI or WFE, or a PE that is off) holds
+//!   nothing. No guest wait stays in native code: native code completes
+//!   WFI and WFE only when they need not wait (a WFE spins at most 2 us for
+//!   its event register, `register_read::event_wait_thunk`), and every
+//!   other wait exits to `Machine::wait`, after which the scheduler marks
+//!   the PE idle ([`Clock::idle`]) before it waits. A PE in WFE that
+//!   leaves its run loop counts as busy until it is back
+//!   (`Machine::leave_run_loop`): XNU waits in WFE only to spin for a lock
+//!   or in a delay, where another PE may hand it work at any time, and such
+//!   a PE takes only short host turns (the long service is for PEs that
+//!   wait for an interrupt). One more exception: guest
+//!   work another core brings it while it is out of its run loop serving
+//!   the host (`Machine::serve_host`), an interrupt or fast IPI it accepts
+//!   (it ends the PE's wait, or the PE takes it at its PSTATE,
+//!   `Machine::accepted_lines`). Its guest no longer waits then, and
+//!   another core's XNU times its answer (a cross-call's acknowledgement),
+//!   so from the wake it counts as a PE with guest work that ran nothing:
+//!   the count holds a stall limit later if it is still out
+//!   (`SharedClock::pending`, named `wake` in reports), and its host work
+//!   ends at its next part (`GuestWatch`). Its own timer coming due ends
+//!   that host work too, but holds nothing: no other core waits for a
+//!   waiting PE's own tick, and marking it made every service turn of an
+//!   idle PE that outlived its next tick by a part of the limit hold every
+//!   PE's time. As with every hold, the held time is lag the slew repays,
+//!   so guest time comes back to wall time.
 //! - A slow PE got more timer interrupts per unit of its work: the EL0
 //!   release experiment counted 34 guest seconds
 //!   where a paced count counted 16, with every PE in timer interrupts. A
@@ -81,10 +91,26 @@
 //! accumulated lag, as on a machine whose counter was paused, and ahead by
 //! any idle leaps. A shared count repays the lag its holds left: once no
 //! hold is in force it runs [`SLEW_PARTS`]⁻¹ (1%) faster than the host's,
-//! in steps of at most [`SLEW_STEP_PARTS`]⁻¹ of the stall limit, until it
-//! is back on the host's count ([`SharedClock::look`]). A step only raises
-//! the offset, so every reader's count stays monotonic, and waits and
-//! native deadlines count the slew in, so no timer is late for it.
+//! [`FAST_SLEW_PARTS`]⁻¹ (10%) while more than [`FAST_LAG_PARTS`] stall
+//! limits (1 s) are owed, in steps at least [`SLEW_STEP_PARTS`]⁻¹ of the
+//! stall limit apart, until it is back on the host's count
+//! ([`SharedClock::look`]). A step only raises the offset, by at most its
+//! rate's share of the host time since the last step, and at the fast rate
+//! by at most a tenth of the least time between steps (312 us at 50 ms),
+//! so every reader's count stays monotonic and moves in small steps. Waits
+//! and native deadlines count the slew in at the rate it runs, and a
+//! count's bound ([`Clock::below`]) at the fast rate whenever lag is owed,
+//! so no timer is late for it.
+//!
+//! Holds can owe at most [`HOLD_LAG_PARTS`] stall limits (5 s): a hold
+//! that would leave more is given up, and none is set until the slew has
+//! repaid half of it ([`SharedClock::holds_off`]). XNU's longest timeout a
+//! hold protects is the mutex interlock's 0.5 s, so a guest that owes
+//! seconds is not protecting a lock but following a PE that will not come
+//! back soon, or a misfire; without the bound either left macOS hours
+//! behind (5 h 29 min on 2026-11-20, repaid at 1%). The bound costs only
+//! the protection of locks held across such stops, which XNU's own
+//! timeouts then report, as on a machine without the hold.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -128,6 +154,36 @@ const IDLE: u64 = u64::MAX;
 /// kernel ([`Clock::leave`]): its limit holds whatever its age.
 const STOPPED: u64 = 1 << 63;
 
+/// Set in a count another core's wake marked in the slot of a PE that
+/// serves the host ([`SharedClock::pending`]), for reports.
+const WOKEN: u64 = 1 << 62;
+
+/// The flags a published count other than [`IDLE`] may carry.
+const FLAGS: u64 = STOPPED | WOKEN;
+
+/// Why a PE holds the count ([`SharedClock::holder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// It stopped in the kernel for host work ([`Clock::leave`]).
+    HostWork,
+    /// It published no progress for a part of the limit: it runs, or it
+    /// is out of its run loop with guest work.
+    NoProgress,
+    /// Its guest waited, and a wake came for it while it served the host.
+    Wake,
+}
+
+impl Hold {
+    /// The name reports give it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::HostWork => "host-work",
+            Self::NoProgress => "no-progress",
+            Self::Wake => "wake",
+        }
+    }
+}
+
 /// The longest gaps reported, in host counts, keep the phase in their low
 /// bits ([`Clock::stall_phase`]).
 const PHASE_BITS: u32 = 3;
@@ -160,10 +216,27 @@ const UNBOUNDED: u64 = u64::MAX;
 /// of wall time.
 pub(super) const SLEW_PARTS: u64 = 100;
 
+/// The slew's rate while more than [`FAST_LAG_PARTS`] stall limits are
+/// owed: one count of lag for each this many host counts, 10%, so that the
+/// most holds may leave ([`HOLD_LAG_PARTS`]) is repaid within a minute
+/// rather than eight. Still a step at a time, as a host's NTP slews a clock
+/// it found seconds off.
+pub(super) const FAST_SLEW_PARTS: u64 = 10;
+
+/// In stall limits: the lag above which the slew runs at
+/// [`FAST_SLEW_PARTS`] (1 s at 50 ms). A host stop of a second or two,
+/// repaid at 1%, still runs at the rate a guest would never notice.
+const FAST_LAG_PARTS: u64 = 20;
+
+/// In stall limits: the most lag holds may leave owed (5 s at 50 ms).
+/// Reaching it gives up the hold in force and sets none until the slew has
+/// repaid half of it ([`SharedClock::holds_off`]).
+const HOLD_LAG_PARTS: u64 = 100;
+
 /// In parts of the stall limit: the least host time between two slew
-/// steps (3.1 ms at 50 ms, a step of at most 31 us), so that the state
-/// native reads share sees at most a few hundred writes a second while
-/// lag is owed.
+/// steps (3.1 ms at 50 ms, a step of at most 31 us, or 312 us at the fast
+/// rate), so that the state native reads share sees at most a few hundred
+/// writes a second while lag is owed.
 const SLEW_STEP_PARTS: u64 = 16;
 
 /// The host's counter, read fresh at each call.
@@ -196,6 +269,12 @@ pub struct SharedClock {
     slewed: AtomicU64,
     /// Counts the slew repaid since the last [`Self::take_repaid`].
     repaid: AtomicU64,
+    /// Whether holds are off: the lag reached [`HOLD_LAG_PARTS`] stall
+    /// limits, and the slew has not yet repaid half of it. Written only
+    /// under the sequence.
+    holds_off: AtomicBool,
+    /// The times holds went off since the last [`Self::take_capped`].
+    capped: AtomicU64,
     /// The count before which no running PE can look stalled
     /// ([`Self::look`]), on a line of its own.
     next_scan: Summary,
@@ -210,22 +289,35 @@ pub struct SharedClock {
 struct Summary(AtomicU64);
 
 /// What one read of a [`SharedClock`] saw: its offset, its lag, the host
-/// count its slew steps from, and the host's counter then.
+/// count its slew steps from, the host's counter then, and whether the slew
+/// runs at the fast rate for that lag ([`FAST_SLEW_PARTS`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Seen {
     offset: u64,
     lag: u64,
     slewed: u64,
     host: u64,
+    fast: bool,
 }
 
 impl Seen {
     /// The highest the offset can be at host count `host`: a slew adds at
-    /// most one count for each [`SLEW_PARTS`] host counts since `slewed`,
-    /// and never more than the lag. A ceiling only lowers the count.
+    /// most one count for each [`FAST_SLEW_PARTS`] host counts since
+    /// `slewed`, whatever the rate this read saw (a hold lifted since may
+    /// have owed more and made it fast), and never more than the lag. A
+    /// ceiling only lowers the count.
     fn offset_by(&self, host: u64) -> u64 {
-        let ahead = host.saturating_sub(self.slewed) / SLEW_PARTS;
+        let ahead = host.saturating_sub(self.slewed) / FAST_SLEW_PARTS;
         self.offset.wrapping_add(self.lag.min(ahead))
+    }
+
+    /// The host counts for each count of lag the slew repays at this lag.
+    fn parts(&self) -> u64 {
+        if self.fast {
+            FAST_SLEW_PARTS
+        } else {
+            SLEW_PARTS
+        }
     }
 
     /// The first host count at which the count reaches `count`, as soon as
@@ -237,9 +329,10 @@ impl Seen {
         if self.lag == 0 || plain <= first {
             return plain;
         }
-        // The least `d` with `d + d / SLEW_PARTS` at least `plain - slewed`.
+        // The least `d` with `d + d / parts` at least `plain - slewed`.
+        let parts = self.parts();
         let distance = plain - self.slewed;
-        let full = self.slewed + distance - distance / (SLEW_PARTS + 1);
+        let full = self.slewed + distance - distance / (parts + 1);
         full.max(plain.saturating_sub(self.lag)).max(first)
     }
 }
@@ -280,6 +373,8 @@ impl SharedClock {
             target: AtomicU64::new(0),
             slewed: AtomicU64::new(0),
             repaid: AtomicU64::new(0),
+            holds_off: AtomicBool::new(false),
+            capped: AtomicU64::new(0),
             next_scan: Summary::default(),
             #[cfg(test)]
             loads: AtomicU64::new(0),
@@ -318,7 +413,7 @@ impl SharedClock {
         }
         let stall = self.stall.load(Ordering::Relaxed);
         let stopped = count & STOPPED != 0;
-        let count = count & !STOPPED;
+        let count = count & !FLAGS;
         (stopped || now.saturating_sub(count) >= stall / SUSPECT_PARTS)
             .then(|| count.saturating_add(stall))
     }
@@ -334,11 +429,36 @@ impl SharedClock {
             let count = self.slot(pe);
             match self.limit_of(count, now) {
                 Some(of) => limit = limit.min(of),
-                None if count != IDLE => next = next.min(count.saturating_add(suspect)),
+                None if count != IDLE => {
+                    next = next.min((count & !FLAGS).saturating_add(suspect));
+                }
                 None => {}
             }
         }
         (limit, next)
+    }
+
+    /// Whether holds are off ([`HOLD_LAG_PARTS`]).
+    fn holds_off(&self) -> bool {
+        self.holds_off.load(Ordering::Relaxed)
+    }
+
+    /// Whether `lag` is as much as holds may leave owed
+    /// ([`HOLD_LAG_PARTS`]); never before the clock is seeded.
+    fn owes_too_much(&self, lag: u64) -> bool {
+        let most = self
+            .stall
+            .load(Ordering::Relaxed)
+            .saturating_mul(HOLD_LAG_PARTS);
+        most != 0 && lag >= most
+    }
+
+    /// Whether the slew repays `lag` at the fast rate ([`FAST_LAG_PARTS`]).
+    fn fast(&self, lag: u64) -> bool {
+        lag > self
+            .stall
+            .load(Ordering::Relaxed)
+            .saturating_mul(FAST_LAG_PARTS)
     }
 
     /// The lowest limit of the PEs that look stalled at count `now`.
@@ -359,6 +479,10 @@ impl SharedClock {
     /// settles at once ([`Self::stop`]). So the slots are read about once a
     /// part of the limit in all, by the one look that claims the scan,
     /// whatever the number of PEs, and publishing writes only its own slot.
+    ///
+    /// While holds are off ([`Self::holds_off`]) no PE's limit counts, and
+    /// a hold in force is given up as soon as the lag it leaves reaches
+    /// what holds may owe.
     fn look(&self, counter: &mut impl Counter) {
         let (count, seen) = self.read(counter);
         let ceiling = self.state.ceiling.load(Ordering::Relaxed);
@@ -382,10 +506,16 @@ impl SharedClock {
         }
         let (limit, next) = self.scan(count);
         self.next_scan.0.fetch_min(next, Ordering::Relaxed);
+        let limit = if self.holds_off() { UNBOUNDED } else { limit };
         let held = ceiling != UNBOUNDED && count >= ceiling;
+        // The lag owed once this hold is lifted: settled, it gives the
+        // hold up if that is as much as holds may owe.
+        let free = seen.host.wrapping_add(seen.offset);
+        let owed = seen.lag.saturating_add(free.saturating_sub(ceiling));
+        let given_up = held && self.owes_too_much(owed);
         // A limit set ahead and still right, or a count held at a limit
         // still owed: the held part becomes lag only when it is lifted.
-        if limit == ceiling || held && limit <= ceiling {
+        if !given_up && (limit == ceiling || held && limit <= ceiling) {
             if ceiling == UNBOUNDED {
                 self.slew(&seen, counter);
             }
@@ -396,8 +526,11 @@ impl SharedClock {
 
     /// Repay lag by one step, if lag is owed, no ceiling is set and a step's
     /// time has passed since the last one ([`SLEW_PARTS`]): the offset rises
-    /// by a count for each [`SLEW_PARTS`] host counts since, and never past
-    /// the lag. `seen` is a read's, checked first without a write.
+    /// by a count for each [`SLEW_PARTS`] host counts since, or each
+    /// [`FAST_SLEW_PARTS`] while more than [`FAST_LAG_PARTS`] stall limits
+    /// are owed, by at most a tenth of a step's time at the fast rate, and
+    /// never past the lag. Holds come back on once half of what they may
+    /// owe is left. `seen` is a read's, checked first without a write.
     fn slew(&self, seen: &Seen, counter: &mut impl Counter) {
         let step = self.slew_step();
         if seen.lag == 0 || seen.host.saturating_sub(seen.slewed) < step {
@@ -410,15 +543,22 @@ impl SharedClock {
         let slewed = self.slewed.load(Ordering::Relaxed);
         let since = host.saturating_sub(slewed);
         if self.state.ceiling.load(Ordering::Relaxed) == UNBOUNDED && lag != 0 && since >= step {
-            let repay = lag.min(since / SLEW_PARTS);
+            let (parts, most) = if self.fast(lag) {
+                (FAST_SLEW_PARTS, (step / FAST_SLEW_PARTS).max(1))
+            } else {
+                (SLEW_PARTS, lag)
+            };
+            let repay = lag.min(since / parts).min(most);
             self.state
                 .offset
                 .store(offset.wrapping_add(repay), Ordering::Relaxed);
             // The remainder counts toward the next step; repaid in full,
             // the next lag's slew starts from its settle.
-            self.slewed
-                .store(slewed + repay * SLEW_PARTS, Ordering::Relaxed);
+            self.slewed.store(slewed + repay * parts, Ordering::Relaxed);
             self.repaid.fetch_add(repay, Ordering::Relaxed);
+            if self.holds_off() && !self.owes_too_much((lag - repay).saturating_mul(2)) {
+                self.holds_off.store(false, Ordering::Relaxed);
+            }
         }
         self.unlock(sequence);
     }
@@ -429,24 +569,33 @@ impl SharedClock {
     }
 
     /// Set the count's ceiling to the PEs' lowest limit, the count a limit
-    /// held becoming lag, so that it continues from where it was held.
+    /// held becoming lag, so that it continues from where it was held. Once
+    /// that leaves as much lag as holds may owe, holds go off and no limit
+    /// is set ([`HOLD_LAG_PARTS`]).
     fn settle(&self, counter: &mut impl Counter) {
         let sequence = self.lock();
         let host = sampled(counter);
-        let offset = self.state.offset.load(Ordering::Relaxed);
+        let mut offset = self.state.offset.load(Ordering::Relaxed);
         let ceiling = self.state.ceiling.load(Ordering::Relaxed);
         let free = host.wrapping_add(offset);
         let count = free.min(ceiling);
         if free > count {
             self.stalled.fetch_add(free - count, Ordering::Relaxed);
-            self.state
-                .offset
-                .store(count.wrapping_sub(host), Ordering::Relaxed);
+            offset = count.wrapping_sub(host);
+            self.state.offset.store(offset, Ordering::Relaxed);
         }
         // No slew runs while a ceiling is set: the next step counts from
         // here.
         self.slewed.store(host, Ordering::Relaxed);
-        let limit = self.limit(count);
+        let lag = self.target.load(Ordering::Relaxed).wrapping_sub(offset);
+        if self.owes_too_much(lag) && !self.holds_off.swap(true, Ordering::Relaxed) {
+            self.capped.fetch_add(1, Ordering::Relaxed);
+        }
+        let limit = if self.holds_off() {
+            UNBOUNDED
+        } else {
+            self.limit(count)
+        };
         let ceiling = if limit == UNBOUNDED {
             UNBOUNDED
         } else {
@@ -484,19 +633,24 @@ impl SharedClock {
     }
 
     /// Guest work waits for PE `pe` from `count` on while it is out of its
-    /// run loop serving the host: a wake that another core sends it, or its
-    /// own timer's deadline (`Machine::serve_host`). Its slot takes `count`
+    /// run loop serving the host: a wake that another core sends it
+    /// (`Machine::serve_host`). Its slot takes `count`, marked [`WOKEN`],
     /// if it showed later or idle, so that the count holds a stall limit
     /// past `count` until the PE looks again ([`Clock::idle`],
-    /// [`Clock::busy`], [`Clock::look`]): a waiting PE that does not answer
+    /// [`Clock::busy`], [`Clock::look`]): a woken PE that does not answer
     /// then looks stalled like a running one. A PE stopped in the kernel
     /// ([`STOPPED`]) already holds the count and keeps its mark. Any core
     /// may call this; only the wake path and the start of host service do.
     pub(super) fn pending(&self, pe: usize, count: u64) {
         let slot = &self.slots[pe].count;
         let mut seen = slot.load(Ordering::Relaxed);
-        while (seen == IDLE || seen & STOPPED == 0) && count < seen {
-            match slot.compare_exchange_weak(seen, count, Ordering::Relaxed, Ordering::Relaxed) {
+        while seen == IDLE || (seen & STOPPED == 0 && count < (seen & !FLAGS)) {
+            match slot.compare_exchange_weak(
+                seen,
+                count | WOKEN,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(now) => seen = now,
             }
@@ -523,6 +677,7 @@ impl SharedClock {
         self.state.offset.store(offset, Ordering::Relaxed);
         self.target.store(offset, Ordering::Relaxed);
         self.slewed.store(0, Ordering::Relaxed);
+        self.holds_off.store(false, Ordering::Relaxed);
         self.next_scan.0.store(0, Ordering::Relaxed);
         self.stall
             .store(frequency * STALL_MILLIS / 1000, Ordering::Relaxed);
@@ -547,11 +702,13 @@ impl SharedClock {
             let host = sampled(counter);
             fence(Ordering::Acquire);
             if self.state.sequence.load(Ordering::Relaxed) == sequence {
+                let lag = target.wrapping_sub(offset);
                 let seen = Seen {
                     offset,
-                    lag: target.wrapping_sub(offset),
+                    lag,
                     slewed,
                     host,
+                    fast: self.fast(lag),
                 };
                 return (host.wrapping_add(offset).min(ceiling), seen);
             }
@@ -572,11 +729,13 @@ impl SharedClock {
             let slewed = self.slewed.load(Ordering::Relaxed);
             fence(Ordering::Acquire);
             if self.state.sequence.load(Ordering::Relaxed) == sequence {
+                let lag = target.wrapping_sub(offset);
                 return Seen {
                     offset,
-                    lag: target.wrapping_sub(offset),
+                    lag,
                     slewed,
                     host: 0,
+                    fast: self.fast(lag),
                 };
             }
         }
@@ -598,23 +757,31 @@ impl SharedClock {
         self.stall.load(Ordering::Relaxed) / STALL_MILLIS
     }
 
-    /// While a ceiling holds the count: the PE whose limit set it, whether
-    /// it stopped in the kernel for host work (else it published nothing
-    /// for a part of the limit), and the count it last published. Read
+    /// While a ceiling holds the count: the PE whose limit set it, why
+    /// ([`Hold`]), and the count it last published or a wake marked. Read
     /// outside the sequence, for reports.
-    pub fn holder(&self) -> Option<(usize, bool, u64)> {
+    pub fn holder(&self) -> Option<(usize, Hold, u64)> {
         let ceiling = self.state.ceiling.load(Ordering::Relaxed);
         if ceiling == UNBOUNDED {
             return None;
         }
         (0..self.slots.len()).find_map(|pe| {
             let count = self.slot(pe);
-            (self.limit_of(count, ceiling) == Some(ceiling)).then_some((
-                pe,
-                count & STOPPED != 0,
-                count & !STOPPED,
-            ))
+            let hold = if count & STOPPED != 0 {
+                Hold::HostWork
+            } else if count & WOKEN != 0 {
+                Hold::Wake
+            } else {
+                Hold::NoProgress
+            };
+            (self.limit_of(count, ceiling) == Some(ceiling)).then_some((pe, hold, count & !FLAGS))
         })
+    }
+
+    /// The times holds went off since the last call: the lag they left
+    /// reached [`HOLD_LAG_PARTS`] stall limits.
+    pub fn take_capped(&self) -> u64 {
+        self.capped.swap(0, Ordering::Relaxed)
     }
 
     /// Host counts the count lags the host's by, owed to the slew.
@@ -656,7 +823,7 @@ impl SharedClock {
         let count = if shown == IDLE || shown & STOPPED != 0 {
             now
         } else {
-            shown.min(now)
+            (shown & !FLAGS).min(now)
         };
         self.publish(pe, count | STOPPED);
         self.settle(counter);
@@ -1075,10 +1242,19 @@ impl Clock {
     }
 
     /// The running PE leaves its run loop to serve the host, its own timers
-    /// next due at `deadline`: the count waits for it a stall limit past
-    /// that deadline if it is still out then ([`SharedClock::pending`]).
+    /// next due at `deadline`. With guest work (it ran guest code, or waits
+    /// in WFE out of its loop) the count waits for it a stall limit past
+    /// that deadline if it shows nothing later then
+    /// ([`SharedClock::pending`]). A PE whose guest waits marks nothing:
+    /// its tick ends its service at the next part (`GuestWatch`), but no
+    /// other core waits for it. Marked, every service turn of a waiting PE
+    /// that outlived its next tick by a part of the limit held every PE's
+    /// time: on an idle Mac whose waiting PEs serve turns of up to a second,
+    /// most of the time.
     pub(super) fn serving(&self, deadline: Option<u64>) {
-        if let (Some(attachment), Some(deadline)) = (&self.shared, deadline) {
+        if let (Some(attachment), Some(deadline)) = (&self.shared, deadline)
+            && !attachment.idle
+        {
             attachment.clock.pending(attachment.pe, deadline);
         }
     }

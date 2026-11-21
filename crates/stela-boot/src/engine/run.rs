@@ -1739,16 +1739,19 @@ impl Heartbeat {
             // What the count still lags host time by after holds, and how
             // much of the lag it made up since the last beat.
             let (lag, repaid) = machine.devices.hub().clock_lag();
+            // The times holds went off for owing too much lag.
+            let capped = machine.devices.hub().clock_capped();
             if self.clock_count != 0 {
                 let rate = u128::from(guest) * 1000 / wall.max(1);
                 let millis = |counts: u64| u128::from(counts) * 1000 / u128::from(host::COUNTER_HZ);
                 output::arguments(format_args!(
-                    "CLOCK RATE guest_per_wall={}.{:03} stalled_ms={} lag_ms={} repaid_ms={}\n",
+                    "CLOCK RATE guest_per_wall={}.{:03} stalled_ms={} lag_ms={} repaid_ms={} capped={}\n",
                     rate / 1000,
                     rate % 1000,
                     millis(stalled),
                     millis(lag),
                     millis(repaid),
+                    capped,
                 ));
             }
             self.clock_count = count;
@@ -1756,10 +1759,9 @@ impl Heartbeat {
             report_stalls(machine);
             // A PE that never runs again holds the count for good, and with
             // it every PE's time: name it while it does.
-            if let Some((pe, stopped, count)) = machine.devices.hub().clock_holder() {
+            if let Some((pe, by, count)) = machine.devices.hub().clock_holder() {
                 output::arguments(format_args!(
-                    "CLOCK HELD pe={pe} by={} published={count:#x} count={:#x}\n",
-                    if stopped { "host-work" } else { "no-progress" },
+                    "CLOCK HELD pe={pe} by={by} published={count:#x} count={:#x}\n",
                     self.clock_count,
                 ));
             }
