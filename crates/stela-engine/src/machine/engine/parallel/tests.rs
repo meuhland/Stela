@@ -4153,6 +4153,11 @@ fn an_ipi_to_a_pe_that_serves_the_host_kicks_it_and_holds_the_count_for_it() {
         "held a stall limit on"
     );
     assert_eq!(
+        hub.clock.holder(),
+        Some((1, super::super::clock::Hold::Wake, ipi)),
+        "named a wake's hold"
+    );
+    assert_eq!(
         watch.waited(end),
         Some((super::Pending::Lines, Some(end - ipi))),
         "the wait is measured from the first wake"
@@ -4170,11 +4175,13 @@ fn an_ipi_to_a_pe_that_serves_the_host_kicks_it_and_holds_the_count_for_it() {
     assert_eq!(kicks.load(Ordering::SeqCst), 1);
 }
 
-/// PE 1's own timer comes due while it serves: the service sees it at its
-/// next part, and the count holds a stall limit past the deadline, as for
-/// an IPI. Its next wait pass clears the mark.
+/// PE 1's own timer comes due while its guest waits and it serves: the
+/// service sees it at its next part, but no other PE's time waits for it,
+/// however long the part takes. A PE with guest work, as one that ran
+/// guest code until it left its loop, still holds the count a stall limit
+/// past its last progress.
 #[test]
-fn a_timer_due_on_a_pe_that_serves_the_host_ends_its_service_and_holds_the_count() {
+fn a_timer_due_on_a_waiting_pe_that_serves_the_host_ends_its_service_but_holds_nothing() {
     let (hub, kicks, _host, mut first, mut second) = serving_pair();
     first.idle(|| 1000, 0, None);
     first.busy(|| 1000, 0, None);
@@ -4187,26 +4194,83 @@ fn a_timer_due_on_a_pe_that_serves_the_host_ends_its_service_and_holds_the_count
     assert_eq!(watch.pending(2999), None);
     assert_eq!(watch.pending(3000), Some(super::Pending::Timer));
     assert_eq!(watch.waited(3500), Some((super::Pending::Timer, Some(500))));
-    // Before its deadline it holds nothing; past it a stall limit on.
+    // Neither before its deadline nor past it does it hold anything.
     let mut retired = 0;
     for now in (1010..10_000).step_by(10) {
         retired += 100;
         first.mark(|| now, retired, None);
-        assert_eq!(
-            first.read(|| now),
-            now.min(deadline + SERVED_STALL),
-            "at {now}"
-        );
+        assert_eq!(first.read(|| now), now, "at {now}");
     }
     assert_eq!(
         kicks.load(Ordering::SeqCst),
         0,
         "its own timer needs no kick"
     );
+    assert_eq!(hub.clock.holder(), None);
+    assert_eq!(hub.clock.take_stalled(), 0);
     hub.set_serving(1, None);
     second.look(|| 10_000);
-    first.mark(|| 10_010, retired + 100, None);
-    assert_eq!(first.read(|| 10_010), deadline + SERVED_STALL + 10);
+    // One that ran guest code until it left waits for it.
+    second.busy(|| 10_000, 0, None);
+    second.serving(Some(12_000));
+    for now in (10_010..20_000).step_by(10) {
+        retired += 100;
+        first.mark(|| now, retired, None);
+    }
+    assert_eq!(first.read(|| 20_000), 10_000 + SERVED_STALL);
+    assert_eq!(
+        hub.clock.holder(),
+        Some((1, super::super::clock::Hold::NoProgress, 10_000))
+    );
+}
+
+/// A PE that waits in WFI, however its WFI ran (native code exits to the
+/// engine's wait for every WFI that waits), is idle for the shared count
+/// from the scheduler's next pass on: its own timer coming due while it
+/// then serves the host for 20 stall limits ends the service, but the
+/// count another PE reads goes on with the host's.
+#[test]
+fn a_pe_waiting_in_wfi_holds_no_count_for_its_own_timer_while_it_serves() {
+    use super::super::tests::serving_timer;
+    struct NoKick;
+    impl Kick for NoKick {
+        fn kick(&self, _pe: usize) {}
+    }
+    let mut machine = serving_timer(super::super::timer::ENABLE, 6000, 0);
+    let hub = Hub::new(2, NoKick);
+    hub.set_live(0, true);
+    hub.set_live(1, true);
+    machine.enter_parallel(Arc::clone(&hub)).unwrap();
+    let mut other = Clock::default();
+    other.attach(Arc::clone(&hub.clock), 1);
+    other.idle(|| 5000, 0, None);
+    other.busy(|| 5000, 0, None);
+    machine.system_instruction(0xd503_207f).unwrap(); // wfi
+    assert!(machine.waiting.is_some(), "the timer is ahead");
+    // The scheduler's pass finds it waiting; the run's time is up.
+    let run = super::super::budget::Deadline::new(machine.host.now, 0);
+    assert!(matches!(
+        machine.schedule_with_deadline(Some(run)),
+        Err(crate::machine::Stop::Budget)
+    ));
+    let stall = hub.clock.counts_per_milli() * super::super::clock::STALL_MILLIS;
+    let end = 6000 + 20 * stall;
+    let step = (stall / 100).max(1);
+    let pending = machine.serve_host(|machine| {
+        let watch = machine.guest_watch();
+        let mut retired = 0;
+        let mut now = 5000;
+        while now < end {
+            now += step;
+            retired += 100;
+            other.mark(|| now, retired, None);
+            assert_eq!(other.read(|| now), now, "at {now}");
+        }
+        watch.pending(end)
+    });
+    assert_eq!(pending, Some(super::Pending::Timer), "its service ends");
+    assert_eq!(hub.clock.holder(), None);
+    assert_eq!(hub.clock.take_stalled(), 0);
 }
 
 /// A line change for a serving PE that accepts no line (it runs with IRQ
