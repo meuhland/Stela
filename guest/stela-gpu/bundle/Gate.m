@@ -19,6 +19,21 @@ static void touch(StelaSpan span, bool write)
 	}
 }
 
+/* Maps the pages of `spans`: the lazy writes too when `lazy` (a write
+ * touch is an atomic, which this emulated machine runs out of line: a 4K
+ * Main 10 destination is 1519 of them). */
+static void touch_spans(StelaSpans spans, bool lazy)
+{
+	for (size_t i = 0; i < spans.read_count; i++) {
+		touch(spans.reads[i], false);
+	}
+	size_t deferred = spans.lazy_writes < spans.write_count ? spans.lazy_writes : spans.write_count;
+	size_t writes = lazy ? spans.write_count : spans.write_count - deferred;
+	for (size_t i = 0; i < writes; i++) {
+		touch(spans.writes[i], true);
+	}
+}
+
 /* Tries for a span the service cannot reach. The pager takes back a page at
  * most a few times; past this, mapping it again will not help. */
 #define MAX_UNMAPPED 1024u
@@ -96,6 +111,14 @@ uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *reques
 	unsigned unreads = 0;
 	unsigned tries = 0;
 	unsigned waits = 0;
+	/* What this try maps first: the first maps every span but the lazy
+	 * writes; one after `Pending` maps none, for the try before it mapped
+	 * them and the service answers `Unmapped` for a page the pager took
+	 * back meanwhile; one after any other answer maps them all. A decode
+	 * answered `Pending` two or three times a frame touched every page of
+	 * its destinations each time (StelaGPU+0xc38c in Aerial's samples). */
+	bool first = true;
+	bool pending = false;
 	bool again;
 	do {
 		if (++tries > MAX_UNMAPPED) {
@@ -103,12 +126,10 @@ uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *reques
 			return failure->status;
 		}
 		touch(stela_span(response, response_bytes), true);
-		for (size_t i = 0; i < spans.read_count; i++) {
-			touch(spans.reads[i], false);
+		if (!pending) {
+			touch_spans(spans, !first);
 		}
-		for (size_t i = 0; i < spans.write_count; i++) {
-			touch(spans.writes[i], true);
-		}
+		first = false;
 		/* The record itself, which the service reads first. */
 		touch(stela_span((const void *)&call, sizeof(call)), true);
 		call = (StelaGateCall){
@@ -124,7 +145,8 @@ uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *reques
 		failure->fault = call.status == StelaStatusClosed ? gate->page[STELA_GATE_FAULT / sizeof(uint64_t)] : 0;
 		/* Not ready: nothing of the call took effect, and a wait is no try
 		 * at mapping its memory. */
-		if (call.status == StelaStatusPending) {
+		pending = call.status == StelaStatusPending;
+		if (pending) {
 			tries--;
 			wait_pending(operation, waits++, response, response_bytes);
 		}
