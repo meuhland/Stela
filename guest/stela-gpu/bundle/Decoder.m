@@ -11,8 +11,9 @@
  *
  * A decode's call carries the sample (read by the host), the destination
  * records (read and written) and each destination's planes (written): the
- * gate call maps their pages before each try, and makes the call again,
- * after the wait its response asks, while the host answers Pending.
+ * gate call maps the sample's and the records' pages before its first try,
+ * the planes' only once the host answered Unmapped, and makes the call
+ * again, after the wait its response asks, while the host answers Pending.
  */
 #include "Bundle.h"
 
@@ -212,11 +213,17 @@ static StelaDecoderStatus decode(StelaDecoderSession *session, StelaDecoderSampl
 		.count = count,
 		.flags = sample->flags,
 	};
+	/* The planes are mapped only once the host found one out of reach: it
+	 * writes only the destinations it shows a picture in, usually one of
+	 * StelaVD's three, and a pool's buffer stays mapped once written. Each
+	 * try touched every page of all three before, 4557 at 4K Main 10. The
+	 * host takes the call up again where the unmapped band stopped it. */
 	StelaSpans spans = {
 		.reads = &request.sample,
 		.read_count = sample->sample_bytes ? 1 : 0,
 		.writes = writes,
 		.write_count = write_count,
+		.lazy_writes = count > 0 ? write_count - 1 : 0,
 	};
 	StelaDecoderDecodeResponse response = {};
 	StelaFailure failure = {};
