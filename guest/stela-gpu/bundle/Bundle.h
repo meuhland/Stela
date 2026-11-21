@@ -30,16 +30,23 @@ typedef struct {
 	char reason[160];
 } StelaFailure;
 
-/* The memory a call's records name, which the call maps before it runs. */
+/* The memory a call's records name, which the call maps before it runs. The
+ * last `lazy_writes` of the writes are mapped only once the service found a
+ * span out of reach: outputs the service may not write at all, and whose pages
+ * are mapped already once they were written before (a video decoder's spare
+ * destination planes, 25 MB each at 4K Main 10). */
 typedef struct {
 	const StelaSpan *reads, *writes;
 	size_t read_count, write_count;
+	size_t lazy_writes;
 } StelaSpans;
 
 /*
  * Runs one operation and answers its status. A page may be away when the service
- * copies it, so the call touches `response` and `spans`, and touches them again
- * if the service found one gone. `failure` may be NULL.
+ * copies it, so the call touches `response` and `spans` (but the lazy writes),
+ * and touches all of them again if the service found one gone. A call made again
+ * after `Pending` touches only its record and response: it reaches the pages the
+ * try before it touched, or the service answers `Unmapped`. `failure` may be NULL.
  */
 uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *request, size_t request_bytes,
 			 void *response, size_t response_bytes, StelaSpans spans, StelaFailure *failure);
