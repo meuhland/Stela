@@ -349,6 +349,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if self.note_itlb_seen(half, page, context) && miss == ItlbMiss::Cold {
                 self.statistics.itlb_sources[ItlbSource::ColdSeen as usize] += 1;
             }
+            if half == 0 && global && self.itlb_seeding {
+                self.note_seed(page);
+            }
         }
         let resident = self.itlb.entry(slot);
         if resident.pc == page && resident.key != context && !self.live_context(half, resident.key)
@@ -677,6 +680,58 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 let key = self.block_key(physical, id);
                 self.take_page(pc, key, false, global);
             }
+        }
+    }
+
+    /// Seed the ITLB of each lower-half context made from now on with the
+    /// global pages fetches missed lately in other contexts
+    /// (`--itlb-seed`, [`Self::seed_context`]).
+    pub fn set_itlb_seeding(&mut self, seeding: bool) {
+        self.itlb_seeding = seeding;
+        if !seeding {
+            self.seed_log = Vec::new();
+        }
+    }
+
+    /// Note that a fetch at the current EL missed the ITLB at the lower-half
+    /// page `page`, whose walk ended in a global leaf ([`Self::seed_log`]).
+    pub(super) fn note_seed(&mut self, page: u64) {
+        if self.seed_log.is_empty() {
+            self.seed_log = vec![(0, 0); SEED_LOG];
+        }
+        let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
+        let at = ((page / FETCH_PAGE).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> (64 - SEED_LOG.trailing_zeros())) as usize;
+        self.seed_log[at] = (page | u64::from(el), self.seed_clock);
+    }
+
+    /// A lower-half context was made for a key of EL `el` (with the guarded
+    /// level in bit 4): queue for [`Self::refill_pages`] the global pages
+    /// fetches at `el` missed within the last [`SEED_GENERATIONS`] such
+    /// contexts, which the shared cache maps alike in every process. Each
+    /// walks in the new context's own translation and takes its own frame,
+    /// or nothing when it faults or the host refuses it: what a TLB may
+    /// take at any time, whatever the page's leaf, so no TLBI, ASID or
+    /// remap since the page's miss can make the entry wrong.
+    pub(super) fn seed_context(&mut self, el: u8) {
+        self.seed_clock += 1;
+        if !self.itlb_seeding {
+            return;
+        }
+        let now = self.seed_clock;
+        let mut seeds = 0;
+        for &(noted, clock) in &self.seed_log {
+            if seeds == SEEDS {
+                break;
+            }
+            if noted == 0
+                || noted & (FETCH_PAGE - 1) != u64::from(el)
+                || now - clock > SEED_GENERATIONS
+            {
+                continue;
+            }
+            self.refills.push(noted & !(FETCH_PAGE - 1));
+            seeds += 1;
         }
     }
 

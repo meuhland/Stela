@@ -117,6 +117,8 @@ pub(crate) struct Settings {
     /// `--table-insert-throttled`, as the home machine throttles block
     /// table inserts.
     pub table_insert_throttled: bool,
+    /// `--itlb-seed`, as the home machine seeds its new lower-half contexts.
+    pub itlb_seed: bool,
     /// `--profile-keep-pack`, as the home machine leaves self-loop counts
     /// out of timed code so its pack serves it.
     pub loop_counts_off: bool,
@@ -158,6 +160,7 @@ pub(crate) fn spawn<H: Host>(
             shared_limits: settings.shared_limits,
             jump_serial_always: settings.jump_serial_always,
             table_insert_throttled: settings.table_insert_throttled,
+            itlb_seed: settings.itlb_seed,
             loop_counts_off: settings.loop_counts_off,
             event_ring: settings.event_ring,
         };
@@ -187,6 +190,7 @@ struct Pe {
     shared_limits: u16,
     jump_serial_always: bool,
     table_insert_throttled: bool,
+    itlb_seed: bool,
     loop_counts_off: bool,
     event_ring: bool,
 }
@@ -206,6 +210,7 @@ impl Pe {
             shared_limits,
             jump_serial_always,
             table_insert_throttled,
+            itlb_seed,
             loop_counts_off,
             event_ring,
         } = self;
@@ -238,6 +243,7 @@ impl Pe {
         machine.set_shared_limits(super::shared_limits(shared_limits));
         machine.set_jump_serial_always(jump_serial_always);
         machine.set_table_insert_throttled(table_insert_throttled);
+        machine.set_itlb_seeding(itlb_seed);
         if step_timing {
             host::pmu::start(pe);
         }

@@ -46,6 +46,7 @@ impl ParseState<'_> {
             }
             "--jump-serial-always" => options.jump_serial_always = true,
             "--table-insert-throttled" => options.table_insert_throttled = true,
+            "--itlb-seed" => options.itlb_seed = true,
             EVENT_RING => options.event_ring = true,
             "--page-relative" => options.page_relative = true,
             "--shared-aliases" => options.shared_aliases = true,

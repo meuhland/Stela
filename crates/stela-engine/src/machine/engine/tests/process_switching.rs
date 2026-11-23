@@ -586,3 +586,128 @@ fn a_tlbi_by_va_and_asid_reaches_other_asids_only_at_their_global_entries() {
     assert_eq!(sources(ItlbSource::DropNoAsid), 2);
     assert_eq!(sources(ItlbSource::DropUpper), 0);
 }
+
+/// Six pages of a RET each, at BASE, page `n` at frame `BASE + n * 4 KiB`.
+fn seeded_machine(seeding: bool) -> (Machine<FakeHost, NoDevices>, Vec<u64>) {
+    const RET: u32 = 0xd65f_03c0;
+    const PAGES: u64 = 6;
+    let mut words = vec![0u32; (PAGES * 0x1000 / 4) as usize];
+    for page in 0..PAGES {
+        words[(page * 0x400) as usize] = RET;
+    }
+    let mut machine = machine(&words);
+    machine.set_itlb_seeding(seeding);
+    let frames: Vec<u64> = (0..PAGES).map(|page| BASE + page * 0x1000).collect();
+    (machine, frames)
+}
+
+fn fetch_page(machine: &mut Machine<FakeHost, NoDevices>, page: u64) {
+    assert!(matches!(
+        machine.fetch_block(BASE + page * 0x1000, false),
+        Ok(Fetched::Block(_))
+    ));
+}
+
+/// `--itlb-seed`: the lower-half context made for a new address space
+/// walks at once the global pages fetches missed in the last one, so none
+/// of its fetches of them misses the ITLB. Each page walks in the new
+/// space's own tables: one it leaves unmapped is left to its fetch (no
+/// fault, no state change), and one it maps to another frame takes that
+/// frame's key, never the one the page had where it missed.
+#[test]
+fn a_new_address_space_walks_the_global_pages_the_last_one_missed() {
+    let (mut machine, frames) = seeded_machine(true);
+    paged_space(&mut machine, 0, &frames);
+    for page in 0..6 {
+        fetch_page(&mut machine, page);
+    }
+    let pc = |page: u64| BASE + page * 0x1000;
+    let keys: Vec<u64> = (0..6)
+        .map(|page| machine.current_key(pc(page)).expect("held"))
+        .collect();
+    let first = machine.chain.contexts();
+    // The second space maps page 5 to page 3's frame and leaves page 4
+    // unmapped.
+    let mut second = frames.clone();
+    second[5] = frames[3];
+    paged_space(&mut machine, 1, &second);
+    let [_, _, l3] = SPACES_TABLES[1];
+    write_entry(&mut machine, l3 + 8 * 4, 0);
+    let (esr, far) = (
+        machine.cpu.read(SystemRegister::ESR_EL1),
+        machine.cpu.read(SystemRegister::FAR_EL1),
+    );
+    let misses = machine.statistics.itlb[0];
+    let refilled = machine.statistics.itlb_sources[ItlbSource::Refilled as usize];
+    fetch_page(&mut machine, 0);
+    assert_ne!(machine.chain.contexts()[0], first[0]);
+    assert_eq!(machine.statistics.itlb[0], misses);
+    assert_eq!(
+        machine.statistics.itlb_sources[ItlbSource::Refilled as usize],
+        refilled + 5
+    );
+    for page in 0..4 {
+        assert_eq!(machine.current_key(pc(page)), Some(keys[page as usize]));
+    }
+    assert_eq!(machine.current_key(pc(4)), None);
+    assert_eq!(machine.current_key(pc(5)), Some(keys[3]));
+    assert_eq!(
+        (
+            machine.cpu.read(SystemRegister::ESR_EL1),
+            machine.cpu.read(SystemRegister::FAR_EL1),
+        ),
+        (esr, far)
+    );
+    for page in [1, 2, 3, 5] {
+        fetch_page(&mut machine, page);
+    }
+    assert_eq!(machine.statistics.itlb[0], misses);
+}
+
+/// Without `--itlb-seed` a new address space fills each page at its first
+/// fetch, as before.
+#[test]
+fn without_seeding_a_new_address_space_fills_each_page() {
+    let (mut machine, frames) = seeded_machine(false);
+    paged_space(&mut machine, 0, &frames);
+    for page in 0..6 {
+        fetch_page(&mut machine, page);
+    }
+    paged_space(&mut machine, 1, &frames);
+    let misses = machine.statistics.itlb[0];
+    let refilled = machine.statistics.itlb_sources[ItlbSource::Refilled as usize];
+    for page in 0..6 {
+        fetch_page(&mut machine, page);
+    }
+    assert_eq!(machine.statistics.itlb[0], misses + 6);
+    assert_eq!(
+        machine.statistics.itlb_sources[ItlbSource::Refilled as usize],
+        refilled
+    );
+    assert!(machine.seed_log.is_empty());
+}
+
+/// A page seeds the lower-half contexts made within SEED_GENERATIONS of its
+/// miss, of the EL it missed at alone; a later miss renews it.
+#[test]
+fn a_seed_lasts_its_generations_and_only_its_el() {
+    const PAGE: u64 = 0x1_8000_4000;
+    let (mut machine, _) = seeded_machine(true);
+    let el = machine.cpu.pstate.el;
+    assert_ne!(el, 0);
+    machine.note_seed(PAGE);
+    let seeded = |machine: &mut Machine<FakeHost, NoDevices>, el: u8| {
+        machine.refills.clear();
+        machine.seed_context(el);
+        machine.refills.contains(&PAGE)
+    };
+    assert!(!seeded(&mut machine, 0), "another EL's context");
+    for _ in 1..SEED_GENERATIONS {
+        assert!(seeded(&mut machine, el));
+    }
+    assert!(!seeded(&mut machine, el), "past its generations");
+    machine.note_seed(PAGE);
+    assert!(seeded(&mut machine, el));
+    machine.set_itlb_seeding(false);
+    assert!(!seeded(&mut machine, el));
+}

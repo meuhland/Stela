@@ -206,6 +206,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some(pages) = self.pending_refills.remove(&(half, key)) {
             self.refills.extend(pages);
         }
+        if half == 0 {
+            self.seed_context(key.el);
+        }
         number
     }
 

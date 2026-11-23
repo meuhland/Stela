@@ -1421,6 +1421,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         shared_limits: options.shared_limits,
         jump_serial_always: options.jump_serial_always,
         table_insert_throttled: options.table_insert_throttled,
+        itlb_seed: options.itlb_seed,
         loop_counts_off: options.profile_keep_pack,
         event_ring: options.event_ring,
     };

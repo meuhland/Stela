@@ -718,6 +718,17 @@ const CONTEXT_FRAMES: usize = 64;
 /// TLBIs of everything (about 300 kernel pages, then each process's).
 const FILL_LOG: usize = 4096;
 
+/// Slots of [`Machine::seed_log`], a power of two: about twice the
+/// lower-half pages a process launch on macOS misses on one PE (dyld and
+/// libSystem's initializers in the shared cache, some 600).
+const SEED_LOG: usize = 2048;
+/// How many lower-half contexts made since a page's last miss still seed
+/// it (`--itlb-seed`): a page every launch runs misses again once in this
+/// many, and one no launch runs is walked at most this many times more.
+const SEED_GENERATIONS: u64 = 32;
+/// The most pages one new context walks at once (`--itlb-seed`).
+const SEEDS: usize = 1024;
+
 /// Whether the context `space` translates `asid`.
 /// ASIDs compare by the eight bits every TCR.AS gives them.
 fn same_asid(space: &contexts::Space, asid: u16) -> bool {
@@ -994,6 +1005,16 @@ pub struct Machine<H: Host, D: Devices> {
     /// the next fetch in the context walks them again
     /// ([`Self::refill_dropped`]).
     dropped_refills: BTreeMap<u64, Vec<u64>>,
+    /// With `--itlb-seed`: a context made for a lower half walks at once
+    /// the global pages fetches of its EL missed lately in other contexts
+    /// ([`Self::seed_context`]).
+    itlb_seeding: bool,
+    /// The lower-half pages whose fetch missed the ITLB through a global
+    /// leaf, direct-mapped by page: each `(page | el, seed_clock)` of its
+    /// last miss, `(0, 0)` for none ([`SEED_LOG`] slots once allocated).
+    seed_log: Vec<(u64, u64)>,
+    /// The lower-half contexts made so far: the age of a seed.
+    seed_clock: u64,
     /// The host tick at which the first native run that returned with
     /// mail waiting returned, 0 for none since the last read
     /// ([`Statistics::mail_waits`]).
@@ -1506,6 +1527,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             pending_refills: BTreeMap::new(),
             refills: Vec::new(),
             dropped_refills: BTreeMap::new(),
+            itlb_seeding: false,
+            seed_log: Vec::new(),
+            seed_clock: 0,
             mail_returned: 0,
             applying_mail: false,
             profile_missing: Vec::new(),

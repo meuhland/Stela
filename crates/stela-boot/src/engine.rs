@@ -1306,6 +1306,13 @@ fn run_machine<H: Host>(
         ));
     }
     machine.set_table_insert_throttled(options.table_insert_throttled);
+    machine.set_itlb_seeding(options.itlb_seed);
+    if options.itlb_seed {
+        output::arguments(format_args!(
+            "ENGINE new lower-half contexts walk the global pages missed lately
+"
+        ));
+    }
     if options.table_insert_throttled {
         output::arguments(format_args!(
             "ENGINE block table inserts all throttled by their block\n"

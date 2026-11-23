@@ -415,6 +415,11 @@ pub struct System {
     /// (`--table-insert-throttled`), as before an entry's first insert on a
     /// PE went in regardless: for A/B runs.
     pub table_insert_throttled: bool,
+    /// Walk at once, in each lower-half context a PE makes (a new process's
+    /// address space), the global pages its fetches at that EL missed
+    /// lately in other contexts (`--itlb-seed`): the shared cache's pages,
+    /// which every process maps alike, then take no ITLB miss exit each.
+    pub itlb_seed: bool,
     /// Record each PE's exception entries, exception returns and
     /// native-fault recoveries in a ring of its own, dump every ring after a
     /// guest panic, and report a recovery that replays guest work
@@ -594,6 +599,7 @@ impl Default for System {
             profile_keep_pack: false,
             jump_serial_always: false,
             table_insert_throttled: false,
+            itlb_seed: false,
             event_ring: false,
             page_relative: false,
             shared_aliases: false,
@@ -1082,6 +1088,7 @@ impl fmt::Display for System {
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
         line.flag("--jump-serial-always", self.jump_serial_always)?;
         line.flag("--table-insert-throttled", self.table_insert_throttled)?;
+        line.flag("--itlb-seed", self.itlb_seed)?;
         line.flag(EVENT_RING, self.event_ring)?;
         line.flag("--page-relative", self.page_relative)?;
         line.flag("--shared-aliases", self.shared_aliases)?;

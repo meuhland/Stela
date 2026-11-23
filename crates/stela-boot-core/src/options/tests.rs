@@ -555,6 +555,16 @@ fn numbers_take_decimal_and_separated_hex() {
 mod constraints;
 mod grammar;
 
+/// `--itlb-seed` is off by default and round-trips.
+#[test]
+fn itlb_seed_is_off_by_default_and_round_trips() {
+    assert!(!System::default().itlb_seed);
+    let line = "--system --table-insert-throttled --itlb-seed";
+    let options = round_trip(line);
+    assert!(options.itlb_seed && options.table_insert_throttled);
+    assert!(!round_trip("--system").itlb_seed);
+}
+
 /// An entry's first block table insert on a PE goes in regardless of its
 /// block's throttle unless `--table-insert-throttled` asks for the old
 /// throttle of every insert, which round-trips.
