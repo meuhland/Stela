@@ -129,10 +129,12 @@ fn shared_in(
 /// [`shared_in`] through a frame's list of its shared blocks alone
 /// (`shared`, by ascending offset, [`BlockIndex::shared`]): one search at
 /// the offset, whatever copies of the frame at other guest pages its
-/// whole list holds.
+/// whole list holds. A block of another frame is never the answer, even
+/// from an entry the list kept by mistake.
 fn shared_at(
     blocks: &impl Index<usize, Output = Block>,
     shared: &[Entry],
+    frame: u64,
     pc: u64,
     offset: u16,
     variant: VariantId,
@@ -146,10 +148,18 @@ fn shared_at(
         .find(|&slot| {
             let block = &blocks[slot];
             block.shared
+                && split(block.physical) == (frame, offset)
                 && block.variant == variant
                 && same_offset_and_half(block.pc, pc)
                 && (!exact || block.pc == pc)
         })
+}
+
+/// Put `entry`, a shared block's, in `shared` in (offset, tag) order.
+fn list_shared(shared: &mut Vec<Entry>, entry: Entry) {
+    let at =
+        shared.partition_point(|listed| (listed.offset, listed.tag) <= (entry.offset, entry.tag));
+    shared.insert(at, entry);
 }
 
 /// The finder's hash of a block's physical address and PC.
@@ -247,13 +257,29 @@ impl BlockIndex {
             let page = self.page_of(frame)?;
             self.shared_lookups[0] += 1;
             self.shared_lookups[1] += 1;
-            return shared_at(blocks, &self.shared[page], pc, offset, variant, exact);
+            return shared_at(
+                blocks,
+                &self.shared[page],
+                frame,
+                pc,
+                offset,
+                variant,
+                exact,
+            );
         }
         let page = self.page_of(frame)?;
         self.front[Self::front_slot(frame)] = (frame, page as u32);
         self.shared_lookups[0] += 1;
         let runs = &mut self.shared_lookups[1];
-        shared_in(blocks, &self.entries[page], pc, offset, variant, exact, runs)
+        shared_in(
+            blocks,
+            &self.entries[page],
+            pc,
+            offset,
+            variant,
+            exact,
+            runs,
+        )
     }
 
     /// The cache slot of the page at `frame`.
@@ -479,12 +505,12 @@ impl BlockIndex {
                 if replaced as usize == slot {
                     return None;
                 }
-                if block.shared
-                    && let Some(listed) = self.shared[page]
-                        .iter_mut()
-                        .find(|entry| entry.slot == replaced)
-                {
-                    listed.slot = slot as u32;
+                // Whatever either block's `shared`: the replaced slot's
+                // entry goes, and the new block's comes if it is shared.
+                let shared = &mut self.shared[page];
+                shared.retain(|entry| entry.slot != replaced);
+                if block.shared {
+                    list_shared(shared, entries[start + position]);
                 }
                 self.finder.unlink(replaced);
                 self.finder
@@ -499,11 +525,7 @@ impl BlockIndex {
                 };
                 entries.insert(start, entry);
                 if block.shared {
-                    let shared = &mut self.shared[page];
-                    let at = shared.partition_point(|listed| {
-                        (listed.offset, listed.tag) <= (offset, tag)
-                    });
-                    shared.insert(at, entry);
+                    list_shared(&mut self.shared[page], entry);
                 }
                 self.finder
                     .link(slot as u32, block.physical, finder_pc(block));
@@ -1341,18 +1363,29 @@ mod tests {
         let tags = page_tags([own]);
         index.forget_marked_in(PAGE, Some(&tags), |slot| slot as usize == shared[1]);
         index.set_offsets(true);
-        assert_eq!(index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(1)), None);
-        agree(&mut index, &queries(shared).map(|(pc, variant, wanted)| {
-            (pc, variant, wanted.filter(|_| variant == 0))
-        }));
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(1)),
+            None
+        );
+        agree(
+            &mut index,
+            &queries(shared)
+                .map(|(pc, variant, wanted)| (pc, variant, wanted.filter(|_| variant == 0))),
+        );
         // A whole forget, then the page again.
         index.forget_marked(PAGE, |_| true);
         index.set_offsets(true);
-        assert_eq!(index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(0)), None);
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(0)),
+            None
+        );
         assert_eq!(index.insert(&blocks, shared[0]), None);
         agree(&mut index, &[(alias, 0, Some(shared[0])), (alias, 1, None)]);
         assert!(index.forget_page(PAGE));
-        assert_eq!(index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(0)), None);
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(0)),
+            None
+        );
         assert_eq!(index.insert(&blocks, shared[1]), None);
         agree(&mut index, &[(alias, 1, Some(shared[1])), (alias, 0, None)]);
     }
@@ -1378,6 +1411,165 @@ mod tests {
         let own = 0x1_0000_0020;
         index.get(&blocks, own, PAGE + 0x20, VariantId(0), true);
         assert_eq!(index.shared_lookups, [lookups + 1, runs + 1]);
+    }
+
+    /// A slot the frame's shared list names that now holds a shared block
+    /// of another frame at the same offset (an entry the list kept by
+    /// mistake): the lookup through the list never answers with it.
+    #[test]
+    fn the_shared_list_never_answers_with_another_frames_block() {
+        const A: u64 = 0x8000_0000;
+        const B: u64 = 0x9000_0000;
+        let mut blocks = Vec::new();
+        let mut index = BlockIndex::new();
+        index.set_offsets(true);
+        let shared = |pc: u64, frame: u64| Block {
+            shared: true,
+            ..block(pc, frame + (pc & 0xfff), 0)
+        };
+        let slot = add(&mut blocks, &mut index, shared(0x1_0000_0040, A));
+        let alias = 0x7_0000_0040;
+        assert_eq!(
+            index.get_shared(&blocks, alias, A + 0x40, VariantId(0)),
+            Some(slot)
+        );
+        // The slot taken by frame B's block of the same offset, variant
+        // and half, A's list unchanged.
+        blocks[slot] = shared(0x2_0000_0040, B);
+        assert_eq!(
+            index.get_shared(&blocks, alias, A + 0x40, VariantId(0)),
+            None
+        );
+        assert_eq!(
+            index.get(&blocks, alias, A + 0x40, VariantId(0), true),
+            None
+        );
+    }
+
+    /// A replacing insert keeps the shared list right whatever the shared
+    /// mark of the block it replaces and of the new one: a replaced shared
+    /// block's slot leaves it, a new shared block joins it.
+    #[test]
+    fn a_replacing_insert_keeps_the_shared_list_right() {
+        const PAGE: u64 = 0x8000_0000;
+        let mut blocks = Vec::new();
+        let mut index = BlockIndex::new();
+        index.set_offsets(true);
+        let alias = 0x7_0000_0040;
+        let at = |shared: bool| Block {
+            shared,
+            ..block(0x1_0000_0040, PAGE + 0x40, 0)
+        };
+        let first = add(&mut blocks, &mut index, at(true));
+        // The same key again: replaced, and the list names the new slot.
+        let second = push(&mut blocks, at(true));
+        assert_eq!(index.insert(&blocks, second), Some(first));
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x40, VariantId(0)),
+            Some(second)
+        );
+        assert!(
+            index.shared[index.page_of(PAGE).unwrap()]
+                .iter()
+                .all(|entry| entry.slot as usize != first)
+        );
+        // A replacement of another shared mark, forced in place: the
+        // replaced shared slot leaves the list, and a non-shared block
+        // never joins it.
+        blocks[second] = at(false);
+        let third = push(&mut blocks, at(false));
+        assert_eq!(index.insert(&blocks, third), Some(second));
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x40, VariantId(0)),
+            None
+        );
+        assert!(index.shared[index.page_of(PAGE).unwrap()].is_empty());
+        // And back: a shared block replacing a non-shared one joins it.
+        blocks[third] = at(true);
+        let fourth = push(&mut blocks, at(true));
+        assert_eq!(index.insert(&blocks, fourth), Some(third));
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x40, VariantId(0)),
+            Some(fourth)
+        );
+        // Reuse of the old slot by another frame's shared block at the
+        // same offset: never found for this frame.
+        blocks[first] = Block {
+            shared: true,
+            ..block(0x2_0000_0040, 0x9000_0040, 0)
+        };
+        assert_eq!(
+            index.get_shared(&blocks, alias, PAGE + 0x40, VariantId(0)),
+            Some(fourth)
+        );
+    }
+
+    /// Random inserts, replacing inserts, forgets of marked blocks in some
+    /// runs or all and forgotten pages over a few frames, offsets, PCs and
+    /// variants: after each, every lookup through the shared lists answers
+    /// as the walk of every run does.
+    #[test]
+    fn random_index_changes_keep_the_shared_lists_in_step_with_the_walk() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let frames = [0x8000_0000u64, 0x8000_1000, 0x9000_0000];
+        let mut blocks = Vec::new();
+        let mut index = BlockIndex::new();
+        let mut indexed: Vec<usize> = Vec::new();
+        for step in 0..4000 {
+            match next(10) {
+                0..=5 => {
+                    let frame = frames[next(3) as usize];
+                    let offset = 0x10 * next(4);
+                    let page = (0x1_0000_0000 + (next(24) << 14)) | (next(2) << 55);
+                    let slot = push(
+                        &mut blocks,
+                        Block {
+                            shared: next(3) == 0,
+                            ..block(page + offset, frame + offset, next(2) as u32)
+                        },
+                    );
+                    index.insert(&blocks, slot);
+                    indexed.push(slot);
+                }
+                6 | 7 if !indexed.is_empty() => {
+                    let victim = indexed[next(indexed.len() as u64) as usize];
+                    let (pc, physical) = (blocks[victim].pc, blocks[victim].physical);
+                    let frame = physical & !(FETCH_PAGE - 1);
+                    if next(2) == 0 {
+                        index.forget_marked(frame, |slot| slot as usize == victim);
+                    } else {
+                        let tags = page_tags([pc]);
+                        index.forget_marked_in(frame, Some(&tags), |slot| {
+                            slot as usize == victim || slot % 3 == 0
+                        });
+                    }
+                }
+                8 => {
+                    index.forget_page(frames[next(3) as usize]);
+                }
+                _ => {}
+            }
+            for _ in 0..8 {
+                let frame = frames[next(3) as usize];
+                let offset = 0x10 * next(4);
+                let pc = (0x1_0000_0000 + (next(32) << 14) + offset) | (next(2) << 55);
+                let variant = VariantId(next(2) as u32);
+                let answers = [false, true].map(|offsets| {
+                    index.set_offsets(offsets);
+                    (
+                        index.get(&blocks, pc, frame + offset, variant, true),
+                        index.get_shared(&blocks, pc, frame + offset, variant),
+                    )
+                });
+                assert_eq!(answers[0], answers[1], "step {step} pc {pc:#x}");
+            }
+        }
     }
 
     /// Host timing of a shared block's locked lookup at an alias PC as a
