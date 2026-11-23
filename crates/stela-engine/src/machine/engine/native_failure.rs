@@ -294,6 +294,51 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if pc != entry_pc {
             self.cpu.pstate.btype = 0;
         }
+        if let Some(ring) = self.event_ring {
+            // The resume runs the settled instruction again from its start:
+            // an access it cannot make belongs to a later instruction of the
+            // same native range, whose earlier effects run twice.
+            let word = self.word(index, pc).ok();
+            let hazard = match site {
+                RecoverySiteKind::GuestAccess => {
+                    word.is_some_and(|word| event_ring::replay_hazard(word, fault.write))
+                }
+                RecoverySiteKind::GuestCheck => word.is_some_and(|word| {
+                    event_ring::memory_effect(word) == event_ring::MemoryEffect::None
+                }),
+                _ => false,
+            };
+            let mut flags = 0;
+            if fault.write {
+                flags |= event_ring::RECOVERY_WRITE;
+            }
+            if hazard {
+                flags |= event_ring::RECOVERY_HAZARD;
+            }
+            ring.record(&event_ring::Entry {
+                kind: event_ring::Kind::Recovery,
+                pe: self.current as u8,
+                from_el: self.cpu.pstate.el,
+                to_el: self.cpu.pstate.el,
+                vector: flags,
+                detail: fault.offset as u32,
+                pc,
+                other: fault.address,
+                retired: self.cpu.retired,
+            });
+            if hazard {
+                self.host.report(&Event::ReplayHazard(ReplayHazard {
+                    pe: self.current,
+                    el: self.cpu.pstate.el,
+                    entry_pc,
+                    pc,
+                    word: word.unwrap_or(0),
+                    fault_address: fault.address,
+                    write: fault.write,
+                    native_offset: fault.offset,
+                }));
+            }
+        }
         // A native DC ZVA's first store, a native DC clean's read of Xt, or
         // a native exclusive faulted with nothing written (a DC ZVA block is
         // in one page): the engine completes the instruction, reporting Xt

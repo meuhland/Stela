@@ -120,6 +120,8 @@ pub(crate) struct Settings {
     /// `--profile-keep-pack`, as the home machine leaves self-loop counts
     /// out of timed code so its pack serves it.
     pub loop_counts_off: bool,
+    /// `--event-ring`, as the home machine records its events.
+    pub event_ring: bool,
 }
 
 /// Give each AP the PE its worker binding names, to run on a machine of its
@@ -157,6 +159,7 @@ pub(crate) fn spawn<H: Host>(
             jump_serial_always: settings.jump_serial_always,
             table_insert_throttled: settings.table_insert_throttled,
             loop_counts_off: settings.loop_counts_off,
+            event_ring: settings.event_ring,
         };
         processor.spawn(Box::new(move |owner| pe.run(owner)), sender, tsc_hz)?;
     }
@@ -185,6 +188,7 @@ struct Pe {
     jump_serial_always: bool,
     table_insert_throttled: bool,
     loop_counts_off: bool,
+    event_ring: bool,
 }
 
 impl Pe {
@@ -203,6 +207,7 @@ impl Pe {
             jump_serial_always,
             table_insert_throttled,
             loop_counts_off,
+            event_ring,
         } = self;
         // This core's driver calls keep the engine's TLB entries.
         let _tagged = super::storage::TaggedRoots::enable();
@@ -227,6 +232,7 @@ impl Pe {
             .unwrap_or_else(|error| output::fatal(error));
         machine.set_step_timing(step_timing);
         machine.set_loop_counts_off(loop_counts_off);
+        machine.set_event_ring(event_ring);
         machine.set_page_relative(page_relative);
         machine.set_shared_aliases(shared_aliases);
         machine.set_shared_limits(super::shared_limits(shared_limits));

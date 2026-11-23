@@ -766,3 +766,15 @@ fn gpu_boost_is_off_by_default_and_round_trips() {
     assert!(usual.gpu_boost && usual.nvenc_selftest && usual.input && usual.parallel);
     assert!(usual.to_string().contains(" --nvenc-selftest --gpu-boost"));
 }
+
+/// `--event-ring` is off unless asked for, and round-trips after the other
+/// engine A/B flags.
+#[test]
+fn event_ring_is_off_by_default_and_round_trips() {
+    assert!(!System::default().event_ring);
+    assert!(!round_trip("--system").event_ring);
+    let line = format!("--system --table-insert-throttled {EVENT_RING}");
+    let options = round_trip(&line);
+    assert!(options.event_ring && options.table_insert_throttled);
+    assert_eq!(options.to_string(), line);
+}

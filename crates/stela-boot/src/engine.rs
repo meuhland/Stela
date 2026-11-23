@@ -661,7 +661,11 @@ impl ConsoleSink for GuestConsole {
         }
         if let Some(fragment) = self.lines.push(byte) {
             if let Ok(mut panic) = GUEST_PANIC.0.try_borrow_mut() {
+                let seen = panic.message().is_some();
                 panic.observe(&fragment);
+                if !seen && let Some(message) = panic.message() {
+                    request_panic_dump(message);
+                }
             }
             let line = fragment.text.clone();
             // The log and the serial port take it outside the board's lock
@@ -795,7 +799,34 @@ pub(crate) fn shared_limits(bits: u16) -> stela_engine::machine::SharedLimits {
     }
 }
 
+/// Replay hazards reported so far ([`Event::ReplayHazard`]); past
+/// [`REPORTED_REPLAY_HAZARDS`] only the event ring's flagged entries keep
+/// them.
+static REPLAY_HAZARDS: AtomicU64 = AtomicU64::new(0);
+const REPORTED_REPLAY_HAZARDS: u64 = 64;
+
 pub(crate) fn report(event: &Event) {
+    // A recovery that replays guest work comes at once and loud: it is the
+    // suspect for a ticket lock whose cticket passed a waiter's ticket.
+    if let Event::ReplayHazard(hazard) = event {
+        let count = REPLAY_HAZARDS.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= REPORTED_REPLAY_HAZARDS {
+            output::arguments(format_args!(
+                "REPLAY HAZARD #{count} pe={} el={} entry={:#x} settled={:#x} word={:#010x} \
+                 fault={:#x} {} native+{:#x}: the resume runs again guest work its native \
+                 range already did\n",
+                hazard.pe,
+                hazard.el,
+                hazard.entry_pc,
+                hazard.pc,
+                hazard.word,
+                hazard.fault_address,
+                if hazard.write { "write" } else { "read" },
+                hazard.native_offset
+            ));
+        }
+        return;
+    }
     // Shared alias diagnostics come at once, unthrottled: a crash capture
     // then shows the last ones.
     if let Event::Shared(shared) = event {
@@ -865,8 +896,8 @@ pub(crate) fn report(event: &Event) {
         return;
     }
     match event {
-        Event::Monitor(_) | Event::Shared(_) => {
-            unreachable!("monitor and shared traces are emitted before event throttling")
+        Event::Monitor(_) | Event::Shared(_) | Event::ReplayHazard(_) => {
+            unreachable!("monitor, shared and replay events are emitted before event throttling")
         }
         Event::Exception {
             vector,
@@ -1098,6 +1129,67 @@ fn guest_panic() -> Option<String> {
         .and_then(|panic| panic.message().map(String::from))
 }
 
+/// The panic dump's state ([`panic_dump`]): none asked for, done, asked
+/// for, or asked for with the address of the ticket lock the panic names.
+static PANIC_DUMP: AtomicU64 = AtomicU64::new(PANIC_DUMP_NONE);
+const PANIC_DUMP_NONE: u64 = 0;
+const PANIC_DUMP_DONE: u64 = 1;
+const PANIC_DUMP_ASKED: u64 = 2;
+/// The entries of each PE's event ring the panic dump shows, after its
+/// flagged ones.
+const PANIC_RING_ENTRIES: usize = 256;
+
+/// Ask the home machine for the panic dump at its next slice: the guest
+/// console just gave its first panic message. Takes no lock: the console
+/// runs under the board's.
+fn request_panic_dump(message: &str) {
+    let asked = stela_engine::machine::engine::event_ring::ticket_lock_address(message)
+        .filter(|&address| address > PANIC_DUMP_ASKED)
+        .unwrap_or(PANIC_DUMP_ASKED);
+    let _ = PANIC_DUMP.compare_exchange(
+        PANIC_DUMP_NONE,
+        asked,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
+
+/// Once, as soon as the guest's first panic message is seen and before its
+/// panic flow and watchdog move on: the 64-byte line of the ticket lock a
+/// `Ticket spinlock[...]` panic names, read through the home PE's
+/// translation regime (kernel addresses translate alike on every PE), and
+/// every PE's event ring (`--event-ring`).
+fn panic_dump<H: Host>(machine: &mut Machine<H, parallel::Board>) {
+    let asked = PANIC_DUMP.load(Ordering::Relaxed);
+    if asked < PANIC_DUMP_ASKED
+        || PANIC_DUMP
+            .compare_exchange(asked, PANIC_DUMP_DONE, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    use stela_engine::machine::engine::event_ring;
+    if asked != PANIC_DUMP_ASKED {
+        let line = asked & !63;
+        let mut bytes = [0u8; 64];
+        if machine.read_virtual(line, &mut bytes) {
+            output::arguments(format_args!(
+                "{} pe={}\n",
+                event_ring::format_lock_line(asked, line, &bytes),
+                machine.processor()
+            ));
+        } else {
+            output::arguments(format_args!(
+                "PANIC LOCK va={asked:#x} does not translate to RAM in pe {}'s regime\n",
+                machine.processor()
+            ));
+        }
+    }
+    for line in event_ring::report(PANIC_RING_ENTRIES) {
+        output::arguments(format_args!("{line}\n"));
+    }
+}
+
 /// The panic region's guest-physical base and size, from the booted
 /// DeviceTree's `/pram reg` (the loader publishes it; zero when absent).
 static PANIC_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -1229,6 +1321,13 @@ fn run_machine<H: Host>(
     if options.page_relative {
         output::arguments(format_args!("ENGINE page-relative code\n"));
     }
+    machine.set_event_ring(options.event_ring);
+    if options.event_ring {
+        output::arguments(format_args!(
+            "ENGINE event ring on: {} entries a PE, dumped after a guest panic\n",
+            stela_engine::machine::engine::event_ring::ENTRIES
+        ));
+    }
     machine.set_shared_aliases(options.shared_aliases);
     machine.set_shared_limits(shared_limits(options.shared_limits));
     if options.shared_aliases {
@@ -1335,6 +1434,7 @@ fn run_machine<H: Host>(
             if let Some(acpi) = host_acpi {
                 acpi.poll();
             }
+            panic_dump(machine);
             execute(machine, limit)
         },
     );
@@ -1367,6 +1467,8 @@ fn finish<H: Host>(
     mut times: StopTimes,
     host_power: &power::HostPowerControl,
 ) -> ! {
+    // A panic seen after the home machine's last slice still gets its dump.
+    panic_dump(machine);
     let started = output::now();
     // An orderly stop has nothing to debug: its registers and frames stay
     // out of the log unless `--profile` asks for them.

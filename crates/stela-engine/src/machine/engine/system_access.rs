@@ -329,11 +329,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let start = self.transition_start();
         let spsr = self.cpu.exception_state();
+        let from_el = self.cpu.pstate.el;
         self.cpu.exception_return(target).map_err(|_| {
             self.unsupported(RequirementKind::Native(
                 "canonical exclusive/event settlement failed before exception return",
             ))
         })?;
+        if let Some(ring) = self.event_ring {
+            ring.record(&event_ring::Entry {
+                kind: event_ring::Kind::Return,
+                pe: self.current as u8,
+                from_el,
+                to_el: self.cpu.pstate.el,
+                vector: 0,
+                detail: spsr as u32,
+                pc,
+                other: self.cpu.pc,
+                retired: self.cpu.retired,
+            });
+        }
         self.pacm_written = true;
         self.host.report(&Event::Return {
             to_el: self.cpu.pstate.el,
@@ -1232,6 +1246,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let (from_el, from_guarded) = (self.cpu.pstate.el, self.cpu.pstate.guarded);
         self.cpu.take(exception);
         self.statistics.exceptions += 1;
+        if let Some(ring) = self.event_ring {
+            ring.record(&event_ring::Entry {
+                kind: event_ring::Kind::Exception,
+                pe: self.current as u8,
+                from_el,
+                to_el: self.cpu.pstate.el,
+                vector: (exception.vector as u32 / 0x80) as u8,
+                detail: exception.syndrome as u32,
+                pc: exception.return_address,
+                other: exception.fault_address.unwrap_or(0),
+                retired: self.cpu.retired,
+            });
+        }
         self.host.report(&Event::Exception {
             vector: exception.vector,
             from_el,

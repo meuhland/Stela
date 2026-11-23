@@ -34,7 +34,7 @@ pub use engine::{
     ConsumedPair, Description, DeviceError, DeviceRegister, Devices, EntryChecks, Event,
     FaultCause, Host, InstallError, Machine, NativeCode, NativeExit, NativeFault,
     NativeFaultOrigin, NativeView, NoDevices, Offer, PeState, PeerState, Preparation, Prepared,
-    Refused, Regime, Requirement, RequirementKind, Reset, SharedEvent, SharedLimits, StaleCode,
+    Refused, Regime, ReplayHazard, Requirement, RequirementKind, Reset, SharedEvent, SharedLimits, StaleCode,
     StaleOrigin, Statistics, Stop, Transition, Translations, entry_checks, window,
 };
 pub use registers::{CpuProfile, Lines};

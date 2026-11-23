@@ -29,6 +29,27 @@ pub enum Event {
     /// A shared alias block's diagnostic (`--shared-log`,
     /// `--shared-verify`), reported at once, unthrottled.
     Shared(SharedEvent),
+    /// A native-fault recovery that resumes before guest work its native
+    /// range already did (`--event-ring`), reported at once.
+    ReplayHazard(ReplayHazard),
+}
+
+/// A native fault settled at an instruction that cannot have made the
+/// access that faulted ([`Event::ReplayHazard`],
+/// [`super::event_ring::replay_hazard`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayHazard {
+    pub pe: usize,
+    pub el: u8,
+    /// The block's entry PC, and the PC the recovery settled at.
+    pub entry_pc: u64,
+    pub pc: u64,
+    /// The settled instruction (0 if unreadable).
+    pub word: u32,
+    pub fault_address: u64,
+    pub write: bool,
+    /// The faulting instruction's offset in the block's native code.
+    pub native_offset: usize,
 }
 
 /// What a shared alias block did at a PC other than the one it was

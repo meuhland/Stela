@@ -86,6 +86,10 @@ pub const INPUT_KICK: &str = "--input-kick";
 /// host has gone unserved for an input poll's interval, when its slice ends
 /// at EL0 or waiting ([`System::input_quiet_step`]).
 pub const INPUT_QUIET_STEP: &str = "--input-quiet-step";
+/// Keep each PE's recent exception entries, returns and native-fault
+/// recoveries in a ring, dumped after a guest panic, and report recoveries
+/// that replay guest work ([`System::event_ring`]).
+pub const EVENT_RING: &str = "--event-ring";
 /// Has GSP-RM hold each NVIDIA GPU at its highest performance level for the
 /// boot ([`System::gpu_boost`]).
 pub const GPU_BOOST: &str = "--gpu-boost";
@@ -411,6 +415,11 @@ pub struct System {
     /// (`--table-insert-throttled`), as before an entry's first insert on a
     /// PE went in regardless: for A/B runs.
     pub table_insert_throttled: bool,
+    /// Record each PE's exception entries, exception returns and
+    /// native-fault recoveries in a ring of its own, dump every ring after a
+    /// guest panic, and report a recovery that replays guest work
+    /// (`--event-ring`): off unless asked for, for A/B runs of its cost.
+    pub event_ring: bool,
     /// Compile guest code page-relative (`--page-relative`): a block's code
     /// serves every page that maps the same bytes, each entry setting the
     /// page it runs at.
@@ -585,6 +594,7 @@ impl Default for System {
             profile_keep_pack: false,
             jump_serial_always: false,
             table_insert_throttled: false,
+            event_ring: false,
             page_relative: false,
             shared_aliases: false,
             shared_limits: 0,
@@ -1072,6 +1082,7 @@ impl fmt::Display for System {
         line.flag("--profile-keep-pack", self.profile_keep_pack)?;
         line.flag("--jump-serial-always", self.jump_serial_always)?;
         line.flag("--table-insert-throttled", self.table_insert_throttled)?;
+        line.flag(EVENT_RING, self.event_ring)?;
         line.flag("--page-relative", self.page_relative)?;
         line.flag("--shared-aliases", self.shared_aliases)?;
         for (bit, name) in SHARED_LIMITS.iter().enumerate() {

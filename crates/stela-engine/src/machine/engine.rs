@@ -15,7 +15,8 @@ use mirrors::*;
 use reports::*;
 pub use reports::{
     Alias, DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS,
-    MailWait, Occupancy, PeState, Requirement, RequirementKind, Reset, SHARED_LOGGED, SharedEvent,
+    MailWait, Occupancy, PeState, ReplayHazard, Requirement, RequirementKind, Reset,
+    SHARED_LOGGED, SharedEvent,
     SharedLimits, Statistics, Stop, Surveyed, Suspension, TRACE_HITS, TraceHit, WATCH_HITS,
     WatchHit,
 };
@@ -37,6 +38,7 @@ mod degraded;
 mod device_access;
 mod device_read;
 mod device_write;
+pub mod event_ring;
 mod exclusive;
 mod fetch;
 #[cfg(all(feature = "std", feature = "native-profile"))]
@@ -1025,6 +1027,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// is on (`--profile-keep-pack`), so the translation context, and with
     /// it the pack, stays that of an untimed boot.
     loop_counts_off: bool,
+    /// The ring this machine records its exception entries, returns and
+    /// native-fault recoveries in (`--event-ring`, [`event_ring`]).
+    event_ring: Option<&'static event_ring::EventRing>,
     /// Every native entry starts the jump cache over, as before it could
     /// keep it while nothing its entries rest on changed
     /// (`--jump-serial-always`, [`chain_control::JumpBasis`]).
@@ -1513,6 +1518,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self_loops: true,
             page_relative: false,
             loop_counts_off: false,
+            event_ring: None,
             jump_serial_always: false,
             remembered: vec![0; compilation::REMEMBERED].into_boxed_slice(),
             table_insert_throttled: false,

@@ -74,6 +74,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.native_system = None;
     }
 
+    /// Record exception entries, returns and native-fault recoveries in
+    /// the ring of the PE this machine holds (`--event-ring`), from now on.
+    /// A machine that runs every PE (`--serialized`) keeps one ring, each
+    /// entry naming its PE. Changes no code.
+    pub fn set_event_ring(&mut self, on: bool) {
+        self.event_ring = on.then(|| super::event_ring::ring_for(self.current)).flatten();
+    }
+
+    /// Whether this machine records in a ring (`--event-ring`).
+    pub fn event_ring(&self) -> bool {
+        self.event_ring.is_some()
+    }
+
     /// The step loop's timing so far, while it is on.
     pub fn step_timing(&self) -> Option<&step_timing::StepTiming> {
         self.step_timing.as_ref()
