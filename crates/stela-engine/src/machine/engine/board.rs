@@ -536,6 +536,9 @@ pub struct CodeReport {
     /// Installs relocated from an entry proven during the boot, entries
     /// proven and refused, and the bytes kept ([`super::rebase`]).
     pub rebases: super::RebaseCounts,
+    /// Shared block lookups under the lock that searched a page, and the
+    /// frame-list runs they visited ([`BlockIndex::shared_lookups`]).
+    pub shared_lookups: [u64; 2],
 }
 
 /// What [`CodeReport::targets`] counts.
@@ -809,16 +812,17 @@ impl Code {
 
     /// What the board's code came to; the lock's longest wait starts over.
     pub(super) fn report(&self) -> CodeReport {
-        let (lock, inserted, raced, churn) = {
+        let (lock, inserted, raced, churn, shared_lookups) = {
             let mut cache = self.cache_at(LockSite::Report);
             let lock = cache.lock;
             let counts = (cache.targets_inserted, cache.targets_raced);
             let churn = cache.churn;
+            let shared_lookups = cache.index.shared_lookups;
             cache.lock.longest = 0;
             for site in &mut cache.lock.sites {
                 site.longest_held = 0;
             }
-            (lock, counts.0, counts.1, churn)
+            (lock, counts.0, counts.1, churn, shared_lookups)
         };
         let count = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CodeReport {
@@ -859,6 +863,7 @@ impl Code {
                 .map_or([0; 4], |arena| arena.ring.outs()),
             rebases: self.rebases.counts(),
             walks: core::array::from_fn(|walk| self.events.walks[walk].swap(0, Ordering::Relaxed)),
+            shared_lookups,
         }
     }
 

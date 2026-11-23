@@ -98,9 +98,11 @@ fn shared_in(
     offset: u16,
     variant: VariantId,
     exact: bool,
+    runs: &mut u64,
 ) -> Option<usize> {
     let mut run = 0;
     while run < entries.len() {
+        *runs += 1;
         let run_tag = entries[run].tag;
         let end = run + entries[run..].partition_point(|entry| entry.tag == run_tag);
         let part = &entries[run..end];
@@ -124,6 +126,32 @@ fn shared_in(
     None
 }
 
+/// [`shared_in`] through a frame's list of its shared blocks alone
+/// (`shared`, by ascending offset, [`BlockIndex::shared`]): one search at
+/// the offset, whatever copies of the frame at other guest pages its
+/// whole list holds.
+fn shared_at(
+    blocks: &impl Index<usize, Output = Block>,
+    shared: &[Entry],
+    pc: u64,
+    offset: u16,
+    variant: VariantId,
+    exact: bool,
+) -> Option<usize> {
+    let start = shared.partition_point(|entry| entry.offset < offset);
+    shared[start..]
+        .iter()
+        .take_while(|entry| entry.offset == offset)
+        .map(|entry| entry.slot as usize)
+        .find(|&slot| {
+            let block = &blocks[slot];
+            block.shared
+                && block.variant == variant
+                && same_offset_and_half(block.pc, pc)
+                && (!exact || block.pc == pc)
+        })
+}
+
 /// The finder's hash of a block's physical address and PC.
 fn key_hash(physical: u64, pc: u64) -> u64 {
     let hash = (physical >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15)
@@ -138,6 +166,20 @@ pub(super) struct BlockIndex {
     pages: BTreeMap<u64, u32>,
     /// A page's blocks, by ascending offset.
     entries: Vec<Vec<Entry>>,
+    /// Each page's shared blocks ([`Block::shared`]) alone, by ascending
+    /// offset then tag, beside [`Self::entries`]: what a lookup of a shared
+    /// block searches with [`Self::offsets`], where a walk of every run of
+    /// the page's list visits each copy of the frame at another guest page
+    /// (each launch of a slid binary leaves one), a load of a block for
+    /// each under the board's lock.
+    shared: Vec<Vec<Entry>>,
+    /// Shared blocks are looked up in [`Self::shared`]
+    /// (`--shared-offset-index`), not by a walk of every run.
+    offsets: bool,
+    /// Shared block lookups ([`Self::get`] with aliases, [`Self::get_shared`])
+    /// that searched a page, and the runs they visited: one each through
+    /// [`Self::shared`], one per copy of the frame they passed in a walk.
+    pub(super) shared_lookups: [u64; 2],
     /// The [`Self::entries`] of forgotten pages.
     free: Vec<u32>,
     /// Recently found pages and their [`Self::entries`].
@@ -166,6 +208,9 @@ impl BlockIndex {
             finder,
             pages: BTreeMap::new(),
             entries: Vec::new(),
+            shared: Vec::new(),
+            offsets: false,
+            shared_lookups: [0; 2],
             free: Vec::new(),
             front: vec![(NO_FRAME, 0); FRONT].into_boxed_slice(),
             exact: false,
@@ -177,6 +222,38 @@ impl BlockIndex {
     pub(super) fn set_exact(&mut self, exact: bool) {
         self.exact = exact;
         self.finder.exact.store(exact, Ordering::Relaxed);
+    }
+
+    /// Look shared blocks up in each page's list of them
+    /// (`--shared-offset-index`, [`Self::shared`]), which the index keeps
+    /// either way.
+    pub(super) fn set_offsets(&mut self, offsets: bool) {
+        self.offsets = offsets;
+    }
+
+    /// The shared block at `offset` of the page at `frame` in `variant`
+    /// that serves `pc`: through [`Self::shared`] with [`Self::offsets`],
+    /// else a walk of every run of the page's list.
+    fn shared_of(
+        &mut self,
+        blocks: &impl Index<usize, Output = Block>,
+        frame: u64,
+        pc: u64,
+        offset: u16,
+        variant: VariantId,
+    ) -> Option<usize> {
+        let exact = self.exact;
+        if self.offsets {
+            let page = self.page_of(frame)?;
+            self.shared_lookups[0] += 1;
+            self.shared_lookups[1] += 1;
+            return shared_at(blocks, &self.shared[page], pc, offset, variant, exact);
+        }
+        let page = self.page_of(frame)?;
+        self.front[Self::front_slot(frame)] = (frame, page as u32);
+        self.shared_lookups[0] += 1;
+        let runs = &mut self.shared_lookups[1];
+        shared_in(blocks, &self.entries[page], pc, offset, variant, exact, runs)
     }
 
     /// The cache slot of the page at `frame`.
@@ -228,9 +305,7 @@ impl BlockIndex {
         if own.is_some() || !aliases {
             return own;
         }
-        let exact = self.exact;
-        let entries = self.list(frame)?;
-        shared_in(blocks, entries, pc, offset, variant, exact)
+        self.shared_of(blocks, frame, pc, offset, variant)
     }
 
     /// The shared block at `physical` in `variant` that serves `pc`
@@ -244,9 +319,7 @@ impl BlockIndex {
         variant: VariantId,
     ) -> Option<usize> {
         let (frame, offset) = split(physical);
-        let exact = self.exact;
-        let entries = self.list(frame)?;
-        shared_in(blocks, entries, pc, offset, variant, exact)
+        self.shared_of(blocks, frame, pc, offset, variant)
     }
 
     /// Whether the block in `slot` is the one the index holds for its key.
@@ -380,6 +453,7 @@ impl BlockIndex {
             None => {
                 let page = self.free.pop().unwrap_or_else(|| {
                     self.entries.push(Vec::new());
+                    self.shared.push(Vec::new());
                     self.entries.len() as u32 - 1
                 });
                 self.pages.insert(frame, page);
@@ -405,20 +479,32 @@ impl BlockIndex {
                 if replaced as usize == slot {
                     return None;
                 }
+                if block.shared
+                    && let Some(listed) = self.shared[page]
+                        .iter_mut()
+                        .find(|entry| entry.slot == replaced)
+                {
+                    listed.slot = slot as u32;
+                }
                 self.finder.unlink(replaced);
                 self.finder
                     .link(slot as u32, block.physical, finder_pc(block));
                 Some(replaced as usize)
             }
             None => {
-                entries.insert(
-                    start,
-                    Entry {
-                        offset,
-                        tag,
-                        slot: slot as u32,
-                    },
-                );
+                let entry = Entry {
+                    offset,
+                    tag,
+                    slot: slot as u32,
+                };
+                entries.insert(start, entry);
+                if block.shared {
+                    let shared = &mut self.shared[page];
+                    let at = shared.partition_point(|listed| {
+                        (listed.offset, listed.tag) <= (offset, tag)
+                    });
+                    shared.insert(at, entry);
+                }
                 self.finder
                     .link(slot as u32, block.physical, finder_pc(block));
                 None
@@ -441,6 +527,7 @@ impl BlockIndex {
             return false;
         };
         entries.remove(position);
+        self.shared[page].retain(|entry| entry.slot as usize != slot);
         self.finder.unlink(slot as u32);
         if entries.is_empty() {
             self.forget_page(frame);
@@ -476,6 +563,8 @@ impl BlockIndex {
             return;
         };
         let finder = &self.finder;
+        let shared = &mut self.shared[page];
+        let mut forgotten = Vec::new();
         let mut write = first;
         let mut runs = runs.into_iter().peekable();
         for read in first..entries.len() {
@@ -486,12 +575,19 @@ impl BlockIndex {
             let visited = runs.peek().is_some_and(|run| run.contains(&read));
             if visited && marked(entry.slot) {
                 finder.unlink(entry.slot);
+                if !shared.is_empty() {
+                    forgotten.push(entry.slot);
+                }
                 continue;
             }
             entries[write] = entry;
             write += 1;
         }
         entries.truncate(write);
+        if !forgotten.is_empty() {
+            forgotten.sort_unstable();
+            shared.retain(|entry| forgotten.binary_search(&entry.slot).is_err());
+        }
         if entries.is_empty() {
             self.forget_page(frame);
         }
@@ -510,6 +606,7 @@ impl BlockIndex {
         }
         entries.clear();
         entries.shrink_to(KEPT_ENTRIES);
+        self.shared[page as usize].clear();
         self.free.push(page);
         let cached = &mut self.front[Self::front_slot(frame)];
         if cached.0 == frame {
@@ -522,6 +619,7 @@ impl BlockIndex {
         self.finder.clear();
         self.pages.clear();
         self.entries.clear();
+        self.shared.clear();
         self.free.clear();
         self.front.fill((NO_FRAME, 0));
     }
@@ -548,8 +646,9 @@ impl BlockIndex {
     /// The heap bytes it holds.
     pub(super) fn heap_bytes(&self) -> usize {
         let entries: usize = self.entries.iter().map(Vec::capacity).sum();
-        entries * size_of::<Entry>()
-            + self.entries.capacity() * size_of::<Vec<Entry>>()
+        let shared: usize = self.shared.iter().map(Vec::capacity).sum();
+        (entries + shared) * size_of::<Entry>()
+            + (self.entries.capacity() + self.shared.capacity()) * size_of::<Vec<Entry>>()
             + self.free.capacity() * size_of::<u32>()
             + self.front.len() * size_of::<(u64, u32)>()
             // A B-tree entry and its share of a node about half full.
@@ -1137,6 +1236,175 @@ mod tests {
                 "aliases={count} insert_ns={insert} find_ns={find} locked_fallbacks={locked} slots={}",
                 slots.len()
             );
+        }
+    }
+
+    /// A frame as a slid binary's launches leave it: `copies` copies of
+    /// its blocks at offsets 0x10, 0x20 and 0x30, each at another guest
+    /// page (not shared, as a PAC terminal's), with shared blocks at 0x20
+    /// in variants 0 and 1 installed for one page among them.
+    fn launched_frame(copies: u64) -> (super::super::board::Blocks, BlockIndex, [usize; 2]) {
+        const PAGE: u64 = 0x8000_0000;
+        let blocks = super::super::board::Blocks::new(4 * copies as u32 + 64);
+        let grace = super::super::board::Grace::new(1);
+        let mut index = BlockIndex::with_finder(Arc::new(Finder::new(4 * copies as u32 + 64)));
+        let mut install = |pc: u64, variant: u32, shared: bool| {
+            let slot = blocks.take(&grace, Some(0)).unwrap();
+            blocks.fill(
+                slot,
+                Block {
+                    shared,
+                    ..block(pc, PAGE + (pc & 0xfff), variant)
+                },
+            );
+            index.insert(&blocks, slot);
+            slot
+        };
+        let mut shared = [0; 2];
+        for copy in 0..copies {
+            let base = 0x1_0000_0000 + (copy << 14);
+            for offset in [0x10, 0x20, 0x30] {
+                install(base + offset, 0, false);
+            }
+            if copy == copies / 2 {
+                shared = [install(base + 0x20, 0, true), install(base + 0x20, 1, true)];
+            }
+        }
+        (blocks, index, shared)
+    }
+
+    /// `--shared-offset-index`: a shared block's lookup through its frame's
+    /// list of shared blocks finds what the walk of every copy's run finds,
+    /// for every offset, variant, half and own-PC setting, and the list
+    /// follows inserts that replace a block, forgets of marked blocks in
+    /// some runs or all, and a forgotten page indexed again.
+    #[test]
+    fn the_offset_index_finds_what_the_walk_of_every_copy_finds() {
+        const PAGE: u64 = 0x8000_0000;
+        let (blocks, mut index, shared) = launched_frame(40);
+        let grace = super::super::board::Grace::new(1);
+        let agree = |index: &mut BlockIndex, expect: &[(u64, u32, Option<usize>)]| {
+            for exact in [false, true] {
+                index.set_exact(exact);
+                for &(pc, variant, wanted) in expect {
+                    let physical = PAGE + (pc & 0xfff);
+                    let mut answers = [false, true].map(|offsets| {
+                        index.set_offsets(offsets);
+                        (
+                            index.get(&blocks, pc, physical, VariantId(variant), true),
+                            index.get_shared(&blocks, pc, physical, VariantId(variant)),
+                        )
+                    });
+                    assert_eq!(answers[0], answers[1], "{pc:#x} variant {variant}");
+                    if !exact && let Some(wanted) = wanted {
+                        assert_eq!(answers[1].1, Some(wanted), "{pc:#x}");
+                    }
+                    answers[0] = (None, None);
+                }
+            }
+            index.set_exact(false);
+        };
+        let alias = 0x7_0000_0020;
+        let upper = alias | 1 << 55;
+        let queries = |shared: [usize; 2]| {
+            [
+                (alias, 0, Some(shared[0])),
+                (alias, 1, Some(shared[1])),
+                (alias, 2, None),
+                (alias - 0x10, 0, None),
+                (alias + 0x10, 0, None),
+                (upper, 0, None),
+                (0x1_0000_0020, 0, None),
+                (0x1_0000_0000 + (20 << 14) + 0x20, 0, None),
+            ]
+        };
+        agree(&mut index, &queries(shared));
+        // The shared block of variant 0 installed again in its slot's place.
+        let again = blocks.take(&grace, Some(0)).unwrap();
+        let (pc, physical) = (blocks[shared[0]].pc, blocks[shared[0]].physical);
+        blocks.fill(
+            again,
+            Block {
+                shared: true,
+                ..block(pc, physical, 0)
+            },
+        );
+        assert_eq!(index.insert(&blocks, again), Some(shared[0]));
+        let shared = [again, shared[1]];
+        agree(&mut index, &queries(shared));
+        // Forgetting in the runs of other pages leaves the shared blocks;
+        // in their own page's run, variant 1's goes.
+        let own = blocks[shared[1]].pc;
+        let others = page_tags((0..10).map(|copy| 0x1_0000_0000 + (copy << 14)));
+        index.forget_marked_in(PAGE, Some(&others), |_| true);
+        agree(&mut index, &queries(shared));
+        let tags = page_tags([own]);
+        index.forget_marked_in(PAGE, Some(&tags), |slot| slot as usize == shared[1]);
+        index.set_offsets(true);
+        assert_eq!(index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(1)), None);
+        agree(&mut index, &queries(shared).map(|(pc, variant, wanted)| {
+            (pc, variant, wanted.filter(|_| variant == 0))
+        }));
+        // A whole forget, then the page again.
+        index.forget_marked(PAGE, |_| true);
+        index.set_offsets(true);
+        assert_eq!(index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(0)), None);
+        assert_eq!(index.insert(&blocks, shared[0]), None);
+        agree(&mut index, &[(alias, 0, Some(shared[0])), (alias, 1, None)]);
+        assert!(index.forget_page(PAGE));
+        assert_eq!(index.get_shared(&blocks, alias, PAGE + 0x20, VariantId(0)), None);
+        assert_eq!(index.insert(&blocks, shared[1]), None);
+        agree(&mut index, &[(alias, 1, Some(shared[1])), (alias, 0, None)]);
+    }
+
+    /// The shared lookups count the runs they visit: a walk passes copies
+    /// of the frame at other guest pages before the shared block's, the
+    /// frame's shared list one search.
+    #[test]
+    fn shared_lookups_count_the_runs_they_visit() {
+        const PAGE: u64 = 0x8000_0000;
+        let (blocks, mut index, shared) = launched_frame(40);
+        let alias = 0x7_0000_0020;
+        let found = index.get(&blocks, alias, PAGE + 0x20, VariantId(1), true);
+        assert_eq!(found, Some(shared[1]));
+        let [lookups, runs] = index.shared_lookups;
+        assert_eq!(lookups, 1);
+        assert!(runs > 1, "{runs} runs");
+        index.set_offsets(true);
+        let found = index.get(&blocks, alias, PAGE + 0x20, VariantId(1), true);
+        assert_eq!(found, Some(shared[1]));
+        assert_eq!(index.shared_lookups, [lookups + 1, runs + 1]);
+        // A block of the PC's own needs no shared lookup.
+        let own = 0x1_0000_0020;
+        index.get(&blocks, own, PAGE + 0x20, VariantId(0), true);
+        assert_eq!(index.shared_lookups, [lookups + 1, runs + 1]);
+    }
+
+    /// Host timing of a shared block's locked lookup at an alias PC as a
+    /// frame's copies at other guest pages grow, by a walk of every run and
+    /// through the frame's shared list: `cargo test -p stela-engine
+    /// --release --lib shared_lookup_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual: opt-in"]
+    fn shared_lookup_cost() {
+        extern crate std;
+        const PAGE: u64 = 0x8000_0000;
+        const ROUNDS: u32 = 20_000;
+        for copies in [1, 16, 64, 256, 1024] {
+            let (blocks, mut index, shared) = launched_frame(copies);
+            let mut line = std::format!("copies={copies}");
+            for offsets in [false, true] {
+                index.set_offsets(offsets);
+                let started = std::time::Instant::now();
+                for round in 0..ROUNDS {
+                    let pc = 0x7_0000_0020 + (u64::from(round % 64) << 14);
+                    let found = index.get(&blocks, pc, PAGE + 0x20, VariantId(0), true);
+                    assert_eq!(found, Some(shared[0]));
+                }
+                let ns = started.elapsed().as_nanos() / u128::from(ROUNDS);
+                line.push_str(&std::format!(" offsets={offsets}:{ns}ns"));
+            }
+            std::println!("{line}");
         }
     }
 }

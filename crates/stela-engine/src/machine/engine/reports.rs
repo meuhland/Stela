@@ -99,6 +99,11 @@ pub struct SharedLimits {
     /// Share only blocks compiled in this boot, none relocated from the
     /// pack or rebased (`--shared-fresh`).
     pub fresh_only: bool,
+    /// Look a shared block up in its frame's list of shared blocks, one
+    /// search at its offset, not by a walk of every copy of the frame at
+    /// another guest page (`--shared-offset-index`): what each block
+    /// table insert and link of an alias PC does under the board's lock.
+    pub offset_index: bool,
 }
 
 /// The alias hits a PE reports with [`SharedLimits::log`].

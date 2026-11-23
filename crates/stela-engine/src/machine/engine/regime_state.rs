@@ -254,10 +254,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// fetch on. A boot's options; every PE of a board takes the same.
     pub fn set_shared_limits(&mut self, limits: SharedLimits) {
         self.shared_limits = limits;
-        self.code
-            .cache_at(board::LockSite::Other)
-            .index
-            .set_exact(limits.own_pc);
+        let mut cache = self.code.cache_at(board::LockSite::Other);
+        cache.index.set_exact(limits.own_pc);
+        cache.index.set_offsets(limits.offset_index);
     }
 
     /// Whether shared blocks run at pages other than their own: shared

@@ -2310,7 +2310,9 @@ impl Heartbeat {
 /// how many); the block table entries jump cache hits would add (taken,
 /// refused under the lock, refused without it, put off); and the code
 /// lock's acquisitions, those that found it held, the microseconds
-/// they waited and the longest wait.
+/// they waited and the longest wait; then the shared block lookups under
+/// the lock that searched a page and the frame-list runs they visited
+/// (one each with `--shared-offset-index`).
 fn board_code(
     now: &stela_engine::machine::engine::CodeReport,
     was: &stela_engine::machine::engine::CodeReport,
@@ -2391,7 +2393,7 @@ fn board_code(
          retire_longest=us/steps:{}/{}{targets} \
          lock=acquired/contended/waited_us/longest_us:{}/{}/{}/{}{sites} \
          walks=cut/relevant:{}/{} detach/relevant:{}/{} unindex/listed:{}/{} \
-         sampled/listed/pages:{}/{}/{}",
+         sampled/listed/pages:{}/{}/{} shared_lookups=lookups/runs:{}/{}",
         now.window >> 20,
         now.parts,
         now.generation,
@@ -2417,6 +2419,8 @@ fn board_code(
         now.walks[8],
         now.walks[6],
         now.walks[7],
+        now.shared_lookups[0].saturating_sub(was.shared_lookups[0]),
+        now.shared_lookups[1].saturating_sub(was.shared_lookups[1]),
     )
 }
 
