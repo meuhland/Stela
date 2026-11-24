@@ -4,9 +4,9 @@
 //! The runtime derives both keep masks through its authoritative PAC layout
 //! and closes this cell whenever derived state changes. A closed cell takes
 //! the original instruction exit, without changing architectural state.
-use super::Thunk;
+use super::{Thunk, ThunkPc};
 use crate::x86_64::asm::{Alu, Asm, BitTest, Code, Cond, Gpr, Mem, Patch, Size};
-use crate::{GuestAddress, Place, aarch64::Register, block::ExitKind};
+use crate::{Place, aarch64::Register, block::ExitKind};
 
 /// Fixed-address state read by a strip thunk. Each keep mask excludes the
 /// extension field that is restored from bit 55; tagged bytes remain set.
@@ -51,21 +51,22 @@ pub(super) fn strip(asm: &mut Asm, register: u8, cell: Place) -> Patch {
 /// Complete XPAC on `register`, with no key access, from `cell` while open.
 /// Only RAX, RCX, RDX, R8 and host flags are clobbered, as at a block exit;
 /// guest NZCV, SP and every other register remain in their canonical frame.
-pub fn thunk(pc: GuestAddress, register: u8, cell: Place) -> Option<Thunk> {
+pub fn thunk(pc: impl Into<ThunkPc>, register: u8, cell: Place) -> Option<Thunk> {
     if register > 31 {
         return None;
     }
+    let pc = pc.into();
     let mut code = Code::pinned();
     let mut asm = code.asm();
+    asm.set_thunk_page(pc.page());
     // XZR has no effect and depends on no regime state.
     let closed = (register != 31).then(|| strip(&mut asm, register, cell));
     let next = asm.len();
-    let fallthrough = GuestAddress(pc.0.wrapping_add(4));
-    super::super::block::direct_exit_with(&mut asm, fallthrough, ExitKind::Fallthrough);
+    super::super::block::direct_exit_with(&mut asm, pc.next(), ExitKind::Fallthrough);
     if let Some(closed) = closed {
         asm.bind(closed);
     }
-    super::super::block::direct_exit_with(&mut asm, pc, ExitKind::PointerAuthentication);
+    super::super::block::direct_exit_with(&mut asm, pc.pc, ExitKind::PointerAuthentication);
     Some(Thunk::new(code.into_bytes(), Some(next), None))
 }
 
@@ -73,6 +74,7 @@ pub fn thunk(pc: GuestAddress, register: u8, cell: Place) -> Option<Thunk> {
 mod tests {
     use super::*;
     use crate::Anchor;
+    use crate::GuestAddress;
 
     const CELL: Place = Place::new(Anchor::Pointer, 0);
 

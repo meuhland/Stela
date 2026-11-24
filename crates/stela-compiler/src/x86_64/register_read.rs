@@ -67,8 +67,8 @@
 //! An [`interrupt_status_thunk`] reads ISR_EL1 from the interrupts waiting
 //! at entry while no line changed since; it clobbers RCX and RDX.
 use super::asm::{Alu, Asm, Cond, Gpr, Mem, Patch, Rm, ShiftOp, Size, Unary};
-use super::pointer::Thunk;
-use crate::{GuestAddress, GuestState, Place, aarch64::Register, block::ExitKind};
+use super::pointer::{Thunk, ThunkPc};
+use crate::{GuestState, Place, aarch64::Register, block::ExitKind};
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 
@@ -136,7 +136,7 @@ fn register(rt: u8) -> Rm {
 
 /// The thunk completing `MRS Xt, <register>` at `pc` from the cell at
 /// `cell`, else exiting at `pc` for the engine.
-pub fn thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
+pub fn thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     if rt != 31 {
         let mut asm = Asm::new(&mut code);
@@ -148,7 +148,7 @@ pub fn thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
 
 /// The thunk completing `MRS Xt, <register>` at `pc` from the storage the
 /// `value` of the cell at `cell` points at, else exiting at `pc`.
-pub fn stored_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
+pub fn stored_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rax, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -159,7 +159,7 @@ pub fn stored_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
 
 /// [`stored_thunk`] of a read that is plain only while the word at `select`
 /// is nonzero.
-pub fn selected_stored_thunk(pc: GuestAddress, rt: u8, cell: Place, select: Place) -> Thunk {
+pub fn selected_stored_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place, select: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     let unselected = selected(&mut code, select);
     let mut asm = Asm::new(&mut code);
@@ -179,7 +179,7 @@ fn selected(code: &mut Vec<u8>, select: Place) -> Patch {
 
 /// The thunk completing `MRS Xt, <register>` at `pc` from the 32-bit frame
 /// field at `offset` while the cell at `cell` is open, else exiting at `pc`.
-pub fn frame_thunk(pc: GuestAddress, rt: u8, cell: Place, offset: usize) -> Thunk {
+pub fn frame_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place, offset: usize) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     let field = Mem::base_disp32(Gpr::Rdi, offset as i32);
@@ -190,7 +190,7 @@ pub fn frame_thunk(pc: GuestAddress, rt: u8, cell: Place, offset: usize) -> Thun
 
 /// The thunk completing `MRS Xt, PAN` at `pc` while the cell at `cell` is
 /// open, else exiting at `pc`.
-pub fn pan_read_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
+pub fn pan_read_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place) -> Thunk {
     /// PAN's bit of the register.
     const PAN_SHIFT: u8 = 22;
     let (mut code, miss) = open(cell);
@@ -231,7 +231,7 @@ impl Written {
 
 /// The thunk completing `MSR <register>, Xt` at `pc` through the storage the
 /// `value` of the cell at `cell` points at, else exiting at `pc`.
-pub fn stored_write_thunk(pc: GuestAddress, rt: u8, cell: Place, written: Written) -> Thunk {
+pub fn stored_write_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place, written: Written) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -244,7 +244,12 @@ pub fn stored_write_thunk(pc: GuestAddress, rt: u8, cell: Place, written: Writte
 /// register takes it, equals what the storage the `value` of the cell at
 /// `cell` points at holds already: such a write changes nothing. Any other
 /// value, or a closed cell, exits at `pc`.
-pub fn unchanged_write_thunk(pc: GuestAddress, rt: u8, cell: Place, written: Written) -> Thunk {
+pub fn unchanged_write_thunk(
+    pc: impl Into<ThunkPc>,
+    rt: u8,
+    cell: Place,
+    written: Written,
+) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -256,7 +261,7 @@ pub fn unchanged_write_thunk(pc: GuestAddress, rt: u8, cell: Place, written: Wri
 
 /// [`stored_write_thunk`] of a register that keeps what it is written, unless
 /// the value has one of the bits `refused`.
-pub fn checked_write_thunk(pc: GuestAddress, rt: u8, cell: Place, refused: u64) -> Thunk {
+pub fn checked_write_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place, refused: u64) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -329,9 +334,15 @@ fn load_x(asm: &mut Asm<'_>, rt: u8) {
 /// [`SwitchLog`] for the engine's diagnostics, which see the switch as an
 /// engine-path write would show it; with the log full, or the cell closed,
 /// it exits at `pc`. It also clobbers RCX and RDX.
-pub fn thread_switch_thunk(pc: GuestAddress, rt: u8, cell: Place, places: &ThreadSwitch) -> Thunk {
+pub fn thread_switch_thunk(
+    pc: impl Into<ThunkPc>,
+    rt: u8,
+    cell: Place,
+    places: &ThreadSwitch,
+) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
+    let pc = pc.into();
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Qword, Rcx, Mem::base_disp8(Rax, VALUE));
@@ -359,7 +370,8 @@ pub fn thread_switch_thunk(pc: GuestAddress, rt: u8, cell: Place, places: &Threa
     asm.mov_store(Qword, entry(core::mem::offset_of!(Switch, frame)), Rax);
     load_x(&mut asm, 30);
     asm.mov_store(Qword, entry(core::mem::offset_of!(Switch, link)), Rax);
-    asm.guest_imm64(Rax, pc);
+    asm.set_thunk_page(pc.page());
+    asm.guest_imm64(Rax, pc.pc);
     asm.mov_store(Qword, entry(core::mem::offset_of!(Switch, pc)), Rax);
     load_x(&mut asm, rt);
     asm.mov_store(Qword, entry(core::mem::offset_of!(Switch, next)), Rax);
@@ -379,7 +391,7 @@ pub fn thread_switch_thunk(pc: GuestAddress, rt: u8, cell: Place, places: &Threa
 
 /// The thunk completing `IC IVAU, Xt` at `pc` of an address in the page the
 /// `value` of the cell at `cell` names, else exiting at `pc`.
-pub fn code_page_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
+pub fn code_page_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -392,7 +404,7 @@ pub fn code_page_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
 /// [`stored_write_thunk`] of a write that is plain only while the word at
 /// `select` is nonzero.
 pub fn selected_write_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     rt: u8,
     cell: Place,
     select: Place,
@@ -411,7 +423,7 @@ pub fn selected_write_thunk(
 /// `cell` is open, its `value` the address of the level's SP_ELx. The word
 /// at `current` holds the selection and `sp0` is the address of SP_EL0.
 pub fn stack_select_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     select: bool,
     cell: Place,
     current: Place,
@@ -440,7 +452,13 @@ pub fn stack_select_thunk(
 /// the `words` tag words at `tags`, as a thread switch writes several halves
 /// and only the last leaves a key worth opening: the next PAC instruction
 /// exits and the engine reopens them under the whole keys.
-pub fn key_write_thunk(pc: GuestAddress, rt: u8, cell: Place, tags: Place, words: usize) -> Thunk {
+pub fn key_write_thunk(
+    pc: impl Into<ThunkPc>,
+    rt: u8,
+    cell: Place,
+    tags: Place,
+    words: usize,
+) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -465,7 +483,7 @@ pub fn key_write_thunk(pc: GuestAddress, rt: u8, cell: Place, tags: Place, words
 /// The thunk completing `MSR <register>, Xt` at `pc` in the 32-bit frame
 /// field at `offset` while the cell at `cell` is open, else exiting at `pc`.
 pub fn frame_write_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     rt: u8,
     cell: Place,
     offset: usize,
@@ -513,7 +531,7 @@ fn frame_field(offset: usize) -> Mem {
 
 /// The thunk completing `MSR PAN, #pan` at `pc` while the cell at `cell` is
 /// open, on a host that keeps PSTATE.PAN in RFLAGS.AC, else exiting at `pc`.
-pub fn pan_thunk(pc: GuestAddress, pan: bool, cell: Place) -> Thunk {
+pub fn pan_thunk(pc: impl Into<ThunkPc>, pan: bool, cell: Place) -> Thunk {
     const CLAC: [u8; 3] = [0x0f, 0x01, 0xca];
     const STAC: [u8; 3] = [0x0f, 0x01, 0xcb];
     let (mut code, miss) = open(cell);
@@ -528,7 +546,7 @@ pub fn pan_thunk(pc: GuestAddress, pan: bool, cell: Place) -> Thunk {
 /// The thunk completing a DSB at `pc` while the cell at `cell` is open, that
 /// is while the engine has no maintenance for it to complete, else exiting
 /// at `pc`.
-pub fn barrier_thunk(pc: GuestAddress, cell: Place) -> Thunk {
+pub fn barrier_thunk(pc: impl Into<ThunkPc>, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     Asm::new(&mut code).mfence();
     finish(code, miss, pc)
@@ -538,7 +556,7 @@ pub fn barrier_thunk(pc: GuestAddress, cell: Place) -> Thunk {
 /// the word its `value` points at is zero, that is while the PE's local
 /// monitor lives in the frame alone: it clears the frame's monitor; else it
 /// exits at `pc` for the engine to clear the rest. It also clobbers RCX.
-pub fn clear_exclusive_thunk(pc: GuestAddress, cell: Place) -> Thunk {
+pub fn clear_exclusive_thunk(pc: impl Into<ThunkPc>, cell: Place) -> Thunk {
     let (mut code, closed) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -552,7 +570,7 @@ pub fn clear_exclusive_thunk(pc: GuestAddress, cell: Place) -> Thunk {
 /// The thunk completing SEVL at `pc` while the cell at `cell` is open: it
 /// sets the event register, the byte the cell's `value` points at, else
 /// exits at `pc`. It also clobbers RCX and RDX.
-pub fn send_event_thunk(pc: GuestAddress, cell: Place) -> Thunk {
+pub fn send_event_thunk(pc: impl Into<ThunkPc>, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
@@ -638,7 +656,7 @@ pub struct EventWaitPlaces {
 /// ends without the register, it exits at `pc` for the engine to wait. An
 /// event stream edge within a spin is the engine's to see as it waits: the
 /// spin delays it no more than a host would. It also clobbers RCX and RDX.
-pub fn event_wait_thunk(pc: GuestAddress, places: EventWaitPlaces) -> Thunk {
+pub fn event_wait_thunk(pc: impl Into<ThunkPc>, places: EventWaitPlaces) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::{Byte, Dword, Qword};
     let spin = |offset| Mem::base_disp8(Rcx, offset);
@@ -826,7 +844,7 @@ fn bump_epoch(asm: &mut Asm<'_>, offset: i8) {
 /// wake_signalled`) without running the MSR again. It clobbers RAX, RCX
 /// and RDX.
 pub fn fast_ipi_request_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     rt: u8,
     global: bool,
     places: FastIpiPlaces,
@@ -923,7 +941,7 @@ pub fn fast_ipi_request_thunk(
 /// it, and closes the native ISR_EL1 read, whose waiting FIQ was taken at
 /// entry; 0 changes nothing; any other value, or a PE whose word the
 /// engine has not named, exits. It clobbers RAX, RCX and RDX.
-pub fn fast_ipi_status_thunk(pc: GuestAddress, rt: u8, places: FastIpiPlaces) -> Thunk {
+pub fn fast_ipi_status_thunk(pc: impl Into<ThunkPc>, rt: u8, places: FastIpiPlaces) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
     let (mut code, closed) = open(places.cell);
@@ -950,7 +968,7 @@ pub fn fast_ipi_status_thunk(pc: GuestAddress, rt: u8, places: FastIpiPlaces) ->
 
 /// The thunk completing `write` at `pc` in the frame while the cell at
 /// `cell` is open, else exiting at `pc`.
-pub fn mask_thunk(write: MaskWrite, pc: GuestAddress, cell: Place) -> Thunk {
+pub fn mask_thunk(write: MaskWrite, pc: impl Into<ThunkPc>, cell: Place) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
     let (mut code, closed) = open(cell);
@@ -988,7 +1006,7 @@ pub fn mask_thunk(write: MaskWrite, pc: GuestAddress, cell: Place) -> Thunk {
 
 /// The thunk completing `MRS Xt, DAIF` at `pc` from the frame while the cell
 /// at `cell` is open, else exiting at `pc`.
-pub fn mask_read_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
+pub fn mask_read_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place) -> Thunk {
     let (mut code, miss) = open(cell);
     let mut asm = Asm::new(&mut code);
     let masks = frame_field(core::mem::offset_of!(GuestState, daif));
@@ -1002,7 +1020,7 @@ pub fn mask_read_thunk(pc: GuestAddress, rt: u8, cell: Place) -> Thunk {
 /// reader at `count` less the `value` of the cell at `cell`, else exiting
 /// at `pc`. It spins while a writer publishes; `lfence` keeps the TSC
 /// sample between the two sequence reads (Intel SDM Vol. 2B, RDTSC).
-pub fn count_thunk(pc: GuestAddress, rt: u8, cell: Place, count: Place) -> Thunk {
+pub fn count_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place, count: Place) -> Thunk {
     use Gpr::{Rax, Rdx};
     use Size::Qword;
     let (mut code, miss) = open(cell);
@@ -1031,7 +1049,7 @@ pub struct Energy {
 /// of the reader at `count`, else exiting at `pc`: as the cell's register's
 /// model computes it, so a reading never goes back. A quotient that would
 /// not fit in 64 bits exits too. It also clobbers RCX and RDX.
-pub fn energy_thunk(pc: GuestAddress, rt: u8, cell: Place, count: Place) -> Thunk {
+pub fn energy_thunk(pc: impl Into<ThunkPc>, rt: u8, cell: Place, count: Place) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
     let (mut code, miss) = open(cell);
@@ -1115,7 +1133,7 @@ impl CycleCounter {
 /// opens `cell` on it, as an engine read does, and completes with it. Else
 /// it exits at `pc`. It also clobbers RCX and RDX.
 pub fn cycle_counter_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     rt: u8,
     cell: Place,
     plain: Place,
@@ -1244,7 +1262,7 @@ impl InstructionCounter {
 /// engine read does, and completes with it. Else it exits at `pc`. It also
 /// clobbers RCX and RDX.
 pub fn instruction_counter_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     rt: u8,
     cell: Place,
     plain: Place,
@@ -1324,7 +1342,7 @@ pub fn instruction_counter_thunk(
 /// deadline passed; `u64::MAX` names none and reads no count). Else it exits
 /// at `pc`. It also clobbers RCX and RDX.
 pub fn interrupt_status_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     rt: u8,
     cell: Place,
     epoch: Place,
@@ -1408,7 +1426,12 @@ const TIMER_STATUS_SHIFT: u8 = 2;
 /// storage. Anything else, which could raise or lower the line now, exits.
 /// A count that passes the new compare after the thunk read it is at or
 /// past those deadlines too. It clobbers RAX, RCX and RDX.
-pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerPlaces) -> Thunk {
+pub fn timer_thunk(
+    pc: impl Into<ThunkPc>,
+    rt: u8,
+    access: TimerAccess,
+    places: TimerPlaces,
+) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
     let (mut code, closed) = open(places.compare);
@@ -1622,7 +1645,7 @@ pub struct DeviceReadPlaces {
 /// a direct exit to the next instruction. Else it exits at `pc`. It also
 /// clobbers RCX and RDX.
 pub fn device_read_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     site: u64,
     load: DeviceLoad,
     places: DeviceReadPlaces,
@@ -1731,23 +1754,25 @@ fn open(cell: Place) -> (Vec<u8>, Patch) {
 
 /// The direct exit to the next instruction, then the `miss` branch's
 /// target: the original exit at `pc`.
-fn finish(code: Vec<u8>, miss: Patch, pc: GuestAddress) -> Thunk {
+fn finish(code: Vec<u8>, miss: Patch, pc: impl Into<ThunkPc>) -> Thunk {
     finish_unless(code, [miss], pc)
 }
 
 /// [`finish`] with several branches to the original exit.
-fn finish_unless<const N: usize>(mut code: Vec<u8>, misses: [Patch; N], pc: GuestAddress) -> Thunk {
+fn finish_unless<const N: usize>(
+    mut code: Vec<u8>,
+    misses: [Patch; N],
+    pc: impl Into<ThunkPc>,
+) -> Thunk {
+    let pc = pc.into();
     let next = code.len();
     let mut asm = Asm::new(&mut code);
-    super::block::direct_exit_with(
-        &mut asm,
-        GuestAddress(pc.0.wrapping_add(4)),
-        ExitKind::Fallthrough,
-    );
+    asm.set_thunk_page(pc.page());
+    super::block::direct_exit_with(&mut asm, pc.next(), ExitKind::Fallthrough);
     for miss in misses {
         asm.bind(miss);
     }
-    super::block::direct_exit_with(&mut asm, pc, ExitKind::System);
+    super::block::direct_exit_with(&mut asm, pc.pc, ExitKind::System);
     Thunk::new(code, Some(next), None)
 }
 
@@ -1755,6 +1780,7 @@ fn finish_unless<const N: usize>(mut code: Vec<u8>, misses: [Patch; N], pc: Gues
 mod tests {
     use super::*;
     use crate::Anchor;
+    use crate::GuestAddress;
     use crate::x86_64::chain::{DIRECT_EXIT_BYTES, direct_exit};
 
     /// The anchors of these tests, each at the data itself.
@@ -2032,6 +2058,105 @@ mod tests {
             assert_eq!(d.storage, 7);
             assert_eq!(d.reads[0].value, 7);
         });
+    }
+
+    /// Page-relative thunks (`ThunkPc::page_relative`) hold their guest
+    /// addresses as offsets from their PC's page, with the page base added:
+    /// built for one offset of two pages they are the same code, and run at
+    /// either page base an MRS completes to that page's next instruction
+    /// (the next page's first for a page's last instruction) or takes its
+    /// original exit there, and a thread switch logs that page's PC.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn page_relative_thunks_exit_at_the_page_they_run_at() {
+        use crate::{GuestState, PageBase};
+        use core::mem::offset_of;
+        #[repr(C)]
+        #[derive(Default)]
+        struct Data {
+            read: Cell,
+            write: Cell,
+            storage: u64,
+            reads: [Cell; 1],
+            log: SwitchLog,
+        }
+        const PAGES: [u64; 2] = [0x4000, 0xffff_fe00_1234_5000];
+        let mut data = alloc::boxed::Box::new(Data::default());
+        let base = &mut *data as *mut Data;
+        let place = |offset: usize| Place::new(Anchor::Mirrors, offset);
+        let (read, write) = (
+            place(offset_of!(Data, read)),
+            place(offset_of!(Data, write)),
+        );
+        let places = ThreadSwitch {
+            reads: place(offset_of!(Data, reads)),
+            stride: size_of::<Cell>(),
+            banks: 1,
+            log: place(offset_of!(Data, log)),
+        };
+        let written = Written {
+            keep: u64::MAX,
+            set: 0,
+        };
+        let mut state = GuestState::default();
+        state.anchors[Anchor::Mirrors] = base as u64;
+        // SAFETY: `base` points into the live box; reads and writes happen
+        // between thunk calls.
+        let data = |f: &mut dyn FnMut(&mut Data)| unsafe { f(&mut *base) };
+        let storage = base as u64 + offset_of!(Data, storage) as u64;
+        for offset in [0x8, 0xffc] {
+            let at = |page: u64| ThunkPc::page_relative(GuestAddress(page + offset));
+            let thunks = |page: u64| {
+                [
+                    thunk(at(page), 19, read),
+                    stored_write_thunk(at(page), 3, write, written),
+                    barrier_thunk(at(page), read),
+                    thread_switch_thunk(at(page), 5, write, &places),
+                ]
+            };
+            let built = thunks(PAGES[0]);
+            assert_eq!(built, thunks(PAGES[1]), "no address of its own");
+            let whole = thunk(GuestAddress(PAGES[0] + offset), 19, read);
+            assert_ne!(built[0].code, whole.code);
+            for page in PAGES {
+                let (pc, next) = (page + offset, page + offset + 4);
+                let (miss, next) = (
+                    Exit {
+                        pc,
+                        kind: ExitKind::System as u64,
+                    },
+                    Exit {
+                        pc: next,
+                        kind: ExitKind::Fallthrough as u64,
+                    },
+                );
+                state.page_base = PageBase(page);
+                data(&mut |d| *d = Data::default());
+                for thunk in &built {
+                    assert_eq!(run(&thunk.code, &mut state), miss);
+                }
+                data(&mut |d| {
+                    d.read = Cell {
+                        readable: 1,
+                        value: 0xffff_fe00_1234_5000,
+                    };
+                    d.write = Cell {
+                        readable: 1,
+                        value: storage,
+                    };
+                    d.storage = 0x1000;
+                });
+                assert_eq!(run(&built[0].code, &mut state), next);
+                assert_eq!(state.x[19], 0xffff_fe00_1234_5000);
+                state.x[3] = 0x3000;
+                assert_eq!(run(&built[1].code, &mut state), next);
+                data(&mut |d| assert_eq!(d.storage, 0x3000));
+                assert_eq!(run(&built[2].code, &mut state), next);
+                state.x[5] = 0x5000;
+                assert_eq!(run(&built[3].code, &mut state), next);
+                data(&mut |d| assert_eq!((d.log.len, d.log.entries[0].pc), (1, pc)));
+            }
+        }
     }
 
     /// Thunks run on the host: a readable cell completes the read into Xt,

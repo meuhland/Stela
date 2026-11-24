@@ -37,6 +37,8 @@ pub(crate) struct Asm<'a> {
     relocations: Option<&'a mut Vec<u32>>,
     /// The [`Code`]'s page-relative mode (`Code::set_page_relative`).
     page_relative: bool,
+    /// A page-relative thunk's page ([`Self::set_thunk_page`]).
+    thunk_page: Option<u64>,
     pinned: bool,
     locals: Option<super::pinned::LocalRegisters>,
     /// The locals a fault recovers from their hosts ([`super::pinned::Span`]).
@@ -75,6 +77,7 @@ impl<'a> Asm<'a> {
             sites: None,
             relocations: None,
             page_relative: false,
+            thunk_page: None,
             pinned: false,
             locals: None,
             dirty: Default::default(),
@@ -384,7 +387,7 @@ impl<'a> Asm<'a> {
     /// (`x86_64::block::branch_condition_with`).
     pub(crate) fn guest_imm64(&mut self, destination: Gpr, address: crate::GuestAddress) {
         self.guest_field(destination, address);
-        if self.page_relative && self.relocations.is_some() {
+        if self.adds_page_base() {
             const PAGE_BASE: u32 = core::mem::offset_of!(crate::GuestState, page_base) as u32;
             self.alu_load(Alu::Add, Size::Qword, destination, super::frame(PAGE_BASE));
         }
@@ -396,8 +399,7 @@ impl<'a> Asm<'a> {
     pub(crate) fn guest_exit_imm64(&mut self, destination: Gpr, address: crate::GuestAddress) {
         debug_assert_eq!(destination, Gpr::Rax, "a direct exit's target is in RAX");
         self.guest_field(destination, address);
-        let relative = self.page_relative && self.relocations.is_some();
-        self.data(if relative {
+        self.data(if self.adds_page_base() {
             &super::chain::BASE_ADD
         } else {
             &super::chain::BASE_NOP
@@ -406,10 +408,28 @@ impl<'a> Asm<'a> {
     fn guest_field(&mut self, destination: Gpr, address: crate::GuestAddress) {
         self.opcode_reg(Size::Qword, 0xb8, destination);
         let at = self.code.len();
+        // A page-relative thunk's field is already its offset: nothing
+        // moves it.
+        if let Some(page) = self.thunk_page {
+            self.data(&address.0.wrapping_sub(page).to_le_bytes());
+            return;
+        }
         self.data(&address.0.to_le_bytes());
         if let Some(relocations) = self.relocations.as_deref_mut() {
             relocations.push(u32::try_from(at).expect("code under 4 GiB"));
         }
+    }
+    /// Whether a guest address adds [`crate::GuestState::page_base`]: in
+    /// page-relative block code, or a page-relative thunk's.
+    fn adds_page_base(&self) -> bool {
+        self.thunk_page.is_some() || (self.page_relative && self.relocations.is_some())
+    }
+    /// Emit the guest addresses of thunk code from here on as offsets from
+    /// `page` that add [`crate::GuestState::page_base`], or with `None`
+    /// whole (`x86_64::pointer::ThunkPc`): a thunk the engine installs
+    /// records no relocations, so its fields hold their final values.
+    pub(crate) fn set_thunk_page(&mut self, page: Option<u64>) {
+        self.thunk_page = page;
     }
     /// `mov rm, imm32` (C7 /0), sign-extended for a quadword.
     pub(crate) fn mov_rm_imm32(&mut self, size: Size, rm: impl Into<Rm>, value: i32) {

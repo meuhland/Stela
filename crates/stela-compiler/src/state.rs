@@ -117,7 +117,9 @@ pub struct GuestState {
     /// The guest page a page-relative block runs at
     /// ([`crate::x86_64::NativeSystem::page_relative`]): its guest addresses
     /// are this plus their offset from the page it was compiled at. Set by
-    /// whatever enters such a block; other code never reads it.
+    /// whatever enters such a block; other code never reads it but the
+    /// block's page-relative thunks (`x86_64::pointer::ThunkPc`), which only
+    /// its exit enters.
     pub page_base: PageBase,
 }
 

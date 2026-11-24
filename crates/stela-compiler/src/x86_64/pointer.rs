@@ -260,6 +260,53 @@ pub struct Thunk {
     pub dynamic: Option<usize>,
 }
 
+/// The PC of the instruction a [`Thunk`] completes, and how the thunk's
+/// code holds the guest addresses it names (the next instruction's, a link
+/// or ELR value, its original exit's back to the engine): whole, for the
+/// block installed at `pc` alone, or page-relative, each its offset from
+/// `pc`'s page ([`super::RELATIVE_PAGE`]) with
+/// [`crate::GuestState::page_base`] added, as a page-relative block's are
+/// (`NativeSystem::page_relative`). The engine enters a thunk only from its
+/// block's own exit, with the page base the block runs at, so one
+/// page-relative thunk serves the block at every guest page that maps its
+/// frame. A guest address converts to the whole form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThunkPc {
+    pub pc: GuestAddress,
+    pub page_relative: bool,
+}
+
+impl ThunkPc {
+    /// The page-relative form of `pc`.
+    pub const fn page_relative(pc: GuestAddress) -> Self {
+        Self {
+            pc,
+            page_relative: true,
+        }
+    }
+    /// The page its guest addresses are offsets from, if page-relative
+    /// (`Asm::set_thunk_page`).
+    pub(crate) const fn page(self) -> Option<u64> {
+        match self.page_relative {
+            true => Some(self.pc.0 & !(super::RELATIVE_PAGE - 1)),
+            false => None,
+        }
+    }
+    /// The next instruction's PC.
+    pub(crate) const fn next(self) -> GuestAddress {
+        GuestAddress(self.pc.0.wrapping_add(4))
+    }
+}
+
+impl From<GuestAddress> for ThunkPc {
+    fn from(pc: GuestAddress) -> Self {
+        Self {
+            pc,
+            page_relative: false,
+        }
+    }
+}
+
 impl Thunk {
     /// The thunk of `code`, its exits at `next` and `dynamic` padded for
     /// their patch points (`chain::direct_patch`, `chain::dynamic_patch`):
@@ -395,14 +442,16 @@ fn call_service(asm: &mut Asm, form: Form, routine: Routine, modifier: Gpr) -> P
 /// The thunk completing the PAC instruction of `form` at `pc` from the memo
 /// ([`Anchor::Memo`]) under the tag words at `tags`, or through `service`, a
 /// [`ServiceRoutine`], else exiting at `pc` for the engine.
-pub fn thunk(form: Form, pc: GuestAddress, tags: Place, service: u64) -> Thunk {
+pub fn thunk(form: Form, pc: impl Into<ThunkPc>, tags: Place, service: u64) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::Qword;
+    let pc = pc.into();
     let mut code = Code::pinned();
     let mut asm = code.asm();
+    asm.set_thunk_page(pc.page());
     let Lookup { misses, modifier } = lookup(&mut asm, form, tags);
     let complete = asm.len();
-    let next_pc = GuestAddress(pc.0.wrapping_add(4));
+    let next_pc = pc.next();
     let mut next = None;
     let mut dynamic = None;
     match form.completion {
@@ -437,7 +486,7 @@ pub fn thunk(form: Form, pc: GuestAddress, tags: Place, service: u64) -> Thunk {
     let failed = call_service(&mut asm, form, Routine::Address(service), modifier);
     let back = asm.jmp();
     asm.bind(failed);
-    super::block::direct_exit_with(&mut asm, pc, ExitKind::PointerAuthentication);
+    super::block::direct_exit_with(&mut asm, pc.pc, ExitKind::PointerAuthentication);
     resolve(&mut code, back, complete);
     Thunk::new(code.into_bytes(), next, dynamic)
 }
