@@ -104,6 +104,11 @@ pub struct SharedLimits {
     /// another guest page (`--shared-offset-index`): what each block
     /// table insert and link of an alias PC does under the board's lock.
     pub offset_index: bool,
+    /// Share blocks whose exit an install-time thunk completes (PAC,
+    /// transition and mirrored-read thunks), the thunk built
+    /// page-relative as the block is, so it completes the instruction at
+    /// whichever page the block runs at (`--shared-thunks`).
+    pub thunks: bool,
 }
 
 /// The alias hits a PE reports with [`SharedLimits::log`].

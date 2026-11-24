@@ -430,7 +430,7 @@ fn shared_aliases_are_off_by_default_and_round_trip() {
         "--system --page-relative --shared-aliases {}",
         SHARED_LIMITS.join(" ")
     );
-    assert_eq!(round_trip(&all).shared_limits, 0x3ff);
+    assert_eq!(round_trip(&all).shared_limits, 0x7ff);
 }
 
 #[test]

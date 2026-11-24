@@ -260,6 +260,7 @@ impl Code {
             sites: Some(&mut self.sites),
             relocations: Some(&mut self.relocations),
             page_relative: self.page_relative,
+            thunk_page: None,
             pinned: self.pinned,
             locals: self.locals,
             dirty: self.dirty,

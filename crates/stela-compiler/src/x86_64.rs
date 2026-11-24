@@ -233,6 +233,11 @@ impl NativeSystem {
     };
 }
 
+/// The page a page-relative block's guest addresses are offsets from
+/// ([`NativeSystem::page_relative`]), and a page-relative thunk's
+/// (`pointer::ThunkPc`): [`crate::GuestState::page_base`] holds one.
+pub const RELATIVE_PAGE: u64 = 4096;
+
 fn offset(register: Register) -> Option<u32> {
     match register {
         Register::X(index) => Some(u32::from(index) * 8),

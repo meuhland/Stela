@@ -448,3 +448,228 @@ fn a_shared_exit_into_a_block_of_one_pc_goes_through_a_cell_once() {
         );
     }
 }
+
+const RETAA: u32 = 0xd65f_0bff;
+const SVC: u32 = 0xd400_0001; // svc #0
+const ERET: u32 = 0xd69f_03e0;
+const MRS_GXF_STATUS: u32 = 0xd53e_f808; // mrs x8, gxf_status_el1
+const BLRAA_X8_X16: u32 = 0xd73f_0910;
+
+/// Blocks a thunk completes (`--shared-thunks`), one instruction each, by
+/// their offset in the frames: RETAA, SVC, ERET and MRS of a mirrored
+/// register, then MRS as the last instruction of the first page, whose
+/// next instruction is the next page's first, and BLRAA as the second
+/// page's last, whose link is the third page's first.
+const THUNKED: [(u64, u32); 6] = [
+    (0x0, RETAA),
+    (0x4, SVC),
+    (0x8, ERET),
+    (0xc, MRS_GXF_STATUS),
+    (0xffc, MRS_GXF_STATUS),
+    (0x1ffc, BLRAA_X8_X16),
+];
+
+/// [`aliased`] with the [`THUNKED`] blocks, sharing them with
+/// `shared_thunks` (`--shared-thunks`), on a host whose counter native
+/// code reads, as ERET's thunk needs.
+fn thunked(shared_thunks: bool) -> (Machine<FakeHost, NoDevices>, u64) {
+    let mut words = vec![RET; (2 * PAGE / 4) as usize];
+    for (offset, word) in THUNKED {
+        words[(offset / 4) as usize] = word;
+    }
+    let limits = SharedLimits {
+        thunks: shared_thunks,
+        ..SharedLimits::default()
+    };
+    let (mut machine, moved) = limited(&words, limits);
+    machine.host.tsc_counter = Some((5, 7));
+    (machine, moved)
+}
+
+/// The code of the thunk the terminal exit of block `index` jumps to.
+fn thunk_of(machine: &Machine<FakeHost, NoDevices>, index: usize) -> Vec<u8> {
+    let code = machine.code.blocks[index].code.0;
+    let (at, jump) = machine
+        .host
+        .patches
+        .iter()
+        .find(|(at, bytes)| (code..code + NATIVE_CODE_STRIDE).contains(at) && bytes[0] == 0xe9)
+        .expect("a jump to a thunk");
+    let relative = i32::from_le_bytes(jump[1..5].try_into().unwrap());
+    let thunk = (*at as i64 + 5 + i64::from(relative)) as usize;
+    assert_eq!(thunk % NATIVE_CODE_STRIDE, 0, "a thunk's install");
+    machine.host.installed[thunk / NATIVE_CODE_STRIDE - 1].clone()
+}
+
+/// A block whose exit a thunk completes (PAC, transition and mirrored-read
+/// thunks) stays one PC's without `--shared-thunks`; with it, the second
+/// page that maps the frame runs the block and thunk the first installed,
+/// compiling and installing nothing.
+#[test]
+fn thunk_exits_share_only_with_shared_thunks() {
+    let (mut machine, moved) = thunked(false);
+    for (offset, _) in THUNKED {
+        let first = fetched(&mut machine, BASE + offset);
+        let second = fetched(&mut machine, moved + offset);
+        assert_ne!(first, second, "{offset:#x}");
+        assert!(!machine.code.blocks[first].shared && !machine.code.blocks[second].shared);
+        thunk_of(&machine, first);
+    }
+    assert_eq!(machine.statistics.aliases[Alias::Installs as usize], 0);
+
+    let (mut machine, moved) = thunked(true);
+    for (offset, word) in THUNKED {
+        let first = fetched(&mut machine, BASE + offset);
+        assert!(machine.code.blocks[first].shared, "{offset:#x}");
+        assert_eq!(machine.code.blocks[first].terminal, word);
+        thunk_of(&machine, first);
+        let (installed, compiled_so_far) = (machine.host.installed.len(), compiled(&machine));
+        assert_eq!(fetched(&mut machine, moved + offset), first, "{offset:#x}");
+        assert_eq!(machine.host.installed.len(), installed, "no install");
+        assert_eq!(compiled(&machine), compiled_so_far);
+    }
+    let count = THUNKED.len() as u64;
+    assert_eq!(machine.statistics.aliases[Alias::Installs as usize], count);
+    assert_eq!(machine.statistics.aliases[Alias::Hits as usize], count);
+}
+
+/// A shared block's thunk, installed for the first page, completes at the
+/// second page as the second page's own block and thunk do without
+/// `--shared-thunks`: RETAA's and BLRAA's targets and link, MRS's next PC
+/// (the next page's first for a page's last instruction) and register, and
+/// SVC's and ERET's exits to the engine, after which ELR_EL1, SPSR_EL1 and
+/// the PC are the same. A refused RETAA exits at the second page's PC.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn shared_thunks_complete_at_the_page_they_run_at() {
+    use super::super::transitions::tests::run_native;
+    use stela_compiler::PageBase;
+    let status = MIRRORED
+        .iter()
+        .position(|&encoding| encoding == registers::encodings::GXF_STATUS_EL1)
+        .unwrap();
+    let ia = usize::from(x86_64_pointer::key_index(PointerAuthenticationKey::Ia));
+    let observed = |machine: &Machine<FakeHost, NoDevices>| {
+        let read = |register| machine.cpu.registers.get(register, 0);
+        alloc::format!(
+            "pc={:#x} x={:x?} sp={:#x} {:?} elr={:#x} spsr={:#x} esr={:#x}",
+            machine.cpu.pc,
+            machine.cpu.state.x,
+            machine.cpu.state.sp,
+            machine.cpu.pstate,
+            read(SystemRegister::ELR_EL1),
+            read(SystemRegister::SPSR_EL1),
+            read(SystemRegister::ESR_EL1),
+        )
+    };
+    for (offset, word) in THUNKED {
+        for refused in [false, true] {
+            let ((mut shared, moved), (mut own, _)) = (thunked(true), thunked(false));
+            let first = fetched(&mut shared, BASE + offset);
+            assert_eq!(fetched(&mut shared, moved + offset), first);
+            let installed = fetched(&mut own, moved + offset);
+            assert!(!own.code.blocks[installed].shared);
+            let (pc, page) = (moved + offset, (moved + offset) & !(PAGE - 1));
+            let mut exits = Vec::new();
+            for (machine, index) in [(&mut shared, first), (&mut own, installed)] {
+                let thunk = thunk_of(machine, index);
+                machine.cpu.pc = pc;
+                machine.cpu.state.x[8] = 0x0000_7000_0000_8000;
+                machine.cpu.state.x[16] = 0x10;
+                machine.cpu.state.x[30] = 0x0000_7000_0000_3000;
+                machine.cpu.state.page_base = PageBase(page);
+                machine.pointer.tags[ia] = if refused { 0 } else { x86_64_pointer::DISABLED };
+                machine.mirrors[status] = register_read::Cell {
+                    readable: 1,
+                    value: 0x5a5a,
+                };
+                let registers = &mut machine.cpu.registers;
+                registers.set(SystemRegister::SPSR_EL1, 0, 0);
+                registers.set(SystemRegister::ELR_EL1, 0, 0x0000_7000_0000_4000);
+                let (next, kind) = run_native(machine, &thunk);
+                machine.cpu.pc = next;
+                if kind == ExitKind::System as u64 {
+                    assert_eq!(next, pc, "the original exit at this page");
+                    machine.system_instruction(word).unwrap();
+                }
+                exits.push((next, kind));
+            }
+            assert_eq!(exits[0], exits[1], "{offset:#x}");
+            assert_eq!(observed(&shared), observed(&own), "{offset:#x}");
+            let (next, kind) = exits[0];
+            let elr = shared.cpu.registers.get(SystemRegister::ELR_EL1, 0);
+            match word {
+                RETAA if refused => {
+                    assert_eq!((next, kind), (pc, ExitKind::PointerAuthentication as u64))
+                }
+                RETAA => assert_eq!(
+                    (next, kind),
+                    (0x0000_7000_0000_3000, ExitKind::Return as u64)
+                ),
+                BLRAA_X8_X16 if !refused => {
+                    assert_eq!((next, kind), (0x0000_7000_0000_8000, ExitKind::Call as u64));
+                    assert_eq!(shared.cpu.state.x[30], pc + 4, "the third page's first PC");
+                }
+                SVC => assert_eq!(elr, pc + 4),
+                MRS_GXF_STATUS => {
+                    assert_eq!((next, kind), (pc + 4, ExitKind::Fallthrough as u64));
+                    assert_eq!(shared.cpu.state.x[8], 0x5a5a);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A shared thunk's direct exit links by the rules of every shared block's:
+/// in its page into the shared block of its target, and out of it (the
+/// next page, for a page's last instruction) through a cell, whose probe
+/// compares the target, never a stamped tail.
+#[test]
+fn shared_thunk_successors_link_as_shared_blocks_do() {
+    let (mut machine, moved) = thunked(true);
+    // In the page: MRS at 0xc, then the RET at 0x10, both shared.
+    machine.cpu.pc = moved + 0xc;
+    machine.host.exits = vec![
+        NativeExit::Exit {
+            next_pc: moved + 0x10,
+            kind: ExitKind::Fallthrough as u64,
+        },
+        NativeExit::Exit {
+            next_pc: moved + 0x14,
+            kind: ExitKind::Return as u64,
+        },
+    ];
+    machine.step().unwrap();
+    machine.step().unwrap();
+    let mrs = fetched(&mut machine, moved + 0xc);
+    let ret = fetched(&mut machine, moved + 0x10);
+    assert!(machine.code.blocks[mrs].shared && machine.code.blocks[ret].shared);
+    assert_eq!(machine.statistics.links, 1);
+    assert!(machine.code.blocks.record(mrs).chained(0));
+    assert_eq!(fetched(&mut machine, BASE + 0xc), mrs);
+    // Out of the page: the next page's first PC, through a cell.
+    let (links, stamped) = (machine.statistics.links, machine.statistics.stamped_tails);
+    machine.cpu.pc = moved + 0xffc;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: moved + PAGE,
+        kind: ExitKind::Fallthrough as u64,
+    }];
+    machine.step().unwrap();
+    assert_eq!(machine.cpu.pc, moved + PAGE);
+    let last = fetched(&mut machine, moved + 0xffc);
+    let block = &machine.code.blocks[last];
+    assert!(block.shared);
+    assert_eq!(block.successors[0].target, GuestAddress(block.pc + 4));
+    let point = chain::direct_patch(block.successors[0].site);
+    assert_eq!(machine.statistics.links, links + 1);
+    assert_eq!(machine.statistics.stamped_tails, stamped);
+    assert!(
+        machine
+            .code
+            .cache()
+            .targets
+            .site_cell_number(point)
+            .is_some()
+    );
+}

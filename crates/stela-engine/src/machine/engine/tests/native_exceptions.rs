@@ -886,3 +886,44 @@ fn native_counter_reads_in_each_logged_segment_equal_the_engine_path() {
         assert_ne!(expected.1, 2_000, "{filter:#x} PMC1 counted");
     }
 }
+
+/// Page-relative ERET and SVC thunks (`ThunkPc::page_relative`), those of
+/// blocks shared among the pages that map a frame (`--shared-thunks`),
+/// complete at whichever page base they run at as the engine does at that
+/// page's PC: SVC banks that page's next instruction in ELR.
+#[test]
+fn page_relative_svc_and_eret_complete_at_the_page_they_run_at() {
+    use stela_compiler::PageBase;
+    let syndrome =
+        crate::machine::exception::syndrome(crate::machine::exception::Class::SupervisorCall, 0x80)
+            as u32;
+    let relative = |pc| x86_64_pointer::ThunkPc::page_relative(GuestAddress(pc));
+    let eret = transition::exception_return_thunk(relative(ERET_PC), &TRANSITIONS, 0);
+    let svc = transition::supervisor_call_thunk(relative(USER), syndrome, &TRANSITIONS, 0);
+    const PAGE: u64 = 0x1000;
+    for page in [BASE, 0x0000_0001_2345_6000] {
+        let (mut engine, mut native) = (host(), host());
+        warm(&mut engine);
+        warm(&mut native);
+        for machine in [&mut engine, &mut native] {
+            prepare(machine);
+            machine.cpu.pc = page + (ERET_PC & (PAGE - 1));
+            machine.cpu.state.page_base = PageBase(page);
+        }
+        native.mirrors.lines_until = u64::MAX;
+        engine.system_instruction(ERET).unwrap();
+        let exit = run_native(&mut native, &eret.code);
+        assert_eq!(exit, (USER, ExitKind::Return as u64));
+        assert_eq!(observed(&engine), observed(&native));
+        let pc = page + (USER & (PAGE - 1));
+        for machine in [&mut engine, &mut native] {
+            machine.cpu.pc = pc;
+        }
+        engine.system_instruction(SVC_WORD).unwrap();
+        let exit = run_native(&mut native, &svc.code);
+        assert_eq!(exit, (SVC_VECTOR, ExitKind::Return as u64));
+        assert_eq!(observed(&engine), observed(&native));
+        let elr = native.cpu.registers.get(SystemRegister::ELR_EL2, 0);
+        assert_eq!(elr, pc + 4, "this page's next instruction");
+    }
+}

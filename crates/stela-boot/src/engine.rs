@@ -797,6 +797,7 @@ pub(crate) fn shared_limits(bits: u16) -> stela_engine::machine::SharedLimits {
         log: bit(7),
         fresh_only: bit(8),
         offset_index: bit(9),
+        thunks: bit(10),
     }
 }
 

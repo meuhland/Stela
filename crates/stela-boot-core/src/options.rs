@@ -38,9 +38,11 @@ pub const NATIVE_CORES: &str = "--native-cores";
 /// in a page from or into one, no cell link out of its page, no block
 /// table entry at an alias PC; serve the installed PC alone; check each
 /// alias PC first; report the first alias hits at EL0; share only blocks
-/// compiled in this boot; and, not a limit, look shared blocks up in each
-/// frame's list of them rather than by a walk of every copy of the frame.
-pub const SHARED_LIMITS: [&str; 10] = [
+/// compiled in this boot; and, not limits, look shared blocks up in each
+/// frame's list of them rather than by a walk of every copy of the frame,
+/// and share blocks whose exit an install-time thunk completes, the thunk
+/// page-relative too.
+pub const SHARED_LIMITS: [&str; 11] = [
     "--shared-el0",
     "--shared-el1",
     "--shared-no-links",
@@ -51,6 +53,7 @@ pub const SHARED_LIMITS: [&str; 10] = [
     "--shared-log",
     "--shared-fresh",
     "--shared-offset-index",
+    "--shared-thunks",
 ];
 pub const GUEST_PES: &str = "--guest-pes";
 pub const MAINTENANCE_WRITE: &str = "--maintenance-write";

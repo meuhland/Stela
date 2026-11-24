@@ -392,3 +392,138 @@ fn register_completions_chain_onward_and_misses_exit_unchanged() {
     let relative = i32::from_le_bytes(ret.code[back + 1..back + 5].try_into().unwrap());
     assert_eq!((back as i64 + 5 + i64::from(relative)) as usize, returns);
 }
+
+/// Page-relative PAC and strip thunks (`ThunkPc::page_relative`) hold their
+/// guest addresses as offsets from their PC's page, with the page base
+/// added: built for one offset of two pages they are the same code, and
+/// run at either page base their next instruction, BLRA*'s link and their
+/// original exit are that page's. The last instruction of a page continues
+/// in the next one.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn page_relative_thunks_name_the_page_they_run_at() {
+    use crate::{GuestState, PageBase};
+    use alloc::vec;
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    unsafe extern "C" {
+        fn mmap(
+            address: *mut c_void,
+            bytes: usize,
+            protection: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        fn mprotect(address: *mut c_void, bytes: usize, protection: i32) -> i32;
+        fn munmap(address: *mut c_void, bytes: usize) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    #[repr(C)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct Exit {
+        pc: u64,
+        kind: u64,
+    }
+    /// What the service answers: whether it completes, and with what.
+    static ANSWER: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    extern "sysv64" fn service(_: u64, _: u32, _: u64, _: u64) -> Completion {
+        Completion {
+            completed: ANSWER[0].load(SeqCst),
+            value: ANSWER[1].load(SeqCst),
+        }
+    }
+    fn run(code: &[u8], state: &mut GuestState) -> Exit {
+        const PAGE: usize = 4096;
+        let code = crate::x86_64::pinned::entered(code);
+        // SAFETY: private anonymous memory, RX after the copy, unmapped
+        // after the call; the thunk touches only `state`, the memo, the
+        // tags, the strip cell and the stack, and calls `service`.
+        unsafe {
+            let page = mmap(core::ptr::null_mut(), PAGE, 3, 2 | MAP_ANONYMOUS, -1, 0);
+            assert_ne!(page as usize, usize::MAX);
+            core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
+            assert_eq!(mprotect(page, PAGE, 5), 0);
+            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
+                core::mem::transmute(page);
+            let exit = entry(state);
+            assert_eq!(munmap(page, PAGE), 0);
+            exit
+        }
+    }
+    const PAGES: [u64; 2] = [0x0000_0001_0000_4000, 0xffff_fe00_1234_5000];
+    const STRIP: Place = Place::new(Anchor::Count, 0);
+    let routine: ServiceRoutine = service;
+    let routine = routine as usize as u64;
+    // An empty memo: every operation goes to the service.
+    let memo = vec![MemoEntry::default(); MEMO_ENTRIES];
+    let tags = [0u64; TAG_WORDS];
+    let mut cell = alloc::boxed::Box::new(strip::Cell::default());
+    let mut state = GuestState::default();
+    state.anchors[Anchor::Memo] = memo.as_ptr() as u64;
+    state.anchors[Anchor::Mirrors] = tags.as_ptr() as u64;
+    state.anchors[Anchor::Count] = &mut *cell as *mut strip::Cell as u64;
+    let sign = Form::of(Operation::SignIbSp).unwrap();
+    let ret = Form::of(Operation::ReturnIaSp).unwrap();
+    let call = Form::of(Operation::Branch {
+        key: Key::Ia,
+        target: 8,
+        modifier: Modifier::Register(16),
+        link: true,
+    })
+    .unwrap();
+    let exit = |pc, kind: ExitKind| Exit {
+        pc,
+        kind: kind as u64,
+    };
+    for offset in [0x10, 0xffc] {
+        let at = |page: u64| ThunkPc::page_relative(GuestAddress(page + offset));
+        let thunks = |page: u64| {
+            [sign, ret, call]
+                .map(|form| thunk(form, at(page), TAGS, routine))
+                .into_iter()
+                .chain(strip::thunk(at(page), 30, STRIP))
+                .collect::<Vec<_>>()
+        };
+        let built = thunks(PAGES[0]);
+        assert_eq!(built, thunks(PAGES[1]), "no address of its own");
+        let whole = thunk(sign, GuestAddress(PAGES[0] + offset), TAGS, routine);
+        assert_ne!(built[0].code, whole.code);
+        let [sign, ret, call, strip] = &built[..] else {
+            panic!("four thunks");
+        };
+        for page in PAGES {
+            let (pc, next) = (page + offset, page + offset + 4);
+            state.page_base = PageBase(page);
+            // Refused: the original exit, at this page.
+            ANSWER[0].store(0, SeqCst);
+            state.x[30] = 0x1234;
+            for thunk in [sign, ret, call] {
+                let original = exit(pc, ExitKind::PointerAuthentication);
+                assert_eq!(run(&thunk.code, &mut state), original);
+            }
+            assert_eq!(state.x[30], 0x1234);
+            // Completed: the next instruction of this page, a return to
+            // the result, and BLRAA's link to this page's next one.
+            ANSWER[0].store(1, SeqCst);
+            ANSWER[1].store(0x5678, SeqCst);
+            let fallthrough = exit(next, ExitKind::Fallthrough);
+            assert_eq!(run(&sign.code, &mut state), fallthrough);
+            assert_eq!(state.x[30], 0x5678);
+            let returned = exit(0x5678, ExitKind::Return);
+            assert_eq!(run(&ret.code, &mut state), returned);
+            assert_eq!(run(&call.code, &mut state), exit(0x5678, ExitKind::Call));
+            assert_eq!(state.x[30], next, "BLRAA links this page's next PC");
+            // XPACI LR: closed, the original exit; open, the next PC.
+            cell.enabled = 0;
+            let original = exit(pc, ExitKind::PointerAuthentication);
+            assert_eq!(run(&strip.code, &mut state), original);
+            cell.enabled = 1;
+            cell.keep = [u64::MAX; 2];
+            assert_eq!(run(&strip.code, &mut state), fallthrough);
+        }
+    }
+}

@@ -585,8 +585,7 @@ impl CompilationPlan {
         self,
         recipes: Option<&mut profile::CompileProfile>,
     ) -> Result<CompiledBlock, CompileError> {
-        const PAGE: u64 = 4096;
-        let page = self.base.0 & !(PAGE - 1);
+        let page = self.base.0 & !(crate::x86_64::RELATIVE_PAGE - 1);
         let relative = self.options.native_system().page_relative;
         let mut block = self.compile_body(recipes)?;
         if relative {

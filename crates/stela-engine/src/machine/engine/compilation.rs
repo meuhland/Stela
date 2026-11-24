@@ -1271,12 +1271,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }))
         .then(|| (code.0 + code_bytes.len() - chain::DYNAMIC_EXIT_BYTES) as u64);
         let first = self.admit(u32::from_le_bytes(source[..4].try_into().expect("a word")));
+        // An exit an install-time thunk may complete: PAC, transition and
+        // mirrored-read thunks.
+        let thunk_exit = code_bytes
+            .len()
+            .checked_sub(chain::DIRECT_EXIT_BYTES)
+            .is_some_and(|site| {
+                let exit = &code_bytes[site..];
+                super::exits_to(exit, terminal_pc, ExitKind::PointerAuthentication)
+                    || super::exits_to(exit, terminal_pc, ExitKind::System)
+            });
         // One body for every page that maps the frame (`--shared-aliases`):
-        // page-relative code with no guest address of its own, ending in no
-        // exit an install-time thunk completes for `pc` (PAC, transition and
-        // mirrored-read thunks are built for `GuestAddress(pc)`), outside a
+        // page-relative code with no guest address of its own, outside a
         // device-site page (which the store neither gives nor takes) and a
-        // page with a host breakpoint or trace point.
+        // page with a host breakpoint or trace point. A block whose exit a
+        // thunk completes is shared only with `--shared-thunks`, which
+        // builds the thunk page-relative too; else it is built for
+        // `GuestAddress(pc)` alone and the block stays one PC's.
         let serves_aliases = !single
             && !self.installing_stub
             && self.aliases_at(pc)
@@ -1286,14 +1297,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             && compiled.page_independent()
             && (compiled.fresh() || !self.shared_limits.fresh_only)
             && !self.page_has_device_sites(physical)
-            && code_bytes
-                .len()
-                .checked_sub(chain::DIRECT_EXIT_BYTES)
-                .is_none_or(|site| {
-                    let exit = &code_bytes[site..];
-                    !super::exits_to(exit, terminal_pc, ExitKind::PointerAuthentication)
-                        && !super::exits_to(exit, terminal_pc, ExitKind::System)
-                });
+            && (!thunk_exit || self.shared_limits.thunks);
+        // A shared block's thunk names guest addresses by their offsets in
+        // the page it runs at: it is entered only from the block's own
+        // exit, with the block's page base.
+        let thunk_pc = match serves_aliases {
+            true => ThunkPc::page_relative(GuestAddress(terminal_pc)),
+            false => ThunkPc::from(GuestAddress(terminal_pc)),
+        };
         // A device site's stub completes only a plain device load natively.
         if !single && self.installing_stub {
             successors.extend(self.complete_device_read_natively(
@@ -1305,20 +1316,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
             ));
         } else if !single && !self.device_site(physical) {
             let (successor, dynamic) = self
-                .complete_pointer_natively(code, code_bytes, terminal_pc, terminal)
+                .complete_pointer_natively(code, code_bytes, thunk_pc, terminal)
                 .unwrap_or_default();
             successors.extend(successor);
             dynamic_site = dynamic_site.or(dynamic);
             let ending = u32::try_from(instructions).unwrap_or(u32::MAX);
             if let Some(exit) =
-                self.complete_transition_natively(code, code_bytes, terminal_pc, terminal, ending)
+                self.complete_transition_natively(code, code_bytes, thunk_pc, terminal, ending)
             {
                 dynamic_site = dynamic_site.or(Some(exit));
             }
             successors.extend(self.complete_mirrored_read_natively(
                 code,
                 code_bytes,
-                terminal_pc,
+                thunk_pc,
                 terminal,
                 (last / INSTRUCTION as usize) as u32,
             ));
@@ -1571,15 +1582,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// Redirect the PAC exit ending a block's `native` code, installed at
     /// `code`, through a thunk that completes the PAC instruction `word` at
-    /// `pc` from the memo when it can (`x86_64::pointer`); the thunk's
-    /// direct exit to the next instruction, if it has one.
+    /// `at` from the memo when it can (`x86_64::pointer`), page-relative for
+    /// a shared block; the thunk's direct exit to the next instruction, if
+    /// it has one.
     pub(super) fn complete_pointer_natively(
         &mut self,
         code: NativeCode,
         native: &[u8],
-        pc: u64,
+        at: ThunkPc,
         word: u32,
     ) -> Option<(Option<Successor>, Option<u64>)> {
+        let pc = at.pc.0;
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
         let exit = ExitKind::PointerAuthentication;
         if !super::exits_to(&native[site..], pc, exit) {
@@ -1588,11 +1601,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let instruction = block::decode_pointer_authentication(GuestAddress(pc), word).ok()??;
         let thunk = match instruction.operation {
             PointerAuthenticationOperation::Strip { data, destination } => {
-                x86_64_pointer::strip::thunk(GuestAddress(pc), destination, strip_place(data))?
+                x86_64_pointer::strip::thunk(at, destination, strip_place(data))?
             }
             operation => {
                 let form = x86_64_pointer::Form::of(operation)?;
-                x86_64_pointer::thunk(form, GuestAddress(pc), TAGS, SERVICE as usize as u64)
+                x86_64_pointer::thunk(form, at, TAGS, SERVICE as usize as u64)
             }
         };
         self.install_stream = self.stream_at(code.0 as u64);
@@ -1629,14 +1642,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// of a [`MIRRORED`] register, from its cell in [`Self::mirrors`] while
     /// it is readable (`x86_64::register_read`); the thunk's direct exit to
     /// the next instruction. `before` instructions of the block precede it.
+    /// The thunk is page-relative for a shared block (`at`).
     pub(super) fn complete_mirrored_read_natively(
         &mut self,
         code: NativeCode,
         native: &[u8],
-        pc: u64,
+        at: ThunkPc,
         word: u32,
         before: u32,
     ) -> Option<Successor> {
+        let pc = at.pc.0;
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
         if !super::exits_to(&native[site..], pc, ExitKind::System) {
             return None;
@@ -1644,69 +1659,69 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let masks = register_read::MaskWrite::of(word).filter(|_| self.native_system().exclusive);
         let thunk = if let Some(write) = masks {
             let cell = cell_place(MASK_WRITES);
-            register_read::mask_thunk(write, GuestAddress(pc), cell)
+            register_read::mask_thunk(write, at, cell)
         } else if let Some(pan) = pan_write(word).filter(|_| self.host.pan_in_flags()) {
             let cell = cell_place(PAN_WRITES);
-            register_read::pan_thunk(GuestAddress(pc), pan, cell)
+            register_read::pan_thunk(at, pan, cell)
         } else if let Some(send) = event_instruction(pc, word) {
             if send {
-                register_read::send_event_thunk(GuestAddress(pc), EVENTS)
+                register_read::send_event_thunk(at, EVENTS)
             } else {
-                register_read::event_wait_thunk(GuestAddress(pc), EVENT_WAIT)
+                register_read::event_wait_thunk(at, EVENT_WAIT)
             }
         } else if data_barrier(pc, word) {
-            register_read::barrier_thunk(GuestAddress(pc), BARRIER)
+            register_read::barrier_thunk(at, BARRIER)
         } else if clear_exclusive(pc, word) {
-            register_read::clear_exclusive_thunk(GuestAddress(pc), CLEAR_EXCLUSIVE)
+            register_read::clear_exclusive_thunk(at, CLEAR_EXCLUSIVE)
         } else if let Some(rt) = code_page_invalidation(word).filter(|&rt| rt != ZERO_REGISTER) {
             let cell = cell_place(CODE_PAGE);
-            register_read::code_page_thunk(GuestAddress(pc), rt, cell)
+            register_read::code_page_thunk(at, rt, cell)
         } else if let Some(select) = stack_select(word) {
             let cell = cell_place(STACK_SELECT);
             let current = SELECTED;
             let sp0 = Place::new(Anchor::StackZero, 0);
-            register_read::stack_select_thunk(GuestAddress(pc), select, cell, current, sp0)
+            register_read::stack_select_thunk(at, select, cell, current, sp0)
         } else if let Some((index, rt)) = written_register(pc, word) {
-            self.stored_write_thunk(GuestAddress(pc), index, rt)
+            self.stored_write_thunk(at, index, rt)
         } else if let Some(rt) = table_base_write(pc, word) {
             let cell = cell_place(TABLE_BASE_KEPT);
             let written = self.register_fixed_bits(SystemRegister::TTBR0_EL1);
-            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
+            register_read::unchanged_write_thunk(at, rt, cell, written)
         } else if let Some((kept, rt)) = permission_write_word(word) {
             let all = register_read::Written {
                 keep: u64::MAX,
                 set: 0,
             };
-            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell_place(kept), all)
+            register_read::unchanged_write_thunk(at, rt, cell_place(kept), all)
         } else if let Some((index, rt)) = guarded_written_register(pc, word) {
             let cell = cell_place(index);
             let all = register_read::Written {
                 keep: u64::MAX,
                 set: 0,
             };
-            register_read::stored_write_thunk(GuestAddress(pc), rt, cell, all)
+            register_read::stored_write_thunk(at, rt, cell, all)
         } else if let Some((index, rt)) = mirrored_read(pc, word) {
             let cell = cell_place(index);
             if GUARDED_MIRRORS.contains(&index) {
-                register_read::stored_thunk(GuestAddress(pc), rt, cell)
+                register_read::stored_thunk(at, rt, cell)
             } else if COUNT_MIRRORS.contains(&index) {
                 self.clock.native(self.host.tsc_counter()?);
                 let count = Place::new(Anchor::Count, 0);
-                register_read::count_thunk(GuestAddress(pc), rt, cell, count)
+                register_read::count_thunk(at, rt, cell, count)
             } else if index == COUNTER_MIRRORS[0]
                 && let Some(tsc) = self.host.tsc_counter()
             {
                 self.clock.native(tsc);
                 let count = Place::new(Anchor::Count, 0);
                 let plain = cell_place(CYCLES_PLAIN);
-                register_read::cycle_counter_thunk(GuestAddress(pc), rt, cell, plain, CYCLES, count)
+                register_read::cycle_counter_thunk(at, rt, cell, plain, CYCLES, count)
             } else if index == COUNTER_MIRRORS[1] {
                 // Its block's instructions before it have retired, and the
                 // chain counts the blocks native code left: what the
                 // engine's exit here would retire before it reads.
                 let plain = cell_place(INSTRUCTIONS_PLAIN);
                 register_read::instruction_counter_thunk(
-                    GuestAddress(pc),
+                    at,
                     rt,
                     cell,
                     plain,
@@ -1714,9 +1729,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     before,
                 )?
             } else if index == DAIF_MIRROR && self.native_system().exclusive {
-                register_read::mask_read_thunk(GuestAddress(pc), rt, cell)
+                register_read::mask_read_thunk(at, rt, cell)
             } else {
-                register_read::thunk(GuestAddress(pc), rt, cell)
+                register_read::thunk(at, rt, cell)
             }
         } else if let Some(rt) = interrupt_status_read(word) {
             self.clock.native(self.host.tsc_counter()?);
@@ -1725,17 +1740,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 Place::new(Anchor::Control, epoch),
                 Place::new(Anchor::Count, 0),
             );
-            register_read::interrupt_status_thunk(
-                GuestAddress(pc),
-                rt,
-                INTERRUPT_STATUS,
-                epoch,
-                count,
-            )
+            register_read::interrupt_status_thunk(at, rt, INTERRUPT_STATUS, epoch, count)
         } else if let Some((register, rt)) = fast_ipi_write(pc, word) {
             use crate::machine::fast_ipi::Register;
             self.enter_fast_ipi()?;
-            let pc = GuestAddress(pc);
+            let pc = at;
             match register {
                 Register::RequestLocal => {
                     register_read::fast_ipi_request_thunk(pc, rt, false, FAST_IPI)
@@ -1756,14 +1765,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.register_fixed_bits(SystemRegister::CNTHV_CTL_EL2),
                 ),
             };
-            register_read::timer_thunk(GuestAddress(pc), rt, access, TIMER)
+            register_read::timer_thunk(at, rt, access, TIMER)
         } else if let Some(access) = mrs_access(pc, word) {
-            self.stored_read_thunk(pc, access)?
+            self.stored_read_thunk(at, access)?
         } else {
             let access = msr_access(pc, word)?;
             let (index, refused) = self.stored_write_cell(access.encoding())?;
             let cell = cell_place(stored_write_cell(index));
-            let (pc, rt) = (GuestAddress(pc), access.rt());
+            let (pc, rt) = (at, access.rt());
             if let Some((_, bit)) = pstate_field(access.encoding()) {
                 let written = register_read::Written { keep: bit, set: 0 };
                 register_read::stored_write_thunk(pc, rt, cell, written)
@@ -1832,10 +1841,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The thunk completing MSR of `WRITTEN[index]` from Xt at `pc`.
     pub(super) fn stored_write_thunk(
         &self,
-        pc: GuestAddress,
+        pc: impl Into<ThunkPc>,
         index: usize,
         rt: u8,
     ) -> x86_64_pointer::Thunk {
+        let pc = pc.into();
         let (_, register) = WRITTEN[index];
         let cell = cell_place(written_cell(index));
         let written = self.register_fixed_bits(register);
@@ -1921,14 +1931,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The thunk completing `access` at `pc` from its stored cell.
     fn stored_read_thunk(
         &mut self,
-        pc: u64,
+        at: ThunkPc,
         access: RegisterAccess,
     ) -> Option<x86_64_pointer::Thunk> {
         use registers::encodings::{FPCR, FPSR, PAN};
         let encoding = access.encoding();
         let index = self.stored_cell(encoding)?;
         let cell = cell_place(index);
-        let (pc, rt) = (GuestAddress(pc), access.rt());
+        let (pc, rt) = (at, access.rt());
         if encoding == STACK_ZERO {
             let selected = SELECTED;
             return Some(register_read::selected_stored_thunk(pc, rt, cell, selected));

@@ -643,16 +643,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// Install the thunk completing the GENTER, GEXIT, SVC or ERET `word` that ends
     /// block `code` (its bytes `native`, its `ending` instructions, which
-    /// the thunk logs with the run's) at `pc`; the address of its exit to
-    /// the target, which may be linked.
+    /// the thunk logs with the run's) at `at`, page-relative for a shared
+    /// block; the address of its exit to the target, which may be linked.
     pub(super) fn complete_transition_natively(
         &mut self,
         code: NativeCode,
         native: &[u8],
-        pc: u64,
+        at: ThunkPc,
         word: u32,
         ending: u32,
     ) -> Option<u64> {
+        let pc = at.pc.0;
         let (kind, immediate) = transition_word(word)?;
         let site = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
         if !super::exits_to(&native[site..], pc, ExitKind::System) {
@@ -665,7 +666,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             None if matches!(kind, GUARDED_EXIT | EXCEPTION_RETURN) => return None,
             None => {}
         }
-        let pc_at = GuestAddress(pc);
+        let pc_at = at;
         let thunk = match kind {
             GUARDED_ENTER => {
                 let syndrome = Cpu::guarded_enter_syndrome(immediate as u8);

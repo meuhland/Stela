@@ -44,8 +44,8 @@
 //! takes a few words of the host stack and the count reader's words.
 use super::asm::{Alu, Asm, Cond, Gpr, Mem, Patch, ShiftOp, Size, Unary};
 use super::flag_word::{ARM_MASK, ARM_SHIFT, PACK_MULTIPLIER, UNPACK_MULTIPLIER, WORD_MASK};
-use super::pointer::Thunk;
-use crate::{Anchor, GuestAddress, GuestState, Place, aarch64::Register, block::ExitKind};
+use super::pointer::{Thunk, ThunkPc};
+use crate::{Anchor, GuestState, Place, aarch64::Register, block::ExitKind};
 use alloc::vec::Vec;
 use core::mem::offset_of;
 
@@ -506,12 +506,13 @@ fn commit(
     places: &Places,
     kind: usize,
     misses: Vec<Patch>,
-    pc: GuestAddress,
+    pc: ThunkPc,
     ending: u32,
 ) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::Qword;
     let mut asm = Asm::new(&mut code);
+    asm.set_thunk_page(pc.page());
     let to = |field| record_field(field);
     asm.place(Rcx, places.state);
     asm.mov_load(Qword, Rax, to(offset_of!(Record, to)));
@@ -650,15 +651,21 @@ fn commit(
     for miss in misses {
         asm.bind(miss);
     }
-    super::block::direct_exit_with(&mut asm, pc, ExitKind::System);
+    super::block::direct_exit_with(&mut asm, pc.pc, ExitKind::System);
     Thunk::new(code, None, Some(dynamic))
 }
 
 /// The thunk completing `GENTER #immediate` at `pc`, whose ESR is
 /// `syndrome` (the immediate in it), else exiting at `pc` for the engine.
-pub fn guarded_enter_thunk(pc: GuestAddress, syndrome: u32, places: &Places, ending: u32) -> Thunk {
+pub fn guarded_enter_thunk(
+    pc: impl Into<ThunkPc>,
+    syndrome: u32,
+    places: &Places,
+    ending: u32,
+) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::{Dword, Qword};
+    let pc = pc.into();
     let mut code = Vec::with_capacity(512);
     let mut misses = Vec::new();
     let mut asm = Asm::new(&mut code);
@@ -676,7 +683,8 @@ pub fn guarded_enter_thunk(pc: GuestAddress, syndrome: u32, places: &Places, end
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, spsr)));
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
-    asm.guest_imm64(Rax, GuestAddress(pc.0.wrapping_add(4)));
+    asm.set_thunk_page(pc.page());
+    asm.guest_imm64(Rax, pc.next());
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, esr)));
     asm.mov_imm32(Rax, syndrome);
@@ -692,9 +700,10 @@ pub fn guarded_enter_thunk(pc: GuestAddress, syndrome: u32, places: &Places, end
 }
 
 /// The thunk completing GEXIT at `pc`, else exiting at `pc` for the engine.
-pub fn guarded_exit_thunk(pc: GuestAddress, places: &Places, ending: u32) -> Thunk {
+pub fn guarded_exit_thunk(pc: impl Into<ThunkPc>, places: &Places, ending: u32) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::Qword;
+    let pc = pc.into();
     let mut code = Vec::with_capacity(512);
     let mut misses = Vec::new();
     let mut asm = Asm::new(&mut code);
@@ -922,13 +931,14 @@ fn swap_pointer(asm: &mut Asm<'_>, places: &Places) {
 /// record's (with PSTATE.PAN the record's `check`), DIT stays; and the PE
 /// continues at the record's vector.
 pub fn supervisor_call_thunk(
-    pc: GuestAddress,
+    pc: impl Into<ThunkPc>,
     syndrome: u32,
     places: &Places,
     ending: u32,
 ) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::{Dword, Qword};
+    let pc = pc.into();
     let mut code = Vec::with_capacity(512);
     let mut misses = Vec::new();
     let mut asm = Asm::new(&mut code);
@@ -948,7 +958,8 @@ pub fn supervisor_call_thunk(
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, spsr)));
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
-    asm.guest_imm64(Rax, GuestAddress(pc.0.wrapping_add(4)));
+    asm.set_thunk_page(pc.page());
+    asm.guest_imm64(Rax, pc.next());
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, esr)));
     asm.mov_imm32(Rax, syndrome);
@@ -990,9 +1001,10 @@ pub fn supervisor_call_thunk(
 /// (`Record::reservation`). PSTATE's operands come from SPSR, the PC
 /// from ELR with its tag removed where the record says, the SP moves, the
 /// frame's local monitor clears and the event register is set.
-pub fn exception_return_thunk(pc: GuestAddress, places: &Places, ending: u32) -> Thunk {
+pub fn exception_return_thunk(pc: impl Into<ThunkPc>, places: &Places, ending: u32) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::{Byte, Dword, Qword};
+    let pc = pc.into();
     let mut code = Vec::with_capacity(640);
     let mut misses = Vec::new();
     let mut asm = Asm::new(&mut code);
@@ -1054,6 +1066,7 @@ pub fn exception_return_thunk(pc: GuestAddress, places: &Places, ending: u32) ->
 ))]
 mod tests {
     use super::*;
+    use crate::GuestAddress;
     use crate::x86_64::chain::ChainControl;
     use crate::x86_64::register_read::{Count, CountState};
     use alloc::boxed::Box;
@@ -1588,6 +1601,55 @@ mod tests {
                 assert_eq!(exit, MISS, "count {count} until {until}");
                 assert_eq!((rig.words.state, rig.state.sp), (6, 0x7000));
                 assert_eq!(rig.jump_serial(), 1);
+            }
+        }
+    }
+
+    /// Page-relative thunks (`ThunkPc::page_relative`) hold their guest
+    /// addresses as offsets from their PC's page, with the page base added:
+    /// built for one offset of two pages they are the same code, and run at
+    /// either page base GENTER banks that page's next instruction as ELR
+    /// (the next page's first for a page's last instruction), and every
+    /// kind's original exit is that page's PC.
+    #[test]
+    fn page_relative_transitions_name_the_page_they_run_at() {
+        use crate::PageBase;
+        const PAGES: [u64; 2] = [0xffff_fe00_0000_8000, 0x0000_0001_2345_6000];
+        let syndrome = 0xfe01_0003;
+        for offset in [0x10, 0xffc] {
+            let at = |page: u64| ThunkPc::page_relative(GuestAddress(page + offset));
+            let thunks = |page: u64| {
+                [
+                    guarded_enter_thunk(at(page), syndrome, &PLACES, 0),
+                    guarded_exit_thunk(at(page), &PLACES, 0),
+                    supervisor_call_thunk(at(page), syndrome, &PLACES, 0),
+                    exception_return_thunk(at(page), &PLACES, 0),
+                ]
+            };
+            let built = thunks(PAGES[0]);
+            assert_eq!(built, thunks(PAGES[1]), "no address of its own");
+            let whole = guarded_enter_thunk(GuestAddress(PAGES[0] + offset), syndrome, &PLACES, 0);
+            assert_ne!(built[0].code, whole.code);
+            for page in PAGES {
+                let pc = page + offset;
+                let mut rig = entering();
+                rig.state.page_base = PageBase(page);
+                let entered = Exit {
+                    pc: ENTER,
+                    kind: ExitKind::Return as u64,
+                };
+                assert_eq!(rig.run(&built[0]), entered);
+                assert_eq!(rig.bank.elr, pc + 4);
+                for thunk in &built {
+                    let mut rig = Rig::new();
+                    rig.state.page_base = PageBase(page);
+                    let original = Exit {
+                        pc,
+                        kind: ExitKind::System as u64,
+                    };
+                    assert_eq!(rig.run(thunk), original);
+                    assert_eq!(rig.table.counts, [0; KINDS]);
+                }
             }
         }
     }
